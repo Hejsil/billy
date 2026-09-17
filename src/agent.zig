@@ -24,6 +24,11 @@ pub const Config = struct {
     /// prices. Null for a model billy does not know, in which case the header
     /// leaves out the context gauge and the cost.
     model_info: ?models.Metadata,
+    /// How a bash command is laid out before it is shown to the user, from the
+    /// configuration. This is presentation only: the command that runs and
+    /// everything stored in the session keep the text the model wrote. Null
+    /// shows the command as written.
+    format: tools.Format = null,
 };
 
 const system_prompt =
@@ -144,7 +149,7 @@ pub fn run(
     session: *session_mod.Session,
 ) !void {
     var editor = line_editor.LineEditor.init(io, out, arena);
-    var tool_set = try tools.Tools.init(io, arena, gpa, out);
+    var tool_set = try tools.Tools.init(io, arena, gpa, out, config.format);
     var client: llm.Client = .{
         .gpa = gpa,
         .arena = arena,
@@ -180,14 +185,16 @@ pub fn run(
 /// Replays a stored conversation the way a live session showed it, so a resumed
 /// session reads exactly like the run it continues. The rendering is shared with
 /// the loop: replies go through `printReply` and tool calls through
-/// `tools.parseCall` and `tools.describe`, and the user prompt through `prompt`.
+/// `tools.parseCall` and `tools.describe`, which lays out a bash command the
+/// same way `format` does, and the user prompt through `prompt`.
 pub fn printTranscript(
     arena: std.mem.Allocator,
     out: *Io.Writer,
     messages: []const llm.Message,
+    format: tools.Format,
 ) !void {
     for (messages, 0..) |message, i| {
-        try printMessage(arena, out, message, messages[i + 1 ..]);
+        try printMessage(arena, out, message, messages[i + 1 ..], format);
     }
     try out.flush();
 }
@@ -201,6 +208,7 @@ fn printMessage(
     out: *Io.Writer,
     message: llm.Message,
     following: []const llm.Message,
+    format: tools.Format,
 ) !void {
     if (std.mem.eql(u8, message.role, "user")) {
         // Mirrors what the line editor leaves on screen for a submitted line.
@@ -210,7 +218,7 @@ fn printMessage(
     const calls = message.tool_calls orelse &.{};
     if (calls.len == 0) return printReply(out, message.content);
     for (calls) |call| {
-        try tools.describe(tools.parseCall(arena, call), resultOf(following, call.id), out);
+        try tools.describe(tools.parseCall(arena, call), resultOf(following, call.id), format, out);
     }
 }
 
@@ -299,7 +307,7 @@ test "printTranscript replays messages the way a live session shows them" {
         .{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;" },
         .{ .role = "assistant", .content = "done" },
     };
-    try printTranscript(arena_state.allocator(), &out.writer, &messages);
+    try printTranscript(arena_state.allocator(), &out.writer, &messages, null);
 
     try std.testing.expectEqualStrings(
         "\n> hello\n" ++
@@ -321,7 +329,7 @@ test "printTranscript leaves out the system prompt and an unpaired tool result" 
         .{ .role = "system", .content = "ignore me" },
         // A result whose call is not in the session has nothing to belong to.
         .{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;" },
-    });
+    }, null);
     try std.testing.expectEqualStrings("", out.written());
 }
 
@@ -340,7 +348,7 @@ test "printTranscript gives each call the result that names it" {
         } },
         .{ .role = "tool", .tool_call_id = "call_1", .content = "contents of a" },
         .{ .role = "tool", .tool_call_id = "call_2", .content = "contents of b" },
-    });
+    }, null);
     try std.testing.expectEqualStrings(
         "--- tool - read ---\na.zig\n--- output ---\ncontents of a\n\n" ++
             "--- tool - read ---\nb.zig\n--- output ---\ncontents of b\n\n",

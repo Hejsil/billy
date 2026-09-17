@@ -14,6 +14,9 @@ const command_timeout_s = 120;
 /// Lines of a result shown before the rest is summarized. The model still gets
 /// the whole result; only the display is cut short.
 const max_block_lines = 5;
+/// Room above the script when the formatted one is read back, so a formatter
+/// that runs away cannot exhaust memory.
+const format_slack = 1 << 20;
 
 /// A tool call parsed into the arguments of the call it names. Parsing happens
 /// once, in `run`, and both the block the user sees and the tool itself read
@@ -66,6 +69,9 @@ pub const Tools = struct {
     gpa: std.mem.Allocator,
     /// Reports tool activity to the user.
     log: *Io.Writer,
+    /// How a bash command is laid out for the user. Shared with the transcript,
+    /// so a replayed session shows the command the way the run did.
+    format: Format,
     definitions: []const llm.Tool,
 
     pub fn init(
@@ -73,12 +79,14 @@ pub const Tools = struct {
         arena: std.mem.Allocator,
         gpa: std.mem.Allocator,
         log: *Io.Writer,
+        format: Format,
     ) !Tools {
         return .{
             .io = io,
             .arena = arena,
             .gpa = gpa,
             .log = log,
+            .format = format,
             .definitions = try definitions(arena),
         };
     }
@@ -92,7 +100,7 @@ pub const Tools = struct {
     /// it is doing, and the result follows it.
     pub fn run(tools: *Tools, call: llm.ToolCall) ![]const u8 {
         const parsed = parseCall(tools.arena, call);
-        try printHead(parsed, tools.log);
+        try printHead(parsed, tools.format, tools.log);
         try tools.log.flush();
 
         const result = switch (parsed) {
@@ -240,6 +248,66 @@ pub const Tools = struct {
     }
 };
 
+/// How a bash command is laid out for the user before it is shown. Null shows
+/// the command as the model wrote it.
+///
+/// The formatting is presentation only: the command that runs, its result and
+/// everything the session stores keep the text the model wrote.
+pub const Format = ?Formatter;
+
+/// A formatter: a shell script that reads the command on standard input and
+/// writes the formatted command on standard output, such as
+/// `shfmt | bat -l bash`. That script is what a configuration sets.
+pub const Formatter = struct {
+    /// The shell script, run with `bash -c`.
+    script: []const u8,
+    io: Io,
+    /// Holds the formatted command while the block is printed.
+    gpa: std.mem.Allocator,
+};
+
+/// Runs `command` through the formatter and writes what it makes of the command
+/// to `out`. Returns whether it could; false leaves `out` untouched, so the
+/// caller can show the command as written. That is what no formatter gives, and
+/// a formatter that cannot be run, rejects the command, writes nothing or
+/// writes too much.
+fn apply(format: Format, command: []const u8, out: *Io.Writer) !bool {
+    const formatter = format orelse return false;
+    var child = std.process.spawn(formatter.io, .{
+        .argv = &.{ "bash", "-c", formatter.script },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    }) catch return false;
+    defer child.kill(formatter.io);
+
+    // The command goes in on standard input, which is what the format script
+    // reads. Closing the pipe is what tells it there is no more.
+    var in_buffer: [4096]u8 = undefined;
+    var script: Io.File.Writer = .init(child.stdin.?, formatter.io, &in_buffer);
+    try script.interface.writeAll(command);
+    try script.interface.flush();
+    child.stdin.?.close(formatter.io);
+    child.stdin = null;
+
+    var out_buffer: [4096]u8 = undefined;
+    var reader: Io.File.Reader = .init(child.stdout.?, formatter.io, &out_buffer);
+    const written = reader.interface.allocRemaining(
+        formatter.gpa,
+        .limited(command.len +| format_slack),
+    ) catch return false;
+    defer formatter.gpa.free(written);
+
+    // A formatter that failed, or left nothing behind, is one the user should
+    // not see the command disappear for; it is shown as written instead.
+    if (exitCode(child.wait(formatter.io) catch return false) != 0) return false;
+    const formatted = std.mem.trimEnd(u8, written, "\n");
+    if (formatted.len == 0) return false;
+
+    try out.writeAll(formatted);
+    return true;
+}
+
 /// Parses a tool call into the arguments of the call it names. It never fails:
 /// an unimplemented tool becomes `unknown` and arguments that do not fit become
 /// `malformed`, so a caller can still name the call it could not run.
@@ -277,17 +345,17 @@ fn parse(comptime T: type, arena: std.mem.Allocator, json: []const u8) !T {
 /// Prints the block a live session shows for a tool call and its result: a
 /// header naming the tool, what it acts on, and its output. The transcript
 /// reuses it so that replaying a session matches the run exactly.
-pub fn describe(call: Call, result: []const u8, out: *Io.Writer) !void {
-    try printHead(call, out);
+pub fn describe(call: Call, result: []const u8, format: Format, out: *Io.Writer) !void {
+    try printHead(call, format, out);
     try printResult(call, result, out);
     try out.writeAll("\n");
 }
 
-/// Prints the header block of a call: which tool it is and what it acts on. The
-/// command of a bash call is printed in full, since it is what the user asked
-/// for; the strings an edit works on are truncated, since they are there for
-/// context rather than to be read in full.
-fn printHead(call: Call, out: *Io.Writer) !void {
+/// Prints the header block of a call: which tool it is and what it acts on. A
+/// bash command is laid out by `format`, so it reads the way it runs; the
+/// strings an edit works on are truncated, since they are there for context
+/// rather than to be read in full.
+fn printHead(call: Call, format: Format, out: *Io.Writer) !void {
     switch (call) {
         .read => |args| try out.print("--- tool - read ---\n{s}\n", .{args.path}),
         .write => |args| try out.print("--- tool - write ---\n{s}\n", .{args.path}),
@@ -298,12 +366,25 @@ fn printHead(call: Call, out: *Io.Writer) !void {
             try out.writeAll("--- replace ---\n");
             try printTruncated(out, args.new_string);
         },
-        .bash => |args| try out.print("--- tool - bash ---\n{s}\n", .{args.command}),
+        .bash => |args| {
+            try out.writeAll("--- tool - bash ---\n");
+            try printScript(args.command, format, out);
+        },
         // Only the name is known, so that is all there is to show; the reason it
         // could not run reaches the user through the output.
         .unknown => |name| try out.print("--- tool - {s} ---\n", .{name}),
         .malformed => |bad| try out.print("--- tool - {s} ---\n", .{bad.name}),
     }
+}
+
+/// Prints a bash command on its own line under the block header, run through
+/// the formatter when the configuration sets one and exactly as the model wrote
+/// it when there is none, or the formatter cannot be used. The trailing newline
+/// is dropped, so the block ends where the command does.
+fn printScript(command: []const u8, format: Format, out: *Io.Writer) !void {
+    const script = std.mem.trimEnd(u8, command, "\n");
+    if (!try apply(format, script, out)) try out.writeAll(script);
+    try out.writeAll("\n");
 }
 
 /// Prints a call's result under `--- output ---`.
@@ -513,6 +594,58 @@ test "describe frames a call and its output" {
     );
 }
 
+test "a bash command is shown the way the formatter lays it out" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // The format script reads the command and writes it back upper case, the
+    // way `shfmt | bat -l bash` reads it and writes it back laid out.
+    const format: Format = .{ .script = "tr a-z A-Z | cat", .io = std.testing.io, .gpa = gpa };
+    try describe(parseCall(arena, .{ .id = "1", .function = .{
+        .name = "bash",
+        .arguments = "{\"command\":\"ls -la\\n\"}",
+    } }), "exit code: 0\n(no output)\n", format, &out.writer);
+
+    // The command is shown as the formatter wrote it; its trailing newline does
+    // not leave a blank line in the block.
+    try std.testing.expectEqualStrings(
+        "--- tool - bash ---\nLS -LA\n--- output ---\nexit code: 0\n(no output)\n\n",
+        out.written(),
+    );
+}
+
+test "a bash command is shown as written when the formatter cannot lay it out" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    const call: llm.ToolCall = .{ .id = "1", .function = .{
+        .name = "bash",
+        .arguments = "{\"command\":\"ls -la\"}",
+    } };
+    const expected =
+        "--- tool - bash ---\nls -la\n--- output ---\nexit code: 0\n(no output)\n\n";
+
+    // A formatter that cannot be run, one that fails and one that writes
+    // nothing all leave the command the model wrote for the user to read.
+    const scripts = [_][]const u8{ "billy-no-such-formatter", "exit 1", "true" };
+    for (scripts) |script| {
+        const format: Format = .{ .script = script, .io = std.testing.io, .gpa = gpa };
+        try describe(parseCall(arena, call), "exit code: 0\n(no output)\n", format, &out.writer);
+        try std.testing.expectEqualStrings(expected, out.written());
+        out.clearRetainingCapacity();
+    }
+}
+
 test "describe keeps a block short and says how much it left out" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -525,6 +658,7 @@ test "describe keeps a block short and says how much it left out" {
     try describe(
         .{ .read = .{ .path = "a.zig" } },
         "1\n2\n3\n4\n5",
+        null,
         &out.writer,
     );
     try std.testing.expectEqualStrings(
@@ -538,6 +672,7 @@ test "describe keeps a block short and says how much it left out" {
     try describe(
         .{ .read = .{ .path = "a.zig" } },
         "1\n2\n3\n4\n5\n6\n7\n",
+        null,
         &out.writer,
     );
     try std.testing.expectEqualStrings(
@@ -547,7 +682,7 @@ test "describe keeps a block short and says how much it left out" {
     out.clearRetainingCapacity();
 
     // An empty result leaves the header with nothing under it.
-    try describe(.{ .read = .{ .path = "a.zig" } }, "", &out.writer);
+    try describe(.{ .read = .{ .path = "a.zig" } }, "", null, &out.writer);
     try std.testing.expectEqualStrings("--- tool - read ---\na.zig\n--- output ---\n\n", out.written());
     out.clearRetainingCapacity();
 
@@ -559,6 +694,7 @@ test "describe keeps a block short and says how much it left out" {
             .new_string = "b",
         } },
         "replaced 1 occurrence(s) in a.zig",
+        null,
         &out.writer,
     );
     try std.testing.expectEqualStrings(
@@ -577,7 +713,7 @@ test "run logs exactly what describe prints" {
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
 
-    var tool_set = try Tools.init(std.testing.io, arena, gpa, &log.writer);
+    var tool_set = try Tools.init(std.testing.io, arena, gpa, &log.writer, null);
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"true\"}",
@@ -586,13 +722,47 @@ test "run logs exactly what describe prints" {
 
     var described: std.Io.Writer.Allocating = .init(gpa);
     defer described.deinit();
-    try describe(parseCall(arena, call), result, &described.writer);
+    try describe(parseCall(arena, call), result, null, &described.writer);
 
     // The live log is the description, so a replayed session reads the same.
     try std.testing.expectEqualStrings(
         "--- tool - bash ---\ntrue\n--- output ---\nexit code: 0\n(no output)\n\n",
         log.written(),
     );
+    try std.testing.expectEqualStrings(log.written(), described.written());
+}
+
+test "the format changes what is shown and nothing else" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var log: std.Io.Writer.Allocating = .init(gpa);
+    defer log.deinit();
+
+    // The format script writes the command back upper case, so what is shown is
+    // plainly not what runs.
+    const format: Format = .{ .script = "tr a-z A-Z", .io = std.testing.io, .gpa = gpa };
+    var tool_set = try Tools.init(std.testing.io, arena, gpa, &log.writer, format);
+    const call: llm.ToolCall = .{ .id = "1", .function = .{
+        .name = "bash",
+        .arguments = "{\"command\":\"echo hi\"}",
+    } };
+    const result = try tool_set.run(call);
+
+    // The command that ran is the one the model wrote, so the result is its
+    // output, and the user reads the command as the formatter laid it out.
+    try std.testing.expectEqualStrings("exit code: 0\nhi\n", result);
+    try std.testing.expectEqualStrings(
+        "--- tool - bash ---\nECHO HI\n--- output ---\nexit code: 0\nhi\n\n",
+        log.written(),
+    );
+
+    // A replayed session describes the stored call the same way.
+    var described: std.Io.Writer.Allocating = .init(gpa);
+    defer described.deinit();
+    try describe(parseCall(arena, call), result, format, &described.writer);
     try std.testing.expectEqualStrings(log.written(), described.written());
 }
 
@@ -632,7 +802,7 @@ fn expectDescribe(expected: []const u8, name: []const u8, arguments: []const u8,
     try describe(parseCall(arena_state.allocator(), .{ .id = "1", .function = .{
         .name = name,
         .arguments = arguments,
-    } }), result, &out.writer);
+    } }), result, null, &out.writer);
     try std.testing.expectEqualStrings(expected, out.written());
 }
 

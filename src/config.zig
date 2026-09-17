@@ -25,6 +25,8 @@ pub const default_max_turns = 100;
 pub const Config = struct {
     /// Model turns allowed for one request before the harness gives up on it.
     max_turns: usize = default_max_turns,
+    /// Settings for the tools the agent can call, by tool name.
+    tools: Tools = .{},
 
     /// What `open` found, including whether the file had to be written.
     pub const Opened = struct {
@@ -52,7 +54,10 @@ pub const Config = struct {
         // Zero turns would give the model no chance to answer at all, which is
         // never what the file is meant to say.
         if (stored.max_turns == 0) return error.InvalidConfig;
-        return .{ .config = .{ .max_turns = stored.max_turns }, .created = false };
+        return .{
+            .config = .{ .max_turns = stored.max_turns, .tools = stored.tools },
+            .created = false,
+        };
     }
 
     /// Writes the configuration to `file_name` in `dir`. The previous contents
@@ -60,7 +65,7 @@ pub const Config = struct {
     pub fn save(config: Config, io: Io, dir: Io.Dir, gpa: std.mem.Allocator) !void {
         const text = try std.json.Stringify.valueAlloc(
             gpa,
-            Stored{ .max_turns = config.max_turns },
+            Stored{ .max_turns = config.max_turns, .tools = config.tools },
             .{},
         );
         defer gpa.free(text);
@@ -75,10 +80,29 @@ pub const Config = struct {
     }
 };
 
-/// The configuration file as it is written to and read from disk.
+/// Settings for the tools the agent can call, one group per tool.
+pub const Tools = struct {
+    bash: Bash = .{},
+};
+
+/// Settings for the bash tool.
+pub const Bash = struct {
+    /// A shell script that lays a bash command out for the display: it reads the
+    /// command on standard input and writes the formatted command on standard
+    /// output, such as `shfmt | bat -l bash`. Null shows the command exactly as
+    /// the model wrote it.
+    ///
+    /// Only the display changes; the command that runs, and everything stored
+    /// in the session, keep what the model wrote.
+    format: ?[]const u8 = null,
+};
+
+/// The configuration file as it is written to and read from disk. The tool
+/// settings are the configuration's own, since the file holds exactly those.
 const Stored = struct {
     version: u32 = format_version,
     max_turns: usize = default_max_turns,
+    tools: Tools = .{},
 };
 
 /// The directory holding the configuration: `$XDG_CONFIG_HOME/billy`, or
@@ -137,7 +161,7 @@ test "open writes the defaults when the file is missing" {
     try std.testing.expectEqual(default_max_turns, second.config.max_turns);
 }
 
-test "open reads the max_turns from the file" {
+test "open reads the max_turns and the bash format from the file" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
@@ -148,12 +172,39 @@ test "open reads the max_turns from the file" {
     // An unknown field and a missing version must not stop the read.
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = file_name,
-        .data = "{\"max_turns\":7,\"future\":true}",
+        .data = "{\"max_turns\":7,\"future\":true," ++
+            "\"tools\":{\"bash\":{\"format\":\"shfmt | bat -l bash\",\"unknown\":1}}}",
     });
 
     const opened = try Config.open(std.testing.io, tmp.dir, allocator);
     try std.testing.expect(!opened.created);
     try std.testing.expectEqual(7, opened.config.max_turns);
+    try std.testing.expectEqualStrings("shfmt | bat -l bash", opened.config.tools.bash.format.?);
+}
+
+test "open leaves the bash format unset when the file does not set one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A session saved before the setting existed has no tools at all.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = file_name,
+        .data = "{\"max_turns\":7}",
+    });
+    const older = try Config.open(std.testing.io, tmp.dir, allocator);
+    try std.testing.expect(older.config.tools.bash.format == null);
+
+    // A format of null is the same as not setting one.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = file_name,
+        .data = "{\"tools\":{\"bash\":{\"format\":null}}}",
+    });
+    const explicit = try Config.open(std.testing.io, tmp.dir, allocator);
+    try std.testing.expect(explicit.config.tools.bash.format == null);
 }
 
 test "save round-trips a custom max_turns" {

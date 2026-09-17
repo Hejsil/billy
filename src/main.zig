@@ -14,10 +14,13 @@ const usage =
     \\under $XDG_DATA_HOME/billy, or ~/.local/share/billy when that is unset.
     \\The configuration lives in $XDG_CONFIG_HOME/billy/config.json, or
     \\~/.config/billy/config.json when that is unset, and is created with the
-    \\defaults on the first run. It holds the turn limit. The context window and
-    \\the token prices the header reports come from a table built into billy,
-    \\keyed by provider and model, since the API reports token counts but
-    \\neither of those.
+    \\defaults on the first run. It holds the turn limit, and, under
+    \\tools.bash.format, a shell script that lays a bash command out for the
+    \\display: it reads the command on standard input and writes the formatted
+    \\command on standard output, such as "shfmt | bat -l bash". The context
+    \\window and the token prices the header reports come from a table built
+    \\into billy, keyed by provider and model, since the API reports token
+    \\counts but neither of those.
     \\
 ;
 
@@ -94,6 +97,15 @@ pub fn main(init: std.process.Init) !void {
         // they are looked up by provider and model; an unknown model simply has
         // no gauge and no cost.
         .model_info = billy.models.lookup(billy.models.Provider.fromUrl(base_url), model),
+        // A bash command is laid out by the format script the configuration
+        // sets, when it sets one, so the user reads the command the way it
+        // runs. Only the display changes: the command that runs and the session
+        // keep what the model wrote.
+        .format = if (settings.config.tools.bash.format) |script| .{
+            .script = script,
+            .io = io,
+            .gpa = init.gpa,
+        } else null,
     };
 
     const directory = billy.session.defaultDir(arena, init.environ_map) catch |err| {
@@ -121,7 +133,7 @@ pub fn main(init: std.process.Init) !void {
     if (options.resume_id != null) {
         // Replay the conversation exactly as a live session showed it, so the
         // context does not have to be remembered from the previous run.
-        try billy.agent.printTranscript(arena, out, session.messages.items);
+        try billy.agent.printTranscript(arena, out, session.messages.items, config.format);
     }
     try billy.agent.run(io, arena, init.gpa, out, config, &session);
 }
