@@ -79,18 +79,18 @@ pub fn costOf(price: models.Price, usage: llm.Usage) f64 {
         output * price.output) / million;
 }
 
-/// A token count in a short form, such as `16k` or `128k`.
+/// A token count in a short form, such as `16k` or `128k`, with no decimals.
 fn formatTokens(arena: std.mem.Allocator, count: usize) ![]const u8 {
     if (count < 1000) return std.fmt.allocPrint(arena, "{d}", .{count});
     if (count < 1_000_000) return formatScaled(arena, count, 1000, 'k');
     return formatScaled(arena, count, 1_000_000, 'M');
 }
 
-/// `count` divided by `unit` with a trailing unit letter, dropping the decimal
-/// when the division is exact.
+/// `count` divided by `unit`, rounded to a whole number, with a trailing unit
+/// letter. The rounding is what makes a count readable without a decimal: half a
+/// thousand reads as the next thousand.
 fn formatScaled(arena: std.mem.Allocator, count: usize, unit: usize, suffix: u8) ![]const u8 {
-    if (count % unit == 0) return std.fmt.allocPrint(arena, "{d}{c}", .{ count / unit, suffix });
-    return std.fmt.allocPrint(arena, "{d:.1}{c}", .{
+    return std.fmt.allocPrint(arena, "{d:.0}{c}", .{
         @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(unit)),
         suffix,
     });
@@ -106,11 +106,18 @@ fn formatPercent(arena: std.mem.Allocator, used: usize, total: usize) ![]const u
     return std.fmt.allocPrint(arena, "{d}%", .{percent});
 }
 
-/// A dollar amount, with enough places to show a fraction of a cent, since a
-/// single turn usually costs well under one.
+/// A dollar amount, rounded to the cent with the trailing zeros dropped, so that
+/// `$1.5` and `$0` read the same way `1.5k` does, without padding to a fixed
+/// number of places.
 fn formatMoney(arena: std.mem.Allocator, amount: f64) ![]const u8 {
-    if (amount >= 0.01) return std.fmt.allocPrint(arena, "${d:.4}", .{amount});
-    return std.fmt.allocPrint(arena, "${d:.6}", .{amount});
+    const digits = try std.fmt.allocPrint(arena, "{d:.2}", .{amount});
+
+    // Drop the trailing zeros of the hundredths, then a bare decimal point.
+    var end = digits.len;
+    while (end > 0 and digits[end - 1] == '0') end -= 1;
+    if (end > 0 and digits[end - 1] == '.') end -= 1;
+
+    return std.fmt.allocPrint(arena, "${s}", .{digits[0..end]});
 }
 
 /// The working directory as shown in the header. A path inside the home
@@ -370,25 +377,25 @@ test "header shows how full the context window is" {
 
     // A fresh session has used nothing.
     try std.testing.expectEqualStrings(
-        "billy · m · /work · 0/128k (0%) · $0.000000",
+        "billy · m · /work · 0/128k (0%) · $0",
         try sessionHeader(arena, allocator, config, 0, 0),
     );
     // A rounded-to-zero percentage still shows the conversation is not empty.
     try std.testing.expectEqualStrings(
-        "billy · m · /work · 500/128k (<1%) · $0.000000",
+        "billy · m · /work · 500/128k (<1%) · $0",
         try sessionHeader(arena, allocator, config, 500, 0),
     );
     try std.testing.expectEqualStrings(
-        "billy · m · /work · 16k/128k (12%) · $0.000000",
+        "billy · m · /work · 16k/128k (12%) · $0",
         try sessionHeader(arena, allocator, config, 16_000, 0),
     );
-    // A full window, and a count that needs a decimal.
+    // A full window, and a count that rounds to a whole thousand.
     try std.testing.expectEqualStrings(
-        "billy · m · /work · 128k/128k (100%) · $0.000000",
+        "billy · m · /work · 128k/128k (100%) · $0",
         try sessionHeader(arena, allocator, config, 128_000, 0),
     );
     try std.testing.expectEqualStrings(
-        "billy · m · /work · 12.5k/128k (9%) · $0.000000",
+        "billy · m · /work · 13k/128k (9%) · $0",
         try sessionHeader(arena, allocator, config, 12_500, 0),
     );
 }
@@ -399,32 +406,60 @@ test "header shows the accumulated session cost" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
 
-    // The real deepseek-flash rates, off-peak.
-    var config = testConfig("deepseek-flash", "/work", null);
+    // The real deepseek-flash rates, off-peak, against a window the totals fit.
     const info = models.lookup(.deepseek, "deepseek-flash").?;
-    config.model_info = info;
+    var config = testConfig("deepseek-flash", "/work", null);
+    config.model_info = .{
+        .provider = info.provider,
+        .model = info.model,
+        .context_window = 4_000_000,
+        .price = info.price,
+    };
 
-    // 1000 cache hits, 1000 misses and 1000 output tokens:
-    // 1000*0.003 + 1000*0.15 + 1000*0.6, all per million.
+    // A million of each token, so the cost is large enough to show in cents:
+    // 1000000*0.003 + 1000000*0.15 + 1000000*0.6, all per million.
     const usage: llm.Usage = .{
-        .prompt_tokens = 2000,
-        .completion_tokens = 1000,
-        .total_tokens = 3000,
-        .cache_hit_tokens = 1000,
-        .cache_miss_tokens = 1000,
+        .prompt_tokens = 2_000_000,
+        .completion_tokens = 1_000_000,
+        .total_tokens = 3_000_000,
+        .cache_hit_tokens = 1_000_000,
+        .cache_miss_tokens = 1_000_000,
     };
     const off_peak_cost = costOf(info.priceAt(off_peak_utc), usage);
     try std.testing.expectEqualStrings(
-        "billy · deepseek-flash · /work · 3k/1M (<1%) · $0.000753",
-        try sessionHeader(arena, allocator, config, 3000, off_peak_cost),
+        "billy · deepseek-flash · /work · 3M/4M (75%) · $0.75",
+        try sessionHeader(arena, allocator, config, 3_000_000, off_peak_cost),
     );
     // A request made in peak hours cost double, which stays on the total even if
     // the header is shown later, off-peak.
     const peak_cost = costOf(info.priceAt(peak_utc), usage);
     try std.testing.expectEqualStrings(
-        "billy · deepseek-flash · /work · 3k/1M (<1%) · $0.001506",
-        try sessionHeader(arena, allocator, config, 3000, peak_cost),
+        "billy · deepseek-flash · /work · 3M/4M (75%) · $1.51",
+        try sessionHeader(arena, allocator, config, 3_000_000, peak_cost),
     );
+}
+
+test "token counts are whole and prices keep at most two decimals" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    // A count is never shown with a decimal, so half a thousand rounds up.
+    try std.testing.expectEqualStrings("0", try formatTokens(allocator, 0));
+    try std.testing.expectEqualStrings("999", try formatTokens(allocator, 999));
+    try std.testing.expectEqualStrings("1k", try formatTokens(allocator, 1000));
+    try std.testing.expectEqualStrings("13k", try formatTokens(allocator, 12_500));
+    try std.testing.expectEqualStrings("128k", try formatTokens(allocator, 128_000));
+    try std.testing.expectEqualStrings("1M", try formatTokens(allocator, 1_000_000));
+
+    // A price is rounded to the cent, and the zeros it does not need are dropped.
+    try std.testing.expectEqualStrings("$0", try formatMoney(allocator, 0));
+    try std.testing.expectEqualStrings("$0.01", try formatMoney(allocator, 0.007));
+    try std.testing.expectEqualStrings("$0.5", try formatMoney(allocator, 0.5));
+    try std.testing.expectEqualStrings("$1", try formatMoney(allocator, 1));
+    try std.testing.expectEqualStrings("$1.25", try formatMoney(allocator, 1.25));
+    try std.testing.expectEqualStrings("$1.51", try formatMoney(allocator, 1.506));
 }
 
 test "header leaves out the gauge and cost for an unknown model" {
