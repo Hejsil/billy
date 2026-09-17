@@ -3,6 +3,7 @@
 pub const agent = @import("agent.zig");
 pub const line_editor = @import("line_editor.zig");
 pub const llm = @import("llm.zig");
+pub const session = @import("session.zig");
 pub const tools = @import("tools.zig");
 
 test {

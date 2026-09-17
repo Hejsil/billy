@@ -6,6 +6,7 @@ const Io = std.Io;
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
 const line_editor = @import("line_editor.zig");
+const session_mod = @import("session.zig");
 
 pub const Config = struct {
     api_key: []const u8,
@@ -29,6 +30,7 @@ pub fn run(
     gpa: std.mem.Allocator,
     out: *Io.Writer,
     config: Config,
+    session: *session_mod.Session,
 ) !void {
     var editor = line_editor.LineEditor.init(io, out, arena);
     var tool_set = try tools.Tools.init(io, arena, gpa, out);
@@ -41,16 +43,17 @@ pub fn run(
         .model = config.model,
     };
 
-    var messages: std.ArrayList(llm.Message) = .empty;
-    try messages.append(arena, .{ .role = "system", .content = system_prompt });
+    // The prompt is added on every start and never stored, so it can change
+    // without invalidating saved sessions.
+    try session.messages.insert(arena, 0, .{ .role = "system", .content = system_prompt });
 
     while (true) {
         const line = (try editor.readLine("> ")) orelse break;
         if (line.len == 0) continue;
-        try messages.append(arena, .{ .role = "user", .content = line });
+        try session.append(.{ .role = "user", .content = line });
         // A failed request must not end the session: report it and take the
         // next request from the user.
-        turn(&client, &tool_set, arena, out, &messages) catch |err|
+        turn(&client, &tool_set, out, session) catch |err|
             std.log.err("request failed: {s}", .{@errorName(err)});
     }
     try out.flush();
@@ -60,20 +63,19 @@ pub fn run(
 fn turn(
     client: *llm.Client,
     tool_set: *tools.Tools,
-    arena: std.mem.Allocator,
     out: *Io.Writer,
-    messages: *std.ArrayList(llm.Message),
+    session: *session_mod.Session,
 ) !void {
     var remaining: usize = max_turns;
     while (remaining > 0) : (remaining -= 1) {
-        const message = try client.complete(messages.items, tool_set.definitions);
-        try messages.append(arena, message);
+        const message = try client.complete(session.messages.items, tool_set.definitions);
+        try session.append(message);
 
         const calls = message.tool_calls orelse return printReply(out, message.content);
         if (calls.len == 0) return printReply(out, message.content);
 
         for (calls) |call| {
-            try messages.append(arena, .{
+            try session.append(.{
                 .role = "tool",
                 .tool_call_id = call.id,
                 .content = try tool_set.run(call),
