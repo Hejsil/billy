@@ -27,12 +27,40 @@ const system_prompt =
 /// replayed session looks like the run it continues.
 const prompt = "> ";
 
+/// The header line shown above the input prompt, naming the model and the
+/// working directory so a session is clear at a glance. It carries no newline:
+/// the line editor prints it on a line of its own.
+pub fn sessionHeader(
+    arena: std.mem.Allocator,
+    model: []const u8,
+    cwd: []const u8,
+    home: ?[]const u8,
+) ![]const u8 {
+    return std.fmt.allocPrint(arena, "billy · {s} · {s}", .{ model, try displayPath(arena, cwd, home) });
+}
+
+/// The working directory as shown in the header. A path inside the home
+/// directory is shortened to `~` so a long path stays readable.
+fn displayPath(arena: std.mem.Allocator, cwd: []const u8, home: ?[]const u8) ![]const u8 {
+    if (home) |dir| {
+        // Require a component boundary, so `/home/user2` is not shortened by a
+        // `/home/user` home directory.
+        if (dir.len > 0 and std.mem.startsWith(u8, cwd, dir)) {
+            const rest = cwd[dir.len..];
+            if (rest.len == 0) return "~";
+            if (rest[0] == '/') return std.fmt.allocPrint(arena, "~{s}", .{rest});
+        }
+    }
+    return cwd;
+}
+
 pub fn run(
     io: Io,
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
     out: *Io.Writer,
     config: Config,
+    header: []const u8,
     session: *session_mod.Session,
 ) !void {
     var editor = line_editor.LineEditor.init(io, out, arena);
@@ -55,7 +83,7 @@ pub fn run(
     try session.ensureTools(tool_set.definitions);
 
     while (true) {
-        const line = (try editor.readLine(prompt)) orelse break;
+        const line = (try editor.readLine(header, prompt)) orelse break;
         if (line.len == 0) continue;
         try session.append(.{ .role = "user", .content = line });
         // A failed request must not end the session: report it and take the
@@ -180,4 +208,38 @@ test "printTranscript leaves out the system prompt and tool results" {
         .{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;" },
     });
     try std.testing.expectEqualStrings("", out.written());
+}
+
+test "header names the model and the working directory" {
+    const arena = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(arena);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    try std.testing.expectEqualStrings(
+        "billy · deepseek-flash · /work",
+        try sessionHeader(allocator, "deepseek-flash", "/work", null),
+    );
+}
+
+test "header shortens a path inside the home directory" {
+    const arena = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(arena);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    try std.testing.expectEqualStrings(
+        "billy · m · ~/repo/billy",
+        try sessionHeader(allocator, "m", "/home/user/repo/billy", "/home/user"),
+    );
+    // The home directory itself becomes just `~`.
+    try std.testing.expectEqualStrings(
+        "billy · m · ~",
+        try sessionHeader(allocator, "m", "/home/user", "/home/user"),
+    );
+    // A sibling that merely shares the prefix is left alone.
+    try std.testing.expectEqualStrings(
+        "billy · m · /home/user2",
+        try sessionHeader(allocator, "m", "/home/user2", "/home/user"),
+    );
 }

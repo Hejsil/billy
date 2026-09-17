@@ -104,16 +104,21 @@ pub fn main(init: std.process.Init) !void {
         else => return err,
     };
 
-    if (options.resume_id) |id| {
-        try out.print("billy · {s} · resumed session {s} · Ctrl-D to exit\n", .{ config.model, id });
+    // The header sits above the input prompt, so the model and the working
+    // directory are visible wherever the user is typing, while replayed user
+    // lines keep a bare `>`.
+    const cwd = std.process.currentPathAlloc(io, arena) catch |err| {
+        std.log.err("cannot find the working directory: {s}", .{@errorName(err)});
+        return err;
+    };
+    const header = try billy.agent.sessionHeader(arena, config.model, cwd, init.environ_map.get("HOME"));
+
+    if (options.resume_id != null) {
         // Replay the conversation exactly as a live session showed it, so the
         // context does not have to be remembered from the previous run.
         try billy.agent.printTranscript(arena, out, session.messages.items);
-    } else {
-        try out.print("billy · {s} · session {s} · Ctrl-D to exit\n", .{ config.model, session.id });
-        try out.print("resume it later with: billy --resume {s}\n", .{session.id});
     }
-    try billy.agent.run(io, arena, init.gpa, out, config, &session);
+    try billy.agent.run(io, arena, init.gpa, out, config, header, &session);
 }
 
 /// Reads the command line, whose first entry is the executable name.

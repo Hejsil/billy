@@ -58,17 +58,28 @@ pub const LineEditor = struct {
 
     /// Reads one line, echoing and editing it in the terminal.
     ///
-    /// `prompt` is printed in front of the line and must not contain a newline,
-    /// so that redraws can repaint it in place.
+    /// `header` is shown on its own line above the prompt while the line is being
+    /// edited and is removed again once the line is submitted, so it never ends up
+    /// in the output. `prompt` is printed in front of the line and is what stays.
+    /// Neither may contain a newline. When stdin is not a terminal there is no
+    /// editing to show a header for, so only the prompt is printed.
     ///
     /// Returns null when stdin is exhausted: end of a piped stdin, or Ctrl-D on
     /// an empty line. The returned slice is allocated with the arena.
-    pub fn readLine(ed: *LineEditor, prompt: []const u8) !?[]const u8 {
+    pub fn readLine(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
+        const interactive = try Io.File.stdin().isTty(ed.io);
+        // Start on a fresh line, then the header, then the prompt the user types
+        // behind. The leading newline also ends the previous line after a piped
+        // read, which has no echo to do that.
         try ed.out.writeAll("\n");
+        if (interactive and header.len > 0) {
+            try ed.out.writeAll(header);
+            try ed.out.writeAll("\n");
+        }
         try ed.out.writeAll(prompt);
         try ed.out.flush();
 
-        if (!try Io.File.stdin().isTty(ed.io)) return ed.readLinePiped();
+        if (!interactive) return ed.readLinePiped();
 
         const saved = try ed.enterRaw();
         defer std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, saved) catch {};
@@ -106,7 +117,7 @@ pub const LineEditor = struct {
                     dirty = true;
                 },
                 .enter => {
-                    try ed.moveToRegionBottom();
+                    try ed.endPrompt(header);
                     try ed.out.writeAll("\r\n");
                     try ed.out.flush();
                     return @as(?[]const u8, try ed.submit(line.items));
@@ -179,8 +190,15 @@ pub const LineEditor = struct {
                     }
                 },
                 .interrupt => {
-                    try ed.moveToRegionBottom();
+                    // The abandoned line is dropped, header and all.
+                    try ed.endPrompt(header);
                     try ed.out.writeAll("\x1b[K^C\r\n");
+                    // The user is still at a prompt, so show the header again;
+                    // the redraw below repaints the prompt under it.
+                    if (header.len > 0) {
+                        try ed.out.writeAll(header);
+                        try ed.out.writeAll("\n");
+                    }
                     line.clearRetainingCapacity();
                     cursor = 0;
                     recalled = null;
@@ -190,7 +208,7 @@ pub const LineEditor = struct {
                     try ed.out.flush();
                 },
                 .eof => if (line.items.len == 0) {
-                    try ed.moveToRegionBottom();
+                    try ed.endPrompt(header);
                     try ed.out.writeAll("\r\n");
                     try ed.out.flush();
                     return null;
@@ -283,6 +301,24 @@ pub const LineEditor = struct {
         ed.last_rows = rows;
         ed.last_cursor_row = cursor_row;
         try ed.out.flush();
+    }
+
+    /// Ends the editable line, leaving the cursor at the start of the last row of
+    /// the line on screen. The header belongs to the editable prompt alone, so it
+    /// is deleted here: the submitted line then reads as a plain `> ` line, the
+    /// same way a resumed session replays it.
+    fn endPrompt(ed: *LineEditor, header: []const u8) !void {
+        if (header.len == 0) {
+            try ed.moveToRegionBottom();
+            return;
+        }
+        // The header occupies the row just above the prompt region, so deleting
+        // that row moves the region up into the space it held.
+        try ed.out.print("\x1b[{d}A", .{ed.last_cursor_row + 1});
+        try ed.out.writeAll("\r\x1b[M");
+        // The cursor sits on the region's first row now; walk down to its last.
+        if (ed.last_rows > 1) try ed.out.print("\x1b[{d}B", .{ed.last_rows - 1});
+        try ed.out.writeAll("\r");
     }
 
     /// Moves the cursor to the first column of the last row of the render, so a
@@ -519,6 +555,40 @@ test "visibleWidth ignores ANSI escapes" {
     try std.testing.expectEqual(2, visibleWidth("> "));
     try std.testing.expectEqual(0, visibleWidth("\x1b[31m\x1b[0m"));
     try std.testing.expectEqual(5, visibleWidth("\x1b[1mbilly\x1b[0m"));
+}
+
+test "endPrompt deletes the header row and lands below the line" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var ed = LineEditor.init(std.testing.io, &out.writer, gpa);
+
+    // One row of input: up to the header, delete it, then down a line.
+    ed.last_rows = 1;
+    ed.last_cursor_row = 0;
+    try ed.endPrompt("billy · m · /w");
+    try std.testing.expectEqualStrings("\x1b[1A\r\x1b[M\r", out.written());
+    out.clearRetainingCapacity();
+
+    // Three rows of input with the cursor on the last: the region moves up one
+    // row and the cursor walks down to the bottom of it.
+    ed.last_rows = 3;
+    ed.last_cursor_row = 2;
+    try ed.endPrompt("billy · m · /w");
+    try std.testing.expectEqualStrings("\x1b[3A\r\x1b[M\x1b[2B\r", out.written());
+    out.clearRetainingCapacity();
+
+    // Without a header only the cursor moves, as before.
+    ed.last_rows = 3;
+    ed.last_cursor_row = 1;
+    try ed.endPrompt("");
+    try std.testing.expectEqualStrings("\x1b[1B\r", out.written());
+    out.clearRetainingCapacity();
+
+    ed.last_rows = 0;
+    ed.last_cursor_row = 0;
+    try ed.endPrompt("");
+    try std.testing.expectEqualStrings("", out.written());
 }
 
 test "moveCursorVertical keeps its target column across rows" {
