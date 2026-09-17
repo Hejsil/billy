@@ -13,10 +13,9 @@ pub const Config = struct {
     /// Full URL of the chat completions endpoint.
     url: []const u8,
     model: []const u8,
+    /// Model turns allowed for one request before the harness gives up on it.
+    max_turns: usize,
 };
-
-/// Model turns allowed for one request before the harness gives up on it.
-const max_turns = 40;
 
 const system_prompt =
     \\You are a coding agent working in the user's project directory.
@@ -53,7 +52,7 @@ pub fn run(
         try session.append(.{ .role = "user", .content = line });
         // A failed request must not end the session: report it and take the
         // next request from the user.
-        turn(&client, &tool_set, out, session) catch |err|
+        turn(&client, &tool_set, out, session, config.max_turns) catch |err|
             std.log.err("request failed: {s}", .{@errorName(err)});
     }
     try out.flush();
@@ -65,6 +64,7 @@ fn turn(
     tool_set: *tools.Tools,
     out: *Io.Writer,
     session: *session_mod.Session,
+    max_turns: usize,
 ) !void {
     var remaining: usize = max_turns;
     while (remaining > 0) : (remaining -= 1) {

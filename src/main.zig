@@ -12,6 +12,9 @@ const usage =
     \\The API key comes from DEEPSEEK_API_KEY or OPENAI_API_KEY. BILLY_BASE_URL
     \\and BILLY_MODEL override the endpoint and the model. Sessions are stored
     \\under $XDG_DATA_HOME/billy, or ~/.local/share/billy when that is unset.
+    \\The configuration lives in $XDG_CONFIG_HOME/billy/config.json, or
+    \\~/.config/billy/config.json when that is unset, and is created with the
+    \\defaults on the first run.
     \\
 ;
 
@@ -49,12 +52,34 @@ pub fn main(init: std.process.Init) !void {
         return error.MissingApiKey;
     };
     const base_url = init.environ_map.get("BILLY_BASE_URL") orelse "https://api.deepseek.com";
+
+    const config_dir = billy.config.defaultDir(arena, init.environ_map) catch |err| {
+        std.log.err("cannot find where to store the configuration: {s}", .{@errorName(err)});
+        return err;
+    };
+    var config_dir_handle = Io.Dir.cwd().createDirPathOpen(io, config_dir, .{}) catch |err| {
+        std.log.err("cannot use {s} for the configuration: {s}", .{ config_dir, @errorName(err) });
+        return err;
+    };
+    defer config_dir_handle.close(io);
+
+    const settings = billy.config.Config.open(io, config_dir_handle, arena) catch |err| {
+        std.log.err("cannot read the configuration in {s}: {s}", .{ config_dir, @errorName(err) });
+        return err;
+    };
+    if (settings.created) {
+        try out.print("wrote the default configuration to {s}\n", .{
+            try std.fs.path.join(arena, &.{ config_dir, billy.config.file_name }),
+        });
+    }
+
     const config: billy.agent.Config = .{
         .api_key = api_key,
         .url = try std.fmt.allocPrint(arena, "{s}/chat/completions", .{
             std.mem.trimEnd(u8, base_url, "/"),
         }),
         .model = init.environ_map.get("BILLY_MODEL") orelse "deepseek-flash",
+        .max_turns = settings.config.max_turns,
     };
 
     const directory = billy.session.defaultDir(arena, init.environ_map) catch |err| {
