@@ -186,28 +186,44 @@ pub fn printTranscript(
     out: *Io.Writer,
     messages: []const llm.Message,
 ) !void {
-    for (messages) |message| try printMessage(arena, out, message);
+    for (messages, 0..) |message, i| {
+        try printMessage(arena, out, message, messages[i + 1 ..]);
+    }
     try out.flush();
 }
 
-/// Prints one message the way a live session shows it. The system prompt and the
-/// tool results are never shown while running, so they are left out here too.
-fn printMessage(arena: std.mem.Allocator, out: *Io.Writer, message: llm.Message) !void {
+/// Prints one message the way a live session shows it. The system prompt is never
+/// shown while running, so it is left out here too. A tool result is shown as the
+/// output of the call that produced it, which is the message just after it, and
+/// not as a message of its own.
+fn printMessage(
+    arena: std.mem.Allocator,
+    out: *Io.Writer,
+    message: llm.Message,
+    following: []const llm.Message,
+) !void {
     if (std.mem.eql(u8, message.role, "user")) {
         // Mirrors what the line editor leaves on screen for a submitted line.
         return out.print("\n{s}{s}\n", .{ prompt, message.content orelse "" });
     }
     if (!std.mem.eql(u8, message.role, "assistant")) return;
-    if (message.tool_calls) |calls| {
-        if (calls.len > 0) {
-            for (calls) |call| {
-                try tools.describe(tools.parseCall(arena, call), out);
-                try out.writeAll("\n");
-            }
-            return;
-        }
+    const calls = message.tool_calls orelse &.{};
+    if (calls.len == 0) return printReply(out, message.content);
+    for (calls) |call| {
+        try tools.describe(tools.parseCall(arena, call), resultOf(following, call.id), out);
     }
-    try printReply(out, message.content);
+}
+
+/// The result a call produced: the content of the tool message that names it,
+/// which follows the assistant message that asked for it. Empty when the session
+/// does not hold it, so a file written without one still replays.
+fn resultOf(messages: []const llm.Message, id: []const u8) []const u8 {
+    for (messages) |message| {
+        if (!std.mem.eql(u8, message.role, "tool")) continue;
+        const call_id = message.tool_call_id orelse continue;
+        if (std.mem.eql(u8, call_id, id)) return message.content orelse "";
+    }
+    return "";
 }
 
 /// Runs the model until it replies with text instead of tool calls.
@@ -272,7 +288,8 @@ test "printTranscript replays messages the way a live session shows them" {
     defer out.deinit();
 
     const messages = [_]llm.Message{
-        // The system prompt and the tool results are never shown while running.
+        // The system prompt is never shown while running, the tool result only as
+        // the output of the call it belongs to.
         .{ .role = "system", .content = "ignore me" },
         .{ .role = "user", .content = "hello" },
         .{ .role = "assistant", .tool_calls = &.{.{
@@ -286,13 +303,13 @@ test "printTranscript replays messages the way a live session shows them" {
 
     try std.testing.expectEqualStrings(
         "\n> hello\n" ++
-            "read a.zig\n" ++
+            "--- tool - read ---\na.zig\n--- output ---\n1\tconst x = 1;\n\n" ++
             "done\n",
         out.written(),
     );
 }
 
-test "printTranscript leaves out the system prompt and tool results" {
+test "printTranscript leaves out the system prompt and an unpaired tool result" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -302,9 +319,33 @@ test "printTranscript leaves out the system prompt and tool results" {
 
     try printTranscript(arena_state.allocator(), &out.writer, &.{
         .{ .role = "system", .content = "ignore me" },
+        // A result whose call is not in the session has nothing to belong to.
         .{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;" },
     });
     try std.testing.expectEqualStrings("", out.written());
+}
+
+test "printTranscript gives each call the result that names it" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    try printTranscript(arena_state.allocator(), &out.writer, &.{
+        .{ .role = "assistant", .tool_calls = &.{
+            .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" } },
+            .{ .id = "call_2", .function = .{ .name = "read", .arguments = "{\"path\":\"b.zig\"}" } },
+        } },
+        .{ .role = "tool", .tool_call_id = "call_1", .content = "contents of a" },
+        .{ .role = "tool", .tool_call_id = "call_2", .content = "contents of b" },
+    });
+    try std.testing.expectEqualStrings(
+        "--- tool - read ---\na.zig\n--- output ---\ncontents of a\n\n" ++
+            "--- tool - read ---\nb.zig\n--- output ---\ncontents of b\n\n",
+        out.written(),
+    );
 }
 
 /// A config with no model metadata, so the header is just the model and the
