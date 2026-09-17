@@ -46,9 +46,11 @@ pub fn run(
         .model = config.model,
     };
 
-    // The prompt is added on every start and never stored, so it can change
-    // without invalidating saved sessions.
-    try session.messages.insert(arena, 0, .{ .role = "system", .content = system_prompt });
+    // The prompt is stored with the session and reused on a resume, so the
+    // messages sent then match the earlier run byte for byte and hit the prompt
+    // cache. It is appended only to an empty conversation, so a new session gets
+    // the current prompt while a resumed one keeps the prompt it was saved with.
+    try session.appendSystemPrompt(system_prompt);
 
     while (true) {
         const line = (try editor.readLine(prompt)) orelse break;

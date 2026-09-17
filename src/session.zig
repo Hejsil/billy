@@ -3,8 +3,10 @@
 //!
 //! Every session is one JSON file named after its id. The file is rewritten
 //! after each message, so killing the process loses at most the message being
-//! written. The system prompt is deliberately not stored: it is added again on
-//! every start, so it can change without making saved sessions unusable.
+//! written. The system prompt is stored with the conversation and reused when
+//! the session is resumed, so a resume resends the exact messages of the run it
+//! continues and hits the prompt cache. A changed prompt therefore takes effect
+//! in new sessions only.
 
 const std = @import("std");
 const Io = std.Io;
@@ -38,8 +40,7 @@ pub const Session = struct {
     id: []const u8,
     /// Name of the session file inside `dir`.
     name: []const u8,
-    /// The conversation, oldest first. A system prompt is kept here while the
-    /// process runs but is never written to disk.
+    /// The conversation, oldest first, starting with the system prompt.
     messages: std.ArrayList(llm.Message) = .empty,
 
     /// Opens the session called `resume_id`, or starts a new one when it is null.
@@ -76,6 +77,16 @@ pub const Session = struct {
         try session.save();
     }
 
+    /// Appends `system_prompt` to an empty conversation, leaving one that has any
+    /// messages alone. Calling it before the first turn puts the prompt first; a
+    /// resumed session already carries the prompt it was saved with, which is
+    /// kept so the messages sent match the earlier run byte for byte and hit the
+    /// prompt cache.
+    pub fn appendSystemPrompt(session: *Session, system_prompt: []const u8) !void {
+        if (session.messages.items.len != 0) return;
+        try session.append(.{ .role = "system", .content = system_prompt });
+    }
+
     /// Writes the conversation to the session file. The previous contents are
     /// replaced in one step, leaving them intact if writing fails part way.
     pub fn save(session: *Session) !void {
@@ -91,10 +102,7 @@ pub const Session = struct {
         try json.write(format_version);
         try json.objectField("messages");
         try json.beginArray();
-        for (session.messages.items) |message| {
-            if (std.mem.eql(u8, message.role, "system")) continue;
-            try json.write(message);
-        }
+        for (session.messages.items) |message| try json.write(message);
         try json.endArray();
         try json.endObject();
 
@@ -123,10 +131,9 @@ pub const Session = struct {
             .allocate = .alloc_always,
         }) catch return error.CorruptSession;
         if (stored.version > format_version) return error.UnsupportedSessionVersion;
-        // A stored system prompt is ignored: the current one is added again at
-        // the start of the run.
+        // The stored messages are kept as they are, system prompt included, so
+        // resuming reuses exactly what the earlier run sent.
         for (stored.messages) |message| {
-            if (std.mem.eql(u8, message.role, "system")) continue;
             try session.messages.append(session.arena, message);
         }
     }
@@ -286,9 +293,10 @@ test "a session survives a save and resume" {
 
     const resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, session.id);
     try std.testing.expectEqualStrings(session.id, resumed.id);
-    // The system prompt is not stored, so it is not read back.
-    try std.testing.expectEqual(session.messages.items.len - 1, resumed.messages.items.len);
-    for (session.messages.items[1..], resumed.messages.items) |before, after| {
+    // The system prompt is stored too, so everything comes back.
+    try std.testing.expectEqual(session.messages.items.len, resumed.messages.items.len);
+    try std.testing.expectEqualStrings("be terse", resumed.messages.items[0].content.?);
+    for (session.messages.items, resumed.messages.items) |before, after| {
         try std.testing.expectEqualStrings(before.role, after.role);
         try std.testing.expectEqualStrings(before.content orelse "", after.content orelse "");
         try std.testing.expectEqualStrings(before.tool_call_id orelse "", after.tool_call_id orelse "");
@@ -300,7 +308,7 @@ test "a session survives a save and resume" {
     }
 }
 
-test "a stored system prompt is dropped when resuming" {
+test "a stored system prompt is kept when resuming" {
     const arena = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(arena);
     defer arena_state.deinit();
@@ -316,10 +324,38 @@ test "a stored system prompt is dropped when resuming" {
             "{\"role\":\"user\",\"content\":\"hi\"}]}",
     });
 
-    const resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, "one");
-    try std.testing.expectEqual(1, resumed.messages.items.len);
-    try std.testing.expectEqualStrings("user", resumed.messages.items[0].role);
-    try std.testing.expectEqualStrings("hi", resumed.messages.items[0].content.?);
+    // Resuming keeps the saved prompt even though a newer one is available.
+    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, "one");
+    try resumed.appendSystemPrompt("new prompt");
+    try std.testing.expectEqual(2, resumed.messages.items.len);
+    try std.testing.expectEqualStrings("system", resumed.messages.items[0].role);
+    try std.testing.expectEqualStrings("old prompt", resumed.messages.items[0].content.?);
+    try std.testing.expectEqualStrings("user", resumed.messages.items[1].role);
+}
+
+test "appendSystemPrompt only adds the prompt to an empty session" {
+    const arena = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(arena);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null);
+    try session.appendSystemPrompt("current prompt");
+    try std.testing.expectEqual(1, session.messages.items.len);
+    try std.testing.expectEqualStrings("system", session.messages.items[0].role);
+    try std.testing.expectEqualStrings("current prompt", session.messages.items[0].content.?);
+
+    // A conversation that already has messages is never touched, even when it
+    // has no system prompt of its own.
+    try session.append(.{ .role = "user", .content = "hi" });
+    try session.appendSystemPrompt("a different prompt");
+    try std.testing.expectEqual(2, session.messages.items.len);
+    try std.testing.expectEqualStrings("system", session.messages.items[0].role);
+    try std.testing.expectEqualStrings("current prompt", session.messages.items[0].content.?);
+    try std.testing.expectEqualStrings("user", session.messages.items[1].role);
 }
 
 test "opening an unknown or damaged session is reported" {
