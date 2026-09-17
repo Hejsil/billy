@@ -106,6 +106,9 @@ pub fn main(init: std.process.Init) !void {
 
     if (options.resume_id) |id| {
         try out.print("billy · {s} · resumed session {s} · Ctrl-D to exit\n", .{ config.model, id });
+        // Replay the conversation exactly as a live session showed it, so the
+        // context does not have to be remembered from the previous run.
+        try billy.agent.printTranscript(arena, out, session.messages.items);
     } else {
         try out.print("billy · {s} · session {s} · Ctrl-D to exit\n", .{ config.model, session.id });
         try out.print("resume it later with: billy --resume {s}\n", .{session.id});

@@ -12,6 +12,48 @@ const max_command_output = 1 << 20;
 /// A command that outlives this is killed, so the agent cannot hang forever.
 const command_timeout_s = 120;
 
+/// A tool call parsed into the arguments of the call it names. Parsing happens
+/// once, in `run`, and both the log line and the tool itself read from here.
+pub const Call = union(enum) {
+    read: Read,
+    write: Write,
+    edit: Edit,
+    bash: Bash,
+    /// A call naming a tool this harness does not implement.
+    unknown: []const u8,
+    /// A known tool whose arguments could not be read; `name` is still known.
+    malformed: Malformed,
+
+    pub const Read = struct {
+        path: []const u8,
+        /// First line to read, 1-based.
+        offset: ?usize = null,
+        /// Maximum number of lines.
+        limit: ?usize = null,
+    };
+
+    pub const Write = struct {
+        path: []const u8,
+        content: []const u8,
+    };
+
+    pub const Edit = struct {
+        path: []const u8,
+        old_string: []const u8,
+        new_string: []const u8,
+        replace_all: bool = false,
+    };
+
+    pub const Bash = struct {
+        command: []const u8,
+    };
+
+    pub const Malformed = struct {
+        name: []const u8,
+        reason: anyerror,
+    };
+};
+
 pub const Tools = struct {
     io: Io,
     /// Holds results, which are kept in the conversation.
@@ -40,27 +82,27 @@ pub const Tools = struct {
     /// Runs one tool call and returns its result. Tool failures are reported to
     /// the model as text so that it can react to them.
     pub fn run(tools: *Tools, call: llm.ToolCall) ![]const u8 {
-        const name = call.function.name;
-        if (std.mem.eql(u8, name, "read")) return tools.read(call.function.arguments);
-        if (std.mem.eql(u8, name, "write")) return tools.write(call.function.arguments);
-        if (std.mem.eql(u8, name, "edit")) return tools.edit(call.function.arguments);
-        if (std.mem.eql(u8, name, "bash")) return tools.bash(call.function.arguments);
-        return tools.fail("unknown tool '{s}'", .{name});
-    }
-
-    fn read(tools: *Tools, arguments: []const u8) ![]const u8 {
-        const Args = struct {
-            path: []const u8,
-            offset: ?usize = null,
-            limit: ?usize = null,
-        };
-        const args = std.json.parseFromSliceLeaky(Args, tools.arena, arguments, .{
-            .ignore_unknown_fields = true,
-            .allocate = .alloc_always,
-        }) catch |err| return tools.invalid("read", err);
-        try tools.log.print("read {s}\n", .{args.path});
+        const parsed = parseCall(tools.arena, call);
+        // The line the user sees comes from `describe`, which the transcript
+        // reuses, so a replayed session shows exactly what a live one did.
+        try describe(parsed, tools.log);
+        try tools.log.writeAll("\n");
         try tools.log.flush();
 
+        return switch (parsed) {
+            .read => |args| tools.read(args),
+            .write => |args| tools.write(args),
+            .edit => |args| tools.edit(args),
+            .bash => |args| tools.bash(args),
+            .unknown => |name| tools.fail("unknown tool '{s}'", .{name}),
+            .malformed => |bad| tools.fail(
+                "invalid arguments for {s}: {s}",
+                .{ bad.name, @errorName(bad.reason) },
+            ),
+        };
+    }
+
+    fn read(tools: *Tools, args: Call.Read) ![]const u8 {
         const contents = std.Io.Dir.cwd().readFileAlloc(
             tools.io,
             args.path,
@@ -97,18 +139,7 @@ pub const Tools = struct {
         return tools.finish(out.written());
     }
 
-    fn write(tools: *Tools, arguments: []const u8) ![]const u8 {
-        const Args = struct {
-            path: []const u8,
-            content: []const u8,
-        };
-        const args = std.json.parseFromSliceLeaky(Args, tools.arena, arguments, .{
-            .ignore_unknown_fields = true,
-            .allocate = .alloc_always,
-        }) catch |err| return tools.invalid("write", err);
-        try tools.log.print("write {s} ({d} bytes)\n", .{ args.path, args.content.len });
-        try tools.log.flush();
-
+    fn write(tools: *Tools, args: Call.Write) ![]const u8 {
         if (std.fs.path.dirname(args.path)) |parent| {
             std.Io.Dir.cwd().createDirPath(tools.io, parent) catch |err|
                 return tools.fail("cannot create {s}: {s}", .{ parent, @errorName(err) });
@@ -118,20 +149,7 @@ pub const Tools = struct {
         return std.fmt.allocPrint(tools.arena, "wrote {d} bytes to {s}", .{ args.content.len, args.path });
     }
 
-    fn edit(tools: *Tools, arguments: []const u8) ![]const u8 {
-        const Args = struct {
-            path: []const u8,
-            old_string: []const u8,
-            new_string: []const u8,
-            replace_all: bool = false,
-        };
-        const args = std.json.parseFromSliceLeaky(Args, tools.arena, arguments, .{
-            .ignore_unknown_fields = true,
-            .allocate = .alloc_always,
-        }) catch |err| return tools.invalid("edit", err);
-        try tools.log.print("edit {s}\n", .{args.path});
-        try tools.log.flush();
-
+    fn edit(tools: *Tools, args: Call.Edit) ![]const u8 {
         if (args.old_string.len == 0) return tools.fail("old_string must not be empty", .{});
 
         const contents = std.Io.Dir.cwd().readFileAlloc(
@@ -168,15 +186,7 @@ pub const Tools = struct {
         return std.fmt.allocPrint(tools.arena, "replaced {d} occurrence(s) in {s}", .{ found, args.path });
     }
 
-    fn bash(tools: *Tools, arguments: []const u8) ![]const u8 {
-        const Args = struct { command: []const u8 };
-        const args = std.json.parseFromSliceLeaky(Args, tools.arena, arguments, .{
-            .ignore_unknown_fields = true,
-            .allocate = .alloc_always,
-        }) catch |err| return tools.invalid("bash", err);
-        try tools.log.print("$ {s}\n", .{args.command});
-        try tools.log.flush();
-
+    fn bash(tools: *Tools, args: Call.Bash) ![]const u8 {
         const result = std.process.run(tools.gpa, tools.io, .{
             .argv = &.{ "bash", "-c", args.command },
             .stdout_limit = .limited(max_command_output),
@@ -210,10 +220,6 @@ pub const Tools = struct {
         return std.fmt.allocPrint(tools.arena, "error: " ++ format, args);
     }
 
-    fn invalid(tools: *Tools, name: []const u8, err: anyerror) ![]const u8 {
-        return tools.fail("invalid arguments for {s}: {s}", .{ name, @errorName(err) });
-    }
-
     fn finish(tools: *Tools, text: []const u8) ![]const u8 {
         if (text.len <= max_result_len) return tools.arena.dupe(u8, text);
         return std.fmt.allocPrint(tools.arena, "{s}\n... {d} more bytes", .{
@@ -222,6 +228,54 @@ pub const Tools = struct {
         });
     }
 };
+
+/// Parses a tool call into the arguments of the call it names. It never fails:
+/// an unimplemented tool becomes `unknown` and arguments that do not fit become
+/// `malformed`, so a caller can still name the call it could not run.
+pub fn parseCall(arena: std.mem.Allocator, call: llm.ToolCall) Call {
+    const name = call.function.name;
+    const arguments = call.function.arguments;
+    if (std.mem.eql(u8, name, "read")) {
+        return .{ .read = parse(Call.Read, arena, arguments) catch |reason|
+            return .{ .malformed = .{ .name = name, .reason = reason } } };
+    }
+    if (std.mem.eql(u8, name, "write")) {
+        return .{ .write = parse(Call.Write, arena, arguments) catch |reason|
+            return .{ .malformed = .{ .name = name, .reason = reason } } };
+    }
+    if (std.mem.eql(u8, name, "edit")) {
+        return .{ .edit = parse(Call.Edit, arena, arguments) catch |reason|
+            return .{ .malformed = .{ .name = name, .reason = reason } } };
+    }
+    if (std.mem.eql(u8, name, "bash")) {
+        return .{ .bash = parse(Call.Bash, arena, arguments) catch |reason|
+            return .{ .malformed = .{ .name = name, .reason = reason } } };
+    }
+    return .{ .unknown = name };
+}
+
+/// Parses arguments that live as long as `arena`. Unknown fields are dropped, so
+/// a call from a newer model does not fail on the fields this version ignores.
+fn parse(comptime T: type, arena: std.mem.Allocator, json: []const u8) !T {
+    return std.json.parseFromSliceLeaky(T, arena, json, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+}
+
+/// Prints the line a live session shows for a tool call, such as `read a.zig`.
+/// The transcript reuses it so that replaying a session matches the run exactly.
+pub fn describe(call: Call, out: *Io.Writer) !void {
+    switch (call) {
+        .read => |args| try out.print("read {s}", .{args.path}),
+        .write => |args| try out.print("write {s} ({d} bytes)", .{ args.path, args.content.len }),
+        .edit => |args| try out.print("edit {s}", .{args.path}),
+        .bash => |args| try out.print("$ {s}", .{args.command}),
+        // Only the name is known, so that is all there is to show.
+        .unknown => |name| try out.writeAll(name),
+        .malformed => |bad| try out.writeAll(bad.name),
+    }
+}
 
 fn exitCode(term: std.process.Child.Term) u8 {
     return switch (term) {
@@ -321,6 +375,81 @@ test "exit codes of signals follow the shell convention" {
     try std.testing.expectEqual(1, exitCode(.{ .exited = 1 }));
     try std.testing.expectEqual(130, exitCode(.{ .signal = .INT }));
     try std.testing.expectEqual(143, exitCode(.{ .signal = .TERM }));
+}
+
+test "describe names the tool and its target" {
+    try expectDescribe("read a.zig", "read", "{\"path\":\"a.zig\"}");
+    try expectDescribe("write a.zig (5 bytes)", "write", "{\"path\":\"a.zig\",\"content\":\"hello\"}");
+    try expectDescribe("edit a.zig", "edit", "{\"path\":\"a.zig\",\"old_string\":\"a\",\"new_string\":\"b\"}");
+    try expectDescribe("$ ls -la", "bash", "{\"command\":\"ls -la\"}");
+    try expectDescribe("frobnicate", "frobnicate", "{}");
+    // A known tool with broken arguments still shows its name.
+    try expectDescribe("read", "read", "{");
+}
+
+test "run logs exactly what describe prints" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var log: std.Io.Writer.Allocating = .init(gpa);
+    defer log.deinit();
+
+    var tool_set = try Tools.init(std.testing.io, arena, gpa, &log.writer);
+    const call: llm.ToolCall = .{ .id = "1", .function = .{
+        .name = "bash",
+        .arguments = "{\"command\":\"true\"}",
+    } };
+    _ = try tool_set.run(call);
+
+    var described: std.Io.Writer.Allocating = .init(gpa);
+    defer described.deinit();
+    try describe(parseCall(arena, call), &described.writer);
+
+    // The live log is the description followed by the newline the loop adds.
+    try std.testing.expectEqualStrings("$ true\n", log.written());
+    try std.testing.expectEqualStrings("$ true", described.written());
+}
+
+test "parseCall splits known, unknown and malformed calls" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const read = parseCall(arena, .{ .id = "1", .function = .{
+        .name = "read",
+        .arguments = "{\"path\":\"a.zig\",\"offset\":5}",
+    } });
+    try std.testing.expectEqualStrings("a.zig", read.read.path);
+    try std.testing.expectEqual(@as(?usize, 5), read.read.offset);
+
+    const missing = parseCall(arena, .{ .id = "1", .function = .{
+        .name = "bash",
+        .arguments = "{}",
+    } });
+    try std.testing.expectEqualStrings("bash", missing.malformed.name);
+
+    const unknown = parseCall(arena, .{ .id = "1", .function = .{
+        .name = "frobnicate",
+        .arguments = "{}",
+    } });
+    try std.testing.expectEqualStrings("frobnicate", unknown.unknown);
+}
+
+fn expectDescribe(expected: []const u8, name: []const u8, arguments: []const u8) !void {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try describe(parseCall(arena_state.allocator(), .{ .id = "1", .function = .{
+        .name = name,
+        .arguments = arguments,
+    } }), &out.writer);
+    try std.testing.expectEqualStrings(expected, out.written());
 }
 
 test "definitions cover every tool the loop dispatches" {
