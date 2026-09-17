@@ -28,6 +28,13 @@ const Stored = struct {
     messages: []const llm.Message = &.{},
     /// The tool definitions the conversation was started with.
     tools: []const llm.Tool = &.{},
+    /// Tokens billed over the whole session, summed over every request.
+    usage: llm.Usage = .{},
+    /// Tokens in the conversation as of the last request, which is what the
+    /// context window gauge shows.
+    context_tokens: usize = 0,
+    /// What the session has cost so far, in USD, summed request by request.
+    cost: f64 = 0,
 };
 
 pub const Session = struct {
@@ -47,6 +54,15 @@ pub const Session = struct {
     /// The tool definitions sent with every request. Stored in the session so a
     /// resume offers the model the same tools as the run it continues.
     tools: []const llm.Tool = &.{},
+    /// Tokens billed over the whole session, summed over every request, so the
+    /// cost of a resumed session includes what earlier runs spent.
+    usage: llm.Usage = .{},
+    /// Tokens in the conversation as of the last request.
+    context_tokens: usize = 0,
+    /// What the session has cost so far, in USD. Accumulated request by request
+    /// because the rate depends on the time of the request, which the token
+    /// totals alone could not recover.
+    cost: f64 = 0,
 
     /// Opens the session called `resume_id`, or starts a new one when it is null.
     ///
@@ -103,6 +119,19 @@ pub const Session = struct {
         try session.save();
     }
 
+    /// Adds a request's tokens and cost to the session totals and remembers how
+    /// full the context window is. The totals reach the file with the next save,
+    /// which follows every message.
+    ///
+    /// `cost` is priced by the caller, which knows the rates that applied when
+    /// the request was made; the session only accumulates it, so a session that
+    /// spans a rate change is billed at the rates it actually ran under.
+    pub fn recordUsage(session: *Session, usage: llm.Usage, cost: f64) void {
+        session.usage = session.usage.plus(usage);
+        session.context_tokens = usage.total_tokens;
+        session.cost += cost;
+    }
+
     /// Writes the conversation to the session file. The previous contents are
     /// replaced in one step, leaving them intact if writing fails part way.
     pub fn save(session: *Session) !void {
@@ -122,6 +151,12 @@ pub const Session = struct {
         try json.endArray();
         try json.objectField("tools");
         try json.write(session.tools);
+        try json.objectField("usage");
+        try json.write(session.usage);
+        try json.objectField("context_tokens");
+        try json.write(session.context_tokens);
+        try json.objectField("cost");
+        try json.write(session.cost);
         try json.endObject();
 
         var atomic = try session.dir.createFileAtomic(session.io, session.name, .{ .replace = true });
@@ -155,6 +190,9 @@ pub const Session = struct {
             try session.messages.append(session.arena, message);
         }
         session.tools = stored.tools;
+        session.usage = stored.usage;
+        session.context_tokens = stored.context_tokens;
+        session.cost = stored.cost;
     }
 };
 
@@ -441,6 +479,45 @@ test "ensureTools gives tools to a session saved without any" {
     try session.ensureTools(&tools);
     try std.testing.expectEqual(1, session.tools.len);
     try std.testing.expectEqualStrings("read", session.tools[0].function.name);
+}
+
+test "the token totals survive a save and resume" {
+    const arena = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(arena);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null);
+    session.recordUsage(.{
+        .prompt_tokens = 100,
+        .completion_tokens = 10,
+        .total_tokens = 110,
+        .cache_hit_tokens = 90,
+        .cache_miss_tokens = 10,
+    }, 0.0001);
+    try session.append(.{ .role = "user", .content = "hi" });
+    // A second request adds to the totals rather than replacing them.
+    session.recordUsage(.{
+        .prompt_tokens = 200,
+        .completion_tokens = 20,
+        .total_tokens = 220,
+        .cache_hit_tokens = 180,
+        .cache_miss_tokens = 20,
+    }, 0.0002);
+    try session.append(.{ .role = "assistant", .content = "hello" });
+
+    const resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, session.id);
+    try std.testing.expectEqual(300, resumed.usage.prompt_tokens);
+    try std.testing.expectEqual(30, resumed.usage.completion_tokens);
+    try std.testing.expectEqual(270, resumed.usage.cache_hit_tokens);
+    try std.testing.expectEqual(30, resumed.usage.cache_miss_tokens);
+    // The context gauge keeps the size of the last request's conversation.
+    try std.testing.expectEqual(220, resumed.context_tokens);
+    // The cost accumulates across requests too.
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0003), resumed.cost, 1e-12);
 }
 
 test "opening an unknown or damaged session is reported" {

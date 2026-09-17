@@ -4,6 +4,7 @@
 const std = @import("std");
 const Io = std.Io;
 const llm = @import("llm.zig");
+const models = @import("models.zig");
 const tools = @import("tools.zig");
 const line_editor = @import("line_editor.zig");
 const session_mod = @import("session.zig");
@@ -15,6 +16,14 @@ pub const Config = struct {
     model: []const u8,
     /// Model turns allowed for one request before the harness gives up on it.
     max_turns: usize,
+    /// Working directory, shown in the header.
+    cwd: []const u8,
+    /// Home directory, so the header can shorten a path inside it; null when unset.
+    home: ?[]const u8,
+    /// What is known about the provider and model: the context window and the
+    /// prices. Null for a model billy does not know, in which case the header
+    /// leaves out the context gauge and the cost.
+    model_info: ?models.Metadata,
 };
 
 const system_prompt =
@@ -27,16 +36,81 @@ const system_prompt =
 /// replayed session looks like the run it continues.
 const prompt = "> ";
 
-/// The header line shown above the input prompt, naming the model and the
-/// working directory so a session is clear at a glance. It carries no newline:
-/// the line editor prints it on a line of its own.
+/// The header line shown above the input prompt: the model, the working
+/// directory, how much of the context window the conversation fills, and what
+/// the session has cost so far. The window size and the prices are not reported
+/// by the API, so they come from the model table. `cost` is the session total
+/// the loop has accumulated, so it does not move as the clock passes a rate
+/// change.
 pub fn sessionHeader(
+    gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
-    model: []const u8,
-    cwd: []const u8,
-    home: ?[]const u8,
+    config: Config,
+    context_tokens: usize,
+    cost: f64,
 ) ![]const u8 {
-    return std.fmt.allocPrint(arena, "billy · {s} · {s}", .{ model, try displayPath(arena, cwd, home) });
+    var text: std.Io.Writer.Allocating = .init(gpa);
+    defer text.deinit();
+    const out = &text.writer;
+
+    try out.print("billy · {s} · {s}", .{
+        config.model,
+        try displayPath(arena, config.cwd, config.home),
+    });
+    if (config.model_info) |info| {
+        try out.print(" · {s}/{s} ({s})", .{
+            try formatTokens(arena, context_tokens),
+            try formatTokens(arena, info.context_window),
+            try formatPercent(arena, context_tokens, info.context_window),
+        });
+        try out.print(" · {s}", .{try formatMoney(arena, cost)});
+    }
+    return arena.dupe(u8, text.written());
+}
+
+/// What a usage costs at the given prices, in USD.
+pub fn costOf(price: models.Price, usage: llm.Usage) f64 {
+    const million = @as(f64, 1_000_000);
+    const hit: f64 = @floatFromInt(usage.cache_hit_tokens);
+    const miss: f64 = @floatFromInt(usage.cache_miss_tokens);
+    const output: f64 = @floatFromInt(usage.completion_tokens);
+    return (hit * price.cache_hit_input +
+        miss * price.cache_miss_input +
+        output * price.output) / million;
+}
+
+/// A token count in a short form, such as `16k` or `128k`.
+fn formatTokens(arena: std.mem.Allocator, count: usize) ![]const u8 {
+    if (count < 1000) return std.fmt.allocPrint(arena, "{d}", .{count});
+    if (count < 1_000_000) return formatScaled(arena, count, 1000, 'k');
+    return formatScaled(arena, count, 1_000_000, 'M');
+}
+
+/// `count` divided by `unit` with a trailing unit letter, dropping the decimal
+/// when the division is exact.
+fn formatScaled(arena: std.mem.Allocator, count: usize, unit: usize, suffix: u8) ![]const u8 {
+    if (count % unit == 0) return std.fmt.allocPrint(arena, "{d}{c}", .{ count / unit, suffix });
+    return std.fmt.allocPrint(arena, "{d:.1}{c}", .{
+        @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(unit)),
+        suffix,
+    });
+}
+
+/// How full the context window is, as a whole percentage. A conversation that
+/// has started but is under one percent is reported as `<1%`, so the gauge does
+/// not read as empty.
+fn formatPercent(arena: std.mem.Allocator, used: usize, total: usize) ![]const u8 {
+    if (total == 0) return "0%";
+    const percent = used * 100 / total;
+    if (percent == 0 and used > 0) return "<1%";
+    return std.fmt.allocPrint(arena, "{d}%", .{percent});
+}
+
+/// A dollar amount, with enough places to show a fraction of a cent, since a
+/// single turn usually costs well under one.
+fn formatMoney(arena: std.mem.Allocator, amount: f64) ![]const u8 {
+    if (amount >= 0.01) return std.fmt.allocPrint(arena, "${d:.4}", .{amount});
+    return std.fmt.allocPrint(arena, "${d:.6}", .{amount});
 }
 
 /// The working directory as shown in the header. A path inside the home
@@ -60,7 +134,6 @@ pub fn run(
     gpa: std.mem.Allocator,
     out: *Io.Writer,
     config: Config,
-    header: []const u8,
     session: *session_mod.Session,
 ) !void {
     var editor = line_editor.LineEditor.init(io, out, arena);
@@ -83,12 +156,15 @@ pub fn run(
     try session.ensureTools(tool_set.definitions);
 
     while (true) {
+        // Rebuilt for every prompt, so it reflects the tokens and cost of the
+        // turns run so far.
+        const header = try sessionHeader(gpa, arena, config, session.context_tokens, session.cost);
         const line = (try editor.readLine(header, prompt)) orelse break;
         if (line.len == 0) continue;
         try session.append(.{ .role = "user", .content = line });
         // A failed request must not end the session: report it and take the
         // next request from the user.
-        turn(&client, &tool_set, out, session, config.max_turns) catch |err|
+        turn(io, &client, &tool_set, out, config, session) catch |err|
             std.log.err("request failed: {s}", .{@errorName(err)});
     }
     try out.flush();
@@ -129,17 +205,24 @@ fn printMessage(arena: std.mem.Allocator, out: *Io.Writer, message: llm.Message)
 
 /// Runs the model until it replies with text instead of tool calls.
 fn turn(
+    io: Io,
     client: *llm.Client,
     tool_set: *tools.Tools,
     out: *Io.Writer,
+    config: Config,
     session: *session_mod.Session,
-    max_turns: usize,
 ) !void {
-    var remaining: usize = max_turns;
+    var remaining: usize = config.max_turns;
     while (remaining > 0) : (remaining -= 1) {
-        const message = try client.complete(session.messages.items, session.tools);
-        try session.append(message);
+        const completion = try client.complete(session.messages.items, session.tools);
+        // The totals are recorded first, so the save inside `append` stores them
+        // along with the message. Each request is priced as it is made, at the
+        // rates in effect then, so a session running through a rate change is
+        // billed for what it actually cost.
+        session.recordUsage(completion.usage, costOf(rateNow(io, config), completion.usage));
+        try session.append(completion.message);
 
+        const message = completion.message;
         const calls = message.tool_calls orelse return printReply(out, message.content);
         if (calls.len == 0) return printReply(out, message.content);
 
@@ -151,8 +234,15 @@ fn turn(
             });
         }
     }
-    try out.print("stopped after {d} turns without a final answer\n", .{max_turns});
+    try out.print("stopped after {d} turns without a final answer\n", .{config.max_turns});
     try out.flush();
+}
+
+/// The rates in effect right now. Zero for a model billy does not know, which
+/// has no prices to cost its tokens at.
+fn rateNow(io: Io, config: Config) models.Price {
+    const info = config.model_info orelse return .{};
+    return info.priceAt(@intCast(Io.Clock.now(.real, io).toSeconds()));
 }
 
 fn printReply(out: *Io.Writer, content: ?[]const u8) !void {
@@ -210,6 +300,25 @@ test "printTranscript leaves out the system prompt and tool results" {
     try std.testing.expectEqualStrings("", out.written());
 }
 
+/// A config with no model metadata, so the header is just the model and the
+/// directory. Tests that need a gauge fill `model_info` in.
+fn testConfig(model: []const u8, cwd: []const u8, home: ?[]const u8) Config {
+    return .{
+        .api_key = "k",
+        .url = "u",
+        .model = model,
+        .max_turns = 10,
+        .cwd = cwd,
+        .home = home,
+        .model_info = null,
+    };
+}
+
+/// Off-peak on a Friday, so the rates are the published base rates.
+const off_peak_utc = 1789732800; // Friday 2026-09-18 12:00 UTC
+/// Peak on a Friday, when DeepSeek doubles its rates.
+const peak_utc = 1789696800; // Friday 2026-09-18 02:00 UTC
+
 test "header names the model and the working directory" {
     const arena = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(arena);
@@ -218,7 +327,7 @@ test "header names the model and the working directory" {
 
     try std.testing.expectEqualStrings(
         "billy · deepseek-flash · /work",
-        try sessionHeader(allocator, "deepseek-flash", "/work", null),
+        try sessionHeader(arena, allocator, testConfig("deepseek-flash", "/work", null), 0, 0),
     );
 }
 
@@ -230,16 +339,114 @@ test "header shortens a path inside the home directory" {
 
     try std.testing.expectEqualStrings(
         "billy · m · ~/repo/billy",
-        try sessionHeader(allocator, "m", "/home/user/repo/billy", "/home/user"),
+        try sessionHeader(arena, allocator, testConfig("m", "/home/user/repo/billy", "/home/user"), 0, 0),
     );
     // The home directory itself becomes just `~`.
     try std.testing.expectEqualStrings(
         "billy · m · ~",
-        try sessionHeader(allocator, "m", "/home/user", "/home/user"),
+        try sessionHeader(arena, allocator, testConfig("m", "/home/user", "/home/user"), 0, 0),
     );
     // A sibling that merely shares the prefix is left alone.
     try std.testing.expectEqualStrings(
         "billy · m · /home/user2",
-        try sessionHeader(allocator, "m", "/home/user2", "/home/user"),
+        try sessionHeader(arena, allocator, testConfig("m", "/home/user2", "/home/user"), 0, 0),
     );
+}
+
+test "header shows how full the context window is" {
+    const arena = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(arena);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    // A model with a small window, so the numbers are easy to read.
+    var config = testConfig("m", "/work", null);
+    config.model_info = .{
+        .provider = .deepseek,
+        .model = "m",
+        .context_window = 128_000,
+        .price = .{ .cache_hit_input = 0.003, .cache_miss_input = 0.15, .output = 0.6 },
+    };
+
+    // A fresh session has used nothing.
+    try std.testing.expectEqualStrings(
+        "billy · m · /work · 0/128k (0%) · $0.000000",
+        try sessionHeader(arena, allocator, config, 0, 0),
+    );
+    // A rounded-to-zero percentage still shows the conversation is not empty.
+    try std.testing.expectEqualStrings(
+        "billy · m · /work · 500/128k (<1%) · $0.000000",
+        try sessionHeader(arena, allocator, config, 500, 0),
+    );
+    try std.testing.expectEqualStrings(
+        "billy · m · /work · 16k/128k (12%) · $0.000000",
+        try sessionHeader(arena, allocator, config, 16_000, 0),
+    );
+    // A full window, and a count that needs a decimal.
+    try std.testing.expectEqualStrings(
+        "billy · m · /work · 128k/128k (100%) · $0.000000",
+        try sessionHeader(arena, allocator, config, 128_000, 0),
+    );
+    try std.testing.expectEqualStrings(
+        "billy · m · /work · 12.5k/128k (9%) · $0.000000",
+        try sessionHeader(arena, allocator, config, 12_500, 0),
+    );
+}
+
+test "header shows the accumulated session cost" {
+    const arena = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(arena);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    // The real deepseek-flash rates, off-peak.
+    var config = testConfig("deepseek-flash", "/work", null);
+    const info = models.lookup(.deepseek, "deepseek-flash").?;
+    config.model_info = info;
+
+    // 1000 cache hits, 1000 misses and 1000 output tokens:
+    // 1000*0.003 + 1000*0.15 + 1000*0.6, all per million.
+    const usage: llm.Usage = .{
+        .prompt_tokens = 2000,
+        .completion_tokens = 1000,
+        .total_tokens = 3000,
+        .cache_hit_tokens = 1000,
+        .cache_miss_tokens = 1000,
+    };
+    const off_peak_cost = costOf(info.priceAt(off_peak_utc), usage);
+    try std.testing.expectEqualStrings(
+        "billy · deepseek-flash · /work · 3k/1M (<1%) · $0.000753",
+        try sessionHeader(arena, allocator, config, 3000, off_peak_cost),
+    );
+    // A request made in peak hours cost double, which stays on the total even if
+    // the header is shown later, off-peak.
+    const peak_cost = costOf(info.priceAt(peak_utc), usage);
+    try std.testing.expectEqualStrings(
+        "billy · deepseek-flash · /work · 3k/1M (<1%) · $0.001506",
+        try sessionHeader(arena, allocator, config, 3000, peak_cost),
+    );
+}
+
+test "header leaves out the gauge and cost for an unknown model" {
+    const arena = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(arena);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const config = testConfig("who-knows", "/work", null);
+    try std.testing.expect(config.model_info == null);
+    try std.testing.expectEqualStrings(
+        "billy · who-knows · /work",
+        try sessionHeader(arena, allocator, config, 5000, 12.34),
+    );
+}
+
+test "cost follows the cache hit, miss and output prices" {
+    const price = models.Price{ .cache_hit_input = 0.1, .cache_miss_input = 1, .output = 2 };
+    const usage: llm.Usage = .{
+        .completion_tokens = 1_000_000,
+        .cache_hit_tokens = 1_000_000,
+        .cache_miss_tokens = 1_000_000,
+    };
+    try std.testing.expectEqual(3.1, costOf(price, usage));
 }

@@ -14,7 +14,10 @@ const usage =
     \\under $XDG_DATA_HOME/billy, or ~/.local/share/billy when that is unset.
     \\The configuration lives in $XDG_CONFIG_HOME/billy/config.json, or
     \\~/.config/billy/config.json when that is unset, and is created with the
-    \\defaults on the first run.
+    \\defaults on the first run. It holds the turn limit. The context window and
+    \\the token prices the header reports come from a table built into billy,
+    \\keyed by provider and model, since the API reports token counts but
+    \\neither of those.
     \\
 ;
 
@@ -52,6 +55,7 @@ pub fn main(init: std.process.Init) !void {
         return error.MissingApiKey;
     };
     const base_url = init.environ_map.get("BILLY_BASE_URL") orelse "https://api.deepseek.com";
+    const model = init.environ_map.get("BILLY_MODEL") orelse "deepseek-flash";
 
     const config_dir = billy.config.defaultDir(arena, init.environ_map) catch |err| {
         std.log.err("cannot find where to store the configuration: {s}", .{@errorName(err)});
@@ -73,13 +77,23 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
+    const cwd = std.process.currentPathAlloc(io, arena) catch |err| {
+        std.log.err("cannot find the working directory: {s}", .{@errorName(err)});
+        return err;
+    };
     const config: billy.agent.Config = .{
         .api_key = api_key,
         .url = try std.fmt.allocPrint(arena, "{s}/chat/completions", .{
             std.mem.trimEnd(u8, base_url, "/"),
         }),
-        .model = init.environ_map.get("BILLY_MODEL") orelse "deepseek-flash",
+        .model = model,
         .max_turns = settings.config.max_turns,
+        .cwd = cwd,
+        .home = init.environ_map.get("HOME"),
+        // The context window and the prices are not reported by the API, so
+        // they are looked up by provider and model; an unknown model simply has
+        // no gauge and no cost.
+        .model_info = billy.models.lookup(billy.models.Provider.fromUrl(base_url), model),
     };
 
     const directory = billy.session.defaultDir(arena, init.environ_map) catch |err| {
@@ -104,21 +118,12 @@ pub fn main(init: std.process.Init) !void {
         else => return err,
     };
 
-    // The header sits above the input prompt, so the model and the working
-    // directory are visible wherever the user is typing, while replayed user
-    // lines keep a bare `>`.
-    const cwd = std.process.currentPathAlloc(io, arena) catch |err| {
-        std.log.err("cannot find the working directory: {s}", .{@errorName(err)});
-        return err;
-    };
-    const header = try billy.agent.sessionHeader(arena, config.model, cwd, init.environ_map.get("HOME"));
-
     if (options.resume_id != null) {
         // Replay the conversation exactly as a live session showed it, so the
         // context does not have to be remembered from the previous run.
         try billy.agent.printTranscript(arena, out, session.messages.items);
     }
-    try billy.agent.run(io, arena, init.gpa, out, config, header, &session);
+    try billy.agent.run(io, arena, init.gpa, out, config, &session);
 }
 
 /// Reads the command line, whose first entry is the executable name.
