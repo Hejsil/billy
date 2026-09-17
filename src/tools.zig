@@ -330,6 +330,6 @@ test "definitions cover every tool the loop dispatches" {
     const defs = try definitions(arena_state.allocator());
     try std.testing.expectEqual(specs.len, defs.len);
     for (defs) |definition| {
-        try std.testing.expect(definition.parameters == .object);
+        try std.testing.expect(definition.function.parameters == .object);
     }
 }

@@ -48,6 +48,9 @@ pub const LineEditor = struct {
     /// may span several lines.
     last_rows: usize = 0,
     last_cursor_row: usize = 0,
+    /// Column the cursor aims for during a run of up/down presses, so crossing a
+    /// short row does not lose the horizontal position. Cleared by any other key.
+    goal_col: ?usize = null,
 
     pub fn init(io: Io, out: *Io.Writer, arena: std.mem.Allocator) LineEditor {
         return .{ .io = io, .out = out, .arena = arena };
@@ -72,6 +75,7 @@ pub const LineEditor = struct {
 
         ed.last_rows = 0;
         ed.last_cursor_row = 0;
+        ed.goal_col = null;
 
         var line: std.ArrayList(u8) = .empty;
         defer line.deinit(ed.arena);
@@ -81,6 +85,12 @@ pub const LineEditor = struct {
 
         while (true) {
             const key = try ed.nextKey();
+            // A run of up/down presses aims for one column; any other key ends it.
+            // Timeouts report `.none` and must not break the run.
+            switch (key) {
+                .up, .down, .none => {},
+                else => ed.goal_col = null,
+            }
             switch (key) {
                 .none => {},
                 .byte => |b| {
@@ -155,10 +165,18 @@ pub const LineEditor = struct {
                     dirty = true;
                 },
                 .up => {
-                    if (try ed.recall(&line, &cursor, &recalled, -1)) dirty = true;
+                    if (moveCursorVertical(&ed.goal_col, line.items, &cursor, -1)) {
+                        dirty = true;
+                    } else if (try ed.recall(&line, &cursor, &recalled, -1)) {
+                        dirty = true;
+                    }
                 },
                 .down => {
-                    if (try ed.recall(&line, &cursor, &recalled, 1)) dirty = true;
+                    if (moveCursorVertical(&ed.goal_col, line.items, &cursor, 1)) {
+                        dirty = true;
+                    } else if (try ed.recall(&line, &cursor, &recalled, 1)) {
+                        dirty = true;
+                    }
                 },
                 .interrupt => {
                     try ed.moveToRegionBottom();
@@ -239,28 +257,13 @@ pub const LineEditor = struct {
         const indent = spaces[0..@min(prompt_width, spaces.len)];
 
         // Locate the cursor and count the terminal rows the new render needs.
-        var rows: usize = 1;
-        var cursor_row: usize = 0;
-        var cursor_col: usize = prompt_width;
-        var row_start: usize = 0;
-        while (true) {
-            const newline = std.mem.indexOfScalarPos(u8, line, row_start, '\n');
-            const row_end = newline orelse line.len;
-            if (cursor <= row_end) {
-                const prefix_width = if (cursor_row == 0) prompt_width else indent.len;
-                cursor_col = prefix_width + (cursor - row_start);
-                break;
-            }
-            if (newline == null) break;
-            row_start = row_end + 1;
-            cursor_row += 1;
-        }
-        for (line) |byte| {
-            if (byte == '\n') rows += 1;
-        }
+        const rows = rowCount(line);
+        const cursor_row = rowAt(line, cursor).index;
+        const prefix_width = if (cursor_row == 0) prompt_width else indent.len;
+        const cursor_col = prefix_width + (cursor - rowStart(line, cursor_row));
 
         // Paint the prompt and the content, one terminal row per source line.
-        row_start = 0;
+        var row_start: usize = 0;
         var row: usize = 0;
         while (row < rows) : (row += 1) {
             if (row > 0) try ed.out.writeAll("\r\n");
@@ -311,6 +314,7 @@ pub const LineEditor = struct {
         line.clearRetainingCapacity();
         if (next) |i| try line.appendSlice(ed.arena, history[i]);
         cursor.* = line.items.len;
+        ed.goal_col = null;
         return true;
     }
 
@@ -427,6 +431,59 @@ fn wordStart(line: []const u8, cursor: usize) usize {
     return start;
 }
 
+/// Moves `cursor` to the same column on the row above (negative `direction`) or
+/// below. `goal_col` remembers the column across a run of presses so crossing a
+/// short row does not lose it. Returns whether the cursor moved; it does not
+/// when there is no row in that direction.
+fn moveCursorVertical(goal_col: *?usize, line: []const u8, cursor: *usize, direction: i8) bool {
+    const current = rowAt(line, cursor.*);
+    if (direction < 0) {
+        if (current.index == 0) return false;
+    } else if (current.index + 1 >= rowCount(line)) {
+        return false;
+    }
+    const goal = goal_col.* orelse (cursor.* - current.start);
+    const target = if (direction < 0) current.index - 1 else current.index + 1;
+    const start = rowStart(line, target);
+    const end = std.mem.indexOfScalarPos(u8, line, start, '\n') orelse line.len;
+    cursor.* = start + @min(goal, end - start);
+    goal_col.* = goal;
+    return true;
+}
+
+/// The index of the source row containing `cursor`, and the offset it starts at.
+fn rowAt(line: []const u8, cursor: usize) struct { index: usize, start: usize } {
+    var index: usize = 0;
+    var start: usize = 0;
+    while (true) {
+        const newline = std.mem.indexOfScalarPos(u8, line, start, '\n');
+        const end = newline orelse line.len;
+        if (cursor <= end) return .{ .index = index, .start = start };
+        start = end + 1;
+        index += 1;
+    }
+}
+
+/// Offset the source row `index` starts at.
+fn rowStart(line: []const u8, index: usize) usize {
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < index) : (i += 1) {
+        const newline = std.mem.indexOfScalarPos(u8, line, start, '\n') orelse return line.len;
+        start = newline + 1;
+    }
+    return start;
+}
+
+/// Number of source rows in `line`, counting the newlines that separate them.
+fn rowCount(line: []const u8) usize {
+    var rows: usize = 1;
+    for (line) |byte| {
+        if (byte == '\n') rows += 1;
+    }
+    return rows;
+}
+
 /// Number of terminal columns `text` occupies, ignoring ANSI escape sequences.
 fn visibleWidth(text: []const u8) usize {
     var width: usize = 0;
@@ -451,12 +508,48 @@ test "wordStart skips trailing whitespace then the word" {
     try std.testing.expectEqual(0, wordStart("hello", 5));
     try std.testing.expectEqual(0, wordStart("hello  ", 7));
     try std.testing.expectEqual(6, wordStart("hello world", 11));
-    try std.testing.expectEqual(5, wordStart("hello world", 6));
+    try std.testing.expectEqual(6, wordStart("hello world", 9));
+    // At the start of "world" the whitespace and the word before it are removed.
+    try std.testing.expectEqual(0, wordStart("hello world", 6));
+    try std.testing.expectEqual(4, wordStart("one two", 7));
     try std.testing.expectEqual(0, wordStart("", 0));
 }
 
 test "visibleWidth ignores ANSI escapes" {
     try std.testing.expectEqual(2, visibleWidth("> "));
     try std.testing.expectEqual(0, visibleWidth("\x1b[31m\x1b[0m"));
-    try std.testing.expectEqual(6, visibleWidth("\x1b[1mbilly\x1b[0m"));
+    try std.testing.expectEqual(5, visibleWidth("\x1b[1mbilly\x1b[0m"));
+}
+
+test "moveCursorVertical keeps its target column across rows" {
+    const line = "hello world\nhi\nbeep boop";
+    var goal: ?usize = null;
+    var cursor: usize = 5;
+    try std.testing.expect(moveCursorVertical(&goal, line, &cursor, 1));
+    try std.testing.expectEqual(14, cursor); // clamped to the short middle row
+    try std.testing.expect(moveCursorVertical(&goal, line, &cursor, 1));
+    try std.testing.expectEqual(20, cursor); // column 5 restored on the last row
+    try std.testing.expect(moveCursorVertical(&goal, line, &cursor, -1));
+    try std.testing.expectEqual(14, cursor);
+    try std.testing.expect(moveCursorVertical(&goal, line, &cursor, -1));
+    try std.testing.expectEqual(5, cursor); // column 5 restored on the first row
+    try std.testing.expect(!moveCursorVertical(&goal, line, &cursor, -1)); // already on the first row
+}
+
+test "moveCursorVertical stops at the last row" {
+    const line = "one\ntwo";
+    var goal: ?usize = null;
+    var cursor: usize = 0;
+    try std.testing.expect(moveCursorVertical(&goal, line, &cursor, 1));
+    try std.testing.expectEqual(4, cursor);
+    try std.testing.expect(!moveCursorVertical(&goal, line, &cursor, 1)); // already on the last row
+}
+
+test "rowAt and rowCount treat trailing newlines as an empty row" {
+    try std.testing.expectEqual(1, rowCount("hi"));
+    try std.testing.expectEqual(2, rowCount("hi\n"));
+    try std.testing.expectEqual(3, rowCount("a\nb\nc"));
+    try std.testing.expectEqual(1, rowAt("hi\n", 3).index); // cursor after the newline
+    try std.testing.expectEqual(3, rowAt("hi\n", 3).start);
+    try std.testing.expectEqual(0, rowAt("hi\n", 2).index); // cursor before the newline
 }

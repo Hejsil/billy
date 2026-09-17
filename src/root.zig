@@ -4,3 +4,10 @@ pub const agent = @import("agent.zig");
 pub const line_editor = @import("line_editor.zig");
 pub const llm = @import("llm.zig");
 pub const tools = @import("tools.zig");
+
+test {
+    // `zig build test` only collects the tests declared in the test target's
+    // root file. The declarations above are lazy, so without this the tests in
+    // the imported files are never analyzed and the suite silently runs nothing.
+    @import("std").testing.refAllDecls(@This());
+}
