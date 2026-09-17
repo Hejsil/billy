@@ -3,10 +3,10 @@
 //!
 //! Every session is one JSON file named after its id. The file is rewritten
 //! after each message, so killing the process loses at most the message being
-//! written. The system prompt is stored with the conversation and reused when
-//! the session is resumed, so a resume resends the exact messages of the run it
-//! continues and hits the prompt cache. A changed prompt therefore takes effect
-//! in new sessions only.
+//! written. The system prompt and the tool definitions are stored with the
+//! conversation and reused when the session is resumed, so a resume resends the
+//! exact request of the run it continues and hits the prompt cache. A changed
+//! prompt or tool therefore takes effect in new sessions only.
 
 const std = @import("std");
 const Io = std.Io;
@@ -26,6 +26,8 @@ const Stored = struct {
     version: u32 = format_version,
     /// The conversation, oldest first.
     messages: []const llm.Message = &.{},
+    /// The tool definitions the conversation was started with.
+    tools: []const llm.Tool = &.{},
 };
 
 pub const Session = struct {
@@ -42,6 +44,9 @@ pub const Session = struct {
     name: []const u8,
     /// The conversation, oldest first, starting with the system prompt.
     messages: std.ArrayList(llm.Message) = .empty,
+    /// The tool definitions sent with every request. Stored in the session so a
+    /// resume offers the model the same tools as the run it continues.
+    tools: []const llm.Tool = &.{},
 
     /// Opens the session called `resume_id`, or starts a new one when it is null.
     ///
@@ -87,6 +92,17 @@ pub const Session = struct {
         try session.append(.{ .role = "system", .content = system_prompt });
     }
 
+    /// Records the tool definitions to send with every request, unless the
+    /// session already has some. A resumed session carries the tools it was
+    /// saved with, which are kept so the request matches the earlier run and
+    /// hits the prompt cache; a new session, or one saved before the tools were
+    /// stored, gets the current definitions instead.
+    pub fn ensureTools(session: *Session, tools: []const llm.Tool) !void {
+        if (session.tools.len != 0) return;
+        session.tools = tools;
+        try session.save();
+    }
+
     /// Writes the conversation to the session file. The previous contents are
     /// replaced in one step, leaving them intact if writing fails part way.
     pub fn save(session: *Session) !void {
@@ -104,6 +120,8 @@ pub const Session = struct {
         try json.beginArray();
         for (session.messages.items) |message| try json.write(message);
         try json.endArray();
+        try json.objectField("tools");
+        try json.write(session.tools);
         try json.endObject();
 
         var atomic = try session.dir.createFileAtomic(session.io, session.name, .{ .replace = true });
@@ -136,6 +154,7 @@ pub const Session = struct {
         for (stored.messages) |message| {
             try session.messages.append(session.arena, message);
         }
+        session.tools = stored.tools;
     }
 };
 
@@ -356,6 +375,72 @@ test "appendSystemPrompt only adds the prompt to an empty session" {
     try std.testing.expectEqualStrings("system", session.messages.items[0].role);
     try std.testing.expectEqualStrings("current prompt", session.messages.items[0].content.?);
     try std.testing.expectEqualStrings("user", session.messages.items[1].role);
+}
+
+test "ensureTools stores the tools and only sets them once" {
+    const arena = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(arena);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tools = [_]llm.Tool{.{ .function = .{
+        .name = "read",
+        .description = "Read a file.",
+        .parameters = .null,
+    } }};
+
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null);
+    try session.ensureTools(&tools);
+    try std.testing.expectEqual(1, session.tools.len);
+    try std.testing.expectEqualStrings("read", session.tools[0].function.name);
+
+    // The stored tools survive a save and resume.
+    const resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, session.id);
+    try std.testing.expectEqual(1, resumed.tools.len);
+    try std.testing.expectEqualStrings("read", resumed.tools[0].function.name);
+    try std.testing.expectEqualStrings("Read a file.", resumed.tools[0].function.description);
+
+    // A session that already has tools keeps them.
+    const replaced = [_]llm.Tool{.{ .function = .{
+        .name = "bash",
+        .description = "Run a command.",
+        .parameters = .null,
+    } }};
+    var reopened = try Session.open(std.testing.io, tmp.dir, allocator, arena, session.id);
+    try reopened.ensureTools(&replaced);
+    try std.testing.expectEqual(1, reopened.tools.len);
+    try std.testing.expectEqualStrings("read", reopened.tools[0].function.name);
+}
+
+test "ensureTools gives tools to a session saved without any" {
+    const arena = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(arena);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Sessions saved before the tools were stored have no tools field.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "legacy.json",
+        .data = "{\"version\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+    });
+
+    const tools = [_]llm.Tool{.{ .function = .{
+        .name = "read",
+        .description = "Read a file.",
+        .parameters = .null,
+    } }};
+
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, "legacy");
+    try std.testing.expectEqual(0, session.tools.len);
+    try session.ensureTools(&tools);
+    try std.testing.expectEqual(1, session.tools.len);
+    try std.testing.expectEqualStrings("read", session.tools[0].function.name);
 }
 
 test "opening an unknown or damaged session is reported" {

@@ -46,11 +46,13 @@ pub fn run(
         .model = config.model,
     };
 
-    // The prompt is stored with the session and reused on a resume, so the
-    // messages sent then match the earlier run byte for byte and hit the prompt
-    // cache. It is appended only to an empty conversation, so a new session gets
-    // the current prompt while a resumed one keeps the prompt it was saved with.
+    // The prompt and the tool definitions are stored with the session and reused
+    // on a resume, so the request sent then matches the earlier run byte for byte
+    // and hits the prompt cache. They are set only on a session that has none, so
+    // a new session gets the current ones while a resumed one keeps what it was
+    // saved with.
     try session.appendSystemPrompt(system_prompt);
+    try session.ensureTools(tool_set.definitions);
 
     while (true) {
         const line = (try editor.readLine(prompt)) orelse break;
@@ -107,7 +109,7 @@ fn turn(
 ) !void {
     var remaining: usize = max_turns;
     while (remaining > 0) : (remaining -= 1) {
-        const message = try client.complete(session.messages.items, tool_set.definitions);
+        const message = try client.complete(session.messages.items, session.tools);
         try session.append(message);
 
         const calls = message.tool_calls orelse return printReply(out, message.content);
