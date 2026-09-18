@@ -316,7 +316,7 @@ test "printTranscript replays messages the way a live session shows them" {
 
     try std.testing.expectEqualStrings(
         "\n> hello\n" ++
-            "▸ read a.zig\n--- output ---\n1\tconst x = 1;\n\n" ++
+            "▸ read a.zig\n▾ output\n1\tconst x = 1;\n\n" ++
             "done\n",
         out.written(),
     );
@@ -355,8 +355,8 @@ test "printTranscript gives each call the result that names it" {
         .{ .role = "tool", .tool_call_id = "call_2", .content = "contents of b" },
     }, null, .plain);
     try std.testing.expectEqualStrings(
-        "▸ read a.zig\n--- output ---\ncontents of a\n\n" ++
-            "▸ read b.zig\n--- output ---\ncontents of b\n\n",
+        "▸ read a.zig\n▾ output\ncontents of a\n\n" ++
+            "▸ read b.zig\n▾ output\ncontents of b\n\n",
         out.written(),
     );
 }

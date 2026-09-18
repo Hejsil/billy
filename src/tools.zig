@@ -452,9 +452,9 @@ fn printHead(call: Call, format: Format, style: Style, out: *Io.Writer) !void {
         .write => |args| try printHeader(marks.write, "write", args.path, style, out),
         .edit => |args| {
             try printHeader(marks.edit, "edit", args.path, style, out);
-            try printLabel("--- find ---", style, out);
+            try printLabel("find", style, out);
             try printTruncated(args.old_string, null, style, out);
-            try printLabel("--- replace ---", style, out);
+            try printLabel("replace", style, out);
             try printTruncated(args.new_string, null, style, out);
         },
         .bash => |args| {
@@ -481,11 +481,15 @@ fn printHeader(mark: Mark, name: []const u8, target: []const u8, style: Style, o
     try out.writeAll("\n");
 }
 
-/// Prints a label such as `--- output ---` dimmed, so it reads as structure
-/// rather than as part of the output under it.
-fn printLabel(text: []const u8, style: Style, out: *Io.Writer) !void {
-    try style.dim(text, out);
-    try out.writeAll("\n");
+/// The mark in front of the labels that break a block into sections, such as
+/// `▾ output`. It points down at the lines under it, where the glyph of a tool
+/// points at the call it names.
+const label_mark = "▾";
+
+/// Prints a label such as `▾ output` dimmed, so it reads as structure rather
+/// than as part of the output under it.
+fn printLabel(name: []const u8, style: Style, out: *Io.Writer) !void {
+    try out.print("{s}{s} {s}{s}\n", .{ style.on("2"), label_mark, name, style.off() });
 }
 
 /// Prints a bash command on its own line under the block header, run through
@@ -498,7 +502,7 @@ fn printScript(command: []const u8, format: Format, out: *Io.Writer) !void {
     try out.writeAll("\n");
 }
 
-/// Prints what a call produced under `--- output ---`. A write shows the content
+/// Prints what a call produced under the `output` label. A write shows the content
 /// it put in the file; an edit shows nothing, since its result would only repeat
 /// the strings shown above it. Anything that failed shows why instead, whatever
 /// it was asked to do.
@@ -507,7 +511,7 @@ fn printResult(call: Call, result: []const u8, style: Style, out: *Io.Writer) !v
     // result is billy's own message, so it is shown the way billy shows a
     // failure.
     if (std.mem.startsWith(u8, result, "error: ")) {
-        try printLabel("--- output ---", style, out);
+        try printLabel("output", style, out);
         return printTruncated(result, .red, style, out);
     }
     switch (call) {
@@ -515,14 +519,14 @@ fn printResult(call: Call, result: []const u8, style: Style, out: *Io.Writer) !v
         // is what it produced. It is on the call rather than in the result, so a
         // replayed session shows it without it having to be stored twice.
         .write => |args| {
-            try printLabel("--- output ---", style, out);
+            try printLabel("output", style, out);
             return printTruncated(args.content, null, style, out);
         },
         // An edit's result would only repeat the strings shown above it.
         .edit => {},
         .bash => return printBash(result, style, out),
         else => {
-            try printLabel("--- output ---", style, out);
+            try printLabel("output", style, out);
             return printTruncated(result, null, style, out);
         },
     }
@@ -533,7 +537,7 @@ fn printResult(call: Call, result: []const u8, style: Style, out: *Io.Writer) !v
 /// status is the first line billy writes into the result, so it is read back
 /// from there; a replayed session holds the same line.
 fn printBash(result: []const u8, style: Style, out: *Io.Writer) !void {
-    try printLabel("--- output ---", style, out);
+    try printLabel("output", style, out);
     const newline = std.mem.indexOfScalar(u8, result, '\n') orelse result.len;
     const status = result[0..newline];
     const hue: Color = if (std.mem.eql(u8, status, "exit code: 0")) .green else .red;
@@ -671,35 +675,35 @@ test "exit codes of signals follow the shell convention" {
 
 test "describe frames a call and its output" {
     try expectDescribe(
-        "▸ read a.zig\n--- output ---\nfile content\n\n",
+        "▸ read a.zig\n▾ output\nfile content\n\n",
         "read",
         "{\"path\":\"a.zig\"}",
         "file content",
     );
     // A write shows the content it put in the file, not its result.
     try expectDescribe(
-        "◂ write a.zig\n--- output ---\nhello\n\n",
+        "◂ write a.zig\n▾ output\nhello\n\n",
         "write",
         "{\"path\":\"a.zig\",\"content\":\"hello\"}",
         "wrote 5 bytes to a.zig",
     );
     // A write that failed shows why instead of the content it never wrote.
     try expectDescribe(
-        "◂ write a.zig\n--- output ---\nerror: cannot write a.zig: AccessDenied\n\n",
+        "◂ write a.zig\n▾ output\nerror: cannot write a.zig: AccessDenied\n\n",
         "write",
         "{\"path\":\"a.zig\",\"content\":\"hello\"}",
         "error: cannot write a.zig: AccessDenied",
     );
     // An edit shows the strings it worked on instead of its result.
     try expectDescribe(
-        "✎ edit a.zig\n--- find ---\nold text\n--- replace ---\nnew text\n\n",
+        "✎ edit a.zig\n▾ find\nold text\n▾ replace\nnew text\n\n",
         "edit",
         "{\"path\":\"a.zig\",\"old_string\":\"old text\",\"new_string\":\"new text\"}",
         "replaced 1 occurrence(s) in a.zig",
     );
     // The command of a bash call is printed whole.
     try expectDescribe(
-        "❯ bash\nls -la\n--- output ---\nexit code: 0\n(no output)\n\n",
+        "❯ bash\nls -la\n▾ output\nexit code: 0\n(no output)\n\n",
         "bash",
         "{\"command\":\"ls -la\"}",
         "exit code: 0\n(no output)\n",
@@ -707,21 +711,21 @@ test "describe frames a call and its output" {
     // A tool that is not implemented shows its name, and the reason it could not
     // run reaches the user as the output.
     try expectDescribe(
-        "? frobnicate\n--- output ---\nerror: unknown tool 'frobnicate'\n\n",
+        "? frobnicate\n▾ output\nerror: unknown tool 'frobnicate'\n\n",
         "frobnicate",
         "{}",
         "error: unknown tool 'frobnicate'",
     );
     // A known tool with broken arguments shows its name too.
     try expectDescribe(
-        "? read\n--- output ---\nerror: invalid arguments for read: SyntaxError\n\n",
+        "? read\n▾ output\nerror: invalid arguments for read: SyntaxError\n\n",
         "read",
         "{",
         "error: invalid arguments for read: SyntaxError",
     );
     // A failed edit shows the error rather than hiding it behind its arguments.
     try expectDescribe(
-        "✎ edit a.zig\n--- find ---\nx\n--- replace ---\ny\n--- output ---\n" ++
+        "✎ edit a.zig\n▾ find\nx\n▾ replace\ny\n▾ output\n" ++
             "error: old_string not found in a.zig\n\n",
         "edit",
         "{\"path\":\"a.zig\",\"old_string\":\"x\",\"new_string\":\"y\"}",
@@ -745,7 +749,7 @@ test "a block header names the tool, its colour, the bold name and the target" {
         .arguments = "{\"path\":\"a.zig\"}",
     } }), "", null, .ansi, &out.writer);
     try std.testing.expectEqualStrings(
-        "\x1b[34m▸\x1b[0m \x1b[1mread\x1b[0m \x1b[2ma.zig\x1b[0m\n\x1b[2m--- output ---\x1b[0m\n\n",
+        "\x1b[34m▸\x1b[0m \x1b[1mread\x1b[0m \x1b[2ma.zig\x1b[0m\n\x1b[2m▾ output\x1b[0m\n\n",
         out.written(),
     );
     out.clearRetainingCapacity();
@@ -755,7 +759,7 @@ test "a block header names the tool, its colour, the bold name and the target" {
         .name = "read",
         .arguments = "{\"path\":\"a.zig\"}",
     } }), "", null, .plain, &out.writer);
-    try std.testing.expectEqualStrings("▸ read a.zig\n--- output ---\n\n", out.written());
+    try std.testing.expectEqualStrings("▸ read a.zig\n▾ output\n\n", out.written());
 }
 
 test "the exit status of a bash call is shown green or red" {
@@ -775,7 +779,7 @@ test "the exit status of a bash call is shown green or red" {
     // A command that succeeded.
     try describe(parseCall(arena, call), "exit code: 0\nbuilt\n", null, .ansi, &out.writer);
     try std.testing.expectEqualStrings(
-        "\x1b[36m❯\x1b[0m \x1b[1mbash\x1b[0m\nmake\n\x1b[2m--- output ---\x1b[0m\n" ++
+        "\x1b[36m❯\x1b[0m \x1b[1mbash\x1b[0m\nmake\n\x1b[2m▾ output\x1b[0m\n" ++
             "\x1b[32mexit code: 0\x1b[0m\nbuilt\n\n",
         out.written(),
     );
@@ -784,7 +788,7 @@ test "the exit status of a bash call is shown green or red" {
     // One that did not, whose output the terminal still shows as it is.
     try describe(parseCall(arena, call), "exit code: 2\nboom\n", null, .ansi, &out.writer);
     try std.testing.expectEqualStrings(
-        "\x1b[36m❯\x1b[0m \x1b[1mbash\x1b[0m\nmake\n\x1b[2m--- output ---\x1b[0m\n" ++
+        "\x1b[36m❯\x1b[0m \x1b[1mbash\x1b[0m\nmake\n\x1b[2m▾ output\x1b[0m\n" ++
             "\x1b[31mexit code: 2\x1b[0m\nboom\n\n",
         out.written(),
     );
@@ -805,7 +809,7 @@ test "what a call failed with is shown red, and what it left out is dimmed" {
         .arguments = "{\"path\":\"a.zig\"}",
     } }), "error: cannot read a.zig: FileNotFound", null, .ansi, &out.writer);
     try std.testing.expectEqualStrings(
-        "\x1b[34m▸\x1b[0m \x1b[1mread\x1b[0m \x1b[2ma.zig\x1b[0m\n\x1b[2m--- output ---\x1b[0m\n" ++
+        "\x1b[34m▸\x1b[0m \x1b[1mread\x1b[0m \x1b[2ma.zig\x1b[0m\n\x1b[2m▾ output\x1b[0m\n" ++
             "\x1b[31merror: cannot read a.zig: FileNotFound\x1b[0m\n\n",
         out.written(),
     );
@@ -820,7 +824,7 @@ test "what a call failed with is shown red, and what it left out is dimmed" {
         &out.writer,
     );
     try std.testing.expectEqualStrings(
-        "\x1b[34m▸\x1b[0m \x1b[1mread\x1b[0m \x1b[2ma.zig\x1b[0m\n\x1b[2m--- output ---\x1b[0m\n" ++
+        "\x1b[34m▸\x1b[0m \x1b[1mread\x1b[0m \x1b[2ma.zig\x1b[0m\n\x1b[2m▾ output\x1b[0m\n" ++
             "1\n2\n3\n4\n5\n\x1b[2m… 2 more lines\x1b[0m\n\n",
         out.written(),
     );
@@ -846,7 +850,7 @@ test "a bash command is shown the way the formatter lays it out" {
     // The command is shown as the formatter wrote it; its trailing newline does
     // not leave a blank line in the block.
     try std.testing.expectEqualStrings(
-        "❯ bash\nLS -LA\n--- output ---\nexit code: 0\n(no output)\n\n",
+        "❯ bash\nLS -LA\n▾ output\nexit code: 0\n(no output)\n\n",
         out.written(),
     );
 }
@@ -865,7 +869,7 @@ test "a bash command is shown as written when the formatter cannot lay it out" {
         .arguments = "{\"command\":\"ls -la\"}",
     } };
     const expected =
-        "❯ bash\nls -la\n--- output ---\nexit code: 0\n(no output)\n\n";
+        "❯ bash\nls -la\n▾ output\nexit code: 0\n(no output)\n\n";
 
     // A formatter that cannot be run, one that fails and one that writes
     // nothing all leave the command the model wrote for the user to read.
@@ -895,7 +899,7 @@ test "describe keeps a block short and says how much it left out" {
         &out.writer,
     );
     try std.testing.expectEqualStrings(
-        "▸ read a.zig\n--- output ---\n1\n2\n3\n4\n5\n\n",
+        "▸ read a.zig\n▾ output\n1\n2\n3\n4\n5\n\n",
         out.written(),
     );
     out.clearRetainingCapacity();
@@ -910,14 +914,14 @@ test "describe keeps a block short and says how much it left out" {
         &out.writer,
     );
     try std.testing.expectEqualStrings(
-        "▸ read a.zig\n--- output ---\n1\n2\n3\n4\n5\n… 2 more lines\n\n",
+        "▸ read a.zig\n▾ output\n1\n2\n3\n4\n5\n… 2 more lines\n\n",
         out.written(),
     );
     out.clearRetainingCapacity();
 
     // An empty result leaves the header with nothing under it.
     try describe(.{ .read = .{ .path = "a.zig" } }, "", null, .plain, &out.writer);
-    try std.testing.expectEqualStrings("▸ read a.zig\n--- output ---\n\n", out.written());
+    try std.testing.expectEqualStrings("▸ read a.zig\n▾ output\n\n", out.written());
     out.clearRetainingCapacity();
 
     // A long find or replace string is cut short the same way.
@@ -933,8 +937,8 @@ test "describe keeps a block short and says how much it left out" {
         &out.writer,
     );
     try std.testing.expectEqualStrings(
-        "✎ edit a.zig\n--- find ---\n1\n2\n3\n4\n5\n… 1 more lines\n" ++
-            "--- replace ---\nb\n\n",
+        "✎ edit a.zig\n▾ find\n1\n2\n3\n4\n5\n… 1 more lines\n" ++
+            "▾ replace\nb\n\n",
         out.written(),
     );
 }
@@ -961,7 +965,7 @@ test "run logs exactly what describe prints" {
 
     // The live log is the description, so a replayed session reads the same.
     try std.testing.expectEqualStrings(
-        "❯ bash\ntrue\n--- output ---\nexit code: 0\n(no output)\n\n",
+        "❯ bash\ntrue\n▾ output\nexit code: 0\n(no output)\n\n",
         log.written(),
     );
     try std.testing.expectEqualStrings(log.written(), described.written());
@@ -990,7 +994,7 @@ test "the format changes what is shown and nothing else" {
     // output, and the user reads the command as the formatter laid it out.
     try std.testing.expectEqualStrings("exit code: 0\nhi\n", result);
     try std.testing.expectEqualStrings(
-        "❯ bash\nECHO HI\n--- output ---\nexit code: 0\nhi\n\n",
+        "❯ bash\nECHO HI\n▾ output\nexit code: 0\nhi\n\n",
         log.written(),
     );
 
