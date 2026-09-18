@@ -144,8 +144,8 @@ pub fn main(init: std.process.Init) !void {
     };
 
     if (options.resume_id != null) {
-        // Replay the conversation exactly as a live session showed it, so the
-        // context does not have to be remembered from the previous run.
+        // Replay the conversation as a transcript, so the context does not
+        // have to be remembered from the previous run.
         try billy.agent.printTranscript(
             arena,
             out,

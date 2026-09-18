@@ -97,11 +97,3 @@ pub fn header(mark: Mark, name: []const u8, target: []const u8, style: Style, ou
     }
     try out.writeAll("\n");
 }
-
-/// Prints a block header without the newline that ends it, so whoever printed it
-/// can be followed on the same line.
-pub fn openHeader(mark: Mark, name: []const u8, style: Style, out: *Io.Writer) !void {
-    try style.color(mark.hue, mark.glyph, out);
-    try out.writeAll(" ");
-    try style.bold(name, out);
-}

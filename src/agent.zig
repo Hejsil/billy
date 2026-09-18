@@ -188,12 +188,6 @@ pub fn run(
         // Rebuilt for every prompt, so it reflects the tokens and cost of the
         // turns run so far.
         const header = try sessionHeader(gpa, arena, config, session.context_tokens, session.cost);
-        // Opens the user's block above the input. The line editor that follows
-        // echoes the line behind `prompt` and its leading newline ends this
-        // header, so what stays on screen is the header and the line under it.
-        try out.writeAll("\n");
-        try styling.openHeader(marks.prompt, "prompt", config.style, out);
-        try out.flush();
         const line = (try editor.readLine(header, prompt)) orelse break;
         if (line.len == 0) continue;
         try session.append(.{ .role = "user", .content = line });
@@ -205,11 +199,14 @@ pub fn run(
     try out.flush();
 }
 
-/// Replays a stored conversation the way a live session showed it, so a resumed
-/// session reads exactly like the run it continues. The rendering is shared with
-/// the loop: replies go through `printAnswer`, the user's prompts through
-/// `prompt` and the tool calls through `tools.parseCall` and `tools.describe`,
-/// which lays out a bash command the same way `format` does.
+/// Replays a stored conversation the way a live session showed it, so that
+/// remembering the context of an earlier run is not left to the user. The tool
+/// calls go through `tools.parseCall` and `tools.describe`, and the replies
+/// through `printAnswer`, both the ones the loop printed and the same.
+///
+/// A prompt is the one thing a live run leaves on screen as it was typed and a
+/// replay does not: the transcript heads it `» prompt` and lays it out like a
+/// reply, since a prompt in a log needs the header the live input does not.
 pub fn printTranscript(
     arena: std.mem.Allocator,
     out: *Io.Writer,
@@ -238,10 +235,16 @@ fn printMessage(
     style: styling.Style,
 ) !void {
     if (std.mem.eql(u8, message.role, "user")) {
-        // Mirrors what the header and the line editor leave on screen together.
+        // A prompt from the session is headed like everything else in the
+        // transcript, and its markdown is laid out the way a reply's is. The
+        // live prompt is left alone: the line editor echoes it as it is typed,
+        // and a header over the input the user is about to fill in says nothing.
         try out.writeAll("\n");
         try styling.header(marks.prompt, "prompt", "", style, out);
-        return out.print("{s}{s}\n", .{ prompt, message.content orelse "" });
+        try out.writeAll(prompt);
+        const text = message.content orelse "";
+        if (!try formatting.apply(markdown, text, out)) try out.writeAll(text);
+        return out.writeAll("\n");
     }
     if (!std.mem.eql(u8, message.role, "assistant")) return;
     const calls = message.tool_calls orelse &.{};
@@ -321,7 +324,7 @@ fn printAnswer(out: *Io.Writer, content: ?[]const u8, markdown: formatting.Forma
     try out.flush();
 }
 
-test "printTranscript replays messages the way a live session shows them" {
+test "printTranscript replays a conversation as the blocks it was made of" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -396,6 +399,30 @@ test "a reply is headed by its own header, and its markdown laid out" {
         .{ .role = "assistant", .content = "hello" },
     }, null, broken, .plain);
     try std.testing.expectEqualStrings("◆ answer\nhello\n", out.written());
+}
+
+test "a prompt from the session is headed and laid out like a reply" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // The same stand-in formatter as a reply: a prompt is markdown too, so it is
+    // laid out by the same script.
+    const markdown: formatting.Format = .{ .script = "tr a-z A-Z", .io = std.testing.io, .gpa = gpa };
+    try printTranscript(arena_state.allocator(), &out.writer, &.{
+        .{ .role = "user", .content = "hello" },
+    }, null, markdown, .plain);
+    try std.testing.expectEqualStrings("\n» prompt\n> HELLO\n", out.written());
+    out.clearRetainingCapacity();
+
+    // Without one, the prompt is shown as it was typed.
+    try printTranscript(arena_state.allocator(), &out.writer, &.{
+        .{ .role = "user", .content = "hello" },
+    }, null, null, .plain);
+    try std.testing.expectEqualStrings("\n» prompt\n> hello\n", out.written());
 }
 
 test "an empty reply is shown under its header, in place of the text" {
