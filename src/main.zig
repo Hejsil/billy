@@ -106,6 +106,10 @@ pub fn main(init: std.process.Init) !void {
             .io = io,
             .gpa = init.gpa,
         } else null,
+        // A terminal gets the block headers with the tool name in bold; a pipe
+        // or a redirection, where the escape codes would only be noise, gets the
+        // same text plain.
+        .style = billy.tools.Style.detect(io),
     };
 
     const directory = billy.session.defaultDir(arena, init.environ_map) catch |err| {
@@ -133,7 +137,7 @@ pub fn main(init: std.process.Init) !void {
     if (options.resume_id != null) {
         // Replay the conversation exactly as a live session showed it, so the
         // context does not have to be remembered from the previous run.
-        try billy.agent.printTranscript(arena, out, session.messages.items, config.format);
+        try billy.agent.printTranscript(arena, out, session.messages.items, config.format, config.style);
     }
     try billy.agent.run(io, arena, init.gpa, out, config, &session);
 }

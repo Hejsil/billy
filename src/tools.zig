@@ -72,6 +72,9 @@ pub const Tools = struct {
     /// How a bash command is laid out for the user. Shared with the transcript,
     /// so a replayed session shows the command the way the run did.
     format: Format,
+    /// How the lines billy prints itself are decorated. Shared with the
+    /// transcript, so a replayed session looks like the run it continues.
+    style: Style,
     definitions: []const llm.Tool,
 
     pub fn init(
@@ -80,6 +83,7 @@ pub const Tools = struct {
         gpa: std.mem.Allocator,
         log: *Io.Writer,
         format: Format,
+        style: Style,
     ) !Tools {
         return .{
             .io = io,
@@ -87,6 +91,7 @@ pub const Tools = struct {
             .gpa = gpa,
             .log = log,
             .format = format,
+            .style = style,
             .definitions = try definitions(arena),
         };
     }
@@ -100,7 +105,7 @@ pub const Tools = struct {
     /// it is doing, and the result follows it.
     pub fn run(tools: *Tools, call: llm.ToolCall) ![]const u8 {
         const parsed = parseCall(tools.arena, call);
-        try printHead(parsed, tools.format, tools.log);
+        try printHead(parsed, tools.format, tools.style, tools.log);
         try tools.log.flush();
 
         const result = switch (parsed) {
@@ -153,7 +158,7 @@ pub const Tools = struct {
             return std.fmt.allocPrint(tools.arena, "offset {d} is past the end; {d} lines", .{ first, number });
         }
         if (shown == limit) {
-            try out.writer.print("... {d} more lines\n", .{number - first + 1 - shown});
+            try out.writer.print("… {d} more lines\n", .{number - first + 1 - shown});
         }
         return tools.finish(out.written());
     }
@@ -241,7 +246,7 @@ pub const Tools = struct {
 
     fn finish(tools: *Tools, text: []const u8) ![]const u8 {
         if (text.len <= max_result_len) return tools.arena.dupe(u8, text);
-        return std.fmt.allocPrint(tools.arena, "{s}\n... {d} more bytes", .{
+        return std.fmt.allocPrint(tools.arena, "{s}\n… {d} more bytes", .{
             text[0..max_result_len],
             text.len - max_result_len,
         });
@@ -254,6 +259,32 @@ pub const Tools = struct {
 /// The formatting is presentation only: the command that runs, its result and
 /// everything the session stores keep the text the model wrote.
 pub const Format = ?Formatter;
+
+/// The decorations billy puts on the lines it prints itself, such as a block
+/// header. A terminal that takes an escape code gets the tool name in bold;
+/// anything else gets the same text plain.
+pub const Style = enum {
+    plain,
+    ansi,
+
+    /// The style to use on the terminal billy prints to. Escape codes are for a
+    /// terminal, which a pipe or a redirection is not: `supportsAnsiEscapeCodes`
+    /// answers whether stdout is one.
+    pub fn detect(io: Io) Style {
+        const supported = Io.File.stdout().supportsAnsiEscapeCodes(io) catch return .plain;
+        return if (supported) .ansi else .plain;
+    }
+};
+
+/// Prints `text` in bold, or as it is when the terminal does not take escape
+/// codes. Only the printing is decorated: what a session stores and what the
+/// model is sent never pass through here.
+fn bold(style: Style, text: []const u8, out: *Io.Writer) !void {
+    switch (style) {
+        .plain => try out.writeAll(text),
+        .ansi => try out.print("\x1b[1m{s}\x1b[0m", .{text}),
+    }
+}
 
 /// A formatter: a shell script that reads the command on standard input and
 /// writes the formatted command on standard output, such as
@@ -345,36 +376,58 @@ fn parse(comptime T: type, arena: std.mem.Allocator, json: []const u8) !T {
 /// Prints the block a live session shows for a tool call and its result: a
 /// header naming the tool, what it acts on, and its output. The transcript
 /// reuses it so that replaying a session matches the run exactly.
-pub fn describe(call: Call, result: []const u8, format: Format, out: *Io.Writer) !void {
-    try printHead(call, format, out);
+pub fn describe(call: Call, result: []const u8, format: Format, style: Style, out: *Io.Writer) !void {
+    try printHead(call, format, style, out);
     try printResult(call, result, out);
     try out.writeAll("\n");
 }
+
+/// The glyph a block header opens with, one per tool. Each stands on the one
+/// line billy writes whole rather than in front of every row of output, which
+/// the terminal wraps on its own and cannot be marked without folding it.
+const glyph = struct {
+    const read = "▸";
+    const write = "◂";
+    const edit = "✎";
+    const bash = "❯";
+    /// A call that could not be named: a tool billy does not implement, or
+    /// arguments that could not be read.
+    const unknown = "?";
+};
 
 /// Prints the header block of a call: which tool it is and what it acts on. A
 /// bash command is laid out by `format`, so it reads the way it runs; the
 /// strings an edit works on are truncated, since they are there for context
 /// rather than to be read in full.
-fn printHead(call: Call, format: Format, out: *Io.Writer) !void {
+fn printHead(call: Call, format: Format, style: Style, out: *Io.Writer) !void {
     switch (call) {
-        .read => |args| try out.print("--- tool - read ---\n{s}\n", .{args.path}),
-        .write => |args| try out.print("--- tool - write ---\n{s}\n", .{args.path}),
+        .read => |args| try printHeader(glyph.read, "read", args.path, style, out),
+        .write => |args| try printHeader(glyph.write, "write", args.path, style, out),
         .edit => |args| {
-            try out.print("--- tool - edit ---\n{s}\n", .{args.path});
+            try printHeader(glyph.edit, "edit", args.path, style, out);
             try out.writeAll("--- find ---\n");
             try printTruncated(out, args.old_string);
             try out.writeAll("--- replace ---\n");
             try printTruncated(out, args.new_string);
         },
         .bash => |args| {
-            try out.writeAll("--- tool - bash ---\n");
+            try printHeader(glyph.bash, "bash", "", style, out);
             try printScript(args.command, format, out);
         },
         // Only the name is known, so that is all there is to show; the reason it
         // could not run reaches the user through the output.
-        .unknown => |name| try out.print("--- tool - {s} ---\n", .{name}),
-        .malformed => |bad| try out.print("--- tool - {s} ---\n", .{bad.name}),
+        .unknown => |name| try printHeader(glyph.unknown, name, "", style, out),
+        .malformed => |bad| try printHeader(glyph.unknown, bad.name, "", style, out),
     }
+}
+
+/// Prints a block header: the glyph of the tool, its name in bold, and what it
+/// acts on when there is one, as `▸ read a.zig`.
+fn printHeader(mark: []const u8, name: []const u8, target: []const u8, style: Style, out: *Io.Writer) !void {
+    try out.print("{s} ", .{mark});
+    try bold(style, name, out);
+    if (target.len > 0) try out.print(" {s}", .{target});
+    try out.writeAll("\n");
 }
 
 /// Prints a bash command on its own line under the block header, run through
@@ -431,7 +484,7 @@ fn printTruncated(out: *Io.Writer, text: []const u8) !void {
         try out.writeAll("\n");
         shown += 1;
     }
-    if (total > shown) try out.print("... {d} more lines\n", .{total - shown});
+    if (total > shown) try out.print("… {d} more lines\n", .{total - shown});
 }
 
 fn exitCode(term: std.process.Child.Term) u8 {
@@ -536,35 +589,35 @@ test "exit codes of signals follow the shell convention" {
 
 test "describe frames a call and its output" {
     try expectDescribe(
-        "--- tool - read ---\na.zig\n--- output ---\nfile content\n\n",
+        "▸ read a.zig\n--- output ---\nfile content\n\n",
         "read",
         "{\"path\":\"a.zig\"}",
         "file content",
     );
     // A write shows the content it put in the file, not its result.
     try expectDescribe(
-        "--- tool - write ---\na.zig\n--- output ---\nhello\n\n",
+        "◂ write a.zig\n--- output ---\nhello\n\n",
         "write",
         "{\"path\":\"a.zig\",\"content\":\"hello\"}",
         "wrote 5 bytes to a.zig",
     );
     // A write that failed shows why instead of the content it never wrote.
     try expectDescribe(
-        "--- tool - write ---\na.zig\n--- output ---\nerror: cannot write a.zig: AccessDenied\n\n",
+        "◂ write a.zig\n--- output ---\nerror: cannot write a.zig: AccessDenied\n\n",
         "write",
         "{\"path\":\"a.zig\",\"content\":\"hello\"}",
         "error: cannot write a.zig: AccessDenied",
     );
     // An edit shows the strings it worked on instead of its result.
     try expectDescribe(
-        "--- tool - edit ---\na.zig\n--- find ---\nold text\n--- replace ---\nnew text\n\n",
+        "✎ edit a.zig\n--- find ---\nold text\n--- replace ---\nnew text\n\n",
         "edit",
         "{\"path\":\"a.zig\",\"old_string\":\"old text\",\"new_string\":\"new text\"}",
         "replaced 1 occurrence(s) in a.zig",
     );
     // The command of a bash call is printed whole.
     try expectDescribe(
-        "--- tool - bash ---\nls -la\n--- output ---\nexit code: 0\n(no output)\n\n",
+        "❯ bash\nls -la\n--- output ---\nexit code: 0\n(no output)\n\n",
         "bash",
         "{\"command\":\"ls -la\"}",
         "exit code: 0\n(no output)\n",
@@ -572,26 +625,55 @@ test "describe frames a call and its output" {
     // A tool that is not implemented shows its name, and the reason it could not
     // run reaches the user as the output.
     try expectDescribe(
-        "--- tool - frobnicate ---\n--- output ---\nerror: unknown tool 'frobnicate'\n\n",
+        "? frobnicate\n--- output ---\nerror: unknown tool 'frobnicate'\n\n",
         "frobnicate",
         "{}",
         "error: unknown tool 'frobnicate'",
     );
     // A known tool with broken arguments shows its name too.
     try expectDescribe(
-        "--- tool - read ---\n--- output ---\nerror: invalid arguments for read: SyntaxError\n\n",
+        "? read\n--- output ---\nerror: invalid arguments for read: SyntaxError\n\n",
         "read",
         "{",
         "error: invalid arguments for read: SyntaxError",
     );
     // A failed edit shows the error rather than hiding it behind its arguments.
     try expectDescribe(
-        "--- tool - edit ---\na.zig\n--- find ---\nx\n--- replace ---\ny\n--- output ---\n" ++
+        "✎ edit a.zig\n--- find ---\nx\n--- replace ---\ny\n--- output ---\n" ++
             "error: old_string not found in a.zig\n\n",
         "edit",
         "{\"path\":\"a.zig\",\"old_string\":\"x\",\"new_string\":\"y\"}",
         "error: old_string not found in a.zig",
     );
+}
+
+test "a block header names the tool, the bold name and what it acts on" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // On a terminal that takes an escape code, the glyph and the target are
+    // shown as they are and only the name is bold.
+    try describe(parseCall(arena, .{ .id = "1", .function = .{
+        .name = "read",
+        .arguments = "{\"path\":\"a.zig\"}",
+    } }), "", null, .ansi, &out.writer);
+    try std.testing.expectEqualStrings(
+        "▸ \x1b[1mread\x1b[0m a.zig\n--- output ---\n\n",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+
+    // A terminal that takes no escape code gets the same text without them.
+    try describe(parseCall(arena, .{ .id = "1", .function = .{
+        .name = "read",
+        .arguments = "{\"path\":\"a.zig\"}",
+    } }), "", null, .plain, &out.writer);
+    try std.testing.expectEqualStrings("▸ read a.zig\n--- output ---\n\n", out.written());
 }
 
 test "a bash command is shown the way the formatter lays it out" {
@@ -609,12 +691,12 @@ test "a bash command is shown the way the formatter lays it out" {
     try describe(parseCall(arena, .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"ls -la\\n\"}",
-    } }), "exit code: 0\n(no output)\n", format, &out.writer);
+    } }), "exit code: 0\n(no output)\n", format, .plain, &out.writer);
 
     // The command is shown as the formatter wrote it; its trailing newline does
     // not leave a blank line in the block.
     try std.testing.expectEqualStrings(
-        "--- tool - bash ---\nLS -LA\n--- output ---\nexit code: 0\n(no output)\n\n",
+        "❯ bash\nLS -LA\n--- output ---\nexit code: 0\n(no output)\n\n",
         out.written(),
     );
 }
@@ -633,14 +715,14 @@ test "a bash command is shown as written when the formatter cannot lay it out" {
         .arguments = "{\"command\":\"ls -la\"}",
     } };
     const expected =
-        "--- tool - bash ---\nls -la\n--- output ---\nexit code: 0\n(no output)\n\n";
+        "❯ bash\nls -la\n--- output ---\nexit code: 0\n(no output)\n\n";
 
     // A formatter that cannot be run, one that fails and one that writes
     // nothing all leave the command the model wrote for the user to read.
     const scripts = [_][]const u8{ "billy-no-such-formatter", "exit 1", "true" };
     for (scripts) |script| {
         const format: Format = .{ .script = script, .io = std.testing.io, .gpa = gpa };
-        try describe(parseCall(arena, call), "exit code: 0\n(no output)\n", format, &out.writer);
+        try describe(parseCall(arena, call), "exit code: 0\n(no output)\n", format, .plain, &out.writer);
         try std.testing.expectEqualStrings(expected, out.written());
         out.clearRetainingCapacity();
     }
@@ -659,10 +741,11 @@ test "describe keeps a block short and says how much it left out" {
         .{ .read = .{ .path = "a.zig" } },
         "1\n2\n3\n4\n5",
         null,
+        .plain,
         &out.writer,
     );
     try std.testing.expectEqualStrings(
-        "--- tool - read ---\na.zig\n--- output ---\n1\n2\n3\n4\n5\n\n",
+        "▸ read a.zig\n--- output ---\n1\n2\n3\n4\n5\n\n",
         out.written(),
     );
     out.clearRetainingCapacity();
@@ -673,17 +756,18 @@ test "describe keeps a block short and says how much it left out" {
         .{ .read = .{ .path = "a.zig" } },
         "1\n2\n3\n4\n5\n6\n7\n",
         null,
+        .plain,
         &out.writer,
     );
     try std.testing.expectEqualStrings(
-        "--- tool - read ---\na.zig\n--- output ---\n1\n2\n3\n4\n5\n... 2 more lines\n\n",
+        "▸ read a.zig\n--- output ---\n1\n2\n3\n4\n5\n… 2 more lines\n\n",
         out.written(),
     );
     out.clearRetainingCapacity();
 
     // An empty result leaves the header with nothing under it.
-    try describe(.{ .read = .{ .path = "a.zig" } }, "", null, &out.writer);
-    try std.testing.expectEqualStrings("--- tool - read ---\na.zig\n--- output ---\n\n", out.written());
+    try describe(.{ .read = .{ .path = "a.zig" } }, "", null, .plain, &out.writer);
+    try std.testing.expectEqualStrings("▸ read a.zig\n--- output ---\n\n", out.written());
     out.clearRetainingCapacity();
 
     // A long find or replace string is cut short the same way.
@@ -695,10 +779,11 @@ test "describe keeps a block short and says how much it left out" {
         } },
         "replaced 1 occurrence(s) in a.zig",
         null,
+        .plain,
         &out.writer,
     );
     try std.testing.expectEqualStrings(
-        "--- tool - edit ---\na.zig\n--- find ---\n1\n2\n3\n4\n5\n... 1 more lines\n" ++
+        "✎ edit a.zig\n--- find ---\n1\n2\n3\n4\n5\n… 1 more lines\n" ++
             "--- replace ---\nb\n\n",
         out.written(),
     );
@@ -713,7 +798,7 @@ test "run logs exactly what describe prints" {
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
 
-    var tool_set = try Tools.init(std.testing.io, arena, gpa, &log.writer, null);
+    var tool_set = try Tools.init(std.testing.io, arena, gpa, &log.writer, null, .plain);
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"true\"}",
@@ -722,11 +807,11 @@ test "run logs exactly what describe prints" {
 
     var described: std.Io.Writer.Allocating = .init(gpa);
     defer described.deinit();
-    try describe(parseCall(arena, call), result, null, &described.writer);
+    try describe(parseCall(arena, call), result, null, .plain, &described.writer);
 
     // The live log is the description, so a replayed session reads the same.
     try std.testing.expectEqualStrings(
-        "--- tool - bash ---\ntrue\n--- output ---\nexit code: 0\n(no output)\n\n",
+        "❯ bash\ntrue\n--- output ---\nexit code: 0\n(no output)\n\n",
         log.written(),
     );
     try std.testing.expectEqualStrings(log.written(), described.written());
@@ -744,7 +829,7 @@ test "the format changes what is shown and nothing else" {
     // The format script writes the command back upper case, so what is shown is
     // plainly not what runs.
     const format: Format = .{ .script = "tr a-z A-Z", .io = std.testing.io, .gpa = gpa };
-    var tool_set = try Tools.init(std.testing.io, arena, gpa, &log.writer, format);
+    var tool_set = try Tools.init(std.testing.io, arena, gpa, &log.writer, format, .plain);
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"echo hi\"}",
@@ -755,14 +840,14 @@ test "the format changes what is shown and nothing else" {
     // output, and the user reads the command as the formatter laid it out.
     try std.testing.expectEqualStrings("exit code: 0\nhi\n", result);
     try std.testing.expectEqualStrings(
-        "--- tool - bash ---\nECHO HI\n--- output ---\nexit code: 0\nhi\n\n",
+        "❯ bash\nECHO HI\n--- output ---\nexit code: 0\nhi\n\n",
         log.written(),
     );
 
     // A replayed session describes the stored call the same way.
     var described: std.Io.Writer.Allocating = .init(gpa);
     defer described.deinit();
-    try describe(parseCall(arena, call), result, format, &described.writer);
+    try describe(parseCall(arena, call), result, format, .plain, &described.writer);
     try std.testing.expectEqualStrings(log.written(), described.written());
 }
 
@@ -802,7 +887,7 @@ fn expectDescribe(expected: []const u8, name: []const u8, arguments: []const u8,
     try describe(parseCall(arena_state.allocator(), .{ .id = "1", .function = .{
         .name = name,
         .arguments = arguments,
-    } }), result, null, &out.writer);
+    } }), result, null, .plain, &out.writer);
     try std.testing.expectEqualStrings(expected, out.written());
 }
 

@@ -29,6 +29,9 @@ pub const Config = struct {
     /// everything stored in the session keep the text the model wrote. Null
     /// shows the command as written.
     format: tools.Format = null,
+    /// How billy decorates the lines it prints itself, such as a block header.
+    /// Plain everywhere the terminal does not take escape codes.
+    style: tools.Style = .plain,
 };
 
 const system_prompt =
@@ -149,7 +152,7 @@ pub fn run(
     session: *session_mod.Session,
 ) !void {
     var editor = line_editor.LineEditor.init(io, out, arena);
-    var tool_set = try tools.Tools.init(io, arena, gpa, out, config.format);
+    var tool_set = try tools.Tools.init(io, arena, gpa, out, config.format, config.style);
     var client: llm.Client = .{
         .gpa = gpa,
         .arena = arena,
@@ -192,9 +195,10 @@ pub fn printTranscript(
     out: *Io.Writer,
     messages: []const llm.Message,
     format: tools.Format,
+    style: tools.Style,
 ) !void {
     for (messages, 0..) |message, i| {
-        try printMessage(arena, out, message, messages[i + 1 ..], format);
+        try printMessage(arena, out, message, messages[i + 1 ..], format, style);
     }
     try out.flush();
 }
@@ -209,6 +213,7 @@ fn printMessage(
     message: llm.Message,
     following: []const llm.Message,
     format: tools.Format,
+    style: tools.Style,
 ) !void {
     if (std.mem.eql(u8, message.role, "user")) {
         // Mirrors what the line editor leaves on screen for a submitted line.
@@ -218,7 +223,7 @@ fn printMessage(
     const calls = message.tool_calls orelse &.{};
     if (calls.len == 0) return printReply(out, message.content);
     for (calls) |call| {
-        try tools.describe(tools.parseCall(arena, call), resultOf(following, call.id), format, out);
+        try tools.describe(tools.parseCall(arena, call), resultOf(following, call.id), format, style, out);
     }
 }
 
@@ -307,11 +312,11 @@ test "printTranscript replays messages the way a live session shows them" {
         .{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;" },
         .{ .role = "assistant", .content = "done" },
     };
-    try printTranscript(arena_state.allocator(), &out.writer, &messages, null);
+    try printTranscript(arena_state.allocator(), &out.writer, &messages, null, .plain);
 
     try std.testing.expectEqualStrings(
         "\n> hello\n" ++
-            "--- tool - read ---\na.zig\n--- output ---\n1\tconst x = 1;\n\n" ++
+            "▸ read a.zig\n--- output ---\n1\tconst x = 1;\n\n" ++
             "done\n",
         out.written(),
     );
@@ -329,7 +334,7 @@ test "printTranscript leaves out the system prompt and an unpaired tool result" 
         .{ .role = "system", .content = "ignore me" },
         // A result whose call is not in the session has nothing to belong to.
         .{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;" },
-    }, null);
+    }, null, .plain);
     try std.testing.expectEqualStrings("", out.written());
 }
 
@@ -348,10 +353,10 @@ test "printTranscript gives each call the result that names it" {
         } },
         .{ .role = "tool", .tool_call_id = "call_1", .content = "contents of a" },
         .{ .role = "tool", .tool_call_id = "call_2", .content = "contents of b" },
-    }, null);
+    }, null, .plain);
     try std.testing.expectEqualStrings(
-        "--- tool - read ---\na.zig\n--- output ---\ncontents of a\n\n" ++
-            "--- tool - read ---\nb.zig\n--- output ---\ncontents of b\n\n",
+        "▸ read a.zig\n--- output ---\ncontents of a\n\n" ++
+            "▸ read b.zig\n--- output ---\ncontents of b\n\n",
         out.written(),
     );
 }
