@@ -491,9 +491,18 @@ fn printHeader(mark: Mark, name: []const u8, target: []const u8, style: Style, o
 }
 
 /// The mark in front of the labels that break a block into sections, such as
-/// `▾ output`. It points down at the lines under it, where the glyph of a tool
+/// `▾ stdout`. It points down at the lines under it, where the glyph of a tool
 /// points at the call it names.
 const label_mark = "▾";
+
+/// The mark in front of an exit status: a check when the command succeeded and a
+/// cross when it did not. It repeats what the colour says, so the line reads the
+/// same where the colour does not, such as a colour-blind terminal or a log with
+/// the escape codes stripped.
+const exit_marks = struct {
+    const ok = "✓";
+    const failed = "✗";
+};
 
 /// How a section of a block is printed. The label line is bold, so it reads as
 /// the heading of what follows, and the output under it is dim, so it stays
@@ -585,17 +594,18 @@ fn printBash(result: []const u8, style: Style, out: *Io.Writer) !void {
     }
 }
 
-/// Prints the status a bash result opens with, on a line of its own: `exit 0` in
-/// green when the command succeeded, `exit 1` and the rest in red when it did
-/// not. The stored line reads `exit code: N` for the model; only the line the
-/// user sees is shortened.
+/// Prints the status a bash result opens with, on a line of its own: `✓ exit 0`
+/// in green when the command succeeded, `✗ exit 1` and the rest in red when it
+/// did not. The stored line reads `exit code: N` for the model; only the line
+/// the user sees is marked and shortened.
 fn printExit(status: []const u8, style: Style, out: *Io.Writer) !void {
     const prefix = "exit code: ";
     const code = if (std.mem.startsWith(u8, status, prefix)) status[prefix.len..] else status;
-    var buffer: [32]u8 = undefined;
-    const line = std.fmt.bufPrint(&buffer, "exit {s}", .{code}) catch status;
-    const hue: Color = if (std.mem.eql(u8, code, "0")) .green else .red;
-    try style.boldColor(hue, line, out);
+    const ok = std.mem.eql(u8, code, "0");
+    const mark = if (ok) exit_marks.ok else exit_marks.failed;
+    var buffer: [64]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, "{s} exit {s}", .{ mark, code }) catch status;
+    try style.boldColor(if (ok) .green else .red, line, out);
     try out.writeAll("\n");
 }
 
@@ -791,7 +801,7 @@ test "describe frames a call and its output" {
     );
     // The command of a bash call is printed whole.
     try expectDescribe(
-        "❯ bash\nls -la\nexit 0\n\n",
+        "❯ bash\nls -la\n✓ exit 0\n\n",
         "bash",
         "{\"command\":\"ls -la\"}",
         "exit code: 0\n(no output)\n",
@@ -867,7 +877,7 @@ test "the exit status of a bash call is shown green or red" {
     // A command that succeeded.
     try describe(parseCall(arena, call), "exit code: 0\nbuilt\n", null, .ansi, &out.writer);
     try std.testing.expectEqualStrings(
-        "\x1b[36m❯\x1b[0m \x1b[1mbash\x1b[0m\nmake\n\x1b[1;32mexit 0\x1b[0m\n\x1b[1m▾ stdout\x1b[0m\n\x1b[2mbuilt\x1b[0m\n\n",
+        "\x1b[36m❯\x1b[0m \x1b[1mbash\x1b[0m\nmake\n\x1b[1;32m✓ exit 0\x1b[0m\n\x1b[1m▾ stdout\x1b[0m\n\x1b[2mbuilt\x1b[0m\n\n",
         out.written(),
     );
     out.clearRetainingCapacity();
@@ -875,7 +885,7 @@ test "the exit status of a bash call is shown green or red" {
     // One that did not, whose output the terminal still shows as it is.
     try describe(parseCall(arena, call), "exit code: 2\nboom\n", null, .ansi, &out.writer);
     try std.testing.expectEqualStrings(
-        "\x1b[36m❯\x1b[0m \x1b[1mbash\x1b[0m\nmake\n\x1b[1;31mexit 2\x1b[0m\n\x1b[1m▾ stdout\x1b[0m\n\x1b[2mboom\x1b[0m\n\n",
+        "\x1b[36m❯\x1b[0m \x1b[1mbash\x1b[0m\nmake\n\x1b[1;31m✗ exit 2\x1b[0m\n\x1b[1m▾ stdout\x1b[0m\n\x1b[2mboom\x1b[0m\n\n",
         out.written(),
     );
 }
@@ -892,15 +902,15 @@ test "a bash block shows only the streams the command filled" {
     var tool_set = try Tools.init(std.testing.io, arena, gpa, &log.writer, null, .plain);
     const cases = [_]struct { command: []const u8, expected: []const u8 }{
         // Nothing printed: the status is all there is.
-        .{ .command = "true", .expected = "❯ bash\ntrue\nexit 0\n\n" },
+        .{ .command = "true", .expected = "❯ bash\ntrue\n✓ exit 0\n\n" },
         // One stream: it follows the status under a label of its own.
-        .{ .command = "echo hi", .expected = "❯ bash\necho hi\nexit 0\n▾ stdout\nhi\n\n" },
-        .{ .command = "echo oops >&2", .expected = "❯ bash\necho oops >&2\nexit 0\n▾ stderr\noops\n\n" },
+        .{ .command = "echo hi", .expected = "❯ bash\necho hi\n✓ exit 0\n▾ stdout\nhi\n\n" },
+        .{ .command = "echo oops >&2", .expected = "❯ bash\necho oops >&2\n✓ exit 0\n▾ stderr\noops\n\n" },
         // Both, each under its own label, standard output first.
         .{ .command = "echo out; echo err >&2", .expected = "❯ bash\necho out; echo err >&2\n" ++
-            "exit 0\n▾ stdout\nout\n▾ stderr\nerr\n\n" },
+            "✓ exit 0\n▾ stdout\nout\n▾ stderr\nerr\n\n" },
         // A command that failed is the same shape with the status in red.
-        .{ .command = "exit 3", .expected = "❯ bash\nexit 3\nexit 3\n\n" },
+        .{ .command = "exit 3", .expected = "❯ bash\nexit 3\n✗ exit 3\n\n" },
     };
     for (cases) |case| {
         log.clearRetainingCapacity();
@@ -992,7 +1002,7 @@ test "a bash command is shown the way the formatter lays it out" {
     // The command is shown as the formatter wrote it; its trailing newline does
     // not leave a blank line in the block.
     try std.testing.expectEqualStrings(
-        "❯ bash\nLS -LA\nexit 0\n\n",
+        "❯ bash\nLS -LA\n✓ exit 0\n\n",
         out.written(),
     );
 }
@@ -1011,7 +1021,7 @@ test "a bash command is shown as written when the formatter cannot lay it out" {
         .arguments = "{\"command\":\"ls -la\"}",
     } };
     const expected =
-        "❯ bash\nls -la\nexit 0\n\n";
+        "❯ bash\nls -la\n✓ exit 0\n\n";
 
     // A formatter that cannot be run, one that fails and one that writes
     // nothing all leave the command the model wrote for the user to read.
@@ -1107,7 +1117,7 @@ test "run logs exactly what describe prints" {
 
     // The live log is the description, so a replayed session reads the same.
     try std.testing.expectEqualStrings(
-        "❯ bash\ntrue\nexit 0\n\n",
+        "❯ bash\ntrue\n✓ exit 0\n\n",
         log.written(),
     );
     try std.testing.expectEqualStrings(log.written(), described.written());
@@ -1136,7 +1146,7 @@ test "the format changes what is shown and nothing else" {
     // output, and the user reads the command as the formatter laid it out.
     try std.testing.expectEqualStrings("exit code: 0\nhi\n", result);
     try std.testing.expectEqualStrings(
-        "❯ bash\nECHO HI\nexit 0\n▾ stdout\nhi\n\n",
+        "❯ bash\nECHO HI\n✓ exit 0\n▾ stdout\nhi\n\n",
         log.written(),
     );
 
