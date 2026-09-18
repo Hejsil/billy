@@ -120,7 +120,7 @@ pub const Tools = struct {
             ),
         };
 
-        try printResult(parsed, result, tools.log);
+        try printResult(parsed, result, tools.style, tools.log);
         try tools.log.writeAll("\n");
         try tools.log.flush();
         return result;
@@ -260,9 +260,11 @@ pub const Tools = struct {
 /// everything the session stores keep the text the model wrote.
 pub const Format = ?Formatter;
 
-/// The decorations billy puts on the lines it prints itself, such as a block
-/// header. A terminal that takes an escape code gets the tool name in bold;
-/// anything else gets the same text plain.
+/// The decorations billy puts on the lines it prints itself: the block header,
+/// the label over the output, and the exit status billy reports. Only those
+/// lines are decorated. What a tool returned, what a session stores and what the
+/// model is sent are printed exactly as they are, which is also what leaves the
+/// command of a bash call to the format script that lays it out.
 pub const Style = enum {
     plain,
     ansi,
@@ -274,17 +276,55 @@ pub const Style = enum {
         const supported = Io.File.stdout().supportsAnsiEscapeCodes(io) catch return .plain;
         return if (supported) .ansi else .plain;
     }
+
+    /// `text` in bold.
+    pub fn bold(style: Style, text: []const u8, out: *Io.Writer) !void {
+        try out.print("{s}{s}{s}", .{ style.on("1"), text, style.off() });
+    }
+
+    /// `text` dimmed, for structure that should sit behind the content.
+    pub fn dim(style: Style, text: []const u8, out: *Io.Writer) !void {
+        try out.print("{s}{s}{s}", .{ style.on("2"), text, style.off() });
+    }
+
+    /// `text` in `hue`.
+    pub fn color(style: Style, hue: Color, text: []const u8, out: *Io.Writer) !void {
+        switch (style) {
+            .plain => try out.writeAll(text),
+            .ansi => try out.print("\x1b[{d}m{s}\x1b[0m", .{ @intFromEnum(hue), text }),
+        }
+    }
+
+    /// The escape code that turns `code` on. Empty when the terminal takes no
+    /// escape codes, so a caller that has to format decorated text around it can
+    /// do so without a branch of its own.
+    fn on(style: Style, comptime code: []const u8) []const u8 {
+        return switch (style) {
+            .plain => "",
+            .ansi => "\x1b[" ++ code ++ "m",
+        };
+    }
+
+    /// The escape code that turns every decoration back off.
+    fn off(style: Style) []const u8 {
+        return switch (style) {
+            .plain => "",
+            .ansi => "\x1b[0m",
+        };
+    }
 };
 
-/// Prints `text` in bold, or as it is when the terminal does not take escape
-/// codes. Only the printing is decorated: what a session stores and what the
-/// model is sent never pass through here.
-fn bold(style: Style, text: []const u8, out: *Io.Writer) !void {
-    switch (style) {
-        .plain => try out.writeAll(text),
-        .ansi => try out.print("\x1b[1m{s}\x1b[0m", .{text}),
-    }
-}
+/// A foreground colour, named by the escape code that selects it. Only the
+/// colours every terminal has are used, so they read as part of the terminal
+/// rather than as a theme of billy's own competing with the one a format script
+/// paints the command in.
+pub const Color = enum(u8) {
+    red = 31,
+    green = 32,
+    yellow = 33,
+    blue = 34,
+    cyan = 36,
+};
 
 /// A formatter: a shell script that reads the command on standard input and
 /// writes the formatted command on standard output, such as
@@ -378,21 +418,28 @@ fn parse(comptime T: type, arena: std.mem.Allocator, json: []const u8) !T {
 /// reuses it so that replaying a session matches the run exactly.
 pub fn describe(call: Call, result: []const u8, format: Format, style: Style, out: *Io.Writer) !void {
     try printHead(call, format, style, out);
-    try printResult(call, result, out);
+    try printResult(call, result, style, out);
     try out.writeAll("\n");
 }
 
-/// The glyph a block header opens with, one per tool. Each stands on the one
-/// line billy writes whole rather than in front of every row of output, which
-/// the terminal wraps on its own and cannot be marked without folding it.
-const glyph = struct {
-    const read = "▸";
-    const write = "◂";
-    const edit = "✎";
-    const bash = "❯";
+/// How a tool's block header opens: the glyph it is marked with and the colour
+/// the glyph is shown in, so a tool is recognisable from the left margin alone.
+const Mark = struct {
+    glyph: []const u8,
+    hue: Color,
+};
+
+/// The mark of each tool. A glyph stands on the one line billy writes whole
+/// rather than in front of every row of output, which the terminal wraps on its
+/// own and cannot be marked without folding it here.
+const marks = struct {
+    const read = Mark{ .glyph = "▸", .hue = .blue };
+    const write = Mark{ .glyph = "◂", .hue = .green };
+    const edit = Mark{ .glyph = "✎", .hue = .yellow };
+    const bash = Mark{ .glyph = "❯", .hue = .cyan };
     /// A call that could not be named: a tool billy does not implement, or
     /// arguments that could not be read.
-    const unknown = "?";
+    const unknown = Mark{ .glyph = "?", .hue = .red };
 };
 
 /// Prints the header block of a call: which tool it is and what it acts on. A
@@ -401,32 +448,43 @@ const glyph = struct {
 /// rather than to be read in full.
 fn printHead(call: Call, format: Format, style: Style, out: *Io.Writer) !void {
     switch (call) {
-        .read => |args| try printHeader(glyph.read, "read", args.path, style, out),
-        .write => |args| try printHeader(glyph.write, "write", args.path, style, out),
+        .read => |args| try printHeader(marks.read, "read", args.path, style, out),
+        .write => |args| try printHeader(marks.write, "write", args.path, style, out),
         .edit => |args| {
-            try printHeader(glyph.edit, "edit", args.path, style, out);
-            try out.writeAll("--- find ---\n");
-            try printTruncated(out, args.old_string);
-            try out.writeAll("--- replace ---\n");
-            try printTruncated(out, args.new_string);
+            try printHeader(marks.edit, "edit", args.path, style, out);
+            try printLabel("--- find ---", style, out);
+            try printTruncated(args.old_string, null, style, out);
+            try printLabel("--- replace ---", style, out);
+            try printTruncated(args.new_string, null, style, out);
         },
         .bash => |args| {
-            try printHeader(glyph.bash, "bash", "", style, out);
+            try printHeader(marks.bash, "bash", "", style, out);
             try printScript(args.command, format, out);
         },
         // Only the name is known, so that is all there is to show; the reason it
         // could not run reaches the user through the output.
-        .unknown => |name| try printHeader(glyph.unknown, name, "", style, out),
-        .malformed => |bad| try printHeader(glyph.unknown, bad.name, "", style, out),
+        .unknown => |name| try printHeader(marks.unknown, name, "", style, out),
+        .malformed => |bad| try printHeader(marks.unknown, bad.name, "", style, out),
     }
 }
 
-/// Prints a block header: the glyph of the tool, its name in bold, and what it
-/// acts on when there is one, as `▸ read a.zig`.
-fn printHeader(mark: []const u8, name: []const u8, target: []const u8, style: Style, out: *Io.Writer) !void {
-    try out.print("{s} ", .{mark});
-    try bold(style, name, out);
-    if (target.len > 0) try out.print(" {s}", .{target});
+/// Prints a block header: the glyph of the tool in its colour, its name in bold
+/// and what it acts on, when there is one, dimmed: `▸ read a.zig`.
+fn printHeader(mark: Mark, name: []const u8, target: []const u8, style: Style, out: *Io.Writer) !void {
+    try style.color(mark.hue, mark.glyph, out);
+    try out.writeAll(" ");
+    try style.bold(name, out);
+    if (target.len > 0) {
+        try out.writeAll(" ");
+        try style.dim(target, out);
+    }
+    try out.writeAll("\n");
+}
+
+/// Prints a label such as `--- output ---` dimmed, so it reads as structure
+/// rather than as part of the output under it.
+fn printLabel(text: []const u8, style: Style, out: *Io.Writer) !void {
+    try style.dim(text, out);
     try out.writeAll("\n");
 }
 
@@ -440,37 +498,55 @@ fn printScript(command: []const u8, format: Format, out: *Io.Writer) !void {
     try out.writeAll("\n");
 }
 
-/// Prints a call's result under `--- output ---`.
-fn printOutput(out: *Io.Writer, result: []const u8) !void {
-    try out.writeAll("--- output ---\n");
-    try printTruncated(out, result);
-}
-
 /// Prints what a call produced under `--- output ---`. A write shows the content
 /// it put in the file; an edit shows nothing, since its result would only repeat
 /// the strings shown above it. Anything that failed shows why instead, whatever
 /// it was asked to do.
-fn printResult(call: Call, result: []const u8, out: *Io.Writer) !void {
-    // A call that failed reports why, whatever it was asked to do.
-    if (std.mem.startsWith(u8, result, "error: ")) return printOutput(out, result);
+fn printResult(call: Call, result: []const u8, style: Style, out: *Io.Writer) !void {
+    // A call that failed reports why, whatever it was asked to do. The whole
+    // result is billy's own message, so it is shown the way billy shows a
+    // failure.
+    if (std.mem.startsWith(u8, result, "error: ")) {
+        try printLabel("--- output ---", style, out);
+        return printTruncated(result, .red, style, out);
+    }
     switch (call) {
         // A write succeeds by putting the content in the file, so that content
         // is what it produced. It is on the call rather than in the result, so a
         // replayed session shows it without it having to be stored twice.
         .write => |args| {
-            try out.writeAll("--- output ---\n");
-            try printTruncated(out, args.content);
+            try printLabel("--- output ---", style, out);
+            return printTruncated(args.content, null, style, out);
         },
         // An edit's result would only repeat the strings shown above it.
         .edit => {},
-        else => try printOutput(out, result),
+        .bash => return printBash(result, style, out),
+        else => {
+            try printLabel("--- output ---", style, out);
+            return printTruncated(result, null, style, out);
+        },
     }
+}
+
+/// Prints the exit status of a bash call in green when the command succeeded and
+/// red when it did not, with what the command printed under it as it is. The
+/// status is the first line billy writes into the result, so it is read back
+/// from there; a replayed session holds the same line.
+fn printBash(result: []const u8, style: Style, out: *Io.Writer) !void {
+    try printLabel("--- output ---", style, out);
+    const newline = std.mem.indexOfScalar(u8, result, '\n') orelse result.len;
+    const status = result[0..newline];
+    const hue: Color = if (std.mem.eql(u8, status, "exit code: 0")) .green else .red;
+    try style.color(hue, status, out);
+    try out.writeAll("\n");
+    if (newline < result.len) try printTruncated(result[newline + 1 ..], null, style, out);
 }
 
 /// Prints `text`, keeping at most `max_block_lines` lines. When it had more, a
 /// count of the rest is printed in place of them, so the block stays short
-/// without hiding that there was more.
-fn printTruncated(out: *Io.Writer, text: []const u8) !void {
+/// without hiding that there was more. A `hue` colours every line of the text,
+/// for output that is billy's own message rather than a tool's.
+fn printTruncated(text: []const u8, hue: ?Color, style: Style, out: *Io.Writer) !void {
     const body = std.mem.trimEnd(u8, text, "\n");
     if (body.len == 0) return;
 
@@ -480,11 +556,17 @@ fn printTruncated(out: *Io.Writer, text: []const u8) !void {
     while (lines.next()) |line| {
         total += 1;
         if (shown == max_block_lines) continue;
-        try out.writeAll(line);
+        if (hue) |h| {
+            try style.color(h, line, out);
+        } else {
+            try out.writeAll(line);
+        }
         try out.writeAll("\n");
         shown += 1;
     }
-    if (total > shown) try out.print("… {d} more lines\n", .{total - shown});
+    if (total > shown) {
+        try out.print("{s}… {d} more lines{s}\n", .{ style.on("2"), total - shown, style.off() });
+    }
 }
 
 fn exitCode(term: std.process.Child.Term) u8 {
@@ -647,7 +729,7 @@ test "describe frames a call and its output" {
     );
 }
 
-test "a block header names the tool, the bold name and what it acts on" {
+test "a block header names the tool, its colour, the bold name and the target" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -656,14 +738,14 @@ test "a block header names the tool, the bold name and what it acts on" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    // On a terminal that takes an escape code, the glyph and the target are
-    // shown as they are and only the name is bold.
+    // On a terminal that takes an escape code, the glyph carries the colour of
+    // the tool, only the name is bold, and the target and the label are dimmed.
     try describe(parseCall(arena, .{ .id = "1", .function = .{
         .name = "read",
         .arguments = "{\"path\":\"a.zig\"}",
     } }), "", null, .ansi, &out.writer);
     try std.testing.expectEqualStrings(
-        "▸ \x1b[1mread\x1b[0m a.zig\n--- output ---\n\n",
+        "\x1b[34m▸\x1b[0m \x1b[1mread\x1b[0m \x1b[2ma.zig\x1b[0m\n\x1b[2m--- output ---\x1b[0m\n\n",
         out.written(),
     );
     out.clearRetainingCapacity();
@@ -674,6 +756,74 @@ test "a block header names the tool, the bold name and what it acts on" {
         .arguments = "{\"path\":\"a.zig\"}",
     } }), "", null, .plain, &out.writer);
     try std.testing.expectEqualStrings("▸ read a.zig\n--- output ---\n\n", out.written());
+}
+
+test "the exit status of a bash call is shown green or red" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    const call: llm.ToolCall = .{ .id = "1", .function = .{
+        .name = "bash",
+        .arguments = "{\"command\":\"make\"}",
+    } };
+
+    // A command that succeeded.
+    try describe(parseCall(arena, call), "exit code: 0\nbuilt\n", null, .ansi, &out.writer);
+    try std.testing.expectEqualStrings(
+        "\x1b[36m❯\x1b[0m \x1b[1mbash\x1b[0m\nmake\n\x1b[2m--- output ---\x1b[0m\n" ++
+            "\x1b[32mexit code: 0\x1b[0m\nbuilt\n\n",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+
+    // One that did not, whose output the terminal still shows as it is.
+    try describe(parseCall(arena, call), "exit code: 2\nboom\n", null, .ansi, &out.writer);
+    try std.testing.expectEqualStrings(
+        "\x1b[36m❯\x1b[0m \x1b[1mbash\x1b[0m\nmake\n\x1b[2m--- output ---\x1b[0m\n" ++
+            "\x1b[31mexit code: 2\x1b[0m\nboom\n\n",
+        out.written(),
+    );
+}
+
+test "what a call failed with is shown red, and what it left out is dimmed" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // A failure is billy's own message, so the whole result is shown as one.
+    try describe(parseCall(arena, .{ .id = "1", .function = .{
+        .name = "read",
+        .arguments = "{\"path\":\"a.zig\"}",
+    } }), "error: cannot read a.zig: FileNotFound", null, .ansi, &out.writer);
+    try std.testing.expectEqualStrings(
+        "\x1b[34m▸\x1b[0m \x1b[1mread\x1b[0m \x1b[2ma.zig\x1b[0m\n\x1b[2m--- output ---\x1b[0m\n" ++
+            "\x1b[31merror: cannot read a.zig: FileNotFound\x1b[0m\n\n",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+
+    // The count of the lines left out is structure too, so it is dimmed.
+    try describe(
+        .{ .read = .{ .path = "a.zig" } },
+        "1\n2\n3\n4\n5\n6\n7\n",
+        null,
+        .ansi,
+        &out.writer,
+    );
+    try std.testing.expectEqualStrings(
+        "\x1b[34m▸\x1b[0m \x1b[1mread\x1b[0m \x1b[2ma.zig\x1b[0m\n\x1b[2m--- output ---\x1b[0m\n" ++
+            "1\n2\n3\n4\n5\n\x1b[2m… 2 more lines\x1b[0m\n\n",
+        out.written(),
+    );
 }
 
 test "a bash command is shown the way the formatter lays it out" {
