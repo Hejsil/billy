@@ -461,9 +461,9 @@ fn printHead(call: Call, format: Format, style: Style, out: *Io.Writer) !void {
         .write => |args| try printHeader(marks.write, "write", args.path, style, out),
         .edit => |args| {
             try printHeader(marks.edit, "edit", args.path, style, out);
-            try printLabel("find", null, style, out);
+            try printLabel("find", style, out);
             try printTruncated(args.old_string, .plain, style, out);
-            try printLabel("replace", null, style, out);
+            try printLabel("replace", style, out);
             try printTruncated(args.new_string, .plain, style, out);
         },
         .bash => |args| {
@@ -495,14 +495,6 @@ fn printHeader(mark: Mark, name: []const u8, target: []const u8, style: Style, o
 /// points at the call it names.
 const label_mark = "▾";
 
-/// A short note about the call, shown beside the label of the section it belongs
-/// to: the exit status of a command. It carries its own colour, since what it
-/// says is the point of putting it there.
-const Note = struct {
-    text: []const u8,
-    hue: Color,
-};
-
 /// How a section of a block is printed. The label line is bold, so it reads as
 /// the heading of what follows, and the output under it is dim, so it stays
 /// readable without competing with it.
@@ -512,22 +504,10 @@ const Ink = union(enum) {
     hue: Color,
 };
 
-/// Prints a label such as `▾ output` in bold, so it reads as the heading of the
-/// lines under it rather than as the first of them. A `note` follows on the same
-/// line, after a separator, in its own colour and bold, so it reads as a
-/// property of the section: `▾ output · exit 0`. A null `name` prints the note
-/// alone, for a section that is only a status.
-fn printLabel(name: ?[]const u8, note: ?Note, style: Style, out: *Io.Writer) !void {
-    try out.writeAll(style.on("1"));
-    try out.writeAll(label_mark);
-    if (name) |text| try out.print(" {s}", .{text});
-    if (name != null and note != null) try out.writeAll(" ·");
-    try out.writeAll(style.off());
-    if (note) |n| {
-        try out.writeAll(" ");
-        try style.boldColor(n.hue, n.text, out);
-    }
-    try out.writeAll("\n");
+/// Prints a label such as `▾ stdout` in bold, so it reads as the heading of the
+/// lines under it rather than as the first of them.
+fn printLabel(name: []const u8, style: Style, out: *Io.Writer) !void {
+    try out.print("{s}{s} {s}{s}\n", .{ style.on("1"), label_mark, name, style.off() });
 }
 
 /// Prints `text` in the way `ink` asks for.
@@ -558,7 +538,7 @@ fn printResult(call: Call, result: []const u8, style: Style, out: *Io.Writer) !v
     // result is billy's own message, so it is shown the way billy shows a
     // failure.
     if (std.mem.startsWith(u8, result, "error: ")) {
-        try printLabel("output", null, style, out);
+        try printLabel("output", style, out);
         return printTruncated(result, .{ .hue = .red }, style, out);
     }
     switch (call) {
@@ -566,24 +546,23 @@ fn printResult(call: Call, result: []const u8, style: Style, out: *Io.Writer) !v
         // is what it produced. It is on the call rather than in the result, so a
         // replayed session shows it without it having to be stored twice.
         .write => |args| {
-            try printLabel("output", null, style, out);
+            try printLabel("output", style, out);
             return printTruncated(args.content, .dim, style, out);
         },
         // An edit's result would only repeat the strings shown above it.
         .edit => {},
         .bash => return printBash(result, style, out),
         else => {
-            try printLabel("output", null, style, out);
+            try printLabel("output", style, out);
             return printTruncated(result, .dim, style, out);
         },
     }
 }
 
-/// Prints the output of a bash call. What the user sees follows the streams the
-/// command actually filled: a command that printed nothing shows only its
-/// status, one that filled a single stream shows that stream with the status,
-/// and one that filled both shows standard output with the status and standard
-/// error under a label of its own.
+/// Prints the output of a bash call: the status the command exited with, and
+/// then whatever it printed, one stream at a time. A command that printed
+/// nothing shows its status alone, and each stream that has anything follows on
+/// its own lines under a label naming it.
 ///
 /// The status and the split are read back from the result, which is what billy
 /// stored and handed the model, so a replayed session shows the same block.
@@ -591,27 +570,33 @@ fn printBash(result: []const u8, style: Style, out: *Io.Writer) !void {
     const parts = splitBash(result) orelse {
         // A result that is not one billy wrote is shown as it is, so a session
         // saved before the status was written still shows everything.
-        try printLabel("output", null, style, out);
+        try printLabel("output", style, out);
         return printTruncated(result, .dim, style, out);
     };
-    var buffer: [32]u8 = undefined;
-    const note = execNote(parts.status, &buffer);
-    const filled = [_]struct { name: []const u8, text: []const u8 }{
-        .{ .name = "output", .text = parts.stdout },
+    try printExit(parts.status, style, out);
+    const streams = [_]struct { name: []const u8, text: []const u8 }{
+        .{ .name = "stdout", .text = parts.stdout },
         .{ .name = "stderr", .text = parts.stderr },
     };
-
-    // The status goes on the first stream there is, and the second, if any,
-    // follows under a label of its own.
-    var first = true;
-    for (filled) |stream| {
+    for (streams) |stream| {
         if (stream.text.len == 0) continue;
-        try printLabel(stream.name, if (first) note else null, style, out);
+        try printLabel(stream.name, style, out);
         try printTruncated(stream.text, .dim, style, out);
-        first = false;
     }
-    // A command that printed nothing is its status alone.
-    if (first) try printLabel(null, note, style, out);
+}
+
+/// Prints the status a bash result opens with, on a line of its own: `exit 0` in
+/// green when the command succeeded, `exit 1` and the rest in red when it did
+/// not. The stored line reads `exit code: N` for the model; only the line the
+/// user sees is shortened.
+fn printExit(status: []const u8, style: Style, out: *Io.Writer) !void {
+    const prefix = "exit code: ";
+    const code = if (std.mem.startsWith(u8, status, prefix)) status[prefix.len..] else status;
+    var buffer: [32]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, "exit {s}", .{code}) catch status;
+    const hue: Color = if (std.mem.eql(u8, code, "0")) .green else .red;
+    try style.boldColor(hue, line, out);
+    try out.writeAll("\n");
 }
 
 /// A bash result split back into the status line billy wrote and what the
@@ -651,19 +636,6 @@ fn splitBash(result: []const u8) ?BashResult {
         };
     }
     return .{ .status = status, .stdout = body, .stderr = "" };
-}
-
-/// The status a bash result opens with, as the note that goes beside the label
-/// of the section it belongs to: `exit 0` in green when the command succeeded,
-/// `exit 1` and the rest in red when it did not. The stored line reads
-/// `exit code: N` for the model; only the note the user sees is shortened.
-fn execNote(status: []const u8, buffer: []u8) Note {
-    const prefix = "exit code: ";
-    const code = if (std.mem.startsWith(u8, status, prefix)) status[prefix.len..] else status;
-    return .{
-        .text = std.fmt.bufPrint(buffer, "exit {s}", .{code}) catch status,
-        .hue = if (std.mem.eql(u8, code, "0")) .green else .red,
-    };
 }
 
 /// Prints `text`, keeping at most `max_block_lines` lines. When it had more, a
@@ -819,7 +791,7 @@ test "describe frames a call and its output" {
     );
     // The command of a bash call is printed whole.
     try expectDescribe(
-        "❯ bash\nls -la\n▾ exit 0\n\n",
+        "❯ bash\nls -la\nexit 0\n\n",
         "bash",
         "{\"command\":\"ls -la\"}",
         "exit code: 0\n(no output)\n",
@@ -895,8 +867,7 @@ test "the exit status of a bash call is shown green or red" {
     // A command that succeeded.
     try describe(parseCall(arena, call), "exit code: 0\nbuilt\n", null, .ansi, &out.writer);
     try std.testing.expectEqualStrings(
-        "\x1b[36m❯\x1b[0m \x1b[1mbash\x1b[0m\nmake\n\x1b[1m▾ output ·\x1b[0m " ++
-            "\x1b[1;32mexit 0\x1b[0m\n\x1b[2mbuilt\x1b[0m\n\n",
+        "\x1b[36m❯\x1b[0m \x1b[1mbash\x1b[0m\nmake\n\x1b[1;32mexit 0\x1b[0m\n\x1b[1m▾ stdout\x1b[0m\n\x1b[2mbuilt\x1b[0m\n\n",
         out.written(),
     );
     out.clearRetainingCapacity();
@@ -904,8 +875,7 @@ test "the exit status of a bash call is shown green or red" {
     // One that did not, whose output the terminal still shows as it is.
     try describe(parseCall(arena, call), "exit code: 2\nboom\n", null, .ansi, &out.writer);
     try std.testing.expectEqualStrings(
-        "\x1b[36m❯\x1b[0m \x1b[1mbash\x1b[0m\nmake\n\x1b[1m▾ output ·\x1b[0m " ++
-            "\x1b[1;31mexit 2\x1b[0m\n\x1b[2mboom\x1b[0m\n\n",
+        "\x1b[36m❯\x1b[0m \x1b[1mbash\x1b[0m\nmake\n\x1b[1;31mexit 2\x1b[0m\n\x1b[1m▾ stdout\x1b[0m\n\x1b[2mboom\x1b[0m\n\n",
         out.written(),
     );
 }
@@ -922,16 +892,15 @@ test "a bash block shows only the streams the command filled" {
     var tool_set = try Tools.init(std.testing.io, arena, gpa, &log.writer, null, .plain);
     const cases = [_]struct { command: []const u8, expected: []const u8 }{
         // Nothing printed: the status is all there is.
-        .{ .command = "true", .expected = "❯ bash\ntrue\n▾ exit 0\n\n" },
-        // One stream: that stream carries the status.
-        .{ .command = "echo hi", .expected = "❯ bash\necho hi\n▾ output · exit 0\nhi\n\n" },
-        .{ .command = "echo oops >&2", .expected = "❯ bash\necho oops >&2\n▾ stderr · exit 0\noops\n\n" },
-        // Both: standard output carries the status and standard error follows
-        // under a label of its own.
+        .{ .command = "true", .expected = "❯ bash\ntrue\nexit 0\n\n" },
+        // One stream: it follows the status under a label of its own.
+        .{ .command = "echo hi", .expected = "❯ bash\necho hi\nexit 0\n▾ stdout\nhi\n\n" },
+        .{ .command = "echo oops >&2", .expected = "❯ bash\necho oops >&2\nexit 0\n▾ stderr\noops\n\n" },
+        // Both, each under its own label, standard output first.
         .{ .command = "echo out; echo err >&2", .expected = "❯ bash\necho out; echo err >&2\n" ++
-            "▾ output · exit 0\nout\n▾ stderr\nerr\n\n" },
+            "exit 0\n▾ stdout\nout\n▾ stderr\nerr\n\n" },
         // A command that failed is the same shape with the status in red.
-        .{ .command = "exit 3", .expected = "❯ bash\nexit 3\n▾ exit 3\n\n" },
+        .{ .command = "exit 3", .expected = "❯ bash\nexit 3\nexit 3\n\n" },
     };
     for (cases) |case| {
         log.clearRetainingCapacity();
@@ -1023,7 +992,7 @@ test "a bash command is shown the way the formatter lays it out" {
     // The command is shown as the formatter wrote it; its trailing newline does
     // not leave a blank line in the block.
     try std.testing.expectEqualStrings(
-        "❯ bash\nLS -LA\n▾ exit 0\n\n",
+        "❯ bash\nLS -LA\nexit 0\n\n",
         out.written(),
     );
 }
@@ -1042,7 +1011,7 @@ test "a bash command is shown as written when the formatter cannot lay it out" {
         .arguments = "{\"command\":\"ls -la\"}",
     } };
     const expected =
-        "❯ bash\nls -la\n▾ exit 0\n\n";
+        "❯ bash\nls -la\nexit 0\n\n";
 
     // A formatter that cannot be run, one that fails and one that writes
     // nothing all leave the command the model wrote for the user to read.
@@ -1138,7 +1107,7 @@ test "run logs exactly what describe prints" {
 
     // The live log is the description, so a replayed session reads the same.
     try std.testing.expectEqualStrings(
-        "❯ bash\ntrue\n▾ exit 0\n\n",
+        "❯ bash\ntrue\nexit 0\n\n",
         log.written(),
     );
     try std.testing.expectEqualStrings(log.written(), described.written());
@@ -1167,7 +1136,7 @@ test "the format changes what is shown and nothing else" {
     // output, and the user reads the command as the formatter laid it out.
     try std.testing.expectEqualStrings("exit code: 0\nhi\n", result);
     try std.testing.expectEqualStrings(
-        "❯ bash\nECHO HI\n▾ output · exit 0\nhi\n\n",
+        "❯ bash\nECHO HI\nexit 0\n▾ stdout\nhi\n\n",
         log.written(),
     );
 
