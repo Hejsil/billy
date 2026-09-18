@@ -14,13 +14,13 @@ const usage =
     \\under $XDG_DATA_HOME/billy, or ~/.local/share/billy when that is unset.
     \\The configuration lives in $XDG_CONFIG_HOME/billy/config.json, or
     \\~/.config/billy/config.json when that is unset, and is created with the
-    \\defaults on the first run. It holds the turn limit, and, under
+    \\defaults on the first run. It holds the turn limit; under
     \\tools.bash.format, a shell script that lays a bash command out for the
-    \\display: it reads the command on standard input and writes the formatted
-    \\command on standard output, such as "shfmt | bat -l bash". The context
-    \\window and the token prices the header reports come from a table built
-    \\into billy, keyed by provider and model, since the API reports token
-    \\counts but neither of those.
+    \\display; and under markdown.format, one that lays out a reply, such as
+    \\"glow -". Either reads the text on standard input and writes it back on
+    \\standard output. The context window and the token prices the header
+    \\reports come from a table built into billy, keyed by provider and model,
+    \\since the API reports token counts but neither of those.
     \\
 ;
 
@@ -106,10 +106,19 @@ pub fn main(init: std.process.Init) !void {
             .io = io,
             .gpa = init.gpa,
         } else null,
-        // A terminal gets the block headers with the tool name in bold; a pipe
-        // or a redirection, where the escape codes would only be noise, gets the
+        // The markdown of a reply and a prompt is laid out by the format script
+        // the configuration sets, when it sets one, so the user reads it the
+        // way it was meant to be shown. Only the display changes: the session
+        // and the model keep the text.
+        .markdown = if (settings.config.markdown.format) |script| .{
+            .script = script,
+            .io = io,
+            .gpa = init.gpa,
+        } else null,
+        // A terminal gets the block headers with the name in bold; a pipe or a
+        // redirection, where the escape codes would only be noise, gets the
         // same text plain.
-        .style = billy.tools.Style.detect(io),
+        .style = billy.style.Style.detect(io),
     };
 
     const directory = billy.session.defaultDir(arena, init.environ_map) catch |err| {
@@ -137,7 +146,14 @@ pub fn main(init: std.process.Init) !void {
     if (options.resume_id != null) {
         // Replay the conversation exactly as a live session showed it, so the
         // context does not have to be remembered from the previous run.
-        try billy.agent.printTranscript(arena, out, session.messages.items, config.format, config.style);
+        try billy.agent.printTranscript(
+            arena,
+            out,
+            session.messages.items,
+            config.format,
+            config.markdown,
+            config.style,
+        );
     }
     try billy.agent.run(io, arena, init.gpa, out, config, &session);
 }

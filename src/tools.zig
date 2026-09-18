@@ -3,6 +3,18 @@
 const std = @import("std");
 const Io = std.Io;
 const llm = @import("llm.zig");
+const formatting = @import("format.zig");
+const styling = @import("style.zig");
+
+/// Laying a bash command out for the display.
+pub const Format = formatting.Format;
+/// How billy decorates the lines it prints itself.
+pub const Style = styling.Style;
+/// A foreground colour for those lines.
+pub const Color = styling.Color;
+
+/// The mark a block header opens with.
+const Mark = styling.Mark;
 
 /// Longest result handed back to the model, so one command cannot flood the
 /// conversation.
@@ -14,9 +26,6 @@ const command_timeout_s = 120;
 /// Lines of a result shown before the rest is summarized. The model still gets
 /// the whole result; only the display is cut short.
 const max_block_lines = 5;
-/// Room above the script when the formatted one is read back, so a formatter
-/// that runs away cannot exhaust memory.
-const format_slack = 1 << 20;
 
 /// A tool call parsed into the arguments of the call it names. Parsing happens
 /// once, in `run`, and both the block the user sees and the tool itself read
@@ -228,7 +237,7 @@ pub const Tools = struct {
 
         var out: std.Io.Writer.Allocating = .init(tools.gpa);
         defer out.deinit();
-        try out.writer.print("exit code: {d}\n", .{exitCode(result.term)});
+        try out.writer.print("exit code: {d}\n", .{formatting.exitCode(result.term)});
         if (result.stdout.len == 0 and result.stderr.len == 0) {
             try out.writer.writeAll("(no output)\n");
         }
@@ -252,141 +261,6 @@ pub const Tools = struct {
         });
     }
 };
-
-/// How a bash command is laid out for the user before it is shown. Null shows
-/// the command as the model wrote it.
-///
-/// The formatting is presentation only: the command that runs, its result and
-/// everything the session stores keep the text the model wrote.
-pub const Format = ?Formatter;
-
-/// The decorations billy puts on the lines it prints itself: the block header,
-/// the label over the output, and the exit status billy reports. Only those
-/// lines are decorated. What a tool returned, what a session stores and what the
-/// model is sent are printed exactly as they are, which is also what leaves the
-/// command of a bash call to the format script that lays it out.
-pub const Style = enum {
-    plain,
-    ansi,
-
-    /// The style to use on the terminal billy prints to. Escape codes are for a
-    /// terminal, which a pipe or a redirection is not: `supportsAnsiEscapeCodes`
-    /// answers whether stdout is one.
-    pub fn detect(io: Io) Style {
-        const supported = Io.File.stdout().supportsAnsiEscapeCodes(io) catch return .plain;
-        return if (supported) .ansi else .plain;
-    }
-
-    /// `text` in bold.
-    pub fn bold(style: Style, text: []const u8, out: *Io.Writer) !void {
-        try out.print("{s}{s}{s}", .{ style.on("1"), text, style.off() });
-    }
-
-    /// `text` dimmed, for structure that should sit behind the content.
-    pub fn dim(style: Style, text: []const u8, out: *Io.Writer) !void {
-        try out.print("{s}{s}{s}", .{ style.on("2"), text, style.off() });
-    }
-
-    /// `text` in `hue`.
-    pub fn color(style: Style, hue: Color, text: []const u8, out: *Io.Writer) !void {
-        switch (style) {
-            .plain => try out.writeAll(text),
-            .ansi => try out.print("\x1b[{d}m{s}\x1b[0m", .{ @intFromEnum(hue), text }),
-        }
-    }
-
-    /// `text` in `hue` and bold, for the one thing on a line that is the point
-    /// of the line.
-    pub fn boldColor(style: Style, hue: Color, text: []const u8, out: *Io.Writer) !void {
-        switch (style) {
-            .plain => try out.writeAll(text),
-            .ansi => try out.print("\x1b[1;{d}m{s}\x1b[0m", .{ @intFromEnum(hue), text }),
-        }
-    }
-
-    /// The escape code that turns `code` on. Empty when the terminal takes no
-    /// escape codes, so a caller that has to format decorated text around it can
-    /// do so without a branch of its own.
-    fn on(style: Style, comptime code: []const u8) []const u8 {
-        return switch (style) {
-            .plain => "",
-            .ansi => "\x1b[" ++ code ++ "m",
-        };
-    }
-
-    /// The escape code that turns every decoration back off.
-    fn off(style: Style) []const u8 {
-        return switch (style) {
-            .plain => "",
-            .ansi => "\x1b[0m",
-        };
-    }
-};
-
-/// A foreground colour, named by the escape code that selects it. Only the
-/// colours every terminal has are used, so they read as part of the terminal
-/// rather than as a theme of billy's own competing with the one a format script
-/// paints the command in.
-pub const Color = enum(u8) {
-    red = 31,
-    green = 32,
-    yellow = 33,
-    blue = 34,
-    cyan = 36,
-};
-
-/// A formatter: a shell script that reads the command on standard input and
-/// writes the formatted command on standard output, such as
-/// `shfmt | bat -l bash`. That script is what a configuration sets.
-pub const Formatter = struct {
-    /// The shell script, run with `bash -c`.
-    script: []const u8,
-    io: Io,
-    /// Holds the formatted command while the block is printed.
-    gpa: std.mem.Allocator,
-};
-
-/// Runs `command` through the formatter and writes what it makes of the command
-/// to `out`. Returns whether it could; false leaves `out` untouched, so the
-/// caller can show the command as written. That is what no formatter gives, and
-/// a formatter that cannot be run, rejects the command, writes nothing or
-/// writes too much.
-fn apply(format: Format, command: []const u8, out: *Io.Writer) !bool {
-    const formatter = format orelse return false;
-    var child = std.process.spawn(formatter.io, .{
-        .argv = &.{ "bash", "-c", formatter.script },
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .ignore,
-    }) catch return false;
-    defer child.kill(formatter.io);
-
-    // The command goes in on standard input, which is what the format script
-    // reads. Closing the pipe is what tells it there is no more.
-    var in_buffer: [4096]u8 = undefined;
-    var script: Io.File.Writer = .init(child.stdin.?, formatter.io, &in_buffer);
-    try script.interface.writeAll(command);
-    try script.interface.flush();
-    child.stdin.?.close(formatter.io);
-    child.stdin = null;
-
-    var out_buffer: [4096]u8 = undefined;
-    var reader: Io.File.Reader = .init(child.stdout.?, formatter.io, &out_buffer);
-    const written = reader.interface.allocRemaining(
-        formatter.gpa,
-        .limited(command.len +| format_slack),
-    ) catch return false;
-    defer formatter.gpa.free(written);
-
-    // A formatter that failed, or left nothing behind, is one the user should
-    // not see the command disappear for; it is shown as written instead.
-    if (exitCode(child.wait(formatter.io) catch return false) != 0) return false;
-    const formatted = std.mem.trimEnd(u8, written, "\n");
-    if (formatted.len == 0) return false;
-
-    try out.writeAll(formatted);
-    return true;
-}
 
 /// Parses a tool call into the arguments of the call it names. It never fails:
 /// an unimplemented tool becomes `unknown` and arguments that do not fit become
@@ -431,13 +305,6 @@ pub fn describe(call: Call, result: []const u8, format: Format, style: Style, ou
     try out.writeAll("\n");
 }
 
-/// How a tool's block header opens: the glyph it is marked with and the colour
-/// the glyph is shown in, so a tool is recognisable from the left margin alone.
-const Mark = struct {
-    glyph: []const u8,
-    hue: Color,
-};
-
 /// The mark of each tool. A glyph stands on the one line billy writes whole
 /// rather than in front of every row of output, which the terminal wraps on its
 /// own and cannot be marked without folding it here.
@@ -457,39 +324,28 @@ const marks = struct {
 /// rather than to be read in full.
 fn printHead(call: Call, format: Format, style: Style, out: *Io.Writer) !void {
     switch (call) {
-        .read => |args| try printHeader(marks.read, "read", args.path, style, out),
-        .write => |args| try printHeader(marks.write, "write", args.path, style, out),
+        .read => |args| try styling.header(marks.read, "read", args.path, style, out),
+        .write => |args| try styling.header(marks.write, "write", args.path, style, out),
         .edit => |args| {
-            try printHeader(marks.edit, "edit", args.path, style, out);
+            try styling.header(marks.edit, "edit", args.path, style, out);
             try printLabel("find", style, out);
             try printTruncated(args.old_string, .plain, style, out);
             try printLabel("replace", style, out);
             try printTruncated(args.new_string, .plain, style, out);
         },
         .bash => |args| {
-            try printHeader(marks.bash, "bash", "", style, out);
+            try styling.header(marks.bash, "bash", "", style, out);
             try printScript(args.command, format, out);
         },
         // Only the name is known, so that is all there is to show; the reason it
         // could not run reaches the user through the output.
-        .unknown => |name| try printHeader(marks.unknown, name, "", style, out),
-        .malformed => |bad| try printHeader(marks.unknown, bad.name, "", style, out),
+        .unknown => |name| try styling.header(marks.unknown, name, "", style, out),
+        .malformed => |bad| try styling.header(marks.unknown, bad.name, "", style, out),
     }
 }
 
 /// Prints a block header: the glyph of the tool in its colour, its name in bold
 /// and what it acts on, when there is one, dimmed: `▸ read a.zig`.
-fn printHeader(mark: Mark, name: []const u8, target: []const u8, style: Style, out: *Io.Writer) !void {
-    try style.color(mark.hue, mark.glyph, out);
-    try out.writeAll(" ");
-    try style.bold(name, out);
-    if (target.len > 0) {
-        try out.writeAll(" ");
-        try style.dim(target, out);
-    }
-    try out.writeAll("\n");
-}
-
 /// The mark in front of the labels that break a block into sections, such as
 /// `▾ stdout`. It points down at the lines under it, where the glyph of a tool
 /// points at the call it names.
@@ -534,7 +390,7 @@ fn printInk(text: []const u8, ink: Ink, style: Style, out: *Io.Writer) !void {
 /// is dropped, so the block ends where the command does.
 fn printScript(command: []const u8, format: Format, out: *Io.Writer) !void {
     const script = std.mem.trimEnd(u8, command, "\n");
-    if (!try apply(format, script, out)) try out.writeAll(script);
+    if (!try formatting.apply(format, script, out)) try out.writeAll(script);
     try out.writeAll("\n");
 }
 
@@ -671,15 +527,6 @@ fn printTruncated(text: []const u8, ink: Ink, style: Style, out: *Io.Writer) !vo
     }
 }
 
-fn exitCode(term: std.process.Child.Term) u8 {
-    return switch (term) {
-        .exited => |code| code,
-        .signal => |signal| @intCast(128 + @as(u32, @intFromEnum(signal))),
-        .stopped => 128,
-        .unknown => 255,
-    };
-}
-
 const Spec = struct {
     name: []const u8,
     description: []const u8,
@@ -765,10 +612,10 @@ fn definitions(arena: std.mem.Allocator) ![]const llm.Tool {
 }
 
 test "exit codes of signals follow the shell convention" {
-    try std.testing.expectEqual(0, exitCode(.{ .exited = 0 }));
-    try std.testing.expectEqual(1, exitCode(.{ .exited = 1 }));
-    try std.testing.expectEqual(130, exitCode(.{ .signal = .INT }));
-    try std.testing.expectEqual(143, exitCode(.{ .signal = .TERM }));
+    try std.testing.expectEqual(0, formatting.exitCode(.{ .exited = 0 }));
+    try std.testing.expectEqual(1, formatting.exitCode(.{ .exited = 1 }));
+    try std.testing.expectEqual(130, formatting.exitCode(.{ .signal = .INT }));
+    try std.testing.expectEqual(143, formatting.exitCode(.{ .signal = .TERM }));
 }
 
 test "describe frames a call and its output" {

@@ -8,6 +8,8 @@ const models = @import("models.zig");
 const tools = @import("tools.zig");
 const line_editor = @import("line_editor.zig");
 const session_mod = @import("session.zig");
+const formatting = @import("format.zig");
+const styling = @import("style.zig");
 
 pub const Config = struct {
     api_key: []const u8,
@@ -29,9 +31,14 @@ pub const Config = struct {
     /// everything stored in the session keep the text the model wrote. Null
     /// shows the command as written.
     format: tools.Format = null,
+    /// How the markdown of a reply and a prompt is laid out before it is shown,
+    /// from the configuration. Presentation only, like `format`: what a session
+    /// stores and what the model is sent keep the text as it was written. Null
+    /// shows the text as written.
+    markdown: formatting.Format = null,
     /// How billy decorates the lines it prints itself, such as a block header.
     /// Plain everywhere the terminal does not take escape codes.
-    style: tools.Style = .plain,
+    style: styling.Style = .plain,
 };
 
 const system_prompt =
@@ -43,6 +50,13 @@ const system_prompt =
 /// Printed in front of every line the user types. The transcript reuses it so a
 /// replayed session looks like the run it continues.
 const prompt = "> ";
+
+/// The marks the two halves of the conversation are headed by. Neither is a
+/// tool, so neither carries a tool's glyph.
+const marks = struct {
+    const prompt = styling.Mark{ .glyph = "»", .hue = .blue };
+    const answer = styling.Mark{ .glyph = "◆", .hue = .green };
+};
 
 /// The header line shown above the input prompt: the model, the working
 /// directory, how much of the context window the conversation fills, and what
@@ -174,6 +188,12 @@ pub fn run(
         // Rebuilt for every prompt, so it reflects the tokens and cost of the
         // turns run so far.
         const header = try sessionHeader(gpa, arena, config, session.context_tokens, session.cost);
+        // Opens the user's block above the input. The line editor that follows
+        // echoes the line behind `prompt` and its leading newline ends this
+        // header, so what stays on screen is the header and the line under it.
+        try out.writeAll("\n");
+        try styling.openHeader(marks.prompt, "prompt", config.style, out);
+        try out.flush();
         const line = (try editor.readLine(header, prompt)) orelse break;
         if (line.len == 0) continue;
         try session.append(.{ .role = "user", .content = line });
@@ -187,18 +207,19 @@ pub fn run(
 
 /// Replays a stored conversation the way a live session showed it, so a resumed
 /// session reads exactly like the run it continues. The rendering is shared with
-/// the loop: replies go through `printReply` and tool calls through
-/// `tools.parseCall` and `tools.describe`, which lays out a bash command the
-/// same way `format` does, and the user prompt through `prompt`.
+/// the loop: replies go through `printAnswer`, the user's prompts through
+/// `prompt` and the tool calls through `tools.parseCall` and `tools.describe`,
+/// which lays out a bash command the same way `format` does.
 pub fn printTranscript(
     arena: std.mem.Allocator,
     out: *Io.Writer,
     messages: []const llm.Message,
     format: tools.Format,
-    style: tools.Style,
+    markdown: formatting.Format,
+    style: styling.Style,
 ) !void {
     for (messages, 0..) |message, i| {
-        try printMessage(arena, out, message, messages[i + 1 ..], format, style);
+        try printMessage(arena, out, message, messages[i + 1 ..], format, markdown, style);
     }
     try out.flush();
 }
@@ -213,15 +234,18 @@ fn printMessage(
     message: llm.Message,
     following: []const llm.Message,
     format: tools.Format,
-    style: tools.Style,
+    markdown: formatting.Format,
+    style: styling.Style,
 ) !void {
     if (std.mem.eql(u8, message.role, "user")) {
-        // Mirrors what the line editor leaves on screen for a submitted line.
-        return out.print("\n{s}{s}\n", .{ prompt, message.content orelse "" });
+        // Mirrors what the header and the line editor leave on screen together.
+        try out.writeAll("\n");
+        try styling.header(marks.prompt, "prompt", "", style, out);
+        return out.print("{s}{s}\n", .{ prompt, message.content orelse "" });
     }
     if (!std.mem.eql(u8, message.role, "assistant")) return;
     const calls = message.tool_calls orelse &.{};
-    if (calls.len == 0) return printReply(out, message.content);
+    if (calls.len == 0) return printAnswer(out, message.content, markdown, style);
     for (calls) |call| {
         try tools.describe(tools.parseCall(arena, call), resultOf(following, call.id), format, style, out);
     }
@@ -259,8 +283,9 @@ fn turn(
         try session.append(completion.message);
 
         const message = completion.message;
-        const calls = message.tool_calls orelse return printReply(out, message.content);
-        if (calls.len == 0) return printReply(out, message.content);
+        const calls = message.tool_calls orelse
+            return printAnswer(out, message.content, config.markdown, config.style);
+        if (calls.len == 0) return printAnswer(out, message.content, config.markdown, config.style);
 
         for (calls) |call| {
             try session.append(.{
@@ -281,14 +306,18 @@ fn rateNow(io: Io, config: Config) models.Price {
     return info.priceAt(@intCast(Io.Clock.now(.real, io).toSeconds()));
 }
 
-fn printReply(out: *Io.Writer, content: ?[]const u8) !void {
+/// Prints a reply under its own header, the markdown laid out by `markdown` when
+/// one is set and as it was written when there is none or it cannot be used.
+/// Only the display changes; the session and the model keep the text itself.
+fn printAnswer(out: *Io.Writer, content: ?[]const u8, markdown: formatting.Format, style: styling.Style) !void {
+    try styling.header(marks.answer, "answer", "", style, out);
     const text = content orelse "";
     if (text.len == 0) {
-        try out.writeAll("(empty reply)\n");
-    } else {
+        try style.dim("(empty reply)", out);
+    } else if (!try formatting.apply(markdown, text, out)) {
         try out.writeAll(text);
-        try out.writeAll("\n");
     }
+    try out.writeAll("\n");
     try out.flush();
 }
 
@@ -312,12 +341,12 @@ test "printTranscript replays messages the way a live session shows them" {
         .{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;" },
         .{ .role = "assistant", .content = "done" },
     };
-    try printTranscript(arena_state.allocator(), &out.writer, &messages, null, .plain);
+    try printTranscript(arena_state.allocator(), &out.writer, &messages, null, null, .plain);
 
     try std.testing.expectEqualStrings(
-        "\n> hello\n" ++
+        "\n» prompt\n> hello\n" ++
             "▸ read a.zig\n▾ output\n1\tconst x = 1;\n\n" ++
-            "done\n",
+            "◆ answer\ndone\n",
         out.written(),
     );
 }
@@ -334,8 +363,75 @@ test "printTranscript leaves out the system prompt and an unpaired tool result" 
         .{ .role = "system", .content = "ignore me" },
         // A result whose call is not in the session has nothing to belong to.
         .{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;" },
-    }, null, .plain);
+    }, null, null, .plain);
     try std.testing.expectEqualStrings("", out.written());
+}
+
+test "a reply is headed by its own header, and its markdown laid out" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // `tr` stands in for a markdown formatter: it reads the reply and writes it
+    // back upper case, so what the display shows is plainly not the text itself.
+    const markdown: formatting.Format = .{ .script = "tr a-z A-Z", .io = std.testing.io, .gpa = gpa };
+    try printTranscript(arena_state.allocator(), &out.writer, &.{
+        .{ .role = "assistant", .content = "hello" },
+    }, null, markdown, .plain);
+    try std.testing.expectEqualStrings("◆ answer\nHELLO\n", out.written());
+    out.clearRetainingCapacity();
+
+    // No formatter, and one that fails, both leave the reply as it was written.
+    try printTranscript(arena_state.allocator(), &out.writer, &.{
+        .{ .role = "assistant", .content = "hello" },
+    }, null, null, .plain);
+    try std.testing.expectEqualStrings("◆ answer\nhello\n", out.written());
+    out.clearRetainingCapacity();
+
+    const broken: formatting.Format = .{ .script = "exit 1", .io = std.testing.io, .gpa = gpa };
+    try printTranscript(arena_state.allocator(), &out.writer, &.{
+        .{ .role = "assistant", .content = "hello" },
+    }, null, broken, .plain);
+    try std.testing.expectEqualStrings("◆ answer\nhello\n", out.written());
+}
+
+test "an empty reply is shown under its header, in place of the text" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    try printTranscript(arena_state.allocator(), &out.writer, &.{
+        .{ .role = "assistant", .content = "" },
+    }, null, null, .plain);
+    try std.testing.expectEqualStrings("◆ answer\n(empty reply)\n", out.written());
+}
+
+test "a prompt and a reply are headed alike, in the colours of the display" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    try printTranscript(arena_state.allocator(), &out.writer, &.{
+        .{ .role = "user", .content = "hello" },
+        .{ .role = "assistant", .content = "hi" },
+    }, null, null, .ansi);
+
+    // The user's block opens with the prompt mark and the reply with the answer
+    // mark, each bold, and the prompt line keeps the `> ` the editor leaves.
+    try std.testing.expectEqualStrings(
+        "\n\x1b[34m»\x1b[0m \x1b[1mprompt\x1b[0m\n> hello\n" ++
+            "\x1b[32m◆\x1b[0m \x1b[1manswer\x1b[0m\nhi\n",
+        out.written(),
+    );
 }
 
 test "printTranscript gives each call the result that names it" {
@@ -353,7 +449,7 @@ test "printTranscript gives each call the result that names it" {
         } },
         .{ .role = "tool", .tool_call_id = "call_1", .content = "contents of a" },
         .{ .role = "tool", .tool_call_id = "call_2", .content = "contents of b" },
-    }, null, .plain);
+    }, null, null, .plain);
     try std.testing.expectEqualStrings(
         "▸ read a.zig\n▾ output\ncontents of a\n\n" ++
             "▸ read b.zig\n▾ output\ncontents of b\n\n",

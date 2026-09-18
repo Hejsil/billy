@@ -27,6 +27,9 @@ pub const Config = struct {
     max_turns: usize = default_max_turns,
     /// Settings for the tools the agent can call, by tool name.
     tools: Tools = .{},
+    /// Settings for the markdown billy shows: the replies it writes and the
+    /// prompts the user types.
+    markdown: Markdown = .{},
 
     /// What `open` found, including whether the file had to be written.
     pub const Opened = struct {
@@ -55,7 +58,11 @@ pub const Config = struct {
         // never what the file is meant to say.
         if (stored.max_turns == 0) return error.InvalidConfig;
         return .{
-            .config = .{ .max_turns = stored.max_turns, .tools = stored.tools },
+            .config = .{
+                .max_turns = stored.max_turns,
+                .tools = stored.tools,
+                .markdown = stored.markdown,
+            },
             .created = false,
         };
     }
@@ -65,7 +72,11 @@ pub const Config = struct {
     pub fn save(config: Config, io: Io, dir: Io.Dir, gpa: std.mem.Allocator) !void {
         const text = try std.json.Stringify.valueAlloc(
             gpa,
-            Stored{ .max_turns = config.max_turns, .tools = config.tools },
+            Stored{
+                .max_turns = config.max_turns,
+                .tools = config.tools,
+                .markdown = config.markdown,
+            },
             .{},
         );
         defer gpa.free(text);
@@ -97,12 +108,27 @@ pub const Bash = struct {
     format: ?[]const u8 = null,
 };
 
-/// The configuration file as it is written to and read from disk. The tool
-/// settings are the configuration's own, since the file holds exactly those.
+/// Settings for the markdown billy shows. Markdown is not a tool: it is the
+/// form the replies and the prompts are written in, so the setting applies to
+/// both.
+pub const Markdown = struct {
+    /// A shell script that lays markdown out for the display: it reads the text
+    /// on standard input and writes the formatted text on standard output, such
+    /// as `glow -` or `bat -l md --plain`. Null shows the text exactly as it was
+    /// written.
+    ///
+    /// Only the display changes; what a session stores and what the model is
+    /// sent keep the text as it was written.
+    format: ?[]const u8 = null,
+};
+
+/// The configuration file as it is written to and read from disk. The settings
+/// are the configuration's own, since the file holds exactly those.
 const Stored = struct {
     version: u32 = format_version,
     max_turns: usize = default_max_turns,
     tools: Tools = .{},
+    markdown: Markdown = .{},
 };
 
 /// The directory holding the configuration: `$XDG_CONFIG_HOME/billy`, or
@@ -180,6 +206,30 @@ test "open reads the max_turns and the bash format from the file" {
     try std.testing.expect(!opened.created);
     try std.testing.expectEqual(7, opened.config.max_turns);
     try std.testing.expectEqualStrings("shfmt | bat -l bash", opened.config.tools.bash.format.?);
+}
+
+test "open reads the markdown format from the file" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = file_name,
+        .data = "{\"markdown\":{\"format\":\"glow -\"}}",
+    });
+
+    const opened = try Config.open(std.testing.io, tmp.dir, allocator);
+    try std.testing.expectEqualStrings("glow -", opened.config.markdown.format.?);
+    // The tools are untouched by a markdown format.
+    try std.testing.expect(opened.config.tools.bash.format == null);
+
+    // A file without one leaves the format unset, as before.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{}" });
+    const bare = try Config.open(std.testing.io, tmp.dir, allocator);
+    try std.testing.expect(bare.config.markdown.format == null);
 }
 
 test "open leaves the bash format unset when the file does not set one" {
