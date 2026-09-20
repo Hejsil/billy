@@ -279,8 +279,13 @@ fn finish(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
 /// an unimplemented tool becomes `unknown` and arguments that do not fit become
 /// `malformed`, so a caller can still name the call it could not run.
 pub fn parseCall(arena: std.mem.Allocator, call: llm.ToolCall) Call {
-    const name = call.function.name;
-    const arguments = call.function.arguments;
+    return parseCallNamed(arena, call.function.name, call.function.arguments);
+}
+
+/// Parses a call from the name of the tool and the arguments it was given, which
+/// is the pair a session stores. This is what a transcript reads a call with, so
+/// that replaying one does not have to build the `llm.ToolCall` it came from.
+pub fn parseCallNamed(arena: std.mem.Allocator, name: []const u8, arguments: []const u8) Call {
     if (std.mem.eql(u8, name, "read")) {
         return .{ .read = parse(Call.Read, arena, arguments) catch |reason|
             return .{ .malformed = .{ .name = name, .reason = reason } } };

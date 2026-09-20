@@ -275,6 +275,41 @@ pub fn conversation(session: *const Session) Conversation {
     return .{ .session = session };
 }
 
+/// A tool call as the transcript reads it: the id that names the result which
+/// answers it, and the tool plus the arguments to run the call back through the
+/// parser. Every one is a window into the pool, so reading a call allocates
+/// nothing.
+pub const Call = struct {
+    id: []const u8,
+    name: []const u8,
+    arguments: []const u8,
+};
+
+/// The role of a message, read from where it is stored.
+pub fn roleOf(session: *const Session, message: Message) []const u8 {
+    return session.string(message.role) orelse "";
+}
+
+/// The content of a message, or null when it has none.
+pub fn contentOf(session: *const Session, message: Message) ?[]const u8 {
+    return session.string(message.content);
+}
+
+/// How many tool calls a message asked for.
+pub fn callCount(session: *const Session, message: Message) usize {
+    return message.tool_calls.resolve(session).len;
+}
+
+/// One tool call of a message, by position within it.
+pub fn callAt(session: *const Session, message: Message, index: usize) Call {
+    const call = message.tool_calls.resolve(session)[index];
+    return .{
+        .id = session.string(call.id) orelse "",
+        .name = session.string(call.function.name) orelse "",
+        .arguments = session.string(call.function.arguments) orelse "",
+    };
+}
+
 /// The content of the tool message that answers `id`, looking from message
 /// `from` onwards, which is where the result of a call sits: the message just
 /// after the one that asked for it. Empty when the session does not hold it, so
@@ -737,6 +772,47 @@ test "a conversation writes the messages a request would have carried" {
             "{\"role\":\"tool\",\"content\":\"1\\tconst x = 1;\\n\",\"tool_call_id\":\"call_1\"}]",
         via_conversation,
     );
+}
+
+test "a stored message reads back as its parts" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, allocator, null);
+    defer session.deinit();
+
+    try session.append(.{ .role = "user", .content = "hello" });
+    try session.append(.{ .role = "assistant", .tool_calls = &.{
+        .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" } },
+        .{ .id = "call_2", .function = .{ .name = "bash", .arguments = "{}" } },
+    } });
+
+    // What the transcript reads a message through, without building a message.
+    const user = session.messages.items[0];
+    try std.testing.expectEqualStrings("user", session.roleOf(user));
+    try std.testing.expectEqualStrings("hello", session.contentOf(user).?);
+    try std.testing.expectEqual(0, session.callCount(user));
+
+    // A message with no content reports none, rather than an empty string.
+    const assistant = session.messages.items[1];
+    try std.testing.expectEqualStrings("assistant", session.roleOf(assistant));
+    try std.testing.expect(session.contentOf(assistant) == null);
+    try std.testing.expectEqual(2, session.callCount(assistant));
+
+    const first = session.callAt(assistant, 0);
+    try std.testing.expectEqualStrings("call_1", first.id);
+    try std.testing.expectEqualStrings("read", first.name);
+    try std.testing.expectEqualStrings("{\"path\":\"a.zig\"}", first.arguments);
+
+    const second = session.callAt(assistant, 1);
+    try std.testing.expectEqualStrings("call_2", second.id);
+    try std.testing.expectEqualStrings("bash", second.name);
+    try std.testing.expectEqualStrings("{}", second.arguments);
 }
 
 test "a tool result is found only from where the search starts" {

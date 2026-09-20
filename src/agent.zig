@@ -223,10 +223,8 @@ pub fn printTranscript(
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
 
-    const messages = session.messages.items;
-    for (messages, 0..) |message, index| {
-        const resolved = try message.resolve(session, scratch);
-        try printMessage(scratch, out, session, index, resolved, format, markdown, style);
+    for (session.messages.items, 0..) |message, index| {
+        try printMessage(scratch, out, session, index, message, format, markdown, style);
         _ = scratch_state.reset(.retain_capacity);
     }
     try out.flush();
@@ -235,35 +233,41 @@ pub fn printTranscript(
 /// Prints one message the way a live session shows it. The system prompt is never
 /// shown while running, so it is left out here too. A tool result is shown as the
 /// output of the call that produced it, and not as a message of its own.
+///
+/// The message is the one the session stores, so every string printed is read
+/// out of the pool as it is printed and no message is built to print it.
 fn printMessage(
     arena: std.mem.Allocator,
     out: *Io.Writer,
     session: *const Session,
     index: usize,
-    message: llm.Message,
+    message: Session.Message,
     format: tools.Format,
     markdown: formatting.Format,
     style: styling.Style,
 ) !void {
-    if (std.mem.eql(u8, message.role, "user")) {
+    const role = session.roleOf(message);
+    if (std.mem.eql(u8, role, "user")) {
         // A prompt from the session is headed like everything else in the
         // transcript, and its markdown is laid out the way a reply's is. The
         // `> ` is not printed: it belongs to the live input alone, and is not
         // part of the prompt until the user sends it.
         try out.writeAll("\n");
         try styling.header(marks.prompt, "prompt", "", style, out);
-        const text = message.content orelse "";
+        const text = session.contentOf(message) orelse "";
         if (!try formatting.apply(markdown, text, out)) try out.writeAll(text);
         return out.writeAll("\n");
     }
-    if (!std.mem.eql(u8, message.role, "assistant")) return;
-    const calls = message.tool_calls orelse &.{};
-    if (calls.len == 0) return printAnswer(out, message.content, markdown, style);
-    for (calls) |call| {
+    if (!std.mem.eql(u8, role, "assistant")) return;
+
+    const calls = session.callCount(message);
+    if (calls == 0) return printAnswer(out, session.contentOf(message), markdown, style);
+    for (0..calls) |i| {
+        const call = session.callAt(message, i);
         // The result belongs to the message just after the one that asked for
         // it, so the search starts from there.
         try tools.describe(
-            tools.parseCall(arena, call),
+            tools.parseCallNamed(arena, call.name, call.arguments),
             session.toolResult(index + 1, call.id),
             format,
             style,
