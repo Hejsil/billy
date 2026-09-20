@@ -65,6 +65,16 @@ pub const LineEditor = struct {
     /// longer matches `width`, the terminal has reflowed the painted region, and
     /// it is measured against `width` instead.
     painted_width: usize = 0,
+    /// Whether the bytes now arriving are a paste rather than typing. The terminal
+    /// wraps a paste in `ESC[200~` and `ESC[201~`, and everything between is
+    /// inserted as it is: a newline a user pasted is a line break in the line,
+    /// where a newline from the keyboard submits it. That is what keeps a pasted
+    /// block of text from going out as one prompt per line.
+    pasting: bool = false,
+    /// Whether the last byte of a paste was a carriage return, so a `\r\n` pair in
+    /// one is a single line break. A terminal that sends `\r\n` for a pasted line
+    /// ending would otherwise open a blank line after every line.
+    paste_cr: bool = false,
 
     pub fn init(io: Io, out: *Io.Writer, arena: std.mem.Allocator) LineEditor {
         return .{ .io = io, .out = out, .arena = arena };
@@ -105,7 +115,20 @@ pub const LineEditor = struct {
         if (!interactive) return ed.readLinePiped();
 
         const saved = try ed.enterRaw();
-        defer std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, saved) catch {};
+        defer {
+            std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, saved) catch {};
+            // Bracketed paste is a property of the terminal rather than of this
+            // process, so it is turned back off when the line is done; left on, it
+            // would wrap pastes in whatever the user runs next.
+            ed.out.writeAll("\x1b[?2004l") catch {};
+            ed.out.flush() catch {};
+            ed.pasting = false;
+            ed.paste_cr = false;
+        }
+        // Ask the terminal to mark where a paste begins and ends, so the bytes in
+        // one can be told from what the user types.
+        try ed.out.writeAll("\x1b[?2004h");
+        try ed.out.flush();
 
         // The prompt alone is what is on screen before any key arrives, and it is
         // one row: an empty line submitted without a redraw is still measured, so
@@ -235,7 +258,10 @@ pub const LineEditor = struct {
                     }
                 },
                 .interrupt => {
-                    // The abandoned line is dropped, header and all.
+                    // The abandoned line is dropped, header and all, and so is a
+                    // paste that was still arriving.
+                    ed.pasting = false;
+                    ed.paste_cr = false;
                     try ed.endPrompt(header);
                     try ed.out.writeAll("\x1b[K^C\r\n");
                     // The user is still at a prompt, so show the header again;
@@ -498,9 +524,24 @@ pub const LineEditor = struct {
 
     fn nextKey(ed: *LineEditor) !Key {
         const byte = (try ed.nextByte()) orelse return .none;
+        if (byte == 0x1b) {
+            ed.paste_cr = false;
+            return ed.nextEscape();
+        }
+        if (byte == '\r' or byte == '\n') {
+            // A newline from the keyboard submits the line; a newline the user
+            // pasted is a line break in it, like Shift+Enter.
+            if (!ed.pasting) return .enter;
+            if (byte == '\n' and ed.paste_cr) {
+                // The LF half of a `\r\n` whose CR already opened the line.
+                ed.paste_cr = false;
+                return .none;
+            }
+            ed.paste_cr = byte == '\r';
+            return .newline;
+        }
+        ed.paste_cr = false;
         return switch (byte) {
-            0x1b => ed.nextEscape(),
-            '\r', '\n' => .enter,
             0x7f, 0x08 => .backspace,
             0x01 => .home,
             0x05 => .end,
@@ -515,7 +556,8 @@ pub const LineEditor = struct {
     }
 
     /// Decodes the `CSI`/`SS3` sequences for the arrow and navigation keys, as
-    /// well as the encodings terminals use for Shift+Enter.
+    /// well as the encodings terminals use for Shift+Enter and the markers that
+    /// bracket a paste.
     fn nextEscape(ed: *LineEditor) !Key {
         const introducer = (try ed.nextByte()) orelse return .none;
         // Some terminals report Shift+Enter as ESC followed by a carriage return.
@@ -527,7 +569,23 @@ pub const LineEditor = struct {
         var len: usize = 0;
         while (true) {
             const byte = (try ed.nextByte()) orelse return .none;
-            if (byte >= 0x40 and byte <= 0x7e) return finalKey(params[0..len], byte);
+            if (byte >= 0x40 and byte <= 0x7e) {
+                // `ESC[200~` opens a paste and `ESC[201~` closes it. Both are the
+                // terminal talking, not the user, so neither is a key of its own.
+                if (byte == '~') {
+                    if (std.mem.eql(u8, params[0..len], "200")) {
+                        ed.pasting = true;
+                        ed.paste_cr = false;
+                        return .none;
+                    }
+                    if (std.mem.eql(u8, params[0..len], "201")) {
+                        ed.pasting = false;
+                        ed.paste_cr = false;
+                        return .none;
+                    }
+                }
+                return finalKey(params[0..len], byte);
+            }
             if (len < params.len) {
                 params[len] = byte;
                 len += 1;
@@ -818,6 +876,65 @@ test "wordStart skips trailing whitespace then the word" {
     try std.testing.expectEqual(0, wordStart("hello world", 6));
     try std.testing.expectEqual(4, wordStart("one two", 7));
     try std.testing.expectEqual(0, wordStart("", 0));
+}
+
+/// Decodes `bytes` into the keys the editor would read from them, with no
+/// terminal behind it: one character per key, a typed byte as itself, a line
+/// break as `\n`, a submit as `E`, a key with no effect as `.` and any other key
+/// as `?`. `std.testing.allocator` owns the result. The bytes go in the read
+/// buffer, which the decoder drains before it would ask a terminal for more.
+fn decodeKeys(bytes: []const u8) ![]u8 {
+    var sink: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer sink.deinit();
+    var ed = LineEditor.init(std.testing.io, &sink.writer, std.testing.allocator);
+
+    @memcpy(ed.in_buf[0..bytes.len], bytes);
+    ed.in_pos = 0;
+    ed.in_len = bytes.len;
+    var keys: std.ArrayList(u8) = .empty;
+    while (ed.in_pos < ed.in_len) {
+        try keys.append(std.testing.allocator, switch (try ed.nextKey()) {
+            .byte => |b| b,
+            .newline => '\n',
+            .enter => 'E',
+            .none => '.',
+            else => '?',
+        });
+    }
+    return keys.toOwnedSlice(std.testing.allocator);
+}
+
+test "a newline in a paste is a line break and only enter submits" {
+    // Text pasted between the markers: its newlines break the line, and the
+    // carriage return typed after the paste is what submits it. The end marker is
+    // what makes that carriage return a submit, so the markers left no trace.
+    const keys = try decodeKeys("\x1b[200~one\ntwo\x1b[201~more\r");
+    defer std.testing.allocator.free(keys);
+    try std.testing.expectEqualStrings(".one\ntwo.moreE", keys);
+}
+
+test "a carriage return from the keyboard still submits outside a paste" {
+    // Typing a line and pressing enter, and the same with a line feed, both
+    // submit: neither is inside a paste.
+    const keys = try decodeKeys("hi\rhi\n");
+    defer std.testing.allocator.free(keys);
+    try std.testing.expectEqualStrings("hiEhiE", keys);
+}
+
+test "a CRLF in a paste opens a single line, not one and a blank" {
+    // The CR opens the line and the LF that follows it is the same line ending,
+    // so the CRLF pair is one break, not two.
+    const keys = try decodeKeys("\x1b[200~a\r\nb\x1b[201~");
+    defer std.testing.allocator.free(keys);
+    try std.testing.expectEqualStrings(".a\n.b.", keys);
+}
+
+test "a shifted enter and the arrow keys still decode" {
+    // Shift+Enter is a line break outside a paste, as before, and an arrow key is
+    // its own key rather than the digits of its escape sequence.
+    const keys = try decodeKeys("a\x1b[13;2ub\x1b[Du\r");
+    defer std.testing.allocator.free(keys);
+    try std.testing.expectEqualStrings("a\nb?uE", keys);
 }
 
 test "visibleWidth ignores ANSI escapes" {
