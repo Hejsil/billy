@@ -72,8 +72,6 @@ pub const Call = union(enum) {
 
 pub const Tools = struct {
     io: Io,
-    /// Holds results, which are kept in the conversation.
-    arena: std.mem.Allocator,
     /// For temporary buffers.
     gpa: std.mem.Allocator,
     /// Reports tool activity to the user.
@@ -86,6 +84,9 @@ pub const Tools = struct {
     style: Style,
     definitions: []const llm.Tool,
 
+    /// `arena` holds the definitions, which are sent with every request and so
+    /// live as long as the run. Nothing else the tools allocate outlives the
+    /// call that made it, so the rest is asked for per call.
     pub fn init(
         io: Io,
         arena: std.mem.Allocator,
@@ -96,7 +97,6 @@ pub const Tools = struct {
     ) !Tools {
         return .{
             .io = io,
-            .arena = arena,
             .gpa = gpa,
             .log = log,
             .format = format,
@@ -112,18 +112,24 @@ pub const Tools = struct {
     /// transcript reuses, so a replayed session shows exactly what a live one
     /// did. The head goes out before the tool runs, so a slow command shows what
     /// it is doing, and the result follows it.
-    pub fn run(tools: *Tools, call: llm.ToolCall) ![]const u8 {
-        const parsed = parseCall(tools.arena, call);
+    ///
+    /// `arena` holds the parsed call and the result. The result is what the
+    /// caller is given, so it has to outlive the call, but no longer than that:
+    /// the session interns what it keeps, so an arena dropped with the request
+    /// is enough and keeps a long conversation from holding every result.
+    pub fn run(tools: *Tools, arena: std.mem.Allocator, call: llm.ToolCall) ![]const u8 {
+        const parsed = parseCall(arena, call);
         try printHead(parsed, tools.format, tools.style, tools.log);
         try tools.log.flush();
 
         const result = switch (parsed) {
-            .read => |args| try tools.read(args),
-            .write => |args| try tools.write(args),
-            .edit => |args| try tools.edit(args),
-            .bash => |args| try tools.bash(args),
-            .unknown => |name| try tools.fail("unknown tool '{s}'", .{name}),
-            .malformed => |bad| try tools.fail(
+            .read => |args| try tools.read(arena, args),
+            .write => |args| try tools.write(arena, args),
+            .edit => |args| try tools.edit(arena, args),
+            .bash => |args| try tools.bash(arena, args),
+            .unknown => |name| try fail(arena, "unknown tool '{s}'", .{name}),
+            .malformed => |bad| try fail(
+                arena,
                 "invalid arguments for {s}: {s}",
                 .{ bad.name, @errorName(bad.reason) },
             ),
@@ -135,18 +141,18 @@ pub const Tools = struct {
         return result;
     }
 
-    fn read(tools: *Tools, args: Call.Read) ![]const u8 {
+    fn read(tools: *Tools, arena: std.mem.Allocator, args: Call.Read) ![]const u8 {
         const contents = std.Io.Dir.cwd().readFileAlloc(
             tools.io,
             args.path,
             tools.gpa,
             .limited(16 << 20),
-        ) catch |err| return tools.fail("cannot read {s}: {s}", .{ args.path, @errorName(err) });
+        ) catch |err| return fail(arena, "cannot read {s}: {s}", .{ args.path, @errorName(err) });
         defer tools.gpa.free(contents);
 
         // A trailing newline would otherwise read as a final empty line.
         const text = std.mem.trimEnd(u8, contents, "\n");
-        if (text.len == 0) return tools.arena.dupe(u8, "(empty file)");
+        if (text.len == 0) return arena.dupe(u8, "(empty file)");
 
         const first = args.offset orelse 1;
         const limit = args.limit orelse 2000;
@@ -164,39 +170,40 @@ pub const Tools = struct {
             try out.writer.print("{d:>6}\t{s}\n", .{ number, line });
         }
         if (shown == 0) {
-            return std.fmt.allocPrint(tools.arena, "offset {d} is past the end; {d} lines", .{ first, number });
+            return std.fmt.allocPrint(arena, "offset {d} is past the end; {d} lines", .{ first, number });
         }
         if (shown == limit) {
             try out.writer.print("… {d} more lines\n", .{number - first + 1 - shown});
         }
-        return tools.finish(out.written());
+        return finish(arena, out.written());
     }
 
-    fn write(tools: *Tools, args: Call.Write) ![]const u8 {
+    fn write(tools: *Tools, arena: std.mem.Allocator, args: Call.Write) ![]const u8 {
         if (std.fs.path.dirname(args.path)) |parent| {
             std.Io.Dir.cwd().createDirPath(tools.io, parent) catch |err|
-                return tools.fail("cannot create {s}: {s}", .{ parent, @errorName(err) });
+                return fail(arena, "cannot create {s}: {s}", .{ parent, @errorName(err) });
         }
         std.Io.Dir.cwd().writeFile(tools.io, .{ .sub_path = args.path, .data = args.content }) catch |err|
-            return tools.fail("cannot write {s}: {s}", .{ args.path, @errorName(err) });
-        return std.fmt.allocPrint(tools.arena, "wrote {d} bytes to {s}", .{ args.content.len, args.path });
+            return fail(arena, "cannot write {s}: {s}", .{ args.path, @errorName(err) });
+        return std.fmt.allocPrint(arena, "wrote {d} bytes to {s}", .{ args.content.len, args.path });
     }
 
-    fn edit(tools: *Tools, args: Call.Edit) ![]const u8 {
-        if (args.old_string.len == 0) return tools.fail("old_string must not be empty", .{});
+    fn edit(tools: *Tools, arena: std.mem.Allocator, args: Call.Edit) ![]const u8 {
+        if (args.old_string.len == 0) return fail(arena, "old_string must not be empty", .{});
 
         const contents = std.Io.Dir.cwd().readFileAlloc(
             tools.io,
             args.path,
             tools.gpa,
             .limited(16 << 20),
-        ) catch |err| return tools.fail("cannot read {s}: {s}", .{ args.path, @errorName(err) });
+        ) catch |err| return fail(arena, "cannot read {s}: {s}", .{ args.path, @errorName(err) });
         defer tools.gpa.free(contents);
 
         const found = std.mem.count(u8, contents, args.old_string);
-        if (found == 0) return tools.fail("old_string not found in {s}", .{args.path});
+        if (found == 0) return fail(arena, "old_string not found in {s}", .{args.path});
         if (found > 1 and !args.replace_all) {
-            return tools.fail(
+            return fail(
+                arena,
                 "old_string appears {d} times in {s}; add context or pass replace_all",
                 .{ found, args.path },
             );
@@ -215,22 +222,23 @@ pub const Tools = struct {
         defer tools.gpa.free(updated);
 
         std.Io.Dir.cwd().writeFile(tools.io, .{ .sub_path = args.path, .data = updated }) catch |err|
-            return tools.fail("cannot write {s}: {s}", .{ args.path, @errorName(err) });
-        return std.fmt.allocPrint(tools.arena, "replaced {d} occurrence(s) in {s}", .{ found, args.path });
+            return fail(arena, "cannot write {s}: {s}", .{ args.path, @errorName(err) });
+        return std.fmt.allocPrint(arena, "replaced {d} occurrence(s) in {s}", .{ found, args.path });
     }
 
-    fn bash(tools: *Tools, args: Call.Bash) ![]const u8 {
+    fn bash(tools: *Tools, arena: std.mem.Allocator, args: Call.Bash) ![]const u8 {
         const result = std.process.run(tools.gpa, tools.io, .{
             .argv = &.{ "bash", "-c", args.command },
             .stdout_limit = .limited(max_command_output),
             .stderr_limit = .limited(max_command_output),
             .timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(command_timeout_s) } },
         }) catch |err| switch (err) {
-            error.StreamTooLong => return tools.fail(
+            error.StreamTooLong => return fail(
+                arena,
                 "command produced more than {d} bytes of output",
                 .{max_command_output},
             ),
-            else => return tools.fail("cannot run command: {s}", .{@errorName(err)}),
+            else => return fail(arena, "cannot run command: {s}", .{@errorName(err)}),
         };
         defer tools.gpa.free(result.stdout);
         defer tools.gpa.free(result.stderr);
@@ -246,21 +254,26 @@ pub const Tools = struct {
             if (result.stdout.len > 0) try out.writer.writeAll("\n");
             try out.writer.print("stderr:\n{s}", .{result.stderr});
         }
-        return tools.finish(out.written());
-    }
-
-    fn fail(tools: *Tools, comptime format: []const u8, args: anytype) ![]const u8 {
-        return std.fmt.allocPrint(tools.arena, "error: " ++ format, args);
-    }
-
-    fn finish(tools: *Tools, text: []const u8) ![]const u8 {
-        if (text.len <= max_result_len) return tools.arena.dupe(u8, text);
-        return std.fmt.allocPrint(tools.arena, "{s}\n… {d} more bytes", .{
-            text[0..max_result_len],
-            text.len - max_result_len,
-        });
+        return finish(arena, out.written());
     }
 };
+
+/// A failure reported to the model as text, so that it can react to it. It is
+/// written into the arena the call's result lives in, since that is where the
+/// caller looks for the result of a call that went wrong.
+fn fail(arena: std.mem.Allocator, comptime format: []const u8, args: anytype) ![]const u8 {
+    return std.fmt.allocPrint(arena, "error: " ++ format, args);
+}
+
+/// A result as the model is given it, cut to `max_result_len` with a count of
+/// what was left out.
+fn finish(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    if (text.len <= max_result_len) return arena.dupe(u8, text);
+    return std.fmt.allocPrint(arena, "{s}\n… {d} more bytes", .{
+        text[0..max_result_len],
+        text.len - max_result_len,
+    });
+}
 
 /// Parses a tool call into the arguments of the call it names. It never fails:
 /// an unimplemented tool becomes `unknown` and arguments that do not fit become
@@ -764,7 +777,7 @@ test "a bash block shows only the streams the command filled" {
         const arguments = try std.fmt.allocPrint(arena, "{{\"command\":{f}}}", .{
             std.json.fmt(case.command, .{}),
         });
-        _ = try tool_set.run(.{ .id = "1", .function = .{ .name = "bash", .arguments = arguments } });
+        _ = try tool_set.run(arena, .{ .id = "1", .function = .{ .name = "bash", .arguments = arguments } });
         try std.testing.expectEqualStrings(case.expected, log.written());
     }
 }
@@ -956,7 +969,7 @@ test "run logs exactly what describe prints" {
         .name = "bash",
         .arguments = "{\"command\":\"true\"}",
     } };
-    const result = try tool_set.run(call);
+    const result = try tool_set.run(arena, call);
 
     var described: std.Io.Writer.Allocating = .init(gpa);
     defer described.deinit();
@@ -987,7 +1000,7 @@ test "the format changes what is shown and nothing else" {
         .name = "bash",
         .arguments = "{\"command\":\"echo hi\"}",
     } };
-    const result = try tool_set.run(call);
+    const result = try tool_set.run(arena, call);
 
     // The command that ran is the one the model wrote, so the result is its
     // output, and the user reads the command as the formatter laid it out.

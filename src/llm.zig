@@ -111,8 +111,6 @@ const Response = struct {
 
 pub const Client = struct {
     gpa: std.mem.Allocator,
-    /// Holds the conversation, including parsed responses.
-    arena: std.mem.Allocator,
     io: Io,
     api_key: []const u8,
     /// Full URL of the chat completions endpoint.
@@ -121,7 +119,16 @@ pub const Client = struct {
 
     /// Sends the conversation and returns the next assistant message together
     /// with the tokens the request used.
-    pub fn complete(client: *Client, messages: []const Message, tools: []const Tool) !Completion {
+    ///
+    /// `arena` holds the parsed response, which has to outlive the response
+    /// buffer but need not outlive the caller's use of it: the session interns
+    /// what it keeps, so an arena dropped with the request is enough.
+    pub fn complete(
+        client: *Client,
+        arena: std.mem.Allocator,
+        messages: []const Message,
+        tools: []const Tool,
+    ) !Completion {
         const body = try std.json.Stringify.valueAlloc(client.gpa, Request{
             .model = client.model,
             .messages = messages,
@@ -152,7 +159,7 @@ pub const Client = struct {
         const text = body_writer.written();
         // The response buffer is freed when this function returns, so the
         // strings in the parsed message must be copies.
-        const response = std.json.parseFromSliceLeaky(Response, client.arena, text, .{
+        const response = std.json.parseFromSliceLeaky(Response, arena, text, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
         }) catch |err| {

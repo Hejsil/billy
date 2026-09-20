@@ -169,7 +169,6 @@ pub fn run(
     var tool_set = try tools.Tools.init(io, arena, gpa, out, config.format, config.style);
     var client: llm.Client = .{
         .gpa = gpa,
-        .arena = arena,
         .io = io,
         .api_key = config.api_key,
         .url = config.url,
@@ -276,13 +275,17 @@ fn turn(
 ) !void {
     var remaining: usize = config.max_turns;
     while (remaining > 0) : (remaining -= 1) {
-        // The conversation is resolved for the request and dropped again, so
-        // the strings the session keeps stay the only copy between requests.
+        // Everything that only has to last the request is allocated here and
+        // dropped when the turn ends: the conversation that is sent, the reply
+        // that comes back and the result of every call it asked for. The
+        // session interns the strings it keeps, so the pool is the only copy
+        // that outlives the turn.
         var request_arena = std.heap.ArenaAllocator.init(client.gpa);
         defer request_arena.deinit();
-        const messages = try session.resolvedMessages(request_arena.allocator());
+        const request = request_arena.allocator();
 
-        const completion = try client.complete(messages, session.tools);
+        const messages = try session.resolvedMessages(request);
+        const completion = try client.complete(request, messages, session.tools);
         // The totals are recorded first, so the save inside `append` stores them
         // along with the message. Each request is priced as it is made, at the
         // rates in effect then, so a session running through a rate change is
@@ -299,7 +302,7 @@ fn turn(
             try session.append(.{
                 .role = "tool",
                 .tool_call_id = call.id,
-                .content = try tool_set.run(call),
+                .content = try tool_set.run(request, call),
             });
         }
     }
