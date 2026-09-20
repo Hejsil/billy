@@ -39,27 +39,135 @@ const Stored = struct {
     cost: f64 = 0,
 };
 
+const StringIndex = enum(u32) {
+    none = std.math.maxInt(u32),
+    _,
+};
+
+/// Equality and hashing for interned strings. A string is named by its index
+/// into the pool rather than by a pointer, so that growing the pool cannot
+/// invalidate a key, and the pool itself stays the only copy of the text.
+const Interned = struct {
+    session: *const Session,
+
+    pub fn hash(context: Interned, index: StringIndex) u64 {
+        return std.hash.Wyhash.hash(0, context.session.string(index) orelse "");
+    }
+
+    pub fn eql(context: Interned, a: StringIndex, b: StringIndex) bool {
+        return std.mem.eql(
+            u8,
+            context.session.string(a) orelse "",
+            context.session.string(b) orelse "",
+        );
+    }
+};
+
+const ToolCallIndex = struct {
+    start: u32,
+    len: u32,
+
+    const empty = ToolCallIndex{ .start = 0, .len = 0 };
+
+    fn resolve(tool_calls: ToolCallIndex, session: *const Session) []const ToolCall {
+        return session.tool_calls.items[tool_calls.start..][0..tool_calls.len];
+    }
+};
+
+/// An llm.ToolCall as stored in a session.
+const ToolCall = struct {
+    id: StringIndex,
+    type: StringIndex,
+    function: Function,
+
+    const Function = struct {
+        name: StringIndex,
+        arguments: StringIndex,
+    };
+
+    fn resolve(tool_call: ToolCall, session: *const Session) llm.ToolCall {
+        return .{
+            .id = session.string(tool_call.id) orelse "",
+            .type = session.string(tool_call.type) orelse "",
+            .function = .{
+                .name = session.string(tool_call.function.name) orelse "",
+                .arguments = session.string(tool_call.function.arguments) orelse "",
+            },
+        };
+    }
+};
+
+/// An llm.Message as stored in a session.
+const Message = struct {
+    role: StringIndex,
+    content: StringIndex = .none,
+    tool_call_id: StringIndex = .none,
+    tool_calls: ToolCallIndex = .empty,
+
+    /// The message as the API client takes it, with every string resolved out of
+    /// the pool. `allocator` owns the tool calls, which have to be pieced back
+    /// together into a slice of their own.
+    fn resolve(message: Message, session: *const Session, allocator: std.mem.Allocator) !llm.Message {
+        const stored = message.tool_calls.resolve(session);
+        var calls: ?[]const llm.ToolCall = null;
+        if (stored.len > 0) {
+            const resolved = try allocator.alloc(llm.ToolCall, stored.len);
+            for (stored, resolved) |tool_call, *out| out.* = tool_call.resolve(session);
+            calls = resolved;
+        }
+        return .{
+            .role = session.string(message.role) orelse "",
+            .content = session.string(message.content),
+            .tool_call_id = session.string(message.tool_call_id),
+            .tool_calls = calls,
+        };
+    }
+};
+
 io: Io,
+
 /// Directory holding the session files. Owned by the caller.
 dir: Io.Dir,
-/// Owns the id, the name and the messages.
+
+/// Owns the id, the name, and what was read back from the file, which holds the
+/// tools a resume sends. The conversation is in `strings`, `tool_calls` and
+/// `messages`, which `gpa` owns and `deinit` frees.
 arena: std.mem.Allocator,
+
 /// For temporary buffers, freed on the way out.
 gpa: std.mem.Allocator,
+
 /// Names the session; also its file name without the extension.
 id: []const u8,
+
 /// Name of the session file inside `dir`.
 name: []const u8,
+
+/// All string data, one NUL-terminated copy per distinct string. Two equal
+/// strings share an index, so a conversation that repeats its roles, its tool
+/// names and what a repeated call returned pays for each of them once.
+strings: std.ArrayList(u8) = .empty,
+
+/// The strings the pool holds, so that one already there is not appended again.
+/// Keyed by index rather than by pointer, since the pool moves as it grows.
+interned: std.HashMapUnmanaged(StringIndex, void, Interned, std.hash_map.default_max_load_percentage) = .empty,
+
+tool_calls: std.ArrayList(ToolCall) = .empty,
+
 /// The conversation, oldest first, starting with the system prompt.
-messages: std.ArrayList(llm.Message) = .empty,
+messages: std.ArrayList(Message) = .empty,
+
 /// The tool definitions sent with every request. Stored in the session so a
 /// resume offers the model the same tools as the run it continues.
 tools: []const llm.Tool = &.{},
+
 /// Tokens billed over the whole session, summed over every request, so the
 /// cost of a resumed session includes what earlier runs spent.
 usage: llm.Usage = .{},
+
 /// Tokens in the conversation as of the last request.
 context_tokens: usize = 0,
+
 /// What the session has cost so far, in USD. Accumulated request by request
 /// because the rate depends on the time of the request, which the token
 /// totals alone could not recover.
@@ -88,15 +196,63 @@ pub fn open(
         .id = id,
         .name = try std.fmt.allocPrint(arena, "{s}{s}", .{ id, extension }),
     };
-    if (resume_id != null) try session.load();
+    // A resume that fails part way leaves the strings it had read behind, since
+    // the caller only gets the session on the way out.
+    errdefer session.deinit();
+    if (resume_id != null)
+        try session.load();
     return session;
+}
+
+pub fn deinit(session: *Session) void {
+    session.strings.deinit(session.gpa);
+    session.interned.deinit(session.gpa);
+    session.tool_calls.deinit(session.gpa);
+    session.messages.deinit(session.gpa);
+}
+
+/// The conversation as the API client sends it, every string resolved out of the
+/// pool. `allocator` owns the result, since resolving a message has to piece its
+/// tool calls back together.
+pub fn resolvedMessages(session: *const Session, allocator: std.mem.Allocator) ![]const llm.Message {
+    const messages = try allocator.alloc(llm.Message, session.messages.items.len);
+    for (session.messages.items, messages) |message, *out| {
+        out.* = try message.resolve(session, allocator);
+    }
+    return messages;
 }
 
 /// Adds a message to the conversation and writes the session out, so the
 /// next run sees it even if this one is killed.
 pub fn append(session: *Session, message: llm.Message) !void {
-    try session.messages.append(session.arena, message);
+    try session.appendNoSave(message);
     try session.save();
+}
+
+pub fn appendNoSave(session: *Session, message: llm.Message) !void {
+    const tool_calls = message.tool_calls orelse &.{};
+    const interned_tool_calls = ToolCallIndex{
+        .start = @intCast(session.tool_calls.items.len),
+        .len = @intCast(tool_calls.len),
+    };
+
+    for (tool_calls) |tool_call| {
+        try session.tool_calls.append(session.gpa, .{
+            .id = try session.internString(tool_call.id),
+            .type = try session.internString(tool_call.type),
+            .function = .{
+                .name = try session.internString(tool_call.function.name),
+                .arguments = try session.internString(tool_call.function.arguments),
+            },
+        });
+    }
+
+    try session.messages.append(session.gpa, .{
+        .role = try session.internString(message.role),
+        .content = try session.internString(message.content),
+        .tool_call_id = try session.internString(message.tool_call_id),
+        .tool_calls = interned_tool_calls,
+    });
 }
 
 /// Appends `system_prompt` to an empty conversation, leaving one that has any
@@ -148,7 +304,32 @@ pub fn save(session: *Session) !void {
     try json.write(format_version);
     try json.objectField("messages");
     try json.beginArray();
-    for (session.messages.items) |message| try json.write(message);
+    for (session.messages.items) |message| {
+        try json.beginObject();
+        if (session.string(message.role)) |role| {
+            try json.objectField("role");
+            try json.write(role);
+        }
+        if (session.string(message.content)) |content| {
+            try json.objectField("content");
+            try json.write(content);
+        }
+        if (session.string(message.tool_call_id)) |tool_call_id| {
+            try json.objectField("tool_call_id");
+            try json.write(tool_call_id);
+        }
+
+        const tool_calls = message.tool_calls.resolve(session);
+        if (tool_calls.len != 0) {
+            try json.objectField("tool_calls");
+            try json.beginArray();
+            for (tool_calls) |tool_call| {
+                try json.write(tool_call.resolve(session));
+            }
+            try json.endArray();
+        }
+        try json.endObject();
+    }
     try json.endArray();
     try json.objectField("tools");
     try json.write(session.tools);
@@ -162,10 +343,11 @@ pub fn save(session: *Session) !void {
 
     var atomic = try session.dir.createFileAtomic(session.io, session.name, .{ .replace = true });
     defer atomic.deinit(session.io);
-    var buffer: [4096]u8 = undefined;
-    var file: Io.File.Writer = .init(atomic.file, session.io, &buffer);
+
+    var file: Io.File.Writer = atomic.file.writer(session.io, "");
     try file.interface.writeAll(text.written());
-    try file.flush();
+    try file.end();
+
     try atomic.replace(session.io);
 }
 
@@ -180,20 +362,55 @@ fn load(session: *Session) !void {
         error.FileNotFound => return error.SessionNotFound,
         else => return err,
     };
+
     const stored = std.json.parseFromSliceLeaky(Stored, session.arena, text, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     }) catch return error.CorruptSession;
-    if (stored.version > format_version) return error.UnsupportedSessionVersion;
+
+    if (stored.version > format_version)
+        return error.UnsupportedSessionVersion;
+
     // The stored messages are kept as they are, system prompt included, so
     // resuming reuses exactly what the earlier run sent.
     for (stored.messages) |message| {
-        try session.messages.append(session.arena, message);
+        try session.appendNoSave(message);
     }
+
     session.tools = stored.tools;
     session.usage = stored.usage;
     session.context_tokens = stored.context_tokens;
     session.cost = stored.cost;
+}
+
+fn internString(session: *Session, text: ?[]const u8) !StringIndex {
+    const value = text orelse return .none;
+
+    // The candidate is put in the pool before it is looked up, since a key has
+    // to name a string the pool already holds. A duplicate is rolled back as
+    // soon as the lookup finds the copy that was there already.
+    const start: u32 = @intCast(session.strings.items.len);
+    try session.strings.appendSlice(session.gpa, value);
+    try session.strings.append(session.gpa, 0);
+    const candidate: StringIndex = @enumFromInt(start);
+
+    const context = Interned{ .session = session };
+    const entry = try session.interned.getOrPutContext(session.gpa, candidate, context);
+    if (!entry.found_existing) return candidate;
+
+    session.strings.shrinkRetainingCapacity(start);
+    return entry.key_ptr.*;
+}
+
+fn string(session: *const Session, index: StringIndex) ?[]const u8 {
+    const ptr = session.stringPtr(index) orelse return null;
+    return std.mem.span(ptr);
+}
+
+fn stringPtr(session: *const Session, index: StringIndex) ?[*:0]const u8 {
+    if (index == .none) return null;
+    const start = @intFromEnum(index);
+    return session.strings.items[start .. session.strings.items.len - 1 :0].ptr;
 }
 
 /// The directory holding the sessions: `$XDG_DATA_HOME/billy`, or
@@ -206,6 +423,7 @@ pub fn defaultDir(arena: std.mem.Allocator, environ: *const std.process.Environ.
             return std.fs.path.join(arena, &.{ xdg, app_dir });
         }
     }
+
     const home = environ.get("HOME") orelse return error.HomeNotSet;
     return std.fs.path.join(arena, &.{ home, ".local", "share", app_dir });
 }
@@ -337,6 +555,8 @@ test "a session survives a save and resume" {
     defer tmp.cleanup();
 
     var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null);
+    defer session.deinit();
+
     try session.append(.{ .role = "system", .content = "be terse" });
     try session.append(.{ .role = "user", .content = "hello" });
     try session.append(.{
@@ -348,21 +568,72 @@ test "a session survives a save and resume" {
     });
     try session.append(.{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;\n" });
 
-    const resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, session.id);
+    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, session.id);
+    defer resumed.deinit();
+
     try std.testing.expectEqualStrings(session.id, resumed.id);
     // The system prompt is stored too, so everything comes back.
     try std.testing.expectEqual(session.messages.items.len, resumed.messages.items.len);
-    try std.testing.expectEqualStrings("be terse", resumed.messages.items[0].content.?);
-    for (session.messages.items, resumed.messages.items) |before, after| {
-        try std.testing.expectEqualStrings(before.role, after.role);
-        try std.testing.expectEqualStrings(before.content orelse "", after.content orelse "");
-        try std.testing.expectEqualStrings(before.tool_call_id orelse "", after.tool_call_id orelse "");
-        if (before.tool_calls) |calls| {
-            try std.testing.expectEqualStrings(calls[0].id, after.tool_calls.?[0].id);
-            try std.testing.expectEqualStrings(calls[0].function.name, after.tool_calls.?[0].function.name);
-            try std.testing.expectEqualStrings(calls[0].function.arguments, after.tool_calls.?[0].function.arguments);
+
+    // Resolving both sides is what makes them comparable: the indices a session
+    // stores are its own, and two sessions with the same conversation number
+    // their strings differently.
+    const before = try session.resolvedMessages(allocator);
+    const after = try resumed.resolvedMessages(allocator);
+    try std.testing.expectEqual(before.len, after.len);
+    for (before, after) |expected, actual| {
+        try std.testing.expectEqualStrings(expected.role, actual.role);
+        try std.testing.expectEqualStrings(expected.content orelse "", actual.content orelse "");
+        try std.testing.expectEqualStrings(expected.tool_call_id orelse "", actual.tool_call_id orelse "");
+
+        const expected_calls = expected.tool_calls orelse &.{};
+        const actual_calls = actual.tool_calls orelse &.{};
+        try std.testing.expectEqual(expected_calls.len, actual_calls.len);
+        for (expected_calls, actual_calls) |expected_call, actual_call| {
+            try std.testing.expectEqualStrings(expected_call.id, actual_call.id);
+            try std.testing.expectEqualStrings(expected_call.type, actual_call.type);
+            try std.testing.expectEqualStrings(expected_call.function.name, actual_call.function.name);
+            try std.testing.expectEqualStrings(expected_call.function.arguments, actual_call.function.arguments);
         }
     }
+}
+
+test "an equal string is interned once and shared" {
+    const arena = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(arena);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null);
+    defer session.deinit();
+
+    try session.append(.{ .role = "user", .content = "hello" });
+    try session.append(.{ .role = "assistant", .content = "hello" });
+    try session.append(.{
+        .role = "assistant",
+        .tool_calls = &.{
+            .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{}" } },
+            // The same call read twice: its id and its name are already in the
+            // pool, and only the arguments that differ are added.
+            .{ .id = "call_1", .function = .{ .name = "read", .arguments = "[]" } },
+        },
+    });
+
+    // Each distinct string once, in the order it was first seen.
+    try std.testing.expectEqualStrings(
+        "user\x00hello\x00assistant\x00call_1\x00function\x00read\x00{}\x00[]\x00",
+        session.strings.items,
+    );
+    // The two equal contents, and the repeated parts of the two tool calls,
+    // name the one copy of each.
+    try std.testing.expectEqual(session.messages.items[0].content, session.messages.items[1].content);
+    const calls = session.messages.items[2].tool_calls.resolve(&session);
+    try std.testing.expectEqual(calls[0].id, calls[1].id);
+    try std.testing.expectEqual(calls[0].function.name, calls[1].function.name);
+    try std.testing.expect(calls[0].function.arguments != calls[1].function.arguments);
 }
 
 test "a stored system prompt is kept when resuming" {
@@ -383,11 +654,13 @@ test "a stored system prompt is kept when resuming" {
 
     // Resuming keeps the saved prompt even though a newer one is available.
     var resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, "one");
+    defer resumed.deinit();
+
     try resumed.appendSystemPrompt("new prompt");
     try std.testing.expectEqual(2, resumed.messages.items.len);
-    try std.testing.expectEqualStrings("system", resumed.messages.items[0].role);
-    try std.testing.expectEqualStrings("old prompt", resumed.messages.items[0].content.?);
-    try std.testing.expectEqualStrings("user", resumed.messages.items[1].role);
+    try std.testing.expectEqualStrings("system", resumed.string(resumed.messages.items[0].role).?);
+    try std.testing.expectEqualStrings("old prompt", resumed.string(resumed.messages.items[0].content).?);
+    try std.testing.expectEqualStrings("user", resumed.string(resumed.messages.items[1].role).?);
 }
 
 test "appendSystemPrompt only adds the prompt to an empty session" {
@@ -400,19 +673,21 @@ test "appendSystemPrompt only adds the prompt to an empty session" {
     defer tmp.cleanup();
 
     var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null);
+    defer session.deinit();
+
     try session.appendSystemPrompt("current prompt");
     try std.testing.expectEqual(1, session.messages.items.len);
-    try std.testing.expectEqualStrings("system", session.messages.items[0].role);
-    try std.testing.expectEqualStrings("current prompt", session.messages.items[0].content.?);
+    try std.testing.expectEqualStrings("system", session.string(session.messages.items[0].role).?);
+    try std.testing.expectEqualStrings("current prompt", session.string(session.messages.items[0].content).?);
 
     // A conversation that already has messages is never touched, even when it
     // has no system prompt of its own.
     try session.append(.{ .role = "user", .content = "hi" });
     try session.appendSystemPrompt("a different prompt");
     try std.testing.expectEqual(2, session.messages.items.len);
-    try std.testing.expectEqualStrings("system", session.messages.items[0].role);
-    try std.testing.expectEqualStrings("current prompt", session.messages.items[0].content.?);
-    try std.testing.expectEqualStrings("user", session.messages.items[1].role);
+    try std.testing.expectEqualStrings("system", session.string(session.messages.items[0].role).?);
+    try std.testing.expectEqualStrings("current prompt", session.string(session.messages.items[0].content).?);
+    try std.testing.expectEqualStrings("user", session.string(session.messages.items[1].role).?);
 }
 
 test "ensureTools stores the tools and only sets them once" {
@@ -475,6 +750,8 @@ test "ensureTools gives tools to a session saved without any" {
     } }};
 
     var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, "legacy");
+    defer session.deinit();
+
     try std.testing.expectEqual(0, session.tools.len);
     try session.ensureTools(&tools);
     try std.testing.expectEqual(1, session.tools.len);
@@ -491,6 +768,8 @@ test "the token totals survive a save and resume" {
     defer tmp.cleanup();
 
     var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null);
+    defer session.deinit();
+
     session.recordUsage(.{
         .prompt_tokens = 100,
         .completion_tokens = 10,
@@ -509,7 +788,9 @@ test "the token totals survive a save and resume" {
     }, 0.0002);
     try session.append(.{ .role = "assistant", .content = "hello" });
 
-    const resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, session.id);
+    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, session.id);
+    defer resumed.deinit();
+
     try std.testing.expectEqual(300, resumed.usage.prompt_tokens);
     try std.testing.expectEqual(30, resumed.usage.completion_tokens);
     try std.testing.expectEqual(270, resumed.usage.cache_hit_tokens);
@@ -557,12 +838,17 @@ test "a new session does not reuse an id whose file exists" {
     defer tmp.cleanup();
 
     var first = try Session.open(std.testing.io, tmp.dir, allocator, arena, null);
+    defer first.deinit();
     try first.append(.{ .role = "user", .content = "keep me" });
 
     var second = try Session.open(std.testing.io, tmp.dir, allocator, arena, null);
+    defer second.deinit();
     try second.append(.{ .role = "user", .content = "and me" });
 
     try std.testing.expect(!std.mem.eql(u8, first.id, second.id));
-    const resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, first.id);
-    try std.testing.expectEqualStrings("keep me", resumed.messages.items[0].content.?);
+
+    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, first.id);
+    defer resumed.deinit();
+
+    try std.testing.expectEqualStrings("keep me", resumed.string(resumed.messages.items[0].content).?);
 }

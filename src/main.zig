@@ -121,7 +121,7 @@ pub fn main(init: std.process.Init) !void {
         .style = billy.style.Style.detect(io),
     };
 
-    const directory = billy.session.defaultDir(arena, init.environ_map) catch |err| {
+    const directory = billy.Session.defaultDir(arena, init.environ_map) catch |err| {
         std.log.err("cannot find where to store sessions: {s}", .{@errorName(err)});
         return err;
     };
@@ -131,7 +131,7 @@ pub fn main(init: std.process.Init) !void {
     };
     defer sessions_dir.close(io);
 
-    var session = billy.session.Session.open(io, sessions_dir, arena, init.gpa, options.resume_id) catch |err| switch (err) {
+    var session = billy.Session.open(io, sessions_dir, arena, init.gpa, options.resume_id) catch |err| switch (err) {
         error.SessionNotFound => {
             std.log.err("no session '{s}' in {s}", .{ options.resume_id.?, directory });
             return err;
@@ -142,6 +142,7 @@ pub fn main(init: std.process.Init) !void {
         },
         else => return err,
     };
+    defer session.deinit();
 
     if (options.resume_id != null) {
         // Replay the conversation as a transcript, so the context does not
@@ -149,7 +150,7 @@ pub fn main(init: std.process.Init) !void {
         try billy.agent.printTranscript(
             arena,
             out,
-            session.messages.items,
+            try session.resolvedMessages(arena),
             config.format,
             config.markdown,
             config.style,
