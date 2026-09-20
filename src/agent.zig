@@ -190,6 +190,12 @@ pub fn run(
         const line = (try editor.readLine(header, prompt)) orelse break;
         if (line.len == 0) continue;
         try session.append(.{ .role = "user", .content = line });
+        // The line editor has erased the prompt it was typed behind, so the
+        // prompt is written out now as the block a replay shows: the `> ` belongs
+        // to the input, not to what was said. Flushed before the request, which
+        // may take a while, so the user sees what was sent.
+        try printPrompt(out, line, config.markdown, config.style);
+        try out.flush();
         // A failed request must not end the session: report it and take the
         // next request from the user.
         turn(io, &client, &tool_set, out, config, session) catch |err|
@@ -203,9 +209,9 @@ pub fn run(
 /// calls go through `tools.parseCall` and `tools.describe`, and the replies
 /// through `printAnswer`, the same as the ones the loop printed.
 ///
-/// A prompt is the one thing a replay shows differently from a live run: it is
-/// headed `» prompt` and laid out like a reply, without the `> ` the live input
-/// is typed behind, which is not part of the prompt.
+/// A prompt is headed and laid out by `printPrompt` here and in the loop alike,
+/// so a replayed one reads exactly as the one that was typed, without the `> `
+/// the input is typed behind.
 ///
 /// The conversation is read where it is stored, a message at a time, so replaying
 /// a long session costs no more than the largest message in it. `gpa` is for the
@@ -248,15 +254,12 @@ fn printMessage(
 ) !void {
     const role = session.roleOf(message);
     if (std.mem.eql(u8, role, "user")) {
-        // A prompt from the session is headed like everything else in the
-        // transcript, and its markdown is laid out the way a reply's is. The
-        // `> ` is not printed: it belongs to the live input alone, and is not
-        // part of the prompt until the user sends it.
+        // A prompt from the session opens a block like everything else in the
+        // transcript, after the blank line that separates it from what came
+        // before. The loop prints the same block, without that line, since the
+        // prompt it just erased already stood on its own row.
         try out.writeAll("\n");
-        try styling.header(marks.prompt, "prompt", "", style, out);
-        const text = session.contentOf(message) orelse "";
-        if (!try formatting.apply(markdown, text, out)) try out.writeAll(text);
-        return out.writeAll("\n");
+        return printPrompt(out, session.contentOf(message) orelse "", markdown, style);
     }
     if (!std.mem.eql(u8, role, "assistant")) return;
 
@@ -326,6 +329,16 @@ fn turn(
 fn rateNow(io: Io, config: Config) models.Price {
     const info = config.model_info orelse return .{};
     return info.priceAt(@intCast(Io.Clock.now(.real, io).toSeconds()));
+}
+
+/// Prints a prompt as its own block: the `» prompt` header, then the text, laid
+/// out by `markdown` when one is set. A live prompt and a replayed one are both
+/// printed by this, so the two read the same. The `> ` the line is typed behind
+/// is not part of the prompt and is not printed.
+fn printPrompt(out: *Io.Writer, text: []const u8, markdown: formatting.Format, style: styling.Style) !void {
+    try styling.header(marks.prompt, "prompt", "", style, out);
+    if (!try formatting.apply(markdown, text, out)) try out.writeAll(text);
+    try out.writeAll("\n");
 }
 
 /// Prints a reply under its own header, the markdown laid out by `markdown` when
@@ -466,6 +479,32 @@ test "a prompt from the session is headed and laid out like a reply" {
         null,
         .plain,
     );
+}
+
+test "a prompt is headed by the same block live and replayed" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // The block a replay shows, but with no blank line in front: it is printed
+    // where the line editor left the cursor, on the row the header stood on.
+    try printPrompt(&out.writer, "hello", null, .plain);
+    try std.testing.expectEqualStrings("» prompt\nhello\n", out.written());
+    out.clearRetainingCapacity();
+
+    // A prompt is markdown, so it is laid out by the same script as a reply.
+    const markdown: formatting.Format = .{
+        .script = "tr a-z A-Z",
+        .io = std.testing.io,
+        .gpa = gpa,
+    };
+    try printPrompt(&out.writer, "hello", markdown, .plain);
+    try std.testing.expectEqualStrings("» prompt\nHELLO\n", out.written());
+    out.clearRetainingCapacity();
+
+    // The `> ` the line was typed behind is not part of the block.
+    try printPrompt(&out.writer, "hello", null, .ansi);
+    try std.testing.expectEqualStrings("\x1b[34m»\x1b[0m \x1b[1mprompt\x1b[0m\nhello\n", out.written());
 }
 
 test "an empty reply is shown under its header, in place of the text" {

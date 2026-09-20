@@ -73,10 +73,12 @@ pub const LineEditor = struct {
     /// Reads one line, echoing and editing it in the terminal.
     ///
     /// `header` is shown on its own line above the prompt while the line is being
-    /// edited and is removed again once the line is submitted, so it never ends up
-    /// in the output. `prompt` is printed in front of the line and is what stays.
-    /// Neither may contain a newline. When stdin is not a terminal there is no
-    /// editing to show a header for, so only the prompt is printed.
+    /// edited. Both it and the `prompt` in front of the line belong to the editing
+    /// alone: on submit the whole region is erased, leaving the cursor where it
+    /// stood, so nothing of the input is left in the output. The caller prints
+    /// what the line was in its place. Neither may contain a newline. When stdin
+    /// is not a terminal there is no line being typed, so neither is shown, and it
+    /// is left to the caller to write the line out.
     ///
     /// Returns null when stdin is exhausted: end of a piped stdin, or Ctrl-D on
     /// an empty line. The returned slice is allocated with the arena.
@@ -85,15 +87,19 @@ pub const LineEditor = struct {
         // The width is only wanted to fold a line being edited, which cannot
         // happen without a terminal.
         ed.width = if (interactive) ed.terminalWidth() else 0;
-        // Start on a fresh line, then the header, then the prompt the user types
+        // Start on a fresh line, then the header and the prompt the user types
         // behind. The leading newline also ends the previous line after a piped
-        // read, which has no echo to do that.
+        // read, which has no echo to do that. With no terminal there is no line
+        // being typed, so neither the header nor the prompt is shown: the caller
+        // prints the line it read as the block a replay would.
         try ed.out.writeAll("\n");
-        if (interactive and header.len > 0) {
-            try ed.out.writeAll(header);
-            try ed.out.writeAll("\n");
+        if (interactive) {
+            if (header.len > 0) {
+                try ed.out.writeAll(header);
+                try ed.out.writeAll("\n");
+            }
+            try ed.out.writeAll(prompt);
         }
-        try ed.out.writeAll(prompt);
         try ed.out.flush();
 
         if (!interactive) return ed.readLinePiped();
@@ -101,7 +107,10 @@ pub const LineEditor = struct {
         const saved = try ed.enterRaw();
         defer std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, saved) catch {};
 
-        ed.last_rows = 0;
+        // The prompt alone is what is on screen before any key arrives, and it is
+        // one row: an empty line submitted without a redraw is still measured, so
+        // the region can be erased from the start.
+        ed.last_rows = 1;
         ed.last_cursor_row = 0;
         ed.goal_col = null;
         ed.painted_width = ed.width;
@@ -147,8 +156,14 @@ pub const LineEditor = struct {
                     dirty = true;
                 },
                 .enter => {
+                    // The whole prompt is erased, and no newline is written: the
+                    // caller prints the prompt's own block in its place, and that
+                    // block ends the line.
                     try ed.endPrompt(header);
-                    try ed.out.writeAll("\r\n");
+                    // An empty line says nothing, so the row the prompt stood on is
+                    // given back too and the next prompt draws over the same place,
+                    // rather than leaving a blank line behind.
+                    if (line.items.len == 0) try ed.out.print("\x1b[1A", .{});
                     try ed.out.flush();
                     return @as(?[]const u8, try ed.submit(line.items));
                 },
@@ -389,24 +404,23 @@ pub const LineEditor = struct {
         try ed.out.flush();
     }
 
-    /// Ends the editable line, leaving the cursor at the start of the last row of
-    /// the line on screen. The header belongs to the editable prompt alone, so it
-    /// is deleted here: the submitted line then reads as a plain `> ` line, the
-    /// same way a resumed session replays it.
+    /// Ends the editable line by erasing the whole region it painted. The header
+    /// and the line typed under it are both deleted, and the cursor is left at the
+    /// start of the first row they occupied, so the caller prints the prompt in
+    /// their place. What the region held is the editing of the line, not what was
+    /// said, so none of it is left behind.
     fn endPrompt(ed: *LineEditor, header: []const u8) !void {
-        // The header sits directly above the prompt region, and may itself span
-        // several rows on a narrow terminal, so every one of them is deleted to
-        // move the region up into the space they held.
+        // The header sits directly above the prompt region and may itself span
+        // several rows on a narrow terminal, so both it and the line are deleted,
+        // moving the cursor up into the space they held. The cursor starts within
+        // the line, so the walk up is past its own row and then the header's.
         const header_rows = ed.headerRows(header);
-        if (header_rows == 0) {
-            try ed.moveToRegionBottom();
-            return;
-        }
-        try ed.out.print("\x1b[{d}A", .{ed.last_cursor_row + header_rows});
+        const deleted = header_rows + ed.last_rows;
+        if (deleted == 0) return;
+        const up = ed.last_cursor_row + header_rows;
+        if (up > 0) try ed.out.print("\x1b[{d}A", .{up});
         try ed.out.writeAll("\r");
-        try ed.out.print("\x1b[{d}M", .{header_rows});
-        // The cursor sits on the region's first row now; walk down to its last.
-        if (ed.last_rows > 1) try ed.out.print("\x1b[{d}B", .{ed.last_rows - 1});
+        try ed.out.print("\x1b[{d}M", .{deleted});
         try ed.out.writeAll("\r");
     }
 
@@ -452,15 +466,6 @@ pub const LineEditor = struct {
         const columns_wide = visibleWidth(header);
         if (ed.width == 0 or columns_wide == 0) return 1;
         return (columns_wide + ed.width - 1) / ed.width;
-    }
-
-    /// Moves the cursor to the first column of the last row of the render, so a
-    /// following newline lands below the whole prompt.
-    fn moveToRegionBottom(ed: *LineEditor) !void {
-        if (ed.last_rows == 0) return;
-        const down = ed.last_rows - 1 - ed.last_cursor_row;
-        if (down > 0) try ed.out.print("\x1b[{d}B", .{down});
-        try ed.out.writeAll("\r");
     }
 
     /// Replaces the line with a history entry. `direction` is -1 for older, 1
@@ -825,44 +830,47 @@ test "visibleWidth ignores ANSI escapes" {
     try std.testing.expectEqual(3, visibleWidth("a·b"));
 }
 
-test "endPrompt deletes the header row and lands below the line" {
+test "endPrompt erases the header and the line it heads" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var ed = LineEditor.init(std.testing.io, &out.writer, gpa);
 
-    // One row of input: up to the header, delete it, then down a line.
+    // One row of input: up to the header, delete it and the line, back to column
+    // zero where the prompt's own block is printed.
     ed.last_rows = 1;
     ed.last_cursor_row = 0;
     try ed.endPrompt("billy · m · /w");
-    try std.testing.expectEqualStrings("\x1b[1A\r\x1b[1M\r", out.written());
+    try std.testing.expectEqualStrings("\x1b[1A\r\x1b[2M\r", out.written());
     out.clearRetainingCapacity();
 
-    // Three rows of input with the cursor on the last: the region moves up one
-    // row and the cursor walks down to the bottom of it.
+    // Three rows of input with the cursor on the last: the whole region is taken
+    // back, five rows counting the header, from the cursor up to the top.
     ed.last_rows = 3;
     ed.last_cursor_row = 2;
     try ed.endPrompt("billy · m · /w");
-    try std.testing.expectEqualStrings("\x1b[3A\r\x1b[1M\x1b[2B\r", out.written());
+    try std.testing.expectEqualStrings("\x1b[3A\r\x1b[4M\r", out.written());
     out.clearRetainingCapacity();
 
-    // A header wider than the terminal is deleted a row at a time, however many
-    // rows it takes; the ten column terminal folds the 16 column header in two.
+    // A header wider than the terminal folds, so its rows count too; the ten
+    // column terminal folds the 16 column header in two, and both are erased
+    // along with the line below them.
     ed.width = 10;
     ed.last_rows = 1;
     ed.last_cursor_row = 0;
     try ed.endPrompt("billy · m · /work");
-    try std.testing.expectEqualStrings("\x1b[2A\r\x1b[2M\r", out.written());
+    try std.testing.expectEqualStrings("\x1b[2A\r\x1b[3M\r", out.written());
     out.clearRetainingCapacity();
     ed.width = 0;
 
-    // Without a header only the cursor moves, as before.
+    // Without a header only the line is erased.
     ed.last_rows = 3;
     ed.last_cursor_row = 1;
     try ed.endPrompt("");
-    try std.testing.expectEqualStrings("\x1b[1B\r", out.written());
+    try std.testing.expectEqualStrings("\x1b[1A\r\x1b[3M\r", out.written());
     out.clearRetainingCapacity();
 
+    // Nothing painted, nothing to erase.
     ed.last_rows = 0;
     ed.last_cursor_row = 0;
     try ed.endPrompt("");
