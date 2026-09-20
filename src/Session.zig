@@ -12,6 +12,8 @@ const std = @import("std");
 const Io = std.Io;
 const llm = @import("llm.zig");
 
+const Session = @This();
+
 /// Directory under the XDG data directory that holds the sessions.
 const app_dir = "billy";
 /// Extension of a session file.
@@ -37,164 +39,162 @@ const Stored = struct {
     cost: f64 = 0,
 };
 
-pub const Session = struct {
+io: Io,
+/// Directory holding the session files. Owned by the caller.
+dir: Io.Dir,
+/// Owns the id, the name and the messages.
+arena: std.mem.Allocator,
+/// For temporary buffers, freed on the way out.
+gpa: std.mem.Allocator,
+/// Names the session; also its file name without the extension.
+id: []const u8,
+/// Name of the session file inside `dir`.
+name: []const u8,
+/// The conversation, oldest first, starting with the system prompt.
+messages: std.ArrayList(llm.Message) = .empty,
+/// The tool definitions sent with every request. Stored in the session so a
+/// resume offers the model the same tools as the run it continues.
+tools: []const llm.Tool = &.{},
+/// Tokens billed over the whole session, summed over every request, so the
+/// cost of a resumed session includes what earlier runs spent.
+usage: llm.Usage = .{},
+/// Tokens in the conversation as of the last request.
+context_tokens: usize = 0,
+/// What the session has cost so far, in USD. Accumulated request by request
+/// because the rate depends on the time of the request, which the token
+/// totals alone could not recover.
+cost: f64 = 0,
+
+/// Opens the session called `resume_id`, or starts a new one when it is null.
+///
+/// Fails with `error.SessionNotFound` when the session is missing, and with
+/// `error.InvalidSessionId` when `resume_id` is not a usable name.
+pub fn open(
     io: Io,
-    /// Directory holding the session files. Owned by the caller.
     dir: Io.Dir,
-    /// Owns the id, the name and the messages.
     arena: std.mem.Allocator,
-    /// For temporary buffers, freed on the way out.
     gpa: std.mem.Allocator,
-    /// Names the session; also its file name without the extension.
-    id: []const u8,
-    /// Name of the session file inside `dir`.
-    name: []const u8,
-    /// The conversation, oldest first, starting with the system prompt.
-    messages: std.ArrayList(llm.Message) = .empty,
-    /// The tool definitions sent with every request. Stored in the session so a
-    /// resume offers the model the same tools as the run it continues.
-    tools: []const llm.Tool = &.{},
-    /// Tokens billed over the whole session, summed over every request, so the
-    /// cost of a resumed session includes what earlier runs spent.
-    usage: llm.Usage = .{},
-    /// Tokens in the conversation as of the last request.
-    context_tokens: usize = 0,
-    /// What the session has cost so far, in USD. Accumulated request by request
-    /// because the rate depends on the time of the request, which the token
-    /// totals alone could not recover.
-    cost: f64 = 0,
+    resume_id: ?[]const u8,
+) !Session {
+    const id = if (resume_id) |name|
+        try checkedId(arena, name)
+    else
+        try unusedId(io, dir, arena);
+    var session: Session = .{
+        .io = io,
+        .dir = dir,
+        .arena = arena,
+        .gpa = gpa,
+        .id = id,
+        .name = try std.fmt.allocPrint(arena, "{s}{s}", .{ id, extension }),
+    };
+    if (resume_id != null) try session.load();
+    return session;
+}
 
-    /// Opens the session called `resume_id`, or starts a new one when it is null.
-    ///
-    /// Fails with `error.SessionNotFound` when the session is missing, and with
-    /// `error.InvalidSessionId` when `resume_id` is not a usable name.
-    pub fn open(
-        io: Io,
-        dir: Io.Dir,
-        arena: std.mem.Allocator,
-        gpa: std.mem.Allocator,
-        resume_id: ?[]const u8,
-    ) !Session {
-        const id = if (resume_id) |name|
-            try checkedId(arena, name)
-        else
-            try unusedId(io, dir, arena);
-        var session: Session = .{
-            .io = io,
-            .dir = dir,
-            .arena = arena,
-            .gpa = gpa,
-            .id = id,
-            .name = try std.fmt.allocPrint(arena, "{s}{s}", .{ id, extension }),
-        };
-        if (resume_id != null) try session.load();
-        return session;
-    }
+/// Adds a message to the conversation and writes the session out, so the
+/// next run sees it even if this one is killed.
+pub fn append(session: *Session, message: llm.Message) !void {
+    try session.messages.append(session.arena, message);
+    try session.save();
+}
 
-    /// Adds a message to the conversation and writes the session out, so the
-    /// next run sees it even if this one is killed.
-    pub fn append(session: *Session, message: llm.Message) !void {
+/// Appends `system_prompt` to an empty conversation, leaving one that has any
+/// messages alone. Calling it before the first turn puts the prompt first; a
+/// resumed session already carries the prompt it was saved with, which is
+/// kept so the messages sent match the earlier run byte for byte and hit the
+/// prompt cache.
+pub fn appendSystemPrompt(session: *Session, system_prompt: []const u8) !void {
+    if (session.messages.items.len != 0) return;
+    try session.append(.{ .role = "system", .content = system_prompt });
+}
+
+/// Records the tool definitions to send with every request, unless the
+/// session already has some. A resumed session carries the tools it was
+/// saved with, which are kept so the request matches the earlier run and
+/// hits the prompt cache; a new session, or one saved before the tools were
+/// stored, gets the current definitions instead.
+pub fn ensureTools(session: *Session, tools: []const llm.Tool) !void {
+    if (session.tools.len != 0) return;
+    session.tools = tools;
+    try session.save();
+}
+
+/// Adds a request's tokens and cost to the session totals and remembers how
+/// full the context window is. The totals reach the file with the next save,
+/// which follows every message.
+///
+/// `cost` is priced by the caller, which knows the rates that applied when
+/// the request was made; the session only accumulates it, so a session that
+/// spans a rate change is billed at the rates it actually ran under.
+pub fn recordUsage(session: *Session, usage: llm.Usage, cost: f64) void {
+    session.usage = session.usage.plus(usage);
+    session.context_tokens = usage.total_tokens;
+    session.cost += cost;
+}
+
+/// Writes the conversation to the session file. The previous contents are
+/// replaced in one step, leaving them intact if writing fails part way.
+pub fn save(session: *Session) !void {
+    var text: std.Io.Writer.Allocating = .init(session.gpa);
+    defer text.deinit();
+
+    var json: std.json.Stringify = .{
+        .writer = &text.writer,
+        .options = .{ .emit_null_optional_fields = false },
+    };
+    try json.beginObject();
+    try json.objectField("version");
+    try json.write(format_version);
+    try json.objectField("messages");
+    try json.beginArray();
+    for (session.messages.items) |message| try json.write(message);
+    try json.endArray();
+    try json.objectField("tools");
+    try json.write(session.tools);
+    try json.objectField("usage");
+    try json.write(session.usage);
+    try json.objectField("context_tokens");
+    try json.write(session.context_tokens);
+    try json.objectField("cost");
+    try json.write(session.cost);
+    try json.endObject();
+
+    var atomic = try session.dir.createFileAtomic(session.io, session.name, .{ .replace = true });
+    defer atomic.deinit(session.io);
+    var buffer: [4096]u8 = undefined;
+    var file: Io.File.Writer = .init(atomic.file, session.io, &buffer);
+    try file.interface.writeAll(text.written());
+    try file.flush();
+    try atomic.replace(session.io);
+}
+
+/// Reads the conversation of an existing session into `messages`.
+fn load(session: *Session) !void {
+    const text = session.dir.readFileAlloc(
+        session.io,
+        session.name,
+        session.arena,
+        .limited(max_session_bytes),
+    ) catch |err| switch (err) {
+        error.FileNotFound => return error.SessionNotFound,
+        else => return err,
+    };
+    const stored = std.json.parseFromSliceLeaky(Stored, session.arena, text, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return error.CorruptSession;
+    if (stored.version > format_version) return error.UnsupportedSessionVersion;
+    // The stored messages are kept as they are, system prompt included, so
+    // resuming reuses exactly what the earlier run sent.
+    for (stored.messages) |message| {
         try session.messages.append(session.arena, message);
-        try session.save();
     }
-
-    /// Appends `system_prompt` to an empty conversation, leaving one that has any
-    /// messages alone. Calling it before the first turn puts the prompt first; a
-    /// resumed session already carries the prompt it was saved with, which is
-    /// kept so the messages sent match the earlier run byte for byte and hit the
-    /// prompt cache.
-    pub fn appendSystemPrompt(session: *Session, system_prompt: []const u8) !void {
-        if (session.messages.items.len != 0) return;
-        try session.append(.{ .role = "system", .content = system_prompt });
-    }
-
-    /// Records the tool definitions to send with every request, unless the
-    /// session already has some. A resumed session carries the tools it was
-    /// saved with, which are kept so the request matches the earlier run and
-    /// hits the prompt cache; a new session, or one saved before the tools were
-    /// stored, gets the current definitions instead.
-    pub fn ensureTools(session: *Session, tools: []const llm.Tool) !void {
-        if (session.tools.len != 0) return;
-        session.tools = tools;
-        try session.save();
-    }
-
-    /// Adds a request's tokens and cost to the session totals and remembers how
-    /// full the context window is. The totals reach the file with the next save,
-    /// which follows every message.
-    ///
-    /// `cost` is priced by the caller, which knows the rates that applied when
-    /// the request was made; the session only accumulates it, so a session that
-    /// spans a rate change is billed at the rates it actually ran under.
-    pub fn recordUsage(session: *Session, usage: llm.Usage, cost: f64) void {
-        session.usage = session.usage.plus(usage);
-        session.context_tokens = usage.total_tokens;
-        session.cost += cost;
-    }
-
-    /// Writes the conversation to the session file. The previous contents are
-    /// replaced in one step, leaving them intact if writing fails part way.
-    pub fn save(session: *Session) !void {
-        var text: std.Io.Writer.Allocating = .init(session.gpa);
-        defer text.deinit();
-
-        var json: std.json.Stringify = .{
-            .writer = &text.writer,
-            .options = .{ .emit_null_optional_fields = false },
-        };
-        try json.beginObject();
-        try json.objectField("version");
-        try json.write(format_version);
-        try json.objectField("messages");
-        try json.beginArray();
-        for (session.messages.items) |message| try json.write(message);
-        try json.endArray();
-        try json.objectField("tools");
-        try json.write(session.tools);
-        try json.objectField("usage");
-        try json.write(session.usage);
-        try json.objectField("context_tokens");
-        try json.write(session.context_tokens);
-        try json.objectField("cost");
-        try json.write(session.cost);
-        try json.endObject();
-
-        var atomic = try session.dir.createFileAtomic(session.io, session.name, .{ .replace = true });
-        defer atomic.deinit(session.io);
-        var buffer: [4096]u8 = undefined;
-        var file: Io.File.Writer = .init(atomic.file, session.io, &buffer);
-        try file.interface.writeAll(text.written());
-        try file.flush();
-        try atomic.replace(session.io);
-    }
-
-    /// Reads the conversation of an existing session into `messages`.
-    fn load(session: *Session) !void {
-        const text = session.dir.readFileAlloc(
-            session.io,
-            session.name,
-            session.arena,
-            .limited(max_session_bytes),
-        ) catch |err| switch (err) {
-            error.FileNotFound => return error.SessionNotFound,
-            else => return err,
-        };
-        const stored = std.json.parseFromSliceLeaky(Stored, session.arena, text, .{
-            .ignore_unknown_fields = true,
-            .allocate = .alloc_always,
-        }) catch return error.CorruptSession;
-        if (stored.version > format_version) return error.UnsupportedSessionVersion;
-        // The stored messages are kept as they are, system prompt included, so
-        // resuming reuses exactly what the earlier run sent.
-        for (stored.messages) |message| {
-            try session.messages.append(session.arena, message);
-        }
-        session.tools = stored.tools;
-        session.usage = stored.usage;
-        session.context_tokens = stored.context_tokens;
-        session.cost = stored.cost;
-    }
-};
+    session.tools = stored.tools;
+    session.usage = stored.usage;
+    session.context_tokens = stored.context_tokens;
+    session.cost = stored.cost;
+}
 
 /// The directory holding the sessions: `$XDG_DATA_HOME/billy`, or
 /// `$HOME/.local/share/billy` when that is unset, as the XDG base directory

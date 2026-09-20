@@ -7,7 +7,7 @@ const llm = @import("llm.zig");
 const models = @import("models.zig");
 const tools = @import("tools.zig");
 const line_editor = @import("line_editor.zig");
-const session_mod = @import("session.zig");
+const Session = @import("Session.zig");
 const formatting = @import("format.zig");
 const styling = @import("style.zig");
 
@@ -163,7 +163,7 @@ pub fn run(
     gpa: std.mem.Allocator,
     out: *Io.Writer,
     config: Config,
-    session: *session_mod.Session,
+    session: *Session,
 ) !void {
     var editor = line_editor.LineEditor.init(io, out, arena);
     var tool_set = try tools.Tools.init(io, arena, gpa, out, config.format, config.style);
@@ -272,7 +272,7 @@ fn turn(
     tool_set: *tools.Tools,
     out: *Io.Writer,
     config: Config,
-    session: *session_mod.Session,
+    session: *Session,
 ) !void {
     var remaining: usize = config.max_turns;
     while (remaining > 0) : (remaining -= 1) {
