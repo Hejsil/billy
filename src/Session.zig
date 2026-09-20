@@ -211,9 +211,74 @@ pub fn deinit(session: *Session) void {
     session.messages.deinit(session.gpa);
 }
 
+/// The conversation as a completion request carries it: the `messages` array of
+/// a request body, written straight out of the pool.
+///
+/// A request takes one of these instead of a resolved copy of the conversation,
+/// so that sending what a session holds allocates nothing but the body itself,
+/// and the strings are read where they were stored rather than pointed at from
+/// a second array of slices.
+///
+/// The field order and the fields left out are the ones `llm.Message` produces,
+/// so the body is the same either way.
+pub const Conversation = struct {
+    session: *const Session,
+
+    pub fn jsonStringify(self: Conversation, json: anytype) !void {
+        const session = self.session;
+        try json.beginArray();
+        for (session.messages.items) |message| {
+            try json.beginObject();
+            try json.objectField("role");
+            try json.write(session.string(message.role) orelse "");
+
+            if (session.string(message.content)) |content| {
+                try json.objectField("content");
+                try json.write(content);
+            }
+
+            const calls = message.tool_calls.resolve(session);
+            if (calls.len > 0) {
+                try json.objectField("tool_calls");
+                try json.beginArray();
+                for (calls) |call| {
+                    try json.beginObject();
+                    try json.objectField("id");
+                    try json.write(session.string(call.id) orelse "");
+                    try json.objectField("type");
+                    try json.write(session.string(call.type) orelse "");
+                    try json.objectField("function");
+                    try json.beginObject();
+                    try json.objectField("name");
+                    try json.write(session.string(call.function.name) orelse "");
+                    try json.objectField("arguments");
+                    try json.write(session.string(call.function.arguments) orelse "");
+                    try json.endObject();
+                    try json.endObject();
+                }
+                try json.endArray();
+            }
+
+            if (session.string(message.tool_call_id)) |tool_call_id| {
+                try json.objectField("tool_call_id");
+                try json.write(tool_call_id);
+            }
+            try json.endObject();
+        }
+        try json.endArray();
+    }
+};
+
+/// The conversation as a request carries it, for passing to a client without
+/// resolving it first. The returned value borrows the session.
+pub fn conversation(session: *const Session) Conversation {
+    return .{ .session = session };
+}
+
 /// The conversation as the API client sends it, every string resolved out of the
 /// pool. `allocator` owns the result, since resolving a message has to piece its
-/// tool calls back together.
+/// tool calls back together. Only for a caller that needs the messages
+/// themselves; a request is built from `conversation` instead.
 pub fn resolvedMessages(session: *const Session, allocator: std.mem.Allocator) ![]const llm.Message {
     const messages = try allocator.alloc(llm.Message, session.messages.items.len);
     for (session.messages.items, messages) |message, *out| {
@@ -596,6 +661,60 @@ test "a session survives a save and resume" {
             try std.testing.expectEqualStrings(expected_call.function.arguments, actual_call.function.arguments);
         }
     }
+}
+
+test "a conversation writes the messages a request would have carried" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, allocator, null);
+    defer session.deinit();
+
+    // A message of every shape: an optional left out, one filled in, and a call
+    // alongside the result that answers it.
+    try session.append(.{ .role = "system", .content = "be terse" });
+    try session.append(.{ .role = "user", .content = "hello" });
+    try session.append(.{ .role = "assistant", .tool_calls = &.{.{
+        .id = "call_1",
+        .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" },
+    }} });
+    try session.append(.{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;\n" });
+
+    // Writing the stored conversation has to give the bytes the resolved one
+    // does, field for field and in the same order, or a resumed session would
+    // send a request that misses its prompt cache.
+    var scratch_state = std.heap.ArenaAllocator.init(gpa);
+    defer scratch_state.deinit();
+    const resolved = try session.resolvedMessages(scratch_state.allocator());
+
+    const via_messages = try std.json.Stringify.valueAlloc(
+        gpa,
+        resolved,
+        .{ .emit_null_optional_fields = false },
+    );
+    defer gpa.free(via_messages);
+
+    const via_conversation = try std.json.Stringify.valueAlloc(
+        gpa,
+        session.conversation(),
+        .{ .emit_null_optional_fields = false },
+    );
+    defer gpa.free(via_conversation);
+
+    try std.testing.expectEqualStrings(via_messages, via_conversation);
+    try std.testing.expectEqualStrings(
+        "[{\"role\":\"system\",\"content\":\"be terse\"}," ++
+            "{\"role\":\"user\",\"content\":\"hello\"}," ++
+            "{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\"," ++
+            "\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.zig\\\"}\"}}]}," ++
+            "{\"role\":\"tool\",\"content\":\"1\\tconst x = 1;\\n\",\"tool_call_id\":\"call_1\"}]",
+        via_conversation,
+    );
 }
 
 test "an equal string is interned once and shared" {

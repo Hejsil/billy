@@ -64,12 +64,20 @@ pub const Completion = struct {
     usage: Usage,
 };
 
-const Request = struct {
-    model: []const u8,
-    messages: []const Message,
-    tools: []const Tool,
-    stream: bool = false,
-};
+/// The body of one completion request.
+///
+/// `Messages` is whatever the conversation is held as, which only has to be
+/// able to write itself into the format the API takes. That is what lets a
+/// conversation be sent from where it is stored instead of being resolved into
+/// a second copy of itself first.
+fn Request(comptime Messages: type) type {
+    return struct {
+        model: []const u8,
+        messages: Messages,
+        tools: []const Tool,
+        stream: bool = false,
+    };
+}
 
 /// Token counts as the API reports them. Kept apart from `Usage` because the
 /// fields differ between providers, and each normalizes to the same shape.
@@ -120,16 +128,21 @@ pub const Client = struct {
     /// Sends the conversation and returns the next assistant message together
     /// with the tokens the request used.
     ///
+    /// `messages` is the conversation in whatever form the caller keeps it, so
+    /// long as it writes itself into the format the API takes: a slice of
+    /// `Message`, or the session's own stored messages. Nothing is allocated to
+    /// put the conversation into the request beyond the body itself.
+    ///
     /// `arena` holds the parsed response, which has to outlive the response
     /// buffer but need not outlive the caller's use of it: the session interns
     /// what it keeps, so an arena dropped with the request is enough.
     pub fn complete(
         client: *Client,
         arena: std.mem.Allocator,
-        messages: []const Message,
+        messages: anytype,
         tools: []const Tool,
     ) !Completion {
-        const body = try std.json.Stringify.valueAlloc(client.gpa, Request{
+        const body = try std.json.Stringify.valueAlloc(client.gpa, Request(@TypeOf(messages)){
             .model = client.model,
             .messages = messages,
             .tools = tools,

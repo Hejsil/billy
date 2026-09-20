@@ -276,16 +276,15 @@ fn turn(
     var remaining: usize = config.max_turns;
     while (remaining > 0) : (remaining -= 1) {
         // Everything that only has to last the request is allocated here and
-        // dropped when the turn ends: the conversation that is sent, the reply
-        // that comes back and the result of every call it asked for. The
-        // session interns the strings it keeps, so the pool is the only copy
-        // that outlives the turn.
+        // dropped when the turn ends: the reply that comes back and the result
+        // of every call it asked for. The conversation is written into the body
+        // straight out of the pool, and the session interns what it keeps, so
+        // the pool is the only copy that outlives the turn.
         var request_arena = std.heap.ArenaAllocator.init(client.gpa);
         defer request_arena.deinit();
         const request = request_arena.allocator();
 
-        const messages = try session.resolvedMessages(request);
-        const completion = try client.complete(request, messages, session.tools);
+        const completion = try client.complete(request, session.conversation(), session.tools);
         // The totals are recorded first, so the save inside `append` stores them
         // along with the message. Each request is priced as it is made, at the
         // rates in effect then, so a session running through a rate change is
