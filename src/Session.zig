@@ -215,9 +215,9 @@ pub fn deinit(session: *Session) void {
 /// a request body, written straight out of the pool.
 ///
 /// A request takes one of these instead of a resolved copy of the conversation,
-/// so that sending what a session holds allocates nothing but the body itself,
-/// and the strings are read where they were stored rather than pointed at from
-/// a second array of slices.
+/// so that sending what a session holds allocates nothing at all: the messages
+/// are written straight onto the connection, and the strings are read where they
+/// were stored rather than pointed at from a second array of slices.
 ///
 /// The field order and the fields left out are the ones `llm.Message` produces,
 /// so the body is the same either way.
