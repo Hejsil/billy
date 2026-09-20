@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const search = @import("search.zig");
 
 /// Directory under the XDG config directory that holds the configuration.
 const app_dir = "billy";
@@ -21,6 +22,8 @@ const max_config_bytes = 1 << 20;
 
 /// Turns the model is allowed per request when the file asks for nothing else.
 pub const default_max_turns = 100;
+/// Results asked for per search query when the file asks for nothing else.
+pub const default_max_results = 5;
 
 pub const Config = struct {
     /// Model turns allowed for one request before the harness gives up on it.
@@ -94,6 +97,24 @@ pub const Config = struct {
 /// Settings for the tools the agent can call, one group per tool.
 pub const Tools = struct {
     bash: Bash = .{},
+    web_search: WebSearch = .{},
+};
+
+/// Settings for the web search tool.
+pub const WebSearch = struct {
+    /// The backend to search with, or null to leave web search out of the tools
+    /// the model is offered, which is the default: a fresh configuration has no
+    /// key to search with. The names are the variants of `search.Provider`, and
+    /// one it does not know makes the file corrupt rather than reading as "no
+    /// search".
+    ///
+    /// The key a backend needs is read from its environment variable, named by
+    /// `Provider.keyVariable`, and never from this file, which is written to
+    /// disk in the clear.
+    provider: ?search.Provider = null,
+    /// Results asked for per query. The backend may return fewer, and billy caps
+    /// it.
+    max_results: usize = default_max_results,
 };
 
 /// Settings for the bash tool.
@@ -257,6 +278,38 @@ test "open leaves the bash format unset when the file does not set one" {
     try std.testing.expect(explicit.config.tools.bash.format == null);
 }
 
+test "open reads the web search provider and result count from the file" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = file_name,
+        .data = "{\"tools\":{\"web_search\":{\"provider\":\"tavily\",\"max_results\":3}}}",
+    });
+
+    const opened = try Config.open(std.testing.io, tmp.dir, allocator);
+    try std.testing.expectEqual(search.Provider.tavily, opened.config.tools.web_search.provider.?);
+    try std.testing.expectEqual(3, opened.config.tools.web_search.max_results);
+
+    // The defaults leave it off, and the count ready for a provider to be named.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{}" });
+    const bare = try Config.open(std.testing.io, tmp.dir, allocator);
+    try std.testing.expect(bare.config.tools.web_search.provider == null);
+    try std.testing.expectEqual(default_max_results, bare.config.tools.web_search.max_results);
+
+    // A name that is not a backend makes the file unusable rather than reading
+    // as "no search", so a typo is not silently dropped.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = file_name,
+        .data = "{\"tools\":{\"web_search\":{\"provider\":\"google\"}}}",
+    });
+    try std.testing.expectError(error.CorruptConfig, Config.open(std.testing.io, tmp.dir, allocator));
+}
+
 test "save round-trips a custom max_turns" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -270,6 +323,26 @@ test "save round-trips a custom max_turns" {
 
     const opened = try Config.open(std.testing.io, tmp.dir, allocator);
     try std.testing.expectEqual(3, opened.config.max_turns);
+}
+
+test "save round-trips a configured search backend" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The backend is written by name, which is the variant's own, and read back
+    // as the variant it names.
+    var config: Config = .{};
+    config.tools.web_search = .{ .provider = .tavily, .max_results = 4 };
+    try config.save(std.testing.io, tmp.dir, gpa);
+
+    const opened = try Config.open(std.testing.io, tmp.dir, allocator);
+    try std.testing.expectEqual(search.Provider.tavily, opened.config.tools.web_search.provider.?);
+    try std.testing.expectEqual(4, opened.config.tools.web_search.max_results);
 }
 
 test "open rejects damaged, future and unusable configurations" {

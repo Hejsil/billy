@@ -3,6 +3,7 @@
 const std = @import("std");
 const Io = std.Io;
 const llm = @import("llm.zig");
+const search = @import("search.zig");
 const formatting = @import("format.zig");
 const styling = @import("style.zig");
 
@@ -35,6 +36,7 @@ pub const Call = union(enum) {
     write: Write,
     edit: Edit,
     bash: Bash,
+    web_search: WebSearch,
     /// A call naming a tool this harness does not implement.
     unknown: []const u8,
     /// A known tool whose arguments could not be read; `name` is still known.
@@ -64,6 +66,10 @@ pub const Call = union(enum) {
         command: []const u8,
     };
 
+    pub const WebSearch = struct {
+        query: []const u8,
+    };
+
     pub const Malformed = struct {
         name: []const u8,
         reason: anyerror,
@@ -82,11 +88,18 @@ pub const Tools = struct {
     /// How the lines billy prints itself are decorated. Shared with the
     /// transcript, so a replayed session looks like the run it continues.
     style: Style,
+    /// The web search client, or null when no backend is configured. A null
+    /// leaves `web_search` out of `definitions`, so the model is never offered
+    /// a tool that could not run.
+    search: ?search.Client,
     definitions: []const llm.Tool,
 
     /// `arena` holds the definitions, which are sent with every request and so
     /// live as long as the run. Nothing else the tools allocate outlives the
     /// call that made it, so the rest is asked for per call.
+    ///
+    /// `search_config` is the backend the configuration asked for, with its key
+    /// resolved, or null to leave web search out.
     pub fn init(
         io: Io,
         arena: std.mem.Allocator,
@@ -94,6 +107,7 @@ pub const Tools = struct {
         log: *Io.Writer,
         format: Format,
         style: Style,
+        search_config: ?search.Config,
     ) !Tools {
         return .{
             .io = io,
@@ -101,7 +115,14 @@ pub const Tools = struct {
             .log = log,
             .format = format,
             .style = style,
-            .definitions = try definitions(arena),
+            .search = if (search_config) |config| .{
+                .io = io,
+                .gpa = gpa,
+                .provider = config.provider,
+                .api_key = config.api_key,
+                .max_results = config.max_results,
+            } else null,
+            .definitions = try definitions(arena, search_config != null),
         };
     }
 
@@ -127,6 +148,7 @@ pub const Tools = struct {
             .write => |args| try tools.write(arena, args),
             .edit => |args| try tools.edit(arena, args),
             .bash => |args| try tools.bash(arena, args),
+            .web_search => |args| try tools.webSearch(arena, args),
             .unknown => |name| try fail(arena, "unknown tool '{s}'", .{name}),
             .malformed => |bad| try fail(
                 arena,
@@ -256,6 +278,15 @@ pub const Tools = struct {
         }
         return finish(arena, out.written());
     }
+
+    /// Runs one web search and returns its results as text. No backend is
+    /// configured only when a resumed session carries the tool from a run that
+    /// had one; the model is told so rather than the call failing outright.
+    fn webSearch(tools: *Tools, arena: std.mem.Allocator, args: Call.WebSearch) ![]const u8 {
+        const client = if (tools.search) |*client| client else return fail(arena, "web search is not configured", .{});
+        return client.search(arena, args.query) catch |err|
+            return fail(arena, "search failed: {s}", .{@errorName(err)});
+    }
 };
 
 /// A failure reported to the model as text, so that it can react to it. It is
@@ -302,6 +333,10 @@ pub fn parseCallNamed(arena: std.mem.Allocator, name: []const u8, arguments: []c
         return .{ .bash = parse(Call.Bash, arena, arguments) catch |reason|
             return .{ .malformed = .{ .name = name, .reason = reason } } };
     }
+    if (std.mem.eql(u8, name, "web_search")) {
+        return .{ .web_search = parse(Call.WebSearch, arena, arguments) catch |reason|
+            return .{ .malformed = .{ .name = name, .reason = reason } } };
+    }
     return .{ .unknown = name };
 }
 
@@ -331,6 +366,7 @@ const marks = struct {
     const write = Mark{ .glyph = "◂", .hue = .green };
     const edit = Mark{ .glyph = "✎", .hue = .yellow };
     const bash = Mark{ .glyph = "❯", .hue = .cyan };
+    const search = Mark{ .glyph = "⌕", .hue = .magenta };
     /// A call that could not be named: a tool billy does not implement, or
     /// arguments that could not be read.
     const unknown = Mark{ .glyph = "?", .hue = .red };
@@ -355,6 +391,7 @@ fn printHead(call: Call, format: Format, style: Style, out: *Io.Writer) !void {
             try styling.header(marks.bash, "bash", "", style, out);
             try printScript(args.command, format, out);
         },
+        .web_search => |args| try styling.header(marks.search, "web_search", args.query, style, out),
         // Only the name is known, so that is all there is to show; the reason it
         // could not run reaches the user through the output.
         .unknown => |name| try styling.header(marks.unknown, name, "", style, out),
@@ -551,6 +588,7 @@ const Spec = struct {
     parameters: []const u8,
 };
 
+/// The tools every session is offered, in the order the model receives them.
 const specs = [_]Spec{
     .{
         .name = "read",
@@ -612,21 +650,46 @@ const specs = [_]Spec{
     },
 };
 
-fn definitions(arena: std.mem.Allocator) ![]const llm.Tool {
-    const tools = try arena.alloc(llm.Tool, specs.len);
-    for (specs, tools) |spec, *tool| {
-        tool.* = .{ .function = .{
-            .name = spec.name,
-            .description = spec.description,
-            .parameters = try std.json.parseFromSliceLeaky(
-                std.json.Value,
-                arena,
-                spec.parameters,
-                .{},
-            ),
-        } };
-    }
-    return tools;
+/// The tool that is offered only when a search backend is configured, since it
+/// can do nothing without one. It comes last, after the tools every session
+/// has, so a session that gains it appends to the set rather than reordering it.
+const search_spec = Spec{
+    .name = "web_search",
+    .description = "Search the web and return the top results: a title, a url and a snippet for each.",
+    .parameters =
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "query": {"type": "string", "description": "What to search for."}
+    \\  },
+    \\  "required": ["query"]
+    \\}
+    ,
+};
+
+/// The tool definitions sent with every request. `web_search` is included only
+/// when `include_search` is set, so a run with no backend never offers the model
+/// a tool that could not run.
+fn definitions(arena: std.mem.Allocator, include_search: bool) ![]const llm.Tool {
+    var tools: std.ArrayList(llm.Tool) = .empty;
+    for (specs) |spec| try tools.append(arena, try buildTool(arena, spec));
+    if (include_search) try tools.append(arena, try buildTool(arena, search_spec));
+    return tools.toOwnedSlice(arena);
+}
+
+/// Builds one tool definition from its spec, the parameters parsed into the
+/// JSON the request carries.
+fn buildTool(arena: std.mem.Allocator, spec: Spec) !llm.Tool {
+    return .{ .function = .{
+        .name = spec.name,
+        .description = spec.description,
+        .parameters = try std.json.parseFromSliceLeaky(
+            std.json.Value,
+            arena,
+            spec.parameters,
+            .{},
+        ),
+    } };
 }
 
 test "exit codes of signals follow the shell convention" {
@@ -670,6 +733,14 @@ test "describe frames a call and its output" {
         "bash",
         "{\"command\":\"ls -la\"}",
         "exit code: 0\n(no output)\n",
+    );
+    // A web search shows the query it ran, and its results under the output
+    // label like any other text a tool returned.
+    try expectDescribe(
+        "⌕ web_search zig lang\n▾ output\n1. Zig\nhttps://ziglang.org\n\n",
+        "web_search",
+        "{\"query\":\"zig lang\"}",
+        "1. Zig\nhttps://ziglang.org",
     );
     // A tool that is not implemented shows its name, and the reason it could not
     // run reaches the user as the output.
@@ -764,7 +835,7 @@ test "a bash block shows only the streams the command filled" {
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
 
-    var tool_set = try Tools.init(std.testing.io, arena, gpa, &log.writer, null, .plain);
+    var tool_set = try Tools.init(std.testing.io, arena, gpa, &log.writer, null, .plain, null);
     const cases = [_]struct { command: []const u8, expected: []const u8 }{
         // Nothing printed: the status is all there is.
         .{ .command = "true", .expected = "❯ bash\ntrue\n✓ exit 0\n\n" },
@@ -969,7 +1040,7 @@ test "run logs exactly what describe prints" {
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
 
-    var tool_set = try Tools.init(std.testing.io, arena, gpa, &log.writer, null, .plain);
+    var tool_set = try Tools.init(std.testing.io, arena, gpa, &log.writer, null, .plain, null);
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"true\"}",
@@ -1000,7 +1071,7 @@ test "the format changes what is shown and nothing else" {
     // The format script writes the command back upper case, so what is shown is
     // plainly not what runs.
     const format: Format = .{ .script = "tr a-z A-Z", .io = std.testing.io, .gpa = gpa };
-    var tool_set = try Tools.init(std.testing.io, arena, gpa, &log.writer, format, .plain);
+    var tool_set = try Tools.init(std.testing.io, arena, gpa, &log.writer, format, .plain, null);
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"echo hi\"}",
@@ -1066,9 +1137,28 @@ test "definitions cover every tool the loop dispatches" {
     const arena = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(arena);
     defer arena_state.deinit();
-    const defs = try definitions(arena_state.allocator());
+    const defs = try definitions(arena_state.allocator(), false);
     try std.testing.expectEqual(specs.len, defs.len);
-    for (defs) |definition| {
-        try std.testing.expect(definition.function.parameters == .object);
+    for (defs) |tool| {
+        try std.testing.expect(tool.function.parameters == .object);
     }
+}
+
+test "web search is offered only when a backend is configured" {
+    const arena = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(arena);
+    defer arena_state.deinit();
+
+    // Without a backend the tool is not offered at all, and the tools every
+    // session has come first so the set only grows.
+    const without = try definitions(arena_state.allocator(), false);
+    try std.testing.expectEqual(specs.len, without.len);
+    for (without) |tool| {
+        try std.testing.expect(!std.mem.eql(u8, tool.function.name, "web_search"));
+    }
+
+    // With one it is appended, so a session that gains it keeps the tools it had.
+    const with = try definitions(arena_state.allocator(), true);
+    try std.testing.expectEqual(specs.len + 1, with.len);
+    try std.testing.expectEqualStrings("web_search", with[with.len - 1].function.name);
 }

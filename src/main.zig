@@ -16,11 +16,14 @@ const usage =
     \\~/.config/billy/config.json when that is unset, and is created with the
     \\defaults on the first run. It holds the turn limit; under
     \\tools.bash.format, a shell script that lays a bash command out for the
-    \\display; and under markdown.format, one that lays out a reply, such as
-    \\"glow -". Either reads the text on standard input and writes it back on
-    \\standard output. The context window and the token prices the header
-    \\reports come from a table built into billy, keyed by provider and model,
-    \\since the API reports token counts but neither of those.
+    \\display; under markdown.format, one that lays out a reply, such as
+    \\"glow -"; and under tools.web_search, the backend to search the web with
+    \\(only "tavily" for now) and how many results to ask for. A format reads
+    \\the text on standard input and writes it back on standard output; the
+    \\search key comes from the backend's environment variable, TAVILY_API_KEY.
+    \\The context window and the token prices the header reports come from a
+    \\table built into billy, keyed by provider and model, since the API
+    \\reports token counts but neither of those.
     \\
 ;
 
@@ -84,6 +87,21 @@ pub fn main(init: std.process.Init) !void {
         std.log.err("cannot find the working directory: {s}", .{@errorName(err)});
         return err;
     };
+    const search_config: ?billy.search.Config = if (settings.config.tools.web_search.provider) |provider| blk: {
+        // A backend named without its key is an error rather than a silent "no
+        // search": the configuration asked for the tool, and leaving it out
+        // without a word would look like a bug.
+        const variable = provider.keyVariable();
+        const key = init.environ_map.get(variable) orelse {
+            std.log.err("set {s} to use web search, or clear tools.web_search in the configuration", .{variable});
+            return error.MissingApiKey;
+        };
+        break :blk .{
+            .provider = provider,
+            .api_key = key,
+            .max_results = settings.config.tools.web_search.max_results,
+        };
+    } else null;
     const config: billy.agent.Config = .{
         .api_key = api_key,
         .url = try std.fmt.allocPrint(arena, "{s}/chat/completions", .{
@@ -115,6 +133,9 @@ pub fn main(init: std.process.Init) !void {
             .io = io,
             .gpa = init.gpa,
         } else null,
+        // Web search is offered only when the configuration names a backend and
+        // its key is set; the tool is left out of the request otherwise.
+        .search = search_config,
         // A terminal gets the block headers with the name in bold; a pipe or a
         // redirection, where the escape codes would only be noise, gets the
         // same text plain.

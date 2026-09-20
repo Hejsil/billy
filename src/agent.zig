@@ -6,6 +6,7 @@ const Io = std.Io;
 const llm = @import("llm.zig");
 const models = @import("models.zig");
 const tools = @import("tools.zig");
+const search = @import("search.zig");
 const line_editor = @import("line_editor.zig");
 const Session = @import("Session.zig");
 const formatting = @import("format.zig");
@@ -39,6 +40,9 @@ pub const Config = struct {
     /// How billy decorates the lines it prints itself, such as a block header.
     /// Plain everywhere the terminal does not take escape codes.
     style: styling.Style = .plain,
+    /// Web search, when the configuration names a backend and its key is set.
+    /// Null leaves `web_search` out of the tools the model is offered.
+    search: ?search.Config = null,
 };
 
 const system_prompt =
@@ -166,7 +170,7 @@ pub fn run(
     session: *Session,
 ) !void {
     var editor = line_editor.LineEditor.init(io, out, arena);
-    var tool_set = try tools.Tools.init(io, arena, gpa, out, config.format, config.style);
+    var tool_set = try tools.Tools.init(io, arena, gpa, out, config.format, config.style, config.search);
     var client: llm.Client = .{
         .gpa = gpa,
         .io = io,

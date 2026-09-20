@@ -6,6 +6,7 @@ pub const format = @import("format.zig");
 pub const line_editor = @import("line_editor.zig");
 pub const llm = @import("llm.zig");
 pub const models = @import("models.zig");
+pub const search = @import("search.zig");
 pub const Session = @import("Session.zig");
 pub const style = @import("style.zig");
 pub const tools = @import("tools.zig");
