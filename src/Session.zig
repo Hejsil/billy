@@ -98,7 +98,7 @@ const ToolCall = struct {
 };
 
 /// An llm.Message as stored in a session.
-const Message = struct {
+pub const Message = struct {
     role: StringIndex,
     content: StringIndex = .none,
     tool_call_id: StringIndex = .none,
@@ -107,7 +107,7 @@ const Message = struct {
     /// The message as the API client takes it, with every string resolved out of
     /// the pool. `allocator` owns the tool calls, which have to be pieced back
     /// together into a slice of their own.
-    fn resolve(message: Message, session: *const Session, allocator: std.mem.Allocator) !llm.Message {
+    pub fn resolve(message: Message, session: *const Session, allocator: std.mem.Allocator) !llm.Message {
         const stored = message.tool_calls.resolve(session);
         var calls: ?[]const llm.ToolCall = null;
         if (stored.len > 0) {
@@ -275,10 +275,32 @@ pub fn conversation(session: *const Session) Conversation {
     return .{ .session = session };
 }
 
-/// The conversation as the API client sends it, every string resolved out of the
+/// The content of the tool message that answers `id`, looking from message
+/// `from` onwards, which is where the result of a call sits: the message just
+/// after the one that asked for it. Empty when the session does not hold it, so
+/// a file written without one still replays.
+///
+/// Every string compared is a window into the pool, so finding a result costs
+/// nothing to allocate.
+pub fn toolResult(session: *const Session, from: usize, id: []const u8) []const u8 {
+    const messages = session.messages.items;
+    if (from >= messages.len) return "";
+    for (messages[from..]) |message| {
+        if (!std.mem.eql(u8, session.string(message.role) orelse "", "tool")) continue;
+        const call_id = session.string(message.tool_call_id) orelse continue;
+        if (std.mem.eql(u8, call_id, id)) return session.string(message.content) orelse "";
+    }
+    return "";
+}
+
+/// The conversation as plain API messages, every string resolved out of the
 /// pool. `allocator` owns the result, since resolving a message has to piece its
-/// tool calls back together. Only for a caller that needs the messages
-/// themselves; a request is built from `conversation` instead.
+/// tool calls back together into a slice of its own.
+///
+/// Nothing that shows or sends a conversation needs this: a request is built
+/// from `conversation`, and the transcript reads the session a message at a
+/// time. It is for a caller that wants the conversation as messages, which is
+/// what comparing two of them takes.
 pub fn resolvedMessages(session: *const Session, allocator: std.mem.Allocator) ![]const llm.Message {
     const messages = try allocator.alloc(llm.Message, session.messages.items.len);
     for (session.messages.items, messages) |message, *out| {
@@ -715,6 +737,37 @@ test "a conversation writes the messages a request would have carried" {
             "{\"role\":\"tool\",\"content\":\"1\\tconst x = 1;\\n\",\"tool_call_id\":\"call_1\"}]",
         via_conversation,
     );
+}
+
+test "a tool result is found only from where the search starts" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, allocator, null);
+    defer session.deinit();
+
+    try session.append(.{ .role = "assistant", .tool_calls = &.{.{
+        .id = "call_1",
+        .function = .{ .name = "read", .arguments = "{}" },
+    }} });
+    try session.append(.{ .role = "tool", .tool_call_id = "call_1", .content = "the result" });
+    try session.append(.{ .role = "tool", .tool_call_id = "old", .content = "an earlier result" });
+
+    // The replay searches from the message after the call, which is where its
+    // result sits.
+    try std.testing.expectEqualStrings("the result", session.toolResult(1, "call_1"));
+    // A result behind the point the search starts from is not the answer to
+    // anything ahead of it.
+    try std.testing.expectEqualStrings("", session.toolResult(2, "call_1"));
+    try std.testing.expectEqualStrings("an earlier result", session.toolResult(2, "old"));
+    // A result the session does not hold, and a search past the end of it.
+    try std.testing.expectEqualStrings("", session.toolResult(1, "nothing"));
+    try std.testing.expectEqualStrings("", session.toolResult(99, "call_1"));
 }
 
 test "an equal string is interned once and shared" {

@@ -206,29 +206,41 @@ pub fn run(
 /// A prompt is the one thing a replay shows differently from a live run: it is
 /// headed `» prompt` and laid out like a reply, without the `> ` the live input
 /// is typed behind, which is not part of the prompt.
+///
+/// The conversation is read where it is stored, a message at a time, so replaying
+/// a long session costs no more than the largest message in it. `gpa` is for the
+/// scratch the parsed arguments of a call need, which is dropped between
+/// messages.
 pub fn printTranscript(
-    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     out: *Io.Writer,
-    messages: []const llm.Message,
+    session: *const Session,
     format: tools.Format,
     markdown: formatting.Format,
     style: styling.Style,
 ) !void {
-    for (messages, 0..) |message, i| {
-        try printMessage(arena, out, message, messages[i + 1 ..], format, markdown, style);
+    var scratch_state = std.heap.ArenaAllocator.init(gpa);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+
+    const messages = session.messages.items;
+    for (messages, 0..) |message, index| {
+        const resolved = try message.resolve(session, scratch);
+        try printMessage(scratch, out, session, index, resolved, format, markdown, style);
+        _ = scratch_state.reset(.retain_capacity);
     }
     try out.flush();
 }
 
 /// Prints one message the way a live session shows it. The system prompt is never
 /// shown while running, so it is left out here too. A tool result is shown as the
-/// output of the call that produced it, which is the message just after it, and
-/// not as a message of its own.
+/// output of the call that produced it, and not as a message of its own.
 fn printMessage(
     arena: std.mem.Allocator,
     out: *Io.Writer,
+    session: *const Session,
+    index: usize,
     message: llm.Message,
-    following: []const llm.Message,
     format: tools.Format,
     markdown: formatting.Format,
     style: styling.Style,
@@ -248,20 +260,16 @@ fn printMessage(
     const calls = message.tool_calls orelse &.{};
     if (calls.len == 0) return printAnswer(out, message.content, markdown, style);
     for (calls) |call| {
-        try tools.describe(tools.parseCall(arena, call), resultOf(following, call.id), format, style, out);
+        // The result belongs to the message just after the one that asked for
+        // it, so the search starts from there.
+        try tools.describe(
+            tools.parseCall(arena, call),
+            session.toolResult(index + 1, call.id),
+            format,
+            style,
+            out,
+        );
     }
-}
-
-/// The result a call produced: the content of the tool message that names it,
-/// which follows the assistant message that asked for it. Empty when the session
-/// does not hold it, so a file written without one still replays.
-fn resultOf(messages: []const llm.Message, id: []const u8) []const u8 {
-    for (messages) |message| {
-        if (!std.mem.eql(u8, message.role, "tool")) continue;
-        const call_id = message.tool_call_id orelse continue;
-        if (std.mem.eql(u8, call_id, id)) return message.content orelse "";
-    }
-    return "";
 }
 
 /// Runs the model until it replies with text instead of tool calls.
@@ -331,163 +339,169 @@ fn printAnswer(out: *Io.Writer, content: ?[]const u8, markdown: formatting.Forma
     try out.flush();
 }
 
-test "printTranscript replays a conversation as the blocks it was made of" {
+/// Prints `messages` the way a resumed session replays them, from a session
+/// built to hold exactly them, and compares the blocks to `expected`. The
+/// transcript reads the conversation where a session stores it, so the messages
+/// have to go through a session to be replayed at all.
+fn expectTranscript(
+    expected: []const u8,
+    messages: []const llm.Message,
+    markdown: formatting.Format,
+    style: styling.Style,
+) !void {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(std.testing.io, tmp.dir, arena_state.allocator(), gpa, null);
+    defer session.deinit();
+    for (messages) |message| try session.append(message);
+
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    const messages = [_]llm.Message{
-        // The system prompt is never shown while running, the tool result only as
-        // the output of the call it belongs to.
-        .{ .role = "system", .content = "ignore me" },
-        .{ .role = "user", .content = "hello" },
-        .{ .role = "assistant", .tool_calls = &.{.{
-            .id = "call_1",
-            .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" },
-        }} },
-        .{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;" },
-        .{ .role = "assistant", .content = "done" },
-    };
-    try printTranscript(arena_state.allocator(), &out.writer, &messages, null, null, .plain);
+    // No bash format: what these cover is how a message is headed and laid out,
+    // which the tool format does not touch.
+    try printTranscript(gpa, &out.writer, &session, null, markdown, style);
+    try std.testing.expectEqualStrings(expected, out.written());
+}
 
-    try std.testing.expectEqualStrings(
+test "printTranscript replays a conversation as the blocks it was made of" {
+    // The system prompt is never shown while running, the tool result only as
+    // the output of the call it belongs to.
+    try expectTranscript(
         "\n» prompt\nhello\n" ++
             "▸ read a.zig\n▾ output\n1\tconst x = 1;\n\n" ++
             "◆ answer\ndone\n",
-        out.written(),
+        &.{
+            .{ .role = "system", .content = "ignore me" },
+            .{ .role = "user", .content = "hello" },
+            .{ .role = "assistant", .tool_calls = &.{.{
+                .id = "call_1",
+                .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" },
+            }} },
+            .{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;" },
+            .{ .role = "assistant", .content = "done" },
+        },
+        null,
+        .plain,
     );
 }
 
 test "printTranscript leaves out the system prompt and an unpaired tool result" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    try printTranscript(arena_state.allocator(), &out.writer, &.{
-        .{ .role = "system", .content = "ignore me" },
-        // A result whose call is not in the session has nothing to belong to.
-        .{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;" },
-    }, null, null, .plain);
-    try std.testing.expectEqualStrings("", out.written());
+    // A result whose call is not in the session has nothing to belong to, and a
+    // system prompt is never shown at all.
+    try expectTranscript(
+        "",
+        &.{
+            .{ .role = "system", .content = "ignore me" },
+            .{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;" },
+        },
+        null,
+        .plain,
+    );
 }
 
 test "a reply is headed by its own header, and its markdown laid out" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
     // `tr` stands in for a markdown formatter: it reads the reply and writes it
     // back upper case, so what the display shows is plainly not the text itself.
-    const markdown: formatting.Format = .{ .script = "tr a-z A-Z", .io = std.testing.io, .gpa = gpa };
-    try printTranscript(arena_state.allocator(), &out.writer, &.{
-        .{ .role = "assistant", .content = "hello" },
-    }, null, markdown, .plain);
-    try std.testing.expectEqualStrings("◆ answer\nHELLO\n", out.written());
-    out.clearRetainingCapacity();
+    const markdown: formatting.Format = .{
+        .script = "tr a-z A-Z",
+        .io = std.testing.io,
+        .gpa = std.testing.allocator,
+    };
+    try expectTranscript(
+        "◆ answer\nHELLO\n",
+        &.{.{ .role = "assistant", .content = "hello" }},
+        markdown,
+        .plain,
+    );
 
     // No formatter, and one that fails, both leave the reply as it was written.
-    try printTranscript(arena_state.allocator(), &out.writer, &.{
-        .{ .role = "assistant", .content = "hello" },
-    }, null, null, .plain);
-    try std.testing.expectEqualStrings("◆ answer\nhello\n", out.written());
-    out.clearRetainingCapacity();
-
-    const broken: formatting.Format = .{ .script = "exit 1", .io = std.testing.io, .gpa = gpa };
-    try printTranscript(arena_state.allocator(), &out.writer, &.{
-        .{ .role = "assistant", .content = "hello" },
-    }, null, broken, .plain);
-    try std.testing.expectEqualStrings("◆ answer\nhello\n", out.written());
+    try expectTranscript(
+        "◆ answer\nhello\n",
+        &.{.{ .role = "assistant", .content = "hello" }},
+        null,
+        .plain,
+    );
+    const broken: formatting.Format = .{
+        .script = "exit 1",
+        .io = std.testing.io,
+        .gpa = std.testing.allocator,
+    };
+    try expectTranscript(
+        "◆ answer\nhello\n",
+        &.{.{ .role = "assistant", .content = "hello" }},
+        broken,
+        .plain,
+    );
 }
 
 test "a prompt from the session is headed and laid out like a reply" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
     // The same stand-in formatter as a reply: a prompt is markdown too, so it is
     // laid out by the same script.
-    const markdown: formatting.Format = .{ .script = "tr a-z A-Z", .io = std.testing.io, .gpa = gpa };
-    try printTranscript(arena_state.allocator(), &out.writer, &.{
-        .{ .role = "user", .content = "hello" },
-    }, null, markdown, .plain);
-    try std.testing.expectEqualStrings("\n» prompt\nHELLO\n", out.written());
-    out.clearRetainingCapacity();
+    const markdown: formatting.Format = .{
+        .script = "tr a-z A-Z",
+        .io = std.testing.io,
+        .gpa = std.testing.allocator,
+    };
+    try expectTranscript(
+        "\n» prompt\nHELLO\n",
+        &.{.{ .role = "user", .content = "hello" }},
+        markdown,
+        .plain,
+    );
 
     // Without one, the prompt is shown as it was typed.
-    try printTranscript(arena_state.allocator(), &out.writer, &.{
-        .{ .role = "user", .content = "hello" },
-    }, null, null, .plain);
-    try std.testing.expectEqualStrings("\n» prompt\nhello\n", out.written());
+    try expectTranscript(
+        "\n» prompt\nhello\n",
+        &.{.{ .role = "user", .content = "hello" }},
+        null,
+        .plain,
+    );
 }
 
 test "an empty reply is shown under its header, in place of the text" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    try printTranscript(arena_state.allocator(), &out.writer, &.{
-        .{ .role = "assistant", .content = "" },
-    }, null, null, .plain);
-    try std.testing.expectEqualStrings("◆ answer\n(empty reply)\n", out.written());
+    try expectTranscript(
+        "◆ answer\n(empty reply)\n",
+        &.{.{ .role = "assistant", .content = "" }},
+        null,
+        .plain,
+    );
 }
 
 test "a prompt and a reply are headed alike, in the colours of the display" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    try printTranscript(arena_state.allocator(), &out.writer, &.{
-        .{ .role = "user", .content = "hello" },
-        .{ .role = "assistant", .content = "hi" },
-    }, null, null, .ansi);
-
     // The user's block opens with the prompt mark and the reply with the answer
     // mark, each bold, and neither carries the `> ` the live input uses.
-    try std.testing.expectEqualStrings(
+    try expectTranscript(
         "\n\x1b[34m»\x1b[0m \x1b[1mprompt\x1b[0m\nhello\n" ++
             "\x1b[32m◆\x1b[0m \x1b[1manswer\x1b[0m\nhi\n",
-        out.written(),
+        &.{
+            .{ .role = "user", .content = "hello" },
+            .{ .role = "assistant", .content = "hi" },
+        },
+        null,
+        .ansi,
     );
 }
 
 test "printTranscript gives each call the result that names it" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    try printTranscript(arena_state.allocator(), &out.writer, &.{
-        .{ .role = "assistant", .tool_calls = &.{
-            .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" } },
-            .{ .id = "call_2", .function = .{ .name = "read", .arguments = "{\"path\":\"b.zig\"}" } },
-        } },
-        .{ .role = "tool", .tool_call_id = "call_1", .content = "contents of a" },
-        .{ .role = "tool", .tool_call_id = "call_2", .content = "contents of b" },
-    }, null, null, .plain);
-    try std.testing.expectEqualStrings(
+    try expectTranscript(
         "▸ read a.zig\n▾ output\ncontents of a\n\n" ++
             "▸ read b.zig\n▾ output\ncontents of b\n\n",
-        out.written(),
+        &.{
+            .{ .role = "assistant", .tool_calls = &.{
+                .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" } },
+                .{ .id = "call_2", .function = .{ .name = "read", .arguments = "{\"path\":\"b.zig\"}" } },
+            } },
+            .{ .role = "tool", .tool_call_id = "call_1", .content = "contents of a" },
+            .{ .role = "tool", .tool_call_id = "call_2", .content = "contents of b" },
+        },
+        null,
+        .plain,
     );
 }
 
