@@ -336,13 +336,16 @@ fn rateNow(io: Io, config: Config) models.Price {
 }
 
 /// Prints a prompt as its own block: the `» prompt` header, then the text, laid
-/// out by `markdown` when one is set. A live prompt and a replayed one are both
-/// printed by this, so the two read the same. The `> ` the line is typed behind
-/// is not part of the prompt and is not printed.
+/// out by `markdown` when one is set, and a blank line after it. A live prompt
+/// and a replayed one are both printed by this, so the two read the same. The
+/// `> ` the line is typed behind is not part of the prompt and is not printed.
+///
+/// The blank line keeps the prompt from reading as the label of the answer or
+/// the tool block that follows it, which begin on the very next row otherwise.
 fn printPrompt(out: *Io.Writer, text: []const u8, markdown: formatting.Format, style: styling.Style) !void {
     try styling.header(marks.prompt, "prompt", "", style, out);
     if (!try formatting.apply(markdown, text, out)) try out.writeAll(text);
-    try out.writeAll("\n");
+    try out.writeAll("\n\n");
 }
 
 /// Prints a reply under its own header, the markdown laid out by `markdown` when
@@ -394,7 +397,7 @@ test "printTranscript replays a conversation as the blocks it was made of" {
     // The system prompt is never shown while running, the tool result only as
     // the output of the call it belongs to.
     try expectTranscript(
-        "\n» prompt\nhello\n" ++
+        "\n» prompt\nhello\n\n" ++
             "▸ read a.zig\n▾ output\n1\tconst x = 1;\n\n" ++
             "◆ answer\ndone\n",
         &.{
@@ -470,7 +473,7 @@ test "a prompt from the session is headed and laid out like a reply" {
         .gpa = std.testing.allocator,
     };
     try expectTranscript(
-        "\n» prompt\nHELLO\n",
+        "\n» prompt\nHELLO\n\n",
         &.{.{ .role = "user", .content = "hello" }},
         markdown,
         .plain,
@@ -478,7 +481,7 @@ test "a prompt from the session is headed and laid out like a reply" {
 
     // Without one, the prompt is shown as it was typed.
     try expectTranscript(
-        "\n» prompt\nhello\n",
+        "\n» prompt\nhello\n\n",
         &.{.{ .role = "user", .content = "hello" }},
         null,
         .plain,
@@ -493,7 +496,7 @@ test "a prompt is headed by the same block live and replayed" {
     // The block a replay shows, but with no blank line in front: it is printed
     // where the line editor left the cursor, on the row the header stood on.
     try printPrompt(&out.writer, "hello", null, .plain);
-    try std.testing.expectEqualStrings("» prompt\nhello\n", out.written());
+    try std.testing.expectEqualStrings("» prompt\nhello\n\n", out.written());
     out.clearRetainingCapacity();
 
     // A prompt is markdown, so it is laid out by the same script as a reply.
@@ -503,12 +506,12 @@ test "a prompt is headed by the same block live and replayed" {
         .gpa = gpa,
     };
     try printPrompt(&out.writer, "hello", markdown, .plain);
-    try std.testing.expectEqualStrings("» prompt\nHELLO\n", out.written());
+    try std.testing.expectEqualStrings("» prompt\nHELLO\n\n", out.written());
     out.clearRetainingCapacity();
 
     // The `> ` the line was typed behind is not part of the block.
     try printPrompt(&out.writer, "hello", null, .ansi);
-    try std.testing.expectEqualStrings("\x1b[34m»\x1b[0m \x1b[1mprompt\x1b[0m\nhello\n", out.written());
+    try std.testing.expectEqualStrings("\x1b[34m»\x1b[0m \x1b[1mprompt\x1b[0m\nhello\n\n", out.written());
 }
 
 test "an empty reply is shown under its header, in place of the text" {
@@ -524,7 +527,7 @@ test "a prompt and a reply are headed alike, in the colours of the display" {
     // The user's block opens with the prompt mark and the reply with the answer
     // mark, each bold, and neither carries the `> ` the live input uses.
     try expectTranscript(
-        "\n\x1b[34m»\x1b[0m \x1b[1mprompt\x1b[0m\nhello\n" ++
+        "\n\x1b[34m»\x1b[0m \x1b[1mprompt\x1b[0m\nhello\n\n" ++
             "\x1b[32m◆\x1b[0m \x1b[1manswer\x1b[0m\nhi\n",
         &.{
             .{ .role = "user", .content = "hello" },
