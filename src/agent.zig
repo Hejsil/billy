@@ -19,6 +19,10 @@ pub const Config = struct {
     model: []const u8,
     /// Model turns allowed for one request before the harness gives up on it.
     max_turns: usize,
+    /// Longest a bash command may run before it is killed, in seconds, from the
+    /// configuration. The tools are given it so a runaway command cannot hang
+    /// the agent forever.
+    bash_timeout_s: usize,
     /// Working directory, shown in the header.
     cwd: []const u8,
     /// Home directory, so the header can shorten a path inside it; null when unset.
@@ -274,6 +278,7 @@ pub fn run(
         gpa,
         out,
         config.format,
+        config.bash_timeout_s,
         config.style,
         config.search,
         &http,
@@ -677,6 +682,7 @@ fn testConfig(model: []const u8, cwd: []const u8, home: ?[]const u8) Config {
         .url = "u",
         .model = model,
         .max_turns = 10,
+        .bash_timeout_s = 120,
         .cwd = cwd,
         .home = home,
         .model_info = null,

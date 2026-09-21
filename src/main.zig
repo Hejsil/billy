@@ -25,14 +25,15 @@ const usage =
     \\$XDG_CONFIG_HOME/billy/config.json, or ~/.config/billy/config.json when
     \\that is unset, and is created with the defaults on the first run. It holds
     \\the turn limit; under tools.bash.format, a shell script that lays a bash
-    \\command out for the display; under markdown.format, one that lays out a
-    \\reply, such as "glow -"; and under tools.web_search, the backend to search
-    \\the web with (only "tavily" for now) and how many results to ask for. A
-    \\format reads the text on standard input and writes it back on standard
-    \\output. The keys are kept in credentials.json in the data directory,
-    \\readable by the owner alone. The context window and the token prices the
-    \\header reports come from a table built into billy, keyed by provider and
-    \\model, since the API reports token counts but neither of those.
+    \\command out for the display, and under tools.bash.timeout_s, the seconds a
+    \\command may run before it is killed; under markdown.format, one that lays
+    \\out a reply, such as "glow -"; and under tools.web_search, the backend to
+    \\search the web with (only "tavily" for now) and how many results to ask
+    \\for. A format reads the text on standard input and writes it back on
+    \\standard output. The keys are kept in credentials.json in the data
+    \\directory, readable by the owner alone. The context window and the token
+    \\prices the header reports come from a table built into billy, keyed by
+    \\provider and model, since the API reports token counts but neither of those.
     \\
 ;
 
@@ -189,6 +190,7 @@ pub fn main(init: std.process.Init) !void {
         }),
         .model = model,
         .max_turns = settings.config.max_turns,
+        .bash_timeout_s = settings.config.tools.bash.timeout_s,
         .cwd = session.cwd,
         .home = init.environ_map.get("HOME"),
         // The context window and the prices are not reported by the API, so

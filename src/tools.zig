@@ -23,8 +23,6 @@ const Mark = styling.Mark;
 const max_result_len = 30_000;
 /// Longest output captured from one command.
 const max_command_output = 1 << 20;
-/// A command that outlives this is killed, so the agent cannot hang forever.
-const command_timeout_s = 120;
 /// Lines of a result shown before the rest is summarized. The model still gets
 /// the whole result; only the display is cut short.
 const max_block_lines = 5;
@@ -90,6 +88,9 @@ pub const Tools = struct {
     /// How a bash command is laid out for the user. Shared with the transcript,
     /// so a replayed session shows the command the way the run did.
     format: Format,
+    /// Longest a bash command may run before it is killed, in seconds. Set by
+    /// the configuration, so a runaway command cannot hang the agent forever.
+    bash_timeout_s: usize,
     /// How the lines billy prints itself are decorated. Shared with the
     /// transcript, so a replayed session looks like the run it continues.
     style: Style,
@@ -115,6 +116,7 @@ pub const Tools = struct {
         gpa: std.mem.Allocator,
         log: *Io.Writer,
         format: Format,
+        bash_timeout_s: usize,
         style: Style,
         search_config: ?search.Config,
         http: *std.http.Client,
@@ -125,6 +127,7 @@ pub const Tools = struct {
             .gpa = gpa,
             .log = log,
             .format = format,
+            .bash_timeout_s = bash_timeout_s,
             .style = style,
             .search = if (search_config) |config| .{
                 .io = io,
@@ -262,6 +265,11 @@ pub const Tools = struct {
     }
 
     fn bash(tools: *Tools, arena: std.mem.Allocator, args: Call.Bash) ![]const u8 {
+        // The count the configuration holds is turned into the signed seconds
+        // the clock takes. A value past what it can express is absurd but must
+        // not overflow the cast, so it is clamped to the longest duration, which
+        // is no limit in practice.
+        const timeout_s = std.math.cast(i64, tools.bash_timeout_s) orelse std.math.maxInt(i64);
         const result = std.process.run(tools.gpa, tools.io, .{
             .argv = &.{ "bash", "-c", args.command },
             // The command runs where the session's tools do, so a resumed session
@@ -269,12 +277,19 @@ pub const Tools = struct {
             .cwd = .{ .dir = tools.dir },
             .stdout_limit = .limited(max_command_output),
             .stderr_limit = .limited(max_command_output),
-            .timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(command_timeout_s) } },
+            // A command that outlives the configured limit is killed, so a
+            // runaway command cannot hang the agent forever.
+            .timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(timeout_s) } },
         }) catch |err| switch (err) {
             error.StreamTooLong => return fail(
                 arena,
                 "command produced more than {d} bytes of output",
                 .{max_command_output},
+            ),
+            error.Timeout => return fail(
+                arena,
+                "command did not finish within {d}s and was killed",
+                .{tools.bash_timeout_s},
             ),
             else => return fail(arena, "cannot run command: {s}", .{@errorName(err)}),
         };
@@ -1049,7 +1064,7 @@ test "a bash block shows only the streams the command filled" {
     var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
     defer http.deinit();
 
-    var tool_set = try Tools.init(std.testing.io, Io.Dir.cwd(), arena, gpa, &log.writer, null, .plain, null, &http);
+    var tool_set = try Tools.init(std.testing.io, Io.Dir.cwd(), arena, gpa, &log.writer, null, 120, .plain, null, &http);
     const cases = [_]struct { command: []const u8, expected: []const u8 }{
         // Nothing printed: the status is all there is.
         .{ .command = "true", .expected = "❯ bash\ntrue\n✓ exit 0\n\n" },
@@ -1256,7 +1271,7 @@ test "run logs exactly what describe prints" {
     var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
     defer http.deinit();
 
-    var tool_set = try Tools.init(std.testing.io, Io.Dir.cwd(), arena, gpa, &log.writer, null, .plain, null, &http);
+    var tool_set = try Tools.init(std.testing.io, Io.Dir.cwd(), arena, gpa, &log.writer, null, 120, .plain, null, &http);
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"true\"}",
@@ -1289,7 +1304,7 @@ test "the format changes what is shown and nothing else" {
     // The format script writes the command back upper case, so what is shown is
     // plainly not what runs.
     const format: Format = .{ .script = "tr a-z A-Z", .io = std.testing.io, .gpa = gpa };
-    var tool_set = try Tools.init(std.testing.io, Io.Dir.cwd(), arena, gpa, &log.writer, format, .plain, null, &http);
+    var tool_set = try Tools.init(std.testing.io, Io.Dir.cwd(), arena, gpa, &log.writer, format, 120, .plain, null, &http);
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"echo hi\"}",
@@ -1309,6 +1324,32 @@ test "the format changes what is shown and nothing else" {
     defer described.deinit();
     try describe(parseCall(arena, call), result, format, .plain, &described.writer);
     try std.testing.expectEqualStrings(log.written(), described.written());
+}
+
+test "a bash command that outlives the timeout is killed and reported" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var log: std.Io.Writer.Allocating = .init(gpa);
+    defer log.deinit();
+    var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    defer http.deinit();
+
+    // A one-second limit kills a command that would otherwise run far longer,
+    // and the model is told so rather than left waiting for it to finish.
+    var tool_set = try Tools.init(std.testing.io, Io.Dir.cwd(), arena, gpa, &log.writer, null, 1, .plain, null, &http);
+    const call: llm.ToolCall = .{ .id = "1", .function = .{
+        .name = "bash",
+        .arguments = "{\"command\":\"sleep 30\"}",
+    } };
+    const result = try tool_set.run(arena, call);
+
+    try std.testing.expectEqualStrings(
+        "error: command did not finish within 1s and was killed",
+        result,
+    );
 }
 
 test "parseCall splits known, unknown and malformed calls" {
@@ -1512,7 +1553,7 @@ test "the tools work in the directory they are given, wherever billy runs" {
     defer log.deinit();
     var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
     defer http.deinit();
-    var tool_set = try Tools.init(std.testing.io, work, arena, gpa, &log.writer, null, .plain, null, &http);
+    var tool_set = try Tools.init(std.testing.io, work, arena, gpa, &log.writer, null, 120, .plain, null, &http);
 
     // A file written by the tool lands in that directory.
     _ = try tool_set.run(arena, .{ .id = "1", .function = .{

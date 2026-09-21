@@ -24,6 +24,9 @@ const max_config_bytes = 1 << 20;
 pub const default_max_turns = 100;
 /// Results asked for per search query when the file asks for nothing else.
 pub const default_max_results = 5;
+/// Seconds a bash command may run before it is killed when the file asks for
+/// nothing else.
+pub const default_timeout_s = 120;
 
 pub const Config = struct {
     /// Model turns allowed for one request before the harness gives up on it.
@@ -60,6 +63,9 @@ pub const Config = struct {
         // Zero turns would give the model no chance to answer at all, which is
         // never what the file is meant to say.
         if (stored.max_turns == 0) return error.InvalidConfig;
+        // A zero timeout would kill every command as it starts, which is never
+        // what the file is meant to say either.
+        if (stored.tools.bash.timeout_s == 0) return error.InvalidConfig;
         return .{
             .config = .{
                 .max_turns = stored.max_turns,
@@ -131,6 +137,12 @@ pub const Bash = struct {
     /// Only the display changes; the command that runs, and everything stored
     /// in the session, keep what the model wrote.
     format: ?[]const u8 = null,
+    /// Longest a command may run before it is killed, in seconds. A command that
+    /// outlives this is killed, so a runaway command cannot hang the agent
+    /// forever. Zero would kill every command as it starts, which is never what
+    /// the file is meant to say, so it is rejected rather than read as "no
+    /// limit"; set a large value for a command that legitimately runs long.
+    timeout_s: usize = default_timeout_s,
 };
 
 /// Settings for the markdown billy shows. Markdown is not a tool: it is the
@@ -272,6 +284,8 @@ test "open leaves the bash format unset when the file does not set one" {
     });
     const older = try Config.open(std.testing.io, tmp.dir, allocator);
     try std.testing.expect(older.config.tools.bash.format == null);
+    // The timeout the setting was added with is the default for a file without one.
+    try std.testing.expectEqual(default_timeout_s, older.config.tools.bash.timeout_s);
 
     // A format of null is the same as not setting one.
     try tmp.dir.writeFile(std.testing.io, .{
@@ -280,6 +294,32 @@ test "open leaves the bash format unset when the file does not set one" {
     });
     const explicit = try Config.open(std.testing.io, tmp.dir, allocator);
     try std.testing.expect(explicit.config.tools.bash.format == null);
+}
+
+test "open reads the bash timeout from the file" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The timeout is set alongside the format, and each is read on its own.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = file_name,
+        .data = "{\"tools\":{\"bash\":{\"format\":\"shfmt\",\"timeout_s\":30}}}",
+    });
+    const opened = try Config.open(std.testing.io, tmp.dir, allocator);
+    try std.testing.expectEqual(30, opened.config.tools.bash.timeout_s);
+    try std.testing.expectEqualStrings("shfmt", opened.config.tools.bash.format.?);
+
+    // A file without one falls back to the default.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = file_name,
+        .data = "{\"tools\":{\"bash\":{\"format\":\"shfmt\"}}}",
+    });
+    const bare = try Config.open(std.testing.io, tmp.dir, allocator);
+    try std.testing.expectEqual(default_timeout_s, bare.config.tools.bash.timeout_s);
 }
 
 test "open reads the web search provider and result count from the file" {
@@ -347,7 +387,8 @@ test "the file is indented, so it can be read and edited by hand" {
         \\  "max_turns": 3,
         \\  "tools": {
         \\    "bash": {
-        \\      "format": null
+        \\      "format": null,
+        \\      "timeout_s": 120
         \\    },
         \\    "web_search": {
         \\      "provider": null,
@@ -396,5 +437,11 @@ test "open rejects damaged, future and unusable configurations" {
     try std.testing.expectError(error.UnsupportedConfigVersion, Config.open(std.testing.io, tmp.dir, allocator));
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{\"max_turns\":0}" });
+    try std.testing.expectError(error.InvalidConfig, Config.open(std.testing.io, tmp.dir, allocator));
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = file_name,
+        .data = "{\"tools\":{\"bash\":{\"timeout_s\":0}}}",
+    });
     try std.testing.expectError(error.InvalidConfig, Config.open(std.testing.io, tmp.dir, allocator));
 }
