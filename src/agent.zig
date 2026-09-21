@@ -62,16 +62,18 @@ const marks = struct {
     const answer = styling.Mark{ .glyph = "◆", .hue = .green };
 };
 
-/// The header line shown above the input prompt: the model, the working
-/// directory, how much of the context window the conversation fills, and what
-/// the session has cost so far. The window size and the prices are not reported
-/// by the API, so they come from the model table. `cost` is the session total
-/// the loop has accumulated, so it does not move as the clock passes a rate
-/// change.
+/// The header line shown above the input prompt: the session id, the model, the
+/// working directory, how much of the context window the conversation fills, and
+/// what the session has cost so far. The id is shown so that a run can be named
+/// by what it prints, which is what `--resume` takes to continue it. The window
+/// size and the prices are not reported by the API, so they come from the model
+/// table. `cost` is the session total the loop has accumulated, so it does not
+/// move as the clock passes a rate change.
 pub fn sessionHeader(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     config: Config,
+    session_id: []const u8,
     context_tokens: usize,
     cost: f64,
 ) ![]const u8 {
@@ -79,7 +81,8 @@ pub fn sessionHeader(
     defer text.deinit();
     const out = &text.writer;
 
-    try out.print("billy · {s} · {s}", .{
+    try out.print("billy · {s} · {s} · {s}", .{
+        session_id,
         config.model,
         try displayPath(arena, config.cwd, config.home),
     });
@@ -190,7 +193,7 @@ pub fn run(
     while (true) {
         // Rebuilt for every prompt, so it reflects the tokens and cost of the
         // turns run so far.
-        const header = try sessionHeader(gpa, arena, config, session.context_tokens, session.cost);
+        const header = try sessionHeader(gpa, arena, config, session.id, session.context_tokens, session.cost);
         const line = (try editor.readLine(header, prompt)) orelse break;
         if (line.len == 0) continue;
         try session.append(.{ .role = "user", .content = line });
@@ -574,15 +577,19 @@ const off_peak_utc = 1789732800; // Friday 2026-09-18 12:00 UTC
 /// Peak on a Friday, when DeepSeek doubles its rates.
 const peak_utc = 1789696800; // Friday 2026-09-18 02:00 UTC
 
-test "header names the model and the working directory" {
+/// The id the header tests run under. A real one is the UTC timestamp of the
+/// session, but the header only prints it, so the same id serves every test.
+const test_session_id = "20250131-120000";
+
+test "header names the session, the model and the working directory" {
     const arena = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(arena);
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
 
     try std.testing.expectEqualStrings(
-        "billy · deepseek-flash · /work",
-        try sessionHeader(arena, allocator, testConfig("deepseek-flash", "/work", null), 0, 0),
+        "billy · 20250131-120000 · deepseek-flash · /work",
+        try sessionHeader(arena, allocator, testConfig("deepseek-flash", "/work", null), test_session_id, 0, 0),
     );
 }
 
@@ -593,18 +600,18 @@ test "header shortens a path inside the home directory" {
     const allocator = arena_state.allocator();
 
     try std.testing.expectEqualStrings(
-        "billy · m · ~/repo/billy",
-        try sessionHeader(arena, allocator, testConfig("m", "/home/user/repo/billy", "/home/user"), 0, 0),
+        "billy · 20250131-120000 · m · ~/repo/billy",
+        try sessionHeader(arena, allocator, testConfig("m", "/home/user/repo/billy", "/home/user"), test_session_id, 0, 0),
     );
     // The home directory itself becomes just `~`.
     try std.testing.expectEqualStrings(
-        "billy · m · ~",
-        try sessionHeader(arena, allocator, testConfig("m", "/home/user", "/home/user"), 0, 0),
+        "billy · 20250131-120000 · m · ~",
+        try sessionHeader(arena, allocator, testConfig("m", "/home/user", "/home/user"), test_session_id, 0, 0),
     );
     // A sibling that merely shares the prefix is left alone.
     try std.testing.expectEqualStrings(
-        "billy · m · /home/user2",
-        try sessionHeader(arena, allocator, testConfig("m", "/home/user2", "/home/user"), 0, 0),
+        "billy · 20250131-120000 · m · /home/user2",
+        try sessionHeader(arena, allocator, testConfig("m", "/home/user2", "/home/user"), test_session_id, 0, 0),
     );
 }
 
@@ -625,26 +632,26 @@ test "header shows how full the context window is" {
 
     // A fresh session has used nothing.
     try std.testing.expectEqualStrings(
-        "billy · m · /work · 0/128k (0%) · $0",
-        try sessionHeader(arena, allocator, config, 0, 0),
+        "billy · 20250131-120000 · m · /work · 0/128k (0%) · $0",
+        try sessionHeader(arena, allocator, config, test_session_id, 0, 0),
     );
     // A rounded-to-zero percentage still shows the conversation is not empty.
     try std.testing.expectEqualStrings(
-        "billy · m · /work · 500/128k (<1%) · $0",
-        try sessionHeader(arena, allocator, config, 500, 0),
+        "billy · 20250131-120000 · m · /work · 500/128k (<1%) · $0",
+        try sessionHeader(arena, allocator, config, test_session_id, 500, 0),
     );
     try std.testing.expectEqualStrings(
-        "billy · m · /work · 16k/128k (12%) · $0",
-        try sessionHeader(arena, allocator, config, 16_000, 0),
+        "billy · 20250131-120000 · m · /work · 16k/128k (12%) · $0",
+        try sessionHeader(arena, allocator, config, test_session_id, 16_000, 0),
     );
     // A full window, and a count that rounds to a whole thousand.
     try std.testing.expectEqualStrings(
-        "billy · m · /work · 128k/128k (100%) · $0",
-        try sessionHeader(arena, allocator, config, 128_000, 0),
+        "billy · 20250131-120000 · m · /work · 128k/128k (100%) · $0",
+        try sessionHeader(arena, allocator, config, test_session_id, 128_000, 0),
     );
     try std.testing.expectEqualStrings(
-        "billy · m · /work · 13k/128k (9%) · $0",
-        try sessionHeader(arena, allocator, config, 12_500, 0),
+        "billy · 20250131-120000 · m · /work · 13k/128k (9%) · $0",
+        try sessionHeader(arena, allocator, config, test_session_id, 12_500, 0),
     );
 }
 
@@ -675,15 +682,15 @@ test "header shows the accumulated session cost" {
     };
     const off_peak_cost = costOf(info.priceAt(off_peak_utc), usage);
     try std.testing.expectEqualStrings(
-        "billy · deepseek-flash · /work · 3M/4M (75%) · $0.75",
-        try sessionHeader(arena, allocator, config, 3_000_000, off_peak_cost),
+        "billy · 20250131-120000 · deepseek-flash · /work · 3M/4M (75%) · $0.75",
+        try sessionHeader(arena, allocator, config, test_session_id, 3_000_000, off_peak_cost),
     );
     // A request made in peak hours cost double, which stays on the total even if
     // the header is shown later, off-peak.
     const peak_cost = costOf(info.priceAt(peak_utc), usage);
     try std.testing.expectEqualStrings(
-        "billy · deepseek-flash · /work · 3M/4M (75%) · $1.51",
-        try sessionHeader(arena, allocator, config, 3_000_000, peak_cost),
+        "billy · 20250131-120000 · deepseek-flash · /work · 3M/4M (75%) · $1.51",
+        try sessionHeader(arena, allocator, config, test_session_id, 3_000_000, peak_cost),
     );
 }
 
@@ -719,8 +726,8 @@ test "header leaves out the gauge and cost for an unknown model" {
     const config = testConfig("who-knows", "/work", null);
     try std.testing.expect(config.model_info == null);
     try std.testing.expectEqualStrings(
-        "billy · who-knows · /work",
-        try sessionHeader(arena, allocator, config, 5000, 12.34),
+        "billy · 20250131-120000 · who-knows · /work",
+        try sessionHeader(arena, allocator, config, test_session_id, 5000, 12.34),
     );
 }
 
