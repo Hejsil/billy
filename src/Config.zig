@@ -101,6 +101,12 @@ const Stored = struct {
     markdown: Markdown = .{},
 };
 
+/// Backs every string the configuration holds, which is the format scripts read
+/// out of the file. The configuration owns it, so a caller frees the whole
+/// configuration with `deinit` rather than tracking each string, and every
+/// allocation `open` makes goes through it.
+arena_state: std.heap.ArenaAllocator,
+
 /// Model turns allowed for one request before the harness gives up on it.
 max_turns: usize = default_max_turns,
 /// Settings for the tools the agent can call, by tool name.
@@ -109,13 +115,31 @@ tools: Tools = .{},
 /// prompts the user types.
 markdown: Markdown = .{},
 
+/// An empty configuration, with the arena a file read fills in. Its settings
+/// are the defaults, which is what a missing file is written with.
+pub fn init(gpa: std.mem.Allocator) Config {
+    return .{ .arena_state = .init(gpa) };
+}
+
+/// Frees every string the configuration holds, at once.
+pub fn deinit(config: *Config) void {
+    config.arena_state.deinit();
+}
+
 /// Reads the configuration from `dir`, writing `file_name` with the defaults
 /// when it is missing. `dir` must be the directory holding the file.
-pub fn open(io: Io, dir: Io.Dir, arena: std.mem.Allocator) !Opened {
+///
+/// `gpa` backs the configuration's own arena, where every string it reads and
+/// every buffer it parses through is kept; the caller frees them all at once
+/// with `deinit`.
+pub fn open(io: Io, dir: Io.Dir, gpa: std.mem.Allocator) !Opened {
+    var config = Config.init(gpa);
+    errdefer config.deinit();
+    const arena = config.arena_state.allocator();
+
     const text = dir.readFileAlloc(io, file_name, arena, .limited(max_config_bytes)) catch |err| switch (err) {
         error.FileNotFound => {
-            const config: Config = .{};
-            try config.save(io, dir, arena);
+            try config.save(io, dir);
             return .{ .config = config, .created = true };
         },
         else => return err,
@@ -131,14 +155,11 @@ pub fn open(io: Io, dir: Io.Dir, arena: std.mem.Allocator) !Opened {
     // A zero timeout would kill every command as it starts, which is never
     // what the file is meant to say either.
     if (stored.tools.bash.timeout_s == 0) return error.InvalidConfig;
-    return .{
-        .config = .{
-            .max_turns = stored.max_turns,
-            .tools = stored.tools,
-            .markdown = stored.markdown,
-        },
-        .created = false,
-    };
+
+    config.max_turns = stored.max_turns;
+    config.tools = stored.tools;
+    config.markdown = stored.markdown;
+    return .{ .config = config, .created = false };
 }
 
 /// Writes the configuration to `file_name` in `dir`. The previous contents
@@ -146,24 +167,22 @@ pub fn open(io: Io, dir: Io.Dir, arena: std.mem.Allocator) !Opened {
 ///
 /// It is written indented rather than compact, unlike a session file: it is
 /// there to be read and edited by hand, while a session is only ever read
-/// back as a whole.
-pub fn save(config: Config, io: Io, dir: Io.Dir, gpa: std.mem.Allocator) !void {
-    const text = try std.json.Stringify.valueAlloc(
-        gpa,
+/// back as a whole. The JSON is streamed straight onto the file, so writing it
+/// allocates nothing.
+pub fn save(config: *const Config, io: Io, dir: Io.Dir) !void {
+    var atomic = try dir.createFileAtomic(io, file_name, .{ .replace = true });
+    defer atomic.deinit(io);
+    var buffer: [4096]u8 = undefined;
+    var file: Io.File.Writer = .init(atomic.file, io, &buffer);
+    try std.json.Stringify.value(
         Stored{
             .max_turns = config.max_turns,
             .tools = config.tools,
             .markdown = config.markdown,
         },
         .{ .whitespace = .indent_2 },
+        &file.interface,
     );
-    defer gpa.free(text);
-
-    var atomic = try dir.createFileAtomic(io, file_name, .{ .replace = true });
-    defer atomic.deinit(io);
-    var buffer: [4096]u8 = undefined;
-    var file: Io.File.Writer = .init(atomic.file, io, &buffer);
-    try file.interface.writeAll(text);
     try file.flush();
     try atomic.replace(io);
 }
@@ -171,15 +190,15 @@ pub fn save(config: Config, io: Io, dir: Io.Dir, gpa: std.mem.Allocator) !void {
 /// The directory holding the configuration: `$XDG_CONFIG_HOME/billy`, or
 /// `$HOME/.config/billy` when that is unset, as the XDG base directory
 /// specification prescribes.
-pub fn defaultDir(arena: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
+pub fn defaultDir(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
     if (environ.get("XDG_CONFIG_HOME")) |xdg| {
         // The specification says a relative path must be ignored.
         if (xdg.len > 0 and std.fs.path.isAbsolute(xdg)) {
-            return std.fs.path.join(arena, &.{ xdg, app_dir });
+            return std.fs.path.join(gpa, &.{ xdg, app_dir });
         }
     }
     const home = environ.get("HOME") orelse return error.HomeNotSet;
-    return std.fs.path.join(arena, &.{ home, ".config", app_dir });
+    return std.fs.path.join(gpa, &.{ home, ".config", app_dir });
 }
 
 test "defaultDir follows the XDG base directory specification" {
@@ -207,28 +226,22 @@ test "defaultDir follows the XDG base directory specification" {
 }
 
 test "open writes the defaults when the file is missing" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const first = try Config.open(std.testing.io, tmp.dir, allocator);
+    var first = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer first.config.deinit();
     try std.testing.expect(first.created);
     try std.testing.expectEqual(default_max_turns, first.config.max_turns);
 
     // The file is now there, so a second open leaves it alone and reads it back.
-    const second = try Config.open(std.testing.io, tmp.dir, allocator);
+    var second = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer second.config.deinit();
     try std.testing.expect(!second.created);
     try std.testing.expectEqual(default_max_turns, second.config.max_turns);
 }
 
 test "open reads the max_turns and the bash format from the file" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -239,17 +252,14 @@ test "open reads the max_turns and the bash format from the file" {
             "\"tools\":{\"bash\":{\"format\":\"shfmt | bat -l bash\",\"unknown\":1}}}",
     });
 
-    const opened = try Config.open(std.testing.io, tmp.dir, allocator);
+    var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer opened.config.deinit();
     try std.testing.expect(!opened.created);
     try std.testing.expectEqual(7, opened.config.max_turns);
     try std.testing.expectEqualStrings("shfmt | bat -l bash", opened.config.tools.bash.format.?);
 }
 
 test "open reads the markdown format from the file" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -258,22 +268,20 @@ test "open reads the markdown format from the file" {
         .data = "{\"markdown\":{\"format\":\"glow -\"}}",
     });
 
-    const opened = try Config.open(std.testing.io, tmp.dir, allocator);
+    var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer opened.config.deinit();
     try std.testing.expectEqualStrings("glow -", opened.config.markdown.format.?);
     // The tools are untouched by a markdown format.
     try std.testing.expect(opened.config.tools.bash.format == null);
 
     // A file without one leaves the format unset, as before.
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{}" });
-    const bare = try Config.open(std.testing.io, tmp.dir, allocator);
+    var bare = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer bare.config.deinit();
     try std.testing.expect(bare.config.markdown.format == null);
 }
 
 test "open leaves the bash format unset when the file does not set one" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -282,7 +290,8 @@ test "open leaves the bash format unset when the file does not set one" {
         .sub_path = file_name,
         .data = "{\"max_turns\":7}",
     });
-    const older = try Config.open(std.testing.io, tmp.dir, allocator);
+    var older = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer older.config.deinit();
     try std.testing.expect(older.config.tools.bash.format == null);
     // The timeout the setting was added with is the default for a file without one.
     try std.testing.expectEqual(default_timeout_s, older.config.tools.bash.timeout_s);
@@ -292,15 +301,12 @@ test "open leaves the bash format unset when the file does not set one" {
         .sub_path = file_name,
         .data = "{\"tools\":{\"bash\":{\"format\":null}}}",
     });
-    const explicit = try Config.open(std.testing.io, tmp.dir, allocator);
+    var explicit = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer explicit.config.deinit();
     try std.testing.expect(explicit.config.tools.bash.format == null);
 }
 
 test "open reads the bash timeout from the file" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -309,7 +315,8 @@ test "open reads the bash timeout from the file" {
         .sub_path = file_name,
         .data = "{\"tools\":{\"bash\":{\"format\":\"shfmt\",\"timeout_s\":30}}}",
     });
-    const opened = try Config.open(std.testing.io, tmp.dir, allocator);
+    var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer opened.config.deinit();
     try std.testing.expectEqual(30, opened.config.tools.bash.timeout_s);
     try std.testing.expectEqualStrings("shfmt", opened.config.tools.bash.format.?);
 
@@ -318,15 +325,12 @@ test "open reads the bash timeout from the file" {
         .sub_path = file_name,
         .data = "{\"tools\":{\"bash\":{\"format\":\"shfmt\"}}}",
     });
-    const bare = try Config.open(std.testing.io, tmp.dir, allocator);
+    var bare = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer bare.config.deinit();
     try std.testing.expectEqual(default_timeout_s, bare.config.tools.bash.timeout_s);
 }
 
 test "open reads the web search provider and result count from the file" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -335,13 +339,15 @@ test "open reads the web search provider and result count from the file" {
         .data = "{\"tools\":{\"web_search\":{\"provider\":\"tavily\",\"max_results\":3}}}",
     });
 
-    const opened = try Config.open(std.testing.io, tmp.dir, allocator);
+    var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer opened.config.deinit();
     try std.testing.expectEqual(search.Provider.tavily, opened.config.tools.web_search.provider.?);
     try std.testing.expectEqual(3, opened.config.tools.web_search.max_results);
 
     // The defaults leave it off, and the count ready for a provider to be named.
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{}" });
-    const bare = try Config.open(std.testing.io, tmp.dir, allocator);
+    var bare = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer bare.config.deinit();
     try std.testing.expect(bare.config.tools.web_search.provider == null);
     try std.testing.expectEqual(default_max_results, bare.config.tools.web_search.max_results);
 
@@ -351,36 +357,37 @@ test "open reads the web search provider and result count from the file" {
         .sub_path = file_name,
         .data = "{\"tools\":{\"web_search\":{\"provider\":\"google\"}}}",
     });
-    try std.testing.expectError(error.CorruptConfig, Config.open(std.testing.io, tmp.dir, allocator));
+    try std.testing.expectError(error.CorruptConfig, Config.open(std.testing.io, tmp.dir, std.testing.allocator));
 }
 
 test "save round-trips a custom max_turns" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try (Config{ .max_turns = 3 }).save(std.testing.io, tmp.dir, gpa);
+    var config = Config.init(std.testing.allocator);
+    defer config.deinit();
+    config.max_turns = 3;
+    try config.save(std.testing.io, tmp.dir);
 
-    const opened = try Config.open(std.testing.io, tmp.dir, allocator);
+    var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer opened.config.deinit();
     try std.testing.expectEqual(3, opened.config.max_turns);
 }
 
 test "the file is indented, so it can be read and edited by hand" {
     const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try (Config{ .max_turns = 3 }).save(std.testing.io, tmp.dir, gpa);
+    var config = Config.init(gpa);
+    defer config.deinit();
+    config.max_turns = 3;
+    try config.save(std.testing.io, tmp.dir);
 
-    const text = try tmp.dir.readFileAlloc(std.testing.io, file_name, allocator, .limited(max_config_bytes));
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const text = try tmp.dir.readFileAlloc(std.testing.io, file_name, arena_state.allocator(), .limited(max_config_bytes));
     try std.testing.expectEqualStrings(
         \\{
         \\  "version": 1,
@@ -403,45 +410,40 @@ test "the file is indented, so it can be read and edited by hand" {
 }
 
 test "save round-trips a configured search backend" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     // The backend is written by name, which is the variant's own, and read back
     // as the variant it names.
-    var config: Config = .{};
+    var config = Config.init(std.testing.allocator);
+    defer config.deinit();
     config.tools.web_search = .{ .provider = .tavily, .max_results = 4 };
-    try config.save(std.testing.io, tmp.dir, gpa);
+    try config.save(std.testing.io, tmp.dir);
 
-    const opened = try Config.open(std.testing.io, tmp.dir, allocator);
+    var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer opened.config.deinit();
     try std.testing.expectEqual(search.Provider.tavily, opened.config.tools.web_search.provider.?);
     try std.testing.expectEqual(4, opened.config.tools.web_search.max_results);
 }
 
 test "open rejects damaged, future and unusable configurations" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    // A rejected configuration frees the arena it made on the way out, so a
+    // failure leaks nothing.
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{" });
-    try std.testing.expectError(error.CorruptConfig, Config.open(std.testing.io, tmp.dir, allocator));
+    try std.testing.expectError(error.CorruptConfig, Config.open(std.testing.io, tmp.dir, std.testing.allocator));
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{\"version\":99}" });
-    try std.testing.expectError(error.UnsupportedConfigVersion, Config.open(std.testing.io, tmp.dir, allocator));
+    try std.testing.expectError(error.UnsupportedConfigVersion, Config.open(std.testing.io, tmp.dir, std.testing.allocator));
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{\"max_turns\":0}" });
-    try std.testing.expectError(error.InvalidConfig, Config.open(std.testing.io, tmp.dir, allocator));
+    try std.testing.expectError(error.InvalidConfig, Config.open(std.testing.io, tmp.dir, std.testing.allocator));
 
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = file_name,
         .data = "{\"tools\":{\"bash\":{\"timeout_s\":0}}}",
     });
-    try std.testing.expectError(error.InvalidConfig, Config.open(std.testing.io, tmp.dir, allocator));
+    try std.testing.expectError(error.InvalidConfig, Config.open(std.testing.io, tmp.dir, std.testing.allocator));
 }

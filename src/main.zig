@@ -96,7 +96,6 @@ pub fn main(init: std.process.Init) !void {
             io,
             out,
             arena,
-            init.gpa,
             data_dir_handle,
             data_dir,
             &credentials,
@@ -116,10 +115,13 @@ pub fn main(init: std.process.Init) !void {
     };
     defer config_dir_handle.close(io);
 
-    const settings = billy.Config.open(io, config_dir_handle, arena) catch |err| {
+    // The configuration owns an arena of its own for the strings it reads, so it
+    // is freed when the run is over rather than with the process arena.
+    var settings = billy.Config.open(io, config_dir_handle, init.gpa) catch |err| {
         std.log.err("cannot read the configuration in {s}: {s}", .{ config_dir, @errorName(err) });
         return err;
     };
+    defer settings.config.deinit();
     if (settings.created) {
         try out.print("wrote the default configuration to {s}\n", .{
             try std.fs.path.join(arena, &.{ config_dir, billy.Config.file_name }),
@@ -228,7 +230,7 @@ pub fn main(init: std.process.Init) !void {
         // have to be remembered from the previous run.
         try billy.agent.printTranscript(init.gpa, out, &session, config.display);
     }
-    try billy.agent.run(io, arena, init.gpa, out, config, &session);
+    try billy.agent.run(io, init.gpa, out, config, &session);
 }
 
 /// Reads the command line, whose first entry is the executable name. The `login`

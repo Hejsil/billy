@@ -96,10 +96,14 @@ bash_timeout_s: usize,
 /// transcript, so a replayed session looks like the run it continues.
 style: Style,
 /// The web search client, or null when no backend is configured. A null
-/// leaves `web_search` out of `definitions`, so the model is never offered
-/// a tool that could not run.
+/// leaves `web_search` out of the tool set billy offers, so the model is never
+/// given a tool that could not run.
 search: ?Search.Client,
-definitions: []const Session.Definition,
+/// One call's scratch: the parsed arguments and the result. It is reset at the
+/// start of every call, so nothing here outlives the call that made it; the
+/// caller interns what it keeps. That is what keeps a long conversation from
+/// holding every result, and what lets the tools take no allocator of their own.
+scratch: std.heap.ArenaAllocator,
 
 /// What a tool set is built from, gathered into one so the constructor reads
 /// as what each value is rather than as a run of positional arguments, which
@@ -108,10 +112,6 @@ pub const Options = struct {
     io: Io,
     /// The directory the tools work in. See `Tools.dir`.
     dir: Io.Dir,
-    /// Holds the definitions, which are sent with every request and so live as
-    /// long as the run. Nothing else the tools allocate outlives the call that
-    /// made it, so the rest is asked for per call.
-    arena: std.mem.Allocator,
     /// For temporary buffers.
     gpa: std.mem.Allocator,
     /// Reports tool activity to the user.
@@ -126,7 +126,8 @@ pub const Options = struct {
     style: Style = .plain,
     /// The backend the configuration asked for, with its key resolved, or null
     /// to leave web search out. A null also leaves `web_search` out of the
-    /// definitions, so the model is never offered a tool that could not run.
+    /// tool set billy offers, so the model is never given a tool that could
+    /// not run.
     search: ?Search.Config = null,
     /// The run's one HTTP client, borrowed by the search backend when one is
     /// configured, so a search shares connections and scanned certificates
@@ -151,8 +152,22 @@ pub fn init(options: Options) !Tools {
             .max_results = config.max_results,
             .http = options.http,
         } else null,
-        .definitions = try toolDefinitions(options.arena, options.search != null),
+        .scratch = .init(options.gpa),
     };
+}
+
+/// Frees what a tool set owns. The definitions are built from comptime strings
+/// and go straight into the session, so the scratch is all there is.
+pub fn deinit(tools: *Tools) void {
+    tools.scratch.deinit();
+}
+
+/// The definitions a session should be given: every tool billy offers, with the
+/// search tool last when a backend is configured. The strings are the spec
+/// table's own, which are comptime, so this builds nothing; the session interns
+/// and stores them.
+pub fn definitions(tools: *const Tools) []const Session.Definition {
+    return if (tools.search != null) &specs_with_search else &specs;
 }
 
 /// Runs one tool call and returns its result. Tool failures are reported to
@@ -163,21 +178,25 @@ pub fn init(options: Options) !Tools {
 /// did. The head goes out before the tool runs, so a slow command shows what
 /// it is doing, and the result follows it.
 ///
-/// `arena` holds the parsed call and the result. The result is what the
-/// caller is given, so it has to outlive the call, but no longer than that:
-/// the session interns what it keeps, so an arena dropped with the request
-/// is enough and keeps a long conversation from holding every result.
-pub fn run(tools: *Tools, arena: std.mem.Allocator, call: llm.ToolCall) ![]const u8 {
+/// The parsed call and the result live in the tools' own scratch, which is
+/// dropped at the start of the next call. The caller interns what it keeps, so
+/// the result only has to last until then, which keeps a long conversation from
+/// holding every result. A caller that needs to keep one past the next call
+/// must copy it.
+pub fn run(tools: *Tools, call: llm.ToolCall) ![]const u8 {
+    _ = tools.scratch.reset(.retain_capacity);
+    const arena = tools.scratch.allocator();
+
     const parsed = parseCall(arena, call);
     try printHead(parsed, tools.format, tools.style, tools.log);
     try tools.log.flush();
 
     const result = switch (parsed) {
-        .read => |args| try tools.read(arena, args),
-        .write => |args| try tools.write(arena, args),
-        .edit => |args| try tools.edit(arena, args),
-        .bash => |args| try tools.bash(arena, args),
-        .web_search => |args| try tools.webSearch(arena, args),
+        .read => |args| try tools.read(args),
+        .write => |args| try tools.write(args),
+        .edit => |args| try tools.edit(args),
+        .bash => |args| try tools.bash(args),
+        .web_search => |args| try tools.webSearch(args),
         .unknown => |name| try fail(arena, "unknown tool '{s}'", .{name}),
         .malformed => |bad| try fail(
             arena,
@@ -192,7 +211,8 @@ pub fn run(tools: *Tools, arena: std.mem.Allocator, call: llm.ToolCall) ![]const
     return result;
 }
 
-fn read(tools: *Tools, arena: std.mem.Allocator, args: Call.Read) ![]const u8 {
+fn read(tools: *Tools, args: Call.Read) ![]const u8 {
+    const arena = tools.scratch.allocator();
     const contents = tools.dir.readFileAlloc(
         tools.io,
         args.path,
@@ -229,7 +249,8 @@ fn read(tools: *Tools, arena: std.mem.Allocator, args: Call.Read) ![]const u8 {
     return finish(arena, out.written());
 }
 
-fn write(tools: *Tools, arena: std.mem.Allocator, args: Call.Write) ![]const u8 {
+fn write(tools: *Tools, args: Call.Write) ![]const u8 {
+    const arena = tools.scratch.allocator();
     if (std.fs.path.dirname(args.path)) |parent| {
         tools.dir.createDirPath(tools.io, parent) catch |err|
             return fail(arena, "cannot create {s}: {s}", .{ parent, @errorName(err) });
@@ -239,7 +260,8 @@ fn write(tools: *Tools, arena: std.mem.Allocator, args: Call.Write) ![]const u8 
     return std.fmt.allocPrint(arena, "wrote {d} bytes to {s}", .{ args.content.len, args.path });
 }
 
-fn edit(tools: *Tools, arena: std.mem.Allocator, args: Call.Edit) ![]const u8 {
+fn edit(tools: *Tools, args: Call.Edit) ![]const u8 {
+    const arena = tools.scratch.allocator();
     if (args.old_string.len == 0) return fail(arena, "old_string must not be empty", .{});
 
     const contents = tools.dir.readFileAlloc(
@@ -278,7 +300,8 @@ fn edit(tools: *Tools, arena: std.mem.Allocator, args: Call.Edit) ![]const u8 {
     }
 }
 
-fn bash(tools: *Tools, arena: std.mem.Allocator, args: Call.Bash) ![]const u8 {
+fn bash(tools: *Tools, args: Call.Bash) ![]const u8 {
+    const arena = tools.scratch.allocator();
     // The count the configuration holds is turned into the signed seconds
     // the clock takes. A value past what it can express is absurd but must
     // not overflow the cast, so it is clamped to the longest duration, which
@@ -327,7 +350,8 @@ fn bash(tools: *Tools, arena: std.mem.Allocator, args: Call.Bash) ![]const u8 {
 /// Runs one web search and returns its results as text. No backend is
 /// configured only when a resumed session carries the tool from a run that
 /// had one; the model is told so rather than the call failing outright.
-fn webSearch(tools: *Tools, arena: std.mem.Allocator, args: Call.WebSearch) ![]const u8 {
+fn webSearch(tools: *Tools, args: Call.WebSearch) ![]const u8 {
+    const arena = tools.scratch.allocator();
     const client = if (tools.search) |*client| client else return fail(arena, "web search is not configured", .{});
     return client.search(arena, args.query) catch |err|
         return fail(arena, "search failed: {s}", .{@errorName(err)});
@@ -857,14 +881,8 @@ fn printTruncated(text: []const u8, ink: Ink, style: Style, out: *Io.Writer) !vo
     }
 }
 
-const Spec = struct {
-    name: []const u8,
-    description: []const u8,
-    parameters: []const u8,
-};
-
 /// The tools every session is offered, in the order the model receives them.
-const specs = [_]Spec{
+const specs = [_]Session.Definition{
     .{
         .name = "read",
         .description = "Read a file. Returns the lines with their line numbers.",
@@ -904,7 +922,7 @@ const specs = [_]Spec{
 /// The tool that is offered only when a search backend is configured, since it
 /// can do nothing without one. It comes last, after the tools every session
 /// has, so a session that gains it appends to the set rather than reordering it.
-const search_spec = Spec{
+const search_spec = Session.Definition{
     .name = "web_search",
     .description = "Search the web and return the top results: a title, a url and a snippet for each.",
     .parameters = "{\"type\":\"object\",\"properties\":{" ++
@@ -912,25 +930,9 @@ const search_spec = Spec{
         "\"required\":[\"query\"]}",
 };
 
-/// The tool definitions sent with every request. `web_search` is included only
-/// when `include_search` is set, so a run with no backend never offers the model
-/// a tool that could not run.
-fn toolDefinitions(arena: std.mem.Allocator, include_search: bool) ![]const Session.Definition {
-    var tools: std.ArrayList(Session.Definition) = .empty;
-    for (specs) |spec| try tools.append(arena, definitionOf(spec));
-    if (include_search) try tools.append(arena, definitionOf(search_spec));
-    return tools.toOwnedSlice(arena);
-}
-
-/// The definition of one spec. Its strings are the spec's own, which are
-/// comptime, so nothing is allocated for the text; the session interns it.
-fn definitionOf(spec: Spec) Session.Definition {
-    return .{
-        .name = spec.name,
-        .description = spec.description,
-        .parameters = spec.parameters,
-    };
-}
+/// `specs` with the search tool appended, for a run that has a backend. The
+/// order is what keeps the set growing by appending rather than reordering.
+const specs_with_search = specs ++ [_]Session.Definition{search_spec};
 
 test "exit codes of signals follow the shell convention" {
     try std.testing.expectEqual(0, formatting.exitCode(.{ .exited = 0 }));
@@ -1080,12 +1082,12 @@ test "a bash block shows only the streams the command filled" {
     var tool_set = try Tools.init(.{
         .io = std.testing.io,
         .dir = Io.Dir.cwd(),
-        .arena = arena,
         .gpa = gpa,
         .log = &log.writer,
         .bash_timeout_s = 120,
         .http = &http,
     });
+    defer tool_set.deinit();
     const cases = [_]struct { command: []const u8, expected: []const u8 }{
         // Nothing printed: the status is all there is.
         .{ .command = "true", .expected = "❯ bash\ntrue\n✓ exit 0\n\n" },
@@ -1103,7 +1105,7 @@ test "a bash block shows only the streams the command filled" {
         const arguments = try std.fmt.allocPrint(arena, "{{\"command\":{f}}}", .{
             std.json.fmt(case.command, .{}),
         });
-        _ = try tool_set.run(arena, .{ .id = "1", .function = .{ .name = "bash", .arguments = arguments } });
+        _ = try tool_set.run(.{ .id = "1", .function = .{ .name = "bash", .arguments = arguments } });
         try std.testing.expectEqualStrings(case.expected, log.written());
     }
 }
@@ -1295,17 +1297,17 @@ test "run logs exactly what describe prints" {
     var tool_set = try Tools.init(.{
         .io = std.testing.io,
         .dir = Io.Dir.cwd(),
-        .arena = arena,
         .gpa = gpa,
         .log = &log.writer,
         .bash_timeout_s = 120,
         .http = &http,
     });
+    defer tool_set.deinit();
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"true\"}",
     } };
-    const result = try tool_set.run(arena, call);
+    const result = try tool_set.run(call);
 
     var described: std.Io.Writer.Allocating = .init(gpa);
     defer described.deinit();
@@ -1336,18 +1338,18 @@ test "the format changes what is shown and nothing else" {
     var tool_set = try Tools.init(.{
         .io = std.testing.io,
         .dir = Io.Dir.cwd(),
-        .arena = arena,
         .gpa = gpa,
         .log = &log.writer,
         .format = format,
         .bash_timeout_s = 120,
         .http = &http,
     });
+    defer tool_set.deinit();
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"echo hi\"}",
     } };
-    const result = try tool_set.run(arena, call);
+    const result = try tool_set.run(call);
 
     // The command that ran is the one the model wrote, so the result is its
     // output, and the user reads the command as the formatter laid it out.
@@ -1366,9 +1368,6 @@ test "the format changes what is shown and nothing else" {
 
 test "a bash command that outlives the timeout is killed and reported" {
     const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
 
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
@@ -1380,17 +1379,17 @@ test "a bash command that outlives the timeout is killed and reported" {
     var tool_set = try Tools.init(.{
         .io = std.testing.io,
         .dir = Io.Dir.cwd(),
-        .arena = arena,
         .gpa = gpa,
         .log = &log.writer,
         .bash_timeout_s = 1,
         .http = &http,
     });
+    defer tool_set.deinit();
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"sleep 30\"}",
     } };
-    const result = try tool_set.run(arena, call);
+    const result = try tool_set.run(call);
 
     try std.testing.expectEqualStrings(
         "error: command did not finish within 1s and was killed",
@@ -1550,33 +1549,72 @@ test "a replacement matched exactly is not re-indented" {
     );
 }
 
-test "definitions cover every tool the loop dispatches" {
-    const arena = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(arena);
-    defer arena_state.deinit();
-    const defs = try toolDefinitions(arena_state.allocator(), false);
-    try std.testing.expectEqual(specs.len, defs.len);
-    for (defs) |tool| {
+/// A tool set over `dir` for the definition tests, with a search backend when
+/// `with_search` is set.
+fn definitionsToolSet(
+    dir: Io.Dir,
+    gpa: std.mem.Allocator,
+    log: *Io.Writer,
+    http: *std.http.Client,
+    with_search: bool,
+) !Tools {
+    return Tools.init(.{
+        .io = std.testing.io,
+        .dir = dir,
+        .gpa = gpa,
+        .log = log,
+        .bash_timeout_s = 120,
+        .search = if (with_search) .{
+            .provider = .tavily,
+            .api_key = "key",
+            .max_results = 3,
+        } else null,
+        .http = http,
+    });
+}
+
+test "the definitions cover every tool the loop dispatches" {
+    const gpa = std.testing.allocator;
+    var log: std.Io.Writer.Allocating = .init(gpa);
+    defer log.deinit();
+    var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    defer http.deinit();
+    var tool_set = try definitionsToolSet(Io.Dir.cwd(), gpa, &log.writer, &http, false);
+    defer tool_set.deinit();
+
+    // The names are exactly the tools the loop can dispatch, in the order the
+    // model receives them, so it is never offered one that does not run.
+    const offered = tool_set.definitions();
+    const expected = [_][]const u8{ "read", "write", "edit", "bash" };
+    try std.testing.expectEqual(expected.len, offered.len);
+    for (offered, expected) |definition, name| {
+        try std.testing.expectEqualStrings(name, definition.name);
         // The schema is the JSON text it is sent as, which starts with an object.
-        try std.testing.expect(std.mem.startsWith(u8, tool.parameters, "{"));
+        try std.testing.expect(std.mem.startsWith(u8, definition.parameters, "{"));
     }
 }
 
 test "web search is offered only when a backend is configured" {
-    const arena = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(arena);
-    defer arena_state.deinit();
+    const gpa = std.testing.allocator;
+    var log: std.Io.Writer.Allocating = .init(gpa);
+    defer log.deinit();
+    var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    defer http.deinit();
 
-    // Without a backend the tool is not offered at all, and the tools every
-    // session has come first so the set only grows.
-    const without = try toolDefinitions(arena_state.allocator(), false);
+    // Without a backend the search tool is not offered at all, and the tools
+    // every session has come first so the set only grows.
+    var plain = try definitionsToolSet(Io.Dir.cwd(), gpa, &log.writer, &http, false);
+    defer plain.deinit();
+    const without = plain.definitions();
     try std.testing.expectEqual(specs.len, without.len);
-    for (without) |tool| {
-        try std.testing.expect(!std.mem.eql(u8, tool.name, "web_search"));
+    for (without) |definition| {
+        try std.testing.expect(!std.mem.eql(u8, definition.name, "web_search"));
     }
 
     // With one it is appended, so a session that gains it keeps the tools it had.
-    const with = try toolDefinitions(arena_state.allocator(), true);
+    var searched = try definitionsToolSet(Io.Dir.cwd(), gpa, &log.writer, &http, true);
+    defer searched.deinit();
+    const with = searched.definitions();
     try std.testing.expectEqual(specs.len + 1, with.len);
     try std.testing.expectEqualStrings("web_search", with[with.len - 1].name);
 }
@@ -1602,15 +1640,15 @@ test "the tools work in the directory they are given, wherever billy runs" {
     var tool_set = try Tools.init(.{
         .io = std.testing.io,
         .dir = work,
-        .arena = arena,
         .gpa = gpa,
         .log = &log.writer,
         .bash_timeout_s = 120,
         .http = &http,
     });
+    defer tool_set.deinit();
 
     // A file written by the tool lands in that directory.
-    _ = try tool_set.run(arena, .{ .id = "1", .function = .{
+    _ = try tool_set.run(.{ .id = "1", .function = .{
         .name = "write",
         .arguments = "{\"path\":\"note.txt\",\"content\":\"hi\"}",
     } });
@@ -1620,7 +1658,7 @@ test "the tools work in the directory they are given, wherever billy runs" {
     // And a command runs there too, so `pwd` reports that directory and not the
     // one billy was started in.
     log.clearRetainingCapacity();
-    const result = try tool_set.run(arena, .{ .id = "2", .function = .{
+    const result = try tool_set.run(.{ .id = "2", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"pwd\"}",
     } });

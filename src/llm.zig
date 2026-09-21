@@ -47,9 +47,20 @@ pub const Usage = struct {
 };
 
 /// What one request produced: the assistant message and the tokens it used.
+///
+/// `message` points into `response`, the parsed reply the completion owns, so
+/// the strings stay valid until `deinit` is called. That is what frees the
+/// caller from holding an arena for the response to live in.
 pub const Completion = struct {
     message: Message,
     usage: Usage,
+    /// The parsed response `message` points into, freed by `deinit`.
+    response: std.json.Parsed(Response),
+
+    /// Frees the parsed response the reply points into.
+    pub fn deinit(completion: Completion) void {
+        completion.response.deinit();
+    }
 };
 
 /// The body of one completion request.
@@ -135,12 +146,11 @@ pub const Client = struct {
     /// put the conversation into the request: the body is written straight onto
     /// the connection.
     ///
-    /// `arena` holds the parsed response, which has to outlive the response
-    /// buffer but need not outlive the caller's use of it: the session interns
-    /// what it keeps, so an arena dropped with the request is enough.
+    /// `gpa` owns the parsed response the returned completion carries; the
+    /// caller frees it with `Completion.deinit`.
     pub fn complete(
         client: *Client,
-        arena: std.mem.Allocator,
+        gpa: std.mem.Allocator,
         messages: anytype,
         tools: anytype,
     ) !Completion {
@@ -171,7 +181,7 @@ pub const Client = struct {
                 try client.pause(attempt, answer.retry_after_ms);
                 continue;
             }
-            return interpret(arena, answer);
+            return interpret(gpa, answer);
         }
     }
 
@@ -288,35 +298,40 @@ const Answer = struct {
 /// Turns an answer into a completion: the reply the model wrote and the tokens
 /// it used. A status that is not a success is reported with its body, which is
 /// where the provider usually says why.
-fn interpret(arena: std.mem.Allocator, answer: Answer) !Completion {
+///
+/// The body is parsed into a response the completion carries, so the reply
+/// outlives the answer buffer without the caller holding an arena for it; the
+/// caller frees it with `Completion.deinit`.
+fn interpret(gpa: std.mem.Allocator, answer: Answer) !Completion {
     // The client logs what the server said as context; the error it returns is
     // what the caller reports, so the failure is not announced twice.
     if (answer.status.class() != .success) {
         std.log.warn("HTTP {d}: {s}", .{ @intFromEnum(answer.status), answer.body });
         return error.HttpStatus;
     }
-    // The answer's body is freed once this returns, so the strings in the parsed
-    // message must be copies out of the arena it is parsed into.
-    const parsed = std.json.parseFromSliceLeaky(Response, arena, answer.body, .{
+    const parsed = std.json.parseFromSlice(Response, gpa, answer.body, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     }) catch |err| {
         std.log.warn("HTTP {d}: {s}", .{ @intFromEnum(answer.status), answer.body });
         return err;
     };
-    if (parsed.@"error") |api_error| {
+    errdefer parsed.deinit();
+
+    if (parsed.value.@"error") |api_error| {
         std.log.warn("api error: {s}", .{api_error.message});
         return error.ApiError;
     }
-    if (parsed.choices.len == 0) {
+    if (parsed.value.choices.len == 0) {
         std.log.warn("HTTP {d} without choices: {s}", .{ @intFromEnum(answer.status), answer.body });
         return error.NoChoices;
     }
     // A provider that omits usage leaves the totals at zero, so the session
     // totals under-report rather than the request failing.
     return .{
-        .message = parsed.choices[0].message,
-        .usage = if (parsed.usage) |reported| reported.normalized() else .{},
+        .message = parsed.value.choices[0].message,
+        .usage = if (parsed.value.usage) |reported| reported.normalized() else .{},
+        .response = parsed,
     };
 }
 
@@ -508,9 +523,8 @@ test "a request reaches the wire with the body the head promised" {
         .http = &http,
     };
 
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const completion = try client.complete(arena_state.allocator(), &messages, @as([]const NoTools, &.{}));
+    const completion = try client.complete(gpa, &messages, @as([]const NoTools, &.{}));
+    defer completion.deinit();
 
     try group.await(io);
     if (provider.err) |err| return err;
@@ -664,7 +678,8 @@ const TestListener = struct {
 };
 
 /// Runs one completion against `url`, with the retry backoff turned off so the
-/// test costs no real time.
+/// test costs no real time. The caller owns the returned completion and frees it
+/// with `deinit`.
 fn completeAgainst(gpa: std.mem.Allocator, io: Io, url: []const u8, max_attempts: usize) !Completion {
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -679,18 +694,7 @@ fn completeAgainst(gpa: std.mem.Allocator, io: Io, url: []const u8, max_attempts
         .http = &http,
     };
     const messages = [_]Message{.{ .role = "user", .content = "hi" }};
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    // The message the completion carries has to outlive this, so it is copied
-    // out of the arena the way a session interns what it keeps.
-    const completion = try client.complete(arena_state.allocator(), &messages, @as([]const NoTools, &.{}));
-    return .{
-        .message = .{
-            .role = try gpa.dupe(u8, completion.message.role),
-            .content = if (completion.message.content) |c| try gpa.dupe(u8, c) else null,
-        },
-        .usage = completion.usage,
-    };
+    return client.complete(gpa, &messages, @as([]const NoTools, &.{}));
 }
 
 test "a request that is rate limited is tried again and succeeds" {
@@ -708,8 +712,7 @@ test "a request that is rate limited is tried again and succeeds" {
     try group.concurrent(io, RetryProvider.serve, .{ io, &listen.listener, &provider });
 
     const completion = try completeAgainst(gpa, io, listen.url, 4);
-    defer gpa.free(completion.message.role);
-    defer if (completion.message.content) |c| gpa.free(c);
+    defer completion.deinit();
 
     try group.await(io);
     if (provider.err) |err| return err;
@@ -818,11 +821,9 @@ test "the HTTP client is kept, so requests reuse one connection" {
     // accepts; the second request only completes because the connection is
     // reused.
     const messages = [_]Message{.{ .role = "user", .content = "hi" }};
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
     for (0..2) |_| {
-        _ = arena_state.reset(.retain_capacity);
-        const completion = try client.complete(arena_state.allocator(), &messages, @as([]const NoTools, &.{}));
+        const completion = try client.complete(gpa, &messages, @as([]const NoTools, &.{}));
+        defer completion.deinit();
         try std.testing.expectEqualStrings("hi", completion.message.content.?);
     }
 

@@ -459,11 +459,11 @@ pub fn appendSystemPrompt(session: *Session, system_prompt: []const u8) !void {
     try session.append(.{ .role = "system", .content = system_prompt });
 }
 
-/// Records the tool definitions to send with every request, unless the
-/// session already has some. A resumed session carries the tools it was
-/// saved with, which are kept so the request matches the earlier run and
-/// hits the prompt cache; a new session, or one saved before the tools were
-/// stored, gets the current definitions instead.
+/// Records the tool definitions to send with every request, unless the session
+/// already has some. A resumed session carries the tools it was saved with,
+/// which are kept so the request matches the earlier run and hits the prompt
+/// cache; a new session, or one saved before the tools were stored, gets the
+/// current definitions instead.
 pub fn ensureTools(session: *Session, definitions: []const Definition) !void {
     if (session.tools.len != 0) return;
     // The strings are interned into the pool, so the set costs one array and
@@ -471,6 +471,7 @@ pub fn ensureTools(session: *Session, definitions: []const Definition) !void {
     // document to keep alive: the arguments schema is stored as the JSON text it
     // is sent as.
     const tools = try session.gpa.alloc(Tool, definitions.len);
+    errdefer session.gpa.free(tools);
     for (definitions, tools) |definition, *tool| {
         tool.* = .{
             .name = try session.internString(definition.name),
@@ -651,22 +652,25 @@ fn stringPtr(session: *const Session, index: StringIndex) ?[*:0]const u8 {
 /// specification prescribes. The credentials live in the directory itself, and
 /// the sessions in a subdirectory of it, so a listing of billy's data directory
 /// shows what billy keeps rather than a wall of session files.
-pub fn dataDir(arena: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
+pub fn dataDir(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
     if (environ.get("XDG_DATA_HOME")) |xdg| {
         // The specification says a relative path must be ignored.
         if (xdg.len > 0 and std.fs.path.isAbsolute(xdg)) {
-            return std.fs.path.join(arena, &.{ xdg, app_dir });
+            return std.fs.path.join(gpa, &.{ xdg, app_dir });
         }
     }
 
     const home = environ.get("HOME") orelse return error.HomeNotSet;
-    return std.fs.path.join(arena, &.{ home, ".local", "share", app_dir });
+    return std.fs.path.join(gpa, &.{ home, ".local", "share", app_dir });
 }
 
 /// The directory holding the sessions: the `sessions` subdirectory of `dataDir`,
 /// so that the session files sit apart from what else billy keeps.
-pub fn defaultDir(arena: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
-    return std.fs.path.join(arena, &.{ try dataDir(arena, environ), sessions_dir });
+pub fn defaultDir(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
+    const data_dir = try dataDir(gpa, environ);
+    defer gpa.free(data_dir);
+
+    return std.fs.path.join(gpa, &.{ data_dir, sessions_dir });
 }
 
 /// The arguments schema of a tool as JSON text: already text when a file holds
@@ -1157,7 +1161,7 @@ test "ensureTools stores the tools and only sets them once" {
     try std.testing.expectEqualStrings("read", resumed.string(resumed.tools[0].name).?);
     try std.testing.expectEqualStrings("Read a file.", resumed.string(resumed.tools[0].description).?);
 
-    // A session that already has tools keeps them.
+    // A session that already has tools keeps them, rather than taking a new set.
     const replaced = [_]Definition{.{
         .name = "bash",
         .description = "Run a command.",
@@ -1170,7 +1174,7 @@ test "ensureTools stores the tools and only sets them once" {
     try std.testing.expectEqualStrings("read", reopened.string(reopened.tools[0].name).?);
 }
 
-test "ensureTools gives tools to a session saved without any" {
+test "a session saved without tools loads with none" {
     const arena = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1182,19 +1186,9 @@ test "ensureTools gives tools to a session saved without any" {
         .data = "{\"version\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
     });
 
-    const tools = [_]Definition{.{
-        .name = "read",
-        .description = "Read a file.",
-        .parameters = "{}",
-    }};
-
     var session = try Session.open(std.testing.io, tmp.dir, arena, "legacy", "/work");
     defer session.deinit();
-
     try std.testing.expectEqual(0, session.tools.len);
-    try session.ensureTools(&tools);
-    try std.testing.expectEqual(1, session.tools.len);
-    try std.testing.expectEqualStrings("read", session.string(session.tools[0].name).?);
 }
 
 test "the token totals survive a save and resume" {

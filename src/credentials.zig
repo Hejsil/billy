@@ -173,15 +173,9 @@ pub fn load(io: Io, dir: Io.Dir, arena: std.mem.Allocator) !Store {
 /// written as nothing at all, so the file holds the keys there are.
 ///
 /// It is written indented rather than compact, like the configuration and unlike
-/// a session file, since a file a user may open to look at is worth reading.
-pub fn save(store: *const Store, io: Io, dir: Io.Dir, gpa: std.mem.Allocator) !void {
-    const text = try std.json.Stringify.valueAlloc(
-        gpa,
-        Stored{ .credentials = store.* },
-        .{ .emit_null_optional_fields = false, .whitespace = .indent_2 },
-    );
-    defer gpa.free(text);
-
+/// a session file, since a file a user may open to look at is worth reading. The
+/// JSON is streamed straight onto the file, so writing it allocates nothing.
+pub fn save(store: *const Store, io: Io, dir: Io.Dir) !void {
     var atomic = try dir.createFileAtomic(io, file_name, .{
         .replace = true,
         .permissions = secret_mode,
@@ -190,7 +184,11 @@ pub fn save(store: *const Store, io: Io, dir: Io.Dir, gpa: std.mem.Allocator) !v
 
     var buffer: [4096]u8 = undefined;
     var file: Io.File.Writer = .init(atomic.file, io, &buffer);
-    try file.interface.writeAll(text);
+    try std.json.Stringify.value(
+        Stored{ .credentials = store.* },
+        .{ .emit_null_optional_fields = false, .whitespace = .indent_2 },
+        &file.interface,
+    );
     try file.flush();
     try atomic.replace(io);
 }
@@ -198,11 +196,14 @@ pub fn save(store: *const Store, io: Io, dir: Io.Dir, gpa: std.mem.Allocator) !v
 /// Runs the `login` command: with no service, lists the services and where each
 /// key comes from; with one, reads a key for it and stores it. `dir_path` is the
 /// directory the credentials are kept in, named in what is printed.
+///
+/// `arena` is the store's own allocator: the one `load` read it with, so a key
+/// added here is owned the same way the ones already there are. It must be the
+/// same one, or the store would hold keys two allocators own.
 pub fn run(
     io: Io,
     out: *Io.Writer,
     arena: std.mem.Allocator,
-    gpa: std.mem.Allocator,
     dir: Io.Dir,
     dir_path: []const u8,
     store: *Store,
@@ -210,8 +211,8 @@ pub fn run(
     service_name: ?[]const u8,
 ) !void {
     const path = try std.fs.path.join(arena, &.{ dir_path, file_name });
-    if (service_name) |name| return login(io, out, arena, gpa, dir, path, store, name);
-    try list(out, arena, store, environ, path);
+    if (service_name) |name| return login(io, out, arena, dir, path, store, name);
+    try list(out, store, environ, path);
 }
 
 /// Reads a key for the named service and stores it, so the next run uses it.
@@ -219,7 +220,6 @@ fn login(
     io: Io,
     out: *Io.Writer,
     arena: std.mem.Allocator,
-    gpa: std.mem.Allocator,
     dir: Io.Dir,
     path: []const u8,
     store: *Store,
@@ -243,7 +243,7 @@ fn login(
     }
 
     try store.put(arena, service, key);
-    save(store, io, dir, gpa) catch |err| {
+    save(store, io, dir) catch |err| {
         std.log.err("cannot write the credentials in {s}: {s}", .{ path, @errorName(err) });
         return err;
     };
@@ -254,7 +254,6 @@ fn login(
 /// stored one, the one in its environment variable, or none.
 fn list(
     out: *Io.Writer,
-    arena: std.mem.Allocator,
     store: *const Store,
     environ: *const std.process.Environ.Map,
     path: []const u8,
@@ -268,18 +267,20 @@ fn list(
     }
 
     for (services) |service| {
-        const status = if (store.get(service) != null)
-            "stored"
-        else if (environ.get(service.variable()) != null)
-            try std.fmt.allocPrint(arena, "set in {s}", .{service.variable()})
-        else
-            "not set";
         try out.print("{s}", .{service.name()});
         try spaces(out, name_width - service.name().len);
         try out.writeAll("  ");
         try out.print("{s}", .{service.purpose()});
         try spaces(out, purpose_width - service.purpose().len);
-        try out.print("  {s}\n", .{status});
+        try out.writeAll("  ");
+        if (store.get(service) != null) {
+            try out.writeAll("stored");
+        } else if (environ.get(service.variable()) != null) {
+            try out.print("set in {s}", .{service.variable()});
+        } else {
+            try out.writeAll("not set");
+        }
+        try out.writeAll("\n");
     }
     try out.print("\n`billy login <service>` stores a key in {s}\n", .{path});
 }
@@ -393,7 +394,7 @@ test "a stored key survives a save and a load" {
     var store: Store = .{};
     try store.put(allocator, .tavily, "tvly-secret");
     try store.put(allocator, .deepseek, "sk-secret");
-    try save(&store, std.testing.io, tmp.dir, gpa);
+    try save(&store, std.testing.io, tmp.dir);
 
     const loaded = try load(std.testing.io, tmp.dir, allocator);
     try std.testing.expectEqualStrings("tvly-secret", loaded.get(.tavily).?);
@@ -412,7 +413,7 @@ test "the file holds a field per service that has a key, and nothing else" {
 
     var store: Store = .{};
     try store.put(allocator, .tavily, "tvly-secret");
-    try save(&store, std.testing.io, tmp.dir, gpa);
+    try save(&store, std.testing.io, tmp.dir);
 
     const text = try tmp.dir.readFileAlloc(std.testing.io, file_name, allocator, .limited(max_credentials_bytes));
     // The service is a field named after it; a service with no key is left out
@@ -450,7 +451,7 @@ test "the credentials file is written for the owner alone" {
 
     var store: Store = .{};
     try store.put(arena_state.allocator(), .tavily, "secret");
-    try save(&store, std.testing.io, tmp.dir, gpa);
+    try save(&store, std.testing.io, tmp.dir);
 
     const stat = try tmp.dir.statFile(std.testing.io, file_name, .{});
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
@@ -552,7 +553,7 @@ test "the listing shows each service and where its key comes from" {
 
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try list(&sink.writer, allocator, &store, &environ, "/data/billy/credentials.json");
+    try list(&sink.writer, &store, &environ, "/data/billy/credentials.json");
 
     try std.testing.expectEqualStrings(
         \\deepseek  DeepSeek API key           stored
@@ -576,7 +577,7 @@ test "the listing names a service that has no key of any kind" {
     const store: Store = .{};
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try list(&sink.writer, allocator, &store, &environ, "/c");
+    try list(&sink.writer, &store, &environ, "/c");
 
     try std.testing.expectEqualStrings(
         \\deepseek  DeepSeek API key           not set

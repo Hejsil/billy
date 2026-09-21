@@ -108,7 +108,7 @@ pub const Client = struct {
             std.log.err("search: HTTP {d}: {s}", .{ @intFromEnum(result.status), text });
             return err;
         };
-        return render(client.gpa, arena, parsed.results);
+        return render(arena, parsed.results);
     }
 };
 
@@ -137,17 +137,20 @@ const Response = struct {
 /// Formats results as the numbered list the model reads and the user sees the
 /// top of: each result's title, its url, and whatever snippet the backend
 /// returned. A query that matched nothing says so, which is not an error.
-fn render(gpa: std.mem.Allocator, arena: std.mem.Allocator, results: []const Response.Result) ![]const u8 {
-    if (results.len == 0) return arena.dupe(u8, "(no results)");
+///
+/// `allocator` owns the result and the buffer it is built in, so one allocator
+/// does for the whole thing.
+fn render(allocator: std.mem.Allocator, results: []const Response.Result) ![]const u8 {
+    if (results.len == 0) return allocator.dupe(u8, "(no results)");
 
-    var out: std.Io.Writer.Allocating = .init(gpa);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     for (results, 1..) |result, number| {
         if (number > 1) try out.writer.writeAll("\n");
         try out.writer.print("{d}. {s}\n{s}\n", .{ number, result.title, result.url });
         if (result.content.len > 0) try out.writer.print("{s}\n", .{result.content});
     }
-    return arena.dupe(u8, out.written());
+    return out.toOwnedSlice();
 }
 
 test "results are formatted as a numbered list of title, url and snippet" {
@@ -162,7 +165,7 @@ test "results are formatted as a numbered list of title, url and snippet" {
     };
     try std.testing.expectEqualStrings(
         "1. Zig\nhttps://ziglang.org\nA language.\n\n2. Docs\nhttps://ziglang.org/documentation\n",
-        try render(gpa, arena_state.allocator(), &results),
+        try render(arena_state.allocator(), &results),
     );
 }
 
@@ -171,7 +174,7 @@ test "a query that matched nothing says so" {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
 
-    try std.testing.expectEqualStrings("(no results)", try render(gpa, arena_state.allocator(), &.{}));
+    try std.testing.expectEqualStrings("(no results)", try render(arena_state.allocator(), &.{}));
 }
 
 /// Stands in for the backend over a real socket: it records what the client put

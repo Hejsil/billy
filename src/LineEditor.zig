@@ -43,10 +43,17 @@ const no_wrap = std.math.maxInt(usize) / 4;
 io: Io,
 /// Destination for the prompt, the echoed line and the redraws.
 out: *Io.Writer,
-/// Owns the returned lines, which outlive the call.
-arena: std.mem.Allocator,
-/// Submitted lines, most recent last.
-history: std.ArrayList([]const u8) = .empty,
+/// Owns the pool and the history, which outlive the call that filled them. The
+/// editor frees what it allocates in `deinit`, so the caller need not hold an
+/// allocator for it.
+gpa: std.mem.Allocator,
+/// Every submitted line, concatenated, each ended by a NUL. One growing buffer
+/// holds the whole history, so a line costs its bytes rather than an allocation
+/// of its own, and the history is a list of offsets into it.
+strings: std.ArrayList(u8) = .empty,
+/// Where each submitted line starts in `strings`, oldest first. The line runs
+/// from there to the NUL that ends it.
+history: std.ArrayList(usize) = .empty,
 /// Bytes read from stdin but not yet consumed by the key decoder.
 in_buf: [256]u8 = undefined,
 in_pos: usize = 0,
@@ -77,8 +84,21 @@ pasting: bool = false,
 /// ending would otherwise open a blank line after every line.
 paste_cr: bool = false,
 
-pub fn init(io: Io, out: *Io.Writer, arena: std.mem.Allocator) LineEditor {
-    return .{ .io = io, .out = out, .arena = arena };
+/// `gpa` backs the line pool and the history the editor keeps; both are the
+/// editor's own and are freed by `deinit`.
+pub fn init(io: Io, out: *Io.Writer, gpa: std.mem.Allocator) LineEditor {
+    return .{ .io = io, .out = out, .gpa = gpa };
+}
+
+/// Frees the pool and the history the editor holds.
+pub fn deinit(ed: *LineEditor) void {
+    ed.strings.deinit(ed.gpa);
+    ed.history.deinit(ed.gpa);
+}
+
+/// The text of history entry `index`, up to the NUL that ends it.
+fn historyLine(ed: *const LineEditor, index: usize) []const u8 {
+    return std.mem.sliceTo(ed.strings.items[ed.history.items[index]..], 0);
 }
 
 /// Reads one line, echoing and editing it in the terminal.
@@ -92,7 +112,8 @@ pub fn init(io: Io, out: *Io.Writer, arena: std.mem.Allocator) LineEditor {
 /// is left to the caller to write the line out.
 ///
 /// Returns null when stdin is exhausted: end of a piped stdin, or Ctrl-D on
-/// an empty line. The returned slice is allocated with the arena.
+/// an empty line. The returned slice is kept in the editor's pool, so it is
+/// valid until the next line is submitted.
 pub fn readLine(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
     const interactive = try Io.File.stdin().isTty(ed.io);
     // The width is only wanted to fold a line being edited, which cannot
@@ -143,7 +164,7 @@ pub fn readLine(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]con
     var content_width = ed.contentWidth(visibleWidth(prompt));
 
     var line: std.ArrayList(u8) = .empty;
-    defer line.deinit(ed.arena);
+    defer line.deinit(ed.gpa);
     var cursor: usize = 0;
     var recalled: ?usize = null;
     var dirty = false;
@@ -168,13 +189,13 @@ pub fn readLine(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]con
         switch (key) {
             .none => {},
             .byte => |b| {
-                try line.insert(ed.arena, cursor, b);
+                try line.insert(ed.gpa, cursor, b);
                 cursor += 1;
                 recalled = null;
                 dirty = true;
             },
             .newline => {
-                try line.insert(ed.arena, cursor, '\n');
+                try line.insert(ed.gpa, cursor, '\n');
                 cursor += 1;
                 recalled = null;
                 dirty = true;
@@ -219,7 +240,7 @@ pub fn readLine(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]con
                 dirty = true;
             },
             .kill_to_start => if (cursor > 0) {
-                try line.replaceRange(ed.arena, 0, cursor, "");
+                try line.replaceRange(ed.gpa, 0, cursor, "");
                 cursor = 0;
                 recalled = null;
                 dirty = true;
@@ -232,7 +253,7 @@ pub fn readLine(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]con
             .kill_word => {
                 const start = wordStart(line.items, cursor);
                 if (start < cursor) {
-                    try line.replaceRange(ed.arena, start, cursor - start, "");
+                    try line.replaceRange(ed.gpa, start, cursor - start, "");
                     cursor = start;
                     recalled = null;
                     dirty = true;
@@ -301,12 +322,12 @@ pub fn readLine(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]con
 
 fn readLinePiped(ed: *LineEditor) !?[]const u8 {
     var line: std.ArrayList(u8) = .empty;
-    defer line.deinit(ed.arena);
+    defer line.deinit(ed.gpa);
 
     while (true) {
         const byte = (try ed.nextByte()) orelse break;
         if (byte == '\n') break;
-        try line.append(ed.arena, byte);
+        try line.append(ed.gpa, byte);
     }
     if (line.items.len == 0 and ed.in_len == 0) return null;
     if (line.items.len > 0 and line.items[line.items.len - 1] == '\r') {
@@ -315,10 +336,17 @@ fn readLinePiped(ed: *LineEditor) !?[]const u8 {
     return @as(?[]const u8, try ed.submit(line.items));
 }
 
+/// Records `line` in the history and returns it as the caller keeps it, out of
+/// the pool so it outlives the call. An empty line is not remembered, since
+/// there is nothing to recall, but is still returned as an empty slice.
 fn submit(ed: *LineEditor, line: []const u8) ![]const u8 {
-    const owned = try ed.arena.dupe(u8, line);
-    if (owned.len > 0) try ed.history.append(ed.arena, owned);
-    return owned;
+    const start = ed.strings.items.len;
+    if (line.len > 0) {
+        try ed.strings.appendSlice(ed.gpa, line);
+        try ed.strings.append(ed.gpa, 0);
+        try ed.history.append(ed.gpa, start);
+    }
+    return ed.strings.items[start..][0..line.len];
 }
 
 /// Repaints the prompt and the current line. The line may contain embedded
@@ -513,7 +541,7 @@ fn recall(
 
     recalled.* = next;
     line.clearRetainingCapacity();
-    if (next) |i| try line.appendSlice(ed.arena, history[i]);
+    if (next) |i| try line.appendSlice(ed.gpa, ed.historyLine(i));
     cursor.* = line.items.len;
     ed.goal_col = null;
     return true;
@@ -887,6 +915,7 @@ fn decodeKeys(bytes: []const u8) ![]u8 {
     var sink: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sink.deinit();
     var ed = LineEditor.init(std.testing.io, &sink.writer, std.testing.allocator);
+    defer ed.deinit();
 
     @memcpy(ed.in_buf[0..bytes.len], bytes);
     ed.in_pos = 0;
@@ -937,6 +966,51 @@ test "a shifted enter and the arrow keys still decode" {
     try std.testing.expectEqualStrings("a\nb?uE", keys);
 }
 
+test "the history keeps the submitted lines in one pool" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var ed = LineEditor.init(std.testing.io, &out.writer, gpa);
+    defer ed.deinit();
+
+    // Two lines are stored back to back and each is read back whole, so the
+    // second one is found at its own offset and not at the first line's.
+    try std.testing.expectEqualStrings("hello", try ed.submit("hello"));
+    try std.testing.expectEqualStrings("world", try ed.submit("world"));
+    try std.testing.expectEqual(@as(usize, 2), ed.history.items.len);
+    try std.testing.expectEqualStrings("hello", ed.historyLine(0));
+    try std.testing.expectEqualStrings("world", ed.historyLine(1));
+
+    // An empty line is returned but not remembered: there is nothing to recall.
+    try std.testing.expectEqualStrings("", try ed.submit(""));
+    try std.testing.expectEqual(@as(usize, 2), ed.history.items.len);
+}
+
+test "recall walks the history and puts a line back" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var ed = LineEditor.init(std.testing.io, &out.writer, gpa);
+    defer ed.deinit();
+    _ = try ed.submit("one");
+    _ = try ed.submit("two");
+
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(gpa);
+    var cursor: usize = 0;
+    var recalled: ?usize = null;
+
+    // Up recalls the most recent line, then the older one.
+    try std.testing.expect(try ed.recall(&line, &cursor, &recalled, -1));
+    try std.testing.expectEqualStrings("two", line.items);
+    try std.testing.expectEqual(@as(usize, 3), cursor);
+    try std.testing.expect(try ed.recall(&line, &cursor, &recalled, -1));
+    try std.testing.expectEqualStrings("one", line.items);
+    // Down comes back to the newer one.
+    try std.testing.expect(try ed.recall(&line, &cursor, &recalled, 1));
+    try std.testing.expectEqualStrings("two", line.items);
+}
+
 test "visibleWidth ignores ANSI escapes" {
     try std.testing.expectEqual(2, visibleWidth("> "));
     try std.testing.expectEqual(0, visibleWidth("\x1b[31m\x1b[0m"));
@@ -952,6 +1026,7 @@ test "endPrompt erases the header and the line it heads" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var ed = LineEditor.init(std.testing.io, &out.writer, gpa);
+    defer ed.deinit();
 
     // One row of input: up to the header, delete it and the line, back to column
     // zero where the prompt's own block is printed.
@@ -1091,6 +1166,7 @@ test "redraw folds a line that is wider than the terminal" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var ed = LineEditor.init(std.testing.io, &out.writer, gpa);
+    defer ed.deinit();
 
     // Four columns of text per row, which is a six column terminal for "> ".
     try ed.redraw("> ", 4, "abcdefgh", 8);
@@ -1127,6 +1203,7 @@ test "a redraw after a resize erases the rows the new width needs" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var ed = LineEditor.init(std.testing.io, &out.writer, gpa);
+    defer ed.deinit();
 
     const line = "abcdefghijklmnopqrstuvwxyz0123456789"; // 36 characters
     // One row at 78 columns wide was painted, and the cursor is on it.
