@@ -21,10 +21,30 @@ const app_dir = "billy";
 const sessions_dir = "sessions";
 /// Extension of a session file.
 const extension = ".json";
+/// Most a session id may be. A generated one is the 15 characters of
+/// `YYYYMMDD-HHMMSS`; the room is for a `-N` suffix on a second run in the same
+/// second, or a name typed on the command line. The buffer holds this many bytes
+/// and is written from the front, so there is always a byte left to end the id.
+const max_id_len = 64;
 /// Layout of a session file, bumped when its shape changes.
 const format_version = 1;
 /// Longest session file read back, so a damaged file cannot exhaust memory.
 const max_session_bytes = 64 << 20;
+
+/// A tool definition as the API takes it, which is how a session file holds
+/// one, so a file written before a session kept its own tools still reads. The
+/// arguments schema is the parsed object in the file and becomes the JSON text
+/// the session stores.
+const StoredTool = struct {
+    type: []const u8 = "function",
+    function: Function,
+
+    const Function = struct {
+        name: []const u8 = "",
+        description: []const u8 = "",
+        parameters: std.json.Value = .null,
+    };
+};
 
 /// A session file as it is written to and read from disk.
 const Stored = struct {
@@ -32,7 +52,7 @@ const Stored = struct {
     /// The conversation, oldest first.
     messages: []const llm.Message = &.{},
     /// The tool definitions the conversation was started with.
-    tools: []const llm.Tool = &.{},
+    tools: []const StoredTool = &.{},
     /// Tokens billed over the whole session, summed over every request.
     usage: llm.Usage = .{},
     /// Tokens in the conversation as of the last request, which is what the
@@ -130,24 +150,44 @@ pub const Message = struct {
     }
 };
 
+/// A tool definition as a session stores it. Every string is an index into the
+/// pool, and the arguments schema is the JSON text the request carries, so
+/// nothing here is a parsed document: the set is one array that frees with the
+/// pool and no per-tool walk to free it.
+pub const Tool = struct {
+    name: StringIndex,
+    description: StringIndex,
+    /// The JSON Schema of the arguments, as the JSON text it is sent as.
+    parameters: StringIndex,
+};
+
+/// A tool definition as it comes from outside the session: the strings to be
+/// interned, so a caller builds the set without knowing the pool.
+pub const Definition = struct {
+    name: []const u8,
+    description: []const u8,
+    /// The JSON Schema of the arguments, as JSON text.
+    parameters: []const u8,
+};
+
 io: Io,
 
 /// Directory holding the session files. Owned by the caller.
 dir: Io.Dir,
 
-/// Owns the id, the name, and what was read back from the file, which holds the
-/// tools a resume sends. The conversation is in `strings`, `tool_calls` and
-/// `messages`, which `gpa` owns and `deinit` frees.
-arena: std.mem.Allocator,
-
-/// For temporary buffers, freed on the way out.
+/// Owns the conversation and everything a resume read back, all freed by
+/// `deinit`.
 gpa: std.mem.Allocator,
 
-/// Names the session; also its file name without the extension.
-id: []const u8,
+/// The id, in a fixed buffer written once from the front. The buffer is
+/// zero-filled, so what is written ends in NUL and the id is a NUL-terminated
+/// string with no length kept beside it. A generated id is a timestamp; a resume
+/// takes one from the command line.
+id_buf: [max_id_len]u8 = [_]u8{0} ** max_id_len,
 
-/// Name of the session file inside `dir`.
-name: []const u8,
+/// The id with the file extension: the name of the session file, in a fixed
+/// buffer beside the id and zero-filled past the name for the same reason.
+name_buf: [max_id_len + extension.len]u8 = [_]u8{0} ** (max_id_len + extension.len),
 
 /// All string data, one NUL-terminated copy per distinct string. Two equal
 /// strings share an index, so a conversation that repeats its roles, its tool
@@ -164,8 +204,9 @@ tool_calls: std.ArrayList(ToolCall) = .empty,
 messages: std.ArrayList(Message) = .empty,
 
 /// The tool definitions sent with every request. Stored in the session so a
-/// resume offers the model the same tools as the run it continues.
-tools: []const llm.Tool = &.{},
+/// resume offers the model the same tools as the run it continues. The whole set
+/// is one array `deinit` frees; every string in it is interned in the pool.
+tools: []const Tool = &.{},
 
 /// Tokens billed over the whole session, summed over every request, so the
 /// cost of a resumed session includes what earlier runs spent.
@@ -182,8 +223,8 @@ cost: f64 = 0,
 /// The directory the session was started in. A resumed session keeps it, so
 /// billy works where the session did rather than wherever it is run from now;
 /// a session saved before it was recorded has none, and the run's own directory
-/// is used instead.
-cwd: []const u8,
+/// is used instead. Owned by `gpa`, even when it is the empty default.
+cwd: []const u8 = "",
 
 /// Opens the session called `resume_id`, or starts a new one when it is null.
 ///
@@ -196,29 +237,29 @@ cwd: []const u8,
 pub fn open(
     io: Io,
     dir: Io.Dir,
-    arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
     resume_id: ?[]const u8,
     cwd: []const u8,
 ) !Session {
-    const id = if (resume_id) |name|
-        try checkedId(arena, name)
-    else
-        try unusedId(io, dir, arena);
-    var session: Session = .{
-        .io = io,
-        .dir = dir,
-        .arena = arena,
-        .gpa = gpa,
-        .id = id,
-        .name = try std.fmt.allocPrint(arena, "{s}{s}", .{ id, extension }),
-        .cwd = cwd,
-    };
-    // A resume that fails part way leaves the strings it had read behind, since
-    // the caller only gets the session on the way out.
+    var session: Session = .{ .io = io, .dir = dir, .gpa = gpa };
+    // A resume that fails part way leaves what it had read behind, since the
+    // caller only gets the session on the way out.
     errdefer session.deinit();
-    if (resume_id != null)
-        try session.load();
+
+    // The id is written into its buffer; the file name is the id with the
+    // extension, built from it once so every read and write goes through one
+    // place. Both buffers are zero-filled, so both end in NUL.
+    const session_id = if (resume_id) |given|
+        try setCheckedId(&session.id_buf, given)
+    else
+        try unusedId(io, dir, &session.id_buf);
+    _ = try std.fmt.bufPrint(&session.name_buf, "{s}{s}", .{ session_id, extension });
+
+    // The session owns its directory rather than pointing into the caller's
+    // memory, which it may outlive.
+    session.cwd = try gpa.dupe(u8, cwd);
+
+    if (resume_id != null) try session.load();
     return session;
 }
 
@@ -227,6 +268,19 @@ pub fn deinit(session: *Session) void {
     session.interned.deinit(session.gpa);
     session.tool_calls.deinit(session.gpa);
     session.messages.deinit(session.gpa);
+    session.gpa.free(session.tools);
+    session.gpa.free(session.cwd);
+}
+
+/// Names the session; also its file name without the extension. The buffer ends
+/// in NUL, which is what says where the id does.
+pub fn id(session: *const Session) []const u8 {
+    return std.mem.sliceTo(&session.id_buf, 0);
+}
+
+/// Name of the session file inside `dir`.
+pub fn name(session: *const Session) []const u8 {
+    return std.mem.sliceTo(&session.name_buf, 0);
 }
 
 /// The conversation as a completion request carries it: the `messages` array of
@@ -335,13 +389,13 @@ pub fn callAt(session: *const Session, message: Message, index: usize) Call {
 ///
 /// Every string compared is a window into the pool, so finding a result costs
 /// nothing to allocate.
-pub fn toolResult(session: *const Session, from: usize, id: []const u8) []const u8 {
+pub fn toolResult(session: *const Session, from: usize, call: []const u8) []const u8 {
     const messages = session.messages.items;
     if (from >= messages.len) return "";
     for (messages[from..]) |message| {
         if (!std.mem.eql(u8, session.string(message.role) orelse "", "tool")) continue;
         const call_id = session.string(message.tool_call_id) orelse continue;
-        if (std.mem.eql(u8, call_id, id)) return session.string(message.content) orelse "";
+        if (std.mem.eql(u8, call_id, call)) return session.string(message.content) orelse "";
     }
     return "";
 }
@@ -410,8 +464,20 @@ pub fn appendSystemPrompt(session: *Session, system_prompt: []const u8) !void {
 /// saved with, which are kept so the request matches the earlier run and
 /// hits the prompt cache; a new session, or one saved before the tools were
 /// stored, gets the current definitions instead.
-pub fn ensureTools(session: *Session, tools: []const llm.Tool) !void {
+pub fn ensureTools(session: *Session, definitions: []const Definition) !void {
     if (session.tools.len != 0) return;
+    // The strings are interned into the pool, so the set costs one array and
+    // frees with the pool. Nothing is copied per string and there is no parsed
+    // document to keep alive: the arguments schema is stored as the JSON text it
+    // is sent as.
+    const tools = try session.gpa.alloc(Tool, definitions.len);
+    for (definitions, tools) |definition, *tool| {
+        tool.* = .{
+            .name = try session.internString(definition.name),
+            .description = try session.internString(definition.description),
+            .parameters = try session.internString(definition.parameters),
+        };
+    }
     session.tools = tools;
     try session.save();
 }
@@ -472,7 +538,7 @@ pub fn save(session: *Session) !void {
     }
     try json.endArray();
     try json.objectField("tools");
-    try json.write(session.tools);
+    try json.write(session.toolSet());
     try json.objectField("usage");
     try json.write(session.usage);
     try json.objectField("context_tokens");
@@ -483,7 +549,7 @@ pub fn save(session: *Session) !void {
     try json.write(session.cwd);
     try json.endObject();
 
-    var atomic = try session.dir.createFileAtomic(session.io, session.name, .{ .replace = true });
+    var atomic = try session.dir.createFileAtomic(session.io, session.name(), .{ .replace = true });
     defer atomic.deinit(session.io);
 
     var file: Io.File.Writer = atomic.file.writer(session.io, "");
@@ -497,18 +563,26 @@ pub fn save(session: *Session) !void {
 fn load(session: *Session) !void {
     const text = session.dir.readFileAlloc(
         session.io,
-        session.name,
-        session.arena,
+        session.name(),
+        session.gpa,
         .limited(max_session_bytes),
     ) catch |err| switch (err) {
         error.FileNotFound => return error.SessionNotFound,
         else => return err,
     };
+    // The file's own bytes are not needed once it has been parsed.
+    defer session.gpa.free(text);
 
-    const stored = std.json.parseFromSliceLeaky(Stored, session.arena, text, .{
+    // The parse is freed on the way out: what the session keeps, the tools and
+    // the directory, is copied out of it first, so nothing points into it after
+    // this returns. The conversation is interned into the pool, which is what a
+    // session keeps its strings in.
+    var parsed = std.json.parseFromSlice(Stored, session.gpa, text, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     }) catch return error.CorruptSession;
+    defer parsed.deinit();
+    const stored = parsed.value;
 
     if (stored.version > format_version)
         return error.UnsupportedSessionVersion;
@@ -519,13 +593,27 @@ fn load(session: *Session) !void {
         try session.appendNoSave(message);
     }
 
-    session.tools = stored.tools;
+    // The tools are interned like the conversation, so the set is one array and
+    // the arguments schema becomes the JSON text the request sends it as.
+    const tools = try session.gpa.alloc(Tool, stored.tools.len);
+    for (stored.tools, tools) |stored_tool, *tool| {
+        tool.* = .{
+            .name = try session.internString(stored_tool.function.name),
+            .description = try session.internString(stored_tool.function.description),
+            .parameters = try session.internParameters(stored_tool.function.parameters),
+        };
+    }
+    session.tools = tools;
     session.usage = stored.usage;
     session.context_tokens = stored.context_tokens;
     session.cost = stored.cost;
-    // A session saved before the directory was recorded has none, so billy keeps
-    // running in the directory it was started in now.
-    if (stored.cwd.len > 0) session.cwd = stored.cwd;
+    // A session saved before the directory was recorded has none, and the
+    // directory billy runs in now is kept.
+    if (stored.cwd.len > 0) {
+        const owned = try session.gpa.dupe(u8, stored.cwd);
+        session.gpa.free(session.cwd);
+        session.cwd = owned;
+    }
 }
 
 fn internString(session: *Session, text: ?[]const u8) !StringIndex {
@@ -581,19 +669,64 @@ pub fn defaultDir(arena: std.mem.Allocator, environ: *const std.process.Environ.
     return std.fs.path.join(arena, &.{ try dataDir(arena, environ), sessions_dir });
 }
 
-/// An id based on the current UTC time, such as `20250131-120000`, so that ids
-/// sort in the order their sessions were started.
-fn newId(io: Io, arena: std.mem.Allocator) ![]const u8 {
-    return formatId(arena, @intCast(Io.Clock.now(.real, io).toSeconds()));
+/// The arguments schema of a tool as JSON text: already text when a file holds
+/// it so, and written back out when an older file holds the parsed object, which
+/// is what the request is sent.
+fn internParameters(session: *Session, value: std.json.Value) !StringIndex {
+    switch (value) {
+        .string => |text| return session.internString(text),
+        else => {
+            const text = try std.json.Stringify.valueAlloc(session.gpa, value, .{});
+            defer session.gpa.free(text);
+            return session.internString(text);
+        },
+    }
 }
 
-/// Formats a Unix timestamp as `YYYYMMDD-HHMMSS` in UTC.
-fn formatId(arena: std.mem.Allocator, secs: u64) ![]const u8 {
+/// The tools as JSON: the definitions written out, each with its arguments
+/// schema as the JSON text it is held as. A request writes the tools it sends
+/// through this, and the session file stores them the same way, so the two are
+/// written by one piece of code.
+pub const ToolSet = struct {
+    session: *const Session,
+
+    pub fn jsonStringify(self: ToolSet, json: anytype) !void {
+        const session = self.session;
+        try json.beginArray();
+        for (session.tools) |tool| {
+            try json.beginObject();
+            // The API takes the kind of every tool billy offers as "function".
+            try json.objectField("type");
+            try json.write("function");
+            try json.objectField("function");
+            try json.beginObject();
+            try json.objectField("name");
+            try json.write(session.string(tool.name) orelse "");
+            try json.objectField("description");
+            try json.write(session.string(tool.description) orelse "");
+            try json.objectField("parameters");
+            // The schema is written as the JSON it is, not as a quoted string.
+            try json.print("{s}", .{session.string(tool.parameters) orelse "{}"});
+            try json.endObject();
+            try json.endObject();
+        }
+        try json.endArray();
+    }
+};
+
+/// The tools as a request carries them. The returned value borrows the session.
+pub fn toolSet(session: *const Session) ToolSet {
+    return .{ .session = session };
+}
+
+/// Formats a Unix timestamp as `YYYYMMDD-HHMMSS` in UTC, written into `buf` and
+/// returned as the slice it filled, which is 15 characters.
+fn formatId(buf: []u8, secs: u64) ![]const u8 {
     const seconds = std.time.epoch.EpochSeconds{ .secs = secs };
     const day = seconds.getEpochDay().calculateYearDay();
     const date = day.calculateMonthDay();
     const time = seconds.getDaySeconds();
-    return std.fmt.allocPrint(arena, "{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}", .{
+    return std.fmt.bufPrint(buf, "{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}", .{
         day.year,
         date.month.numeric(),
         date.day_index + 1,
@@ -603,75 +736,81 @@ fn formatId(arena: std.mem.Allocator, secs: u64) ![]const u8 {
     });
 }
 
-/// A new id whose session file does not exist yet, so that starting two runs in
-/// the same second cannot overwrite the first session.
-fn unusedId(io: Io, dir: Io.Dir, arena: std.mem.Allocator) ![]const u8 {
-    const base = try newId(io, arena);
+/// An id based on the current UTC time, such as `20250131-120000`, whose session
+/// file does not exist yet, written into `buf` and returned as a slice of it, so
+/// that starting two runs in the same second cannot overwrite the first session.
+fn unusedId(io: Io, dir: Io.Dir, buf: []u8) ![]const u8 {
+    const base = try formatId(buf, @intCast(Io.Clock.now(.real, io).toSeconds()));
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        const id = if (attempt == 0)
-            base
-        else
-            try std.fmt.allocPrint(arena, "{s}-{d}", .{ base, attempt });
-        const name = try std.fmt.allocPrint(arena, "{s}{s}", .{ id, extension });
-        _ = dir.statFile(io, name, .{}) catch |err| switch (err) {
-            error.FileNotFound => return id,
+        // A second run in the same second appends `-N` to the timestamp, growing
+        // the id in place after the base.
+        const candidate = if (attempt == 0) base else candidate: {
+            const suffix = try std.fmt.bufPrint(buf[base.len..], "-{d}", .{attempt});
+            break :candidate buf[0 .. base.len + suffix.len];
+        };
+        var file_buf: [max_id_len + extension.len]u8 = undefined;
+        const file = try std.fmt.bufPrint(&file_buf, "{s}{s}", .{ candidate, extension });
+        _ = dir.statFile(io, file, .{}) catch |err| switch (err) {
+            error.FileNotFound => return candidate,
             else => return err,
         };
     }
 }
 
-/// Copies an id given on the command line, rejecting anything that could name
-/// another file or directory.
-fn checkedId(arena: std.mem.Allocator, id: []const u8) ![]const u8 {
-    if (id.len == 0) return error.InvalidSessionId;
-    for (id) |byte| switch (byte) {
+/// Copies an id given on the command line into `buf`, rejecting anything that
+/// could name another file or directory or that does not fit. Returns the id as
+/// a slice of `buf`; the buffer is zero-filled, so the copy ends in NUL.
+fn setCheckedId(buf: []u8, given: []const u8) ![]const u8 {
+    // One byte is kept for the NUL that ends the id in the buffer.
+    if (given.len == 0 or given.len + 1 > buf.len) return error.InvalidSessionId;
+    for (given) |byte| switch (byte) {
         'a'...'z', 'A'...'Z', '0'...'9', '-', '_', '.' => {},
         else => return error.InvalidSessionId,
     };
-    if (std.mem.allEqual(u8, id, '.')) return error.InvalidSessionId;
-    return arena.dupe(u8, id);
+    if (std.mem.allEqual(u8, given, '.')) return error.InvalidSessionId;
+    @memcpy(buf[0..given.len], given);
+    return buf[0..given.len];
 }
 
 test "formatId writes a UTC timestamp" {
-    const arena = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(arena);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
+    var buf: [max_id_len]u8 = undefined;
 
-    try std.testing.expectEqualStrings("19700101-000000", try formatId(allocator, 0));
-    try std.testing.expectEqualStrings("19700102-000000", try formatId(allocator, 86400));
-    try std.testing.expectEqualStrings("20000229-000000", try formatId(allocator, 951782400)); // leap day
-    try std.testing.expectEqualStrings("20231114-221320", try formatId(allocator, 1700000000));
-    try std.testing.expectEqualStrings("20240301-000000", try formatId(allocator, 1709251200)); // day after a leap day
+    try std.testing.expectEqualStrings("19700101-000000", try formatId(&buf, 0));
+    try std.testing.expectEqualStrings("19700102-000000", try formatId(&buf, 86400));
+    try std.testing.expectEqualStrings("20000229-000000", try formatId(&buf, 951782400)); // leap day
+    try std.testing.expectEqualStrings("20231114-221320", try formatId(&buf, 1700000000));
+    try std.testing.expectEqualStrings("20240301-000000", try formatId(&buf, 1709251200)); // day after a leap day
 }
 
-test "newId has the shape of a timestamp" {
-    const id = try newId(std.testing.io, std.testing.allocator);
-    defer std.testing.allocator.free(id);
+test "a generated id has the shape of a timestamp" {
+    var buf: [max_id_len]u8 = undefined;
+    const stamp = try formatId(&buf, 1700000000);
 
-    try std.testing.expectEqual(15, id.len);
-    try std.testing.expectEqual('-', id[8]);
-    for (id, 0..) |byte, i| {
+    try std.testing.expectEqual(15, stamp.len);
+    try std.testing.expectEqual('-', stamp[8]);
+    for (stamp, 0..) |byte, i| {
         if (i == 8) continue;
         try std.testing.expect(std.ascii.isDigit(byte));
     }
 }
 
-test "checkedId rejects names that could escape the session directory" {
-    const arena = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(arena);
-    defer arena_state.deinit();
+test "setCheckedId rejects names that could escape the session directory" {
+    var buf: [max_id_len]u8 = undefined;
 
-    const id = try checkedId(arena_state.allocator(), "20250131-120000");
-    try std.testing.expectEqualStrings("20250131-120000", id);
-    try std.testing.expectEqualStrings("dev", try checkedId(arena_state.allocator(), "dev"));
+    try std.testing.expectEqualStrings("20250131-120000", try setCheckedId(&buf, "20250131-120000"));
+    try std.testing.expectEqualStrings("dev", try setCheckedId(&buf, "dev"));
 
-    try std.testing.expectError(error.InvalidSessionId, checkedId(arena_state.allocator(), ""));
-    try std.testing.expectError(error.InvalidSessionId, checkedId(arena_state.allocator(), ".."));
-    try std.testing.expectError(error.InvalidSessionId, checkedId(arena_state.allocator(), "../x"));
-    try std.testing.expectError(error.InvalidSessionId, checkedId(arena_state.allocator(), "a/b"));
-    try std.testing.expectError(error.InvalidSessionId, checkedId(arena_state.allocator(), "a b"));
+    try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, ""));
+    try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, ".."));
+    try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, "../x"));
+    try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, "a/b"));
+    try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, "a b"));
+    // A name that does not fit, with room for its NUL, is refused rather than
+    // cut short: the longest that fits is one byte less than the buffer.
+    try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, "x" ** (max_id_len + 1)));
+    try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, "x" ** max_id_len));
+    _ = try setCheckedId(&buf, "x" ** (max_id_len - 1));
 }
 
 test "defaultDir follows the XDG base directory specification" {
@@ -709,7 +848,7 @@ test "a session survives a save and resume" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null, "/work");
+    var session = try Session.open(std.testing.io, tmp.dir, arena, null, "/work");
     defer session.deinit();
 
     try session.append(.{ .role = "system", .content = "be terse" });
@@ -723,10 +862,10 @@ test "a session survives a save and resume" {
     });
     try session.append(.{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;\n" });
 
-    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, session.id, "/work");
+    var resumed = try Session.open(std.testing.io, tmp.dir, arena, session.id(), "/work");
     defer resumed.deinit();
 
-    try std.testing.expectEqualStrings(session.id, resumed.id);
+    try std.testing.expectEqualStrings(session.id(), resumed.id());
     // The system prompt is stored too, so everything comes back.
     try std.testing.expectEqual(session.messages.items.len, resumed.messages.items.len);
 
@@ -762,7 +901,7 @@ test "a conversation writes the messages a request would have carried" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try Session.open(std.testing.io, tmp.dir, allocator, allocator, null, "/work");
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, null, "/work");
     defer session.deinit();
 
     // A message of every shape: an optional left out, one filled in, and a call
@@ -816,7 +955,7 @@ test "a stored message reads back as its parts" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try Session.open(std.testing.io, tmp.dir, allocator, allocator, null, "/work");
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, null, "/work");
     defer session.deinit();
 
     try session.append(.{ .role = "user", .content = "hello" });
@@ -857,7 +996,7 @@ test "a tool result is found only from where the search starts" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try Session.open(std.testing.io, tmp.dir, allocator, allocator, null, "/work");
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, null, "/work");
     defer session.deinit();
 
     try session.append(.{ .role = "assistant", .tool_calls = &.{.{
@@ -881,14 +1020,11 @@ test "a tool result is found only from where the search starts" {
 
 test "an equal string is interned once and shared" {
     const arena = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(arena);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null, "/work");
+    var session = try Session.open(std.testing.io, tmp.dir, arena, null, "/work");
     defer session.deinit();
 
     try session.append(.{ .role = "user", .content = "hello" });
@@ -919,9 +1055,6 @@ test "an equal string is interned once and shared" {
 
 test "a stored system prompt is kept when resuming" {
     const arena = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(arena);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -934,7 +1067,7 @@ test "a stored system prompt is kept when resuming" {
     });
 
     // Resuming keeps the saved prompt even though a newer one is available.
-    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, "one", "/work");
+    var resumed = try Session.open(std.testing.io, tmp.dir, arena, "one", "/work");
     defer resumed.deinit();
 
     try resumed.appendSystemPrompt("new prompt");
@@ -946,14 +1079,11 @@ test "a stored system prompt is kept when resuming" {
 
 test "appendSystemPrompt only adds the prompt to an empty session" {
     const arena = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(arena);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null, "/work");
+    var session = try Session.open(std.testing.io, tmp.dir, arena, null, "/work");
     defer session.deinit();
 
     try session.appendSystemPrompt("current prompt");
@@ -971,49 +1101,77 @@ test "appendSystemPrompt only adds the prompt to an empty session" {
     try std.testing.expectEqualStrings("user", session.string(session.messages.items[1].role).?);
 }
 
-test "ensureTools stores the tools and only sets them once" {
-    const arena = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(arena);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
+test "the tools are written out with the schema as the JSON it is" {
+    const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tools = [_]llm.Tool{.{ .function = .{
+    const tools = [_]Definition{.{
         .name = "read",
         .description = "Read a file.",
-        .parameters = .null,
-    } }};
+        .parameters = "{\"type\":\"object\",\"required\":[\"path\"]}",
+    }};
 
-    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null, "/work");
+    var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    try session.ensureTools(&tools);
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var json: std.json.Stringify = .{ .writer = &out.writer };
+    try json.write(session.toolSet());
+
+    // The schema is the JSON it is, not the quoted string it is stored as, and
+    // the tool carries the kind the API wants.
+    try std.testing.expectEqualStrings(
+        "[{\"type\":\"function\",\"function\":{" ++
+            "\"name\":\"read\",\"description\":\"Read a file.\"," ++
+            "\"parameters\":{\"type\":\"object\",\"required\":[\"path\"]}}}]",
+        out.written(),
+    );
+}
+
+test "ensureTools stores the tools and only sets them once" {
+    const arena = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tools = [_]Definition{.{
+        .name = "read",
+        .description = "Read a file.",
+        .parameters = "{}",
+    }};
+
+    var session = try Session.open(std.testing.io, tmp.dir, arena, null, "/work");
+    defer session.deinit();
     try session.ensureTools(&tools);
     try std.testing.expectEqual(1, session.tools.len);
-    try std.testing.expectEqualStrings("read", session.tools[0].function.name);
+    try std.testing.expectEqualStrings("read", session.string(session.tools[0].name).?);
 
     // The stored tools survive a save and resume.
-    const resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, session.id, "/work");
+    var resumed = try Session.open(std.testing.io, tmp.dir, arena, session.id(), "/work");
+    defer resumed.deinit();
     try std.testing.expectEqual(1, resumed.tools.len);
-    try std.testing.expectEqualStrings("read", resumed.tools[0].function.name);
-    try std.testing.expectEqualStrings("Read a file.", resumed.tools[0].function.description);
+    try std.testing.expectEqualStrings("read", resumed.string(resumed.tools[0].name).?);
+    try std.testing.expectEqualStrings("Read a file.", resumed.string(resumed.tools[0].description).?);
 
     // A session that already has tools keeps them.
-    const replaced = [_]llm.Tool{.{ .function = .{
+    const replaced = [_]Definition{.{
         .name = "bash",
         .description = "Run a command.",
-        .parameters = .null,
-    } }};
-    var reopened = try Session.open(std.testing.io, tmp.dir, allocator, arena, session.id, "/work");
+        .parameters = "{}",
+    }};
+    var reopened = try Session.open(std.testing.io, tmp.dir, arena, session.id(), "/work");
+    defer reopened.deinit();
     try reopened.ensureTools(&replaced);
     try std.testing.expectEqual(1, reopened.tools.len);
-    try std.testing.expectEqualStrings("read", reopened.tools[0].function.name);
+    try std.testing.expectEqualStrings("read", reopened.string(reopened.tools[0].name).?);
 }
 
 test "ensureTools gives tools to a session saved without any" {
     const arena = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(arena);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1024,31 +1182,28 @@ test "ensureTools gives tools to a session saved without any" {
         .data = "{\"version\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
     });
 
-    const tools = [_]llm.Tool{.{ .function = .{
+    const tools = [_]Definition{.{
         .name = "read",
         .description = "Read a file.",
-        .parameters = .null,
-    } }};
+        .parameters = "{}",
+    }};
 
-    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, "legacy", "/work");
+    var session = try Session.open(std.testing.io, tmp.dir, arena, "legacy", "/work");
     defer session.deinit();
 
     try std.testing.expectEqual(0, session.tools.len);
     try session.ensureTools(&tools);
     try std.testing.expectEqual(1, session.tools.len);
-    try std.testing.expectEqualStrings("read", session.tools[0].function.name);
+    try std.testing.expectEqualStrings("read", session.string(session.tools[0].name).?);
 }
 
 test "the token totals survive a save and resume" {
     const arena = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(arena);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null, "/work");
+    var session = try Session.open(std.testing.io, tmp.dir, arena, null, "/work");
     defer session.deinit();
 
     session.recordUsage(.{
@@ -1069,7 +1224,7 @@ test "the token totals survive a save and resume" {
     }, 0.0002);
     try session.append(.{ .role = "assistant", .content = "hello" });
 
-    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, session.id, "/work");
+    var resumed = try Session.open(std.testing.io, tmp.dir, arena, session.id(), "/work");
     defer resumed.deinit();
 
     try std.testing.expectEqual(300, resumed.usage.prompt_tokens);
@@ -1084,51 +1239,45 @@ test "the token totals survive a save and resume" {
 
 test "opening an unknown or damaged session is reported" {
     const arena = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(arena);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try std.testing.expectError(
         error.SessionNotFound,
-        Session.open(std.testing.io, tmp.dir, allocator, arena, "nope", "/work"),
+        Session.open(std.testing.io, tmp.dir, arena, "nope", "/work"),
     );
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad.json", .data = "{" });
     try std.testing.expectError(
         error.CorruptSession,
-        Session.open(std.testing.io, tmp.dir, allocator, arena, "bad", "/work"),
+        Session.open(std.testing.io, tmp.dir, arena, "bad", "/work"),
     );
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "future.json", .data = "{\"version\":99}" });
     try std.testing.expectError(
         error.UnsupportedSessionVersion,
-        Session.open(std.testing.io, tmp.dir, allocator, arena, "future", "/work"),
+        Session.open(std.testing.io, tmp.dir, arena, "future", "/work"),
     );
 }
 
 test "a new session does not reuse an id whose file exists" {
     const arena = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(arena);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var first = try Session.open(std.testing.io, tmp.dir, allocator, arena, null, "/work");
+    var first = try Session.open(std.testing.io, tmp.dir, arena, null, "/work");
     defer first.deinit();
     try first.append(.{ .role = "user", .content = "keep me" });
 
-    var second = try Session.open(std.testing.io, tmp.dir, allocator, arena, null, "/work");
+    var second = try Session.open(std.testing.io, tmp.dir, arena, null, "/work");
     defer second.deinit();
     try second.append(.{ .role = "user", .content = "and me" });
 
-    try std.testing.expect(!std.mem.eql(u8, first.id, second.id));
+    try std.testing.expect(!std.mem.eql(u8, first.id(), second.id()));
 
-    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, first.id, "/work");
+    var resumed = try Session.open(std.testing.io, tmp.dir, arena, first.id(), "/work");
     defer resumed.deinit();
 
     try std.testing.expectEqualStrings("keep me", resumed.string(resumed.messages.items[0].content).?);
@@ -1136,30 +1285,24 @@ test "a new session does not reuse an id whose file exists" {
 
 test "the working directory is stored and restored on resume" {
     const arena = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(arena);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     // A session started in one directory.
-    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null, "/home/user/project");
+    var session = try Session.open(std.testing.io, tmp.dir, arena, null, "/home/user/project");
     defer session.deinit();
     try std.testing.expectEqualStrings("/home/user/project", session.cwd);
     try session.append(.{ .role = "user", .content = "hello" });
 
     // Resumed from somewhere else, it keeps the directory it was started in.
-    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, session.id, "/somewhere/else");
+    var resumed = try Session.open(std.testing.io, tmp.dir, arena, session.id(), "/somewhere/else");
     defer resumed.deinit();
     try std.testing.expectEqualStrings("/home/user/project", resumed.cwd);
 }
 
 test "a session saved before the directory was recorded uses the run's own" {
     const arena = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(arena);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1170,7 +1313,62 @@ test "a session saved before the directory was recorded uses the run's own" {
         .data = "{\"version\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
     });
 
-    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, "old", "/now/here");
+    var resumed = try Session.open(std.testing.io, tmp.dir, arena, "old", "/now/here");
     defer resumed.deinit();
     try std.testing.expectEqualStrings("/now/here", resumed.cwd);
+}
+
+test "a resumed session frees everything it read back" {
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A file big enough that holding its bytes for the run would show: writing
+    // and resuming it here runs under the testing allocator, which reports any
+    // allocation left behind, so this passing means the file it read and the
+    // parse of it were both freed by `deinit`.
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(gpa);
+    try big.appendSlice(gpa, "{\"version\":1,\"cwd\":\"/work\",\"messages\":[");
+    for (0..2000) |i| {
+        if (i > 0) try big.append(gpa, ',');
+        try big.appendSlice(gpa, "{\"role\":\"user\",\"content\":\"a line of the conversation\"}");
+    }
+    try big.appendSlice(gpa, "]}");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big" ++ extension, .data = big.items });
+
+    var resumed = try Session.open(std.testing.io, tmp.dir, gpa, "big", "/work");
+    defer resumed.deinit();
+    try std.testing.expectEqual(2000, resumed.messages.items.len);
+    try std.testing.expectEqualStrings("/work", resumed.cwd);
+}
+
+test "the id and file name read back from their fixed buffers" {
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A session with a short name typed on the command line, shorter than the
+    // generated timestamp, so the NUL that ends it is what sets its length.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "dev" ++ extension,
+        .data = "{\"version\":1,\"messages\":[]}",
+    });
+    var resumed = try Session.open(std.testing.io, tmp.dir, gpa, "dev", "/work");
+    defer resumed.deinit();
+    try std.testing.expectEqualStrings("dev", resumed.id());
+    try std.testing.expectEqualStrings("dev" ++ extension, resumed.name());
+
+    // A new session gets a generated timestamp id of its own.
+    var fresh = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    defer fresh.deinit();
+    try std.testing.expectEqual(15, fresh.id().len);
+    // The file name is that id with the extension.
+    try std.testing.expect(std.mem.endsWith(u8, fresh.name(), extension));
+    try std.testing.expectEqualStrings(
+        fresh.id(),
+        fresh.name()[0 .. fresh.name().len - extension.len],
+    );
 }

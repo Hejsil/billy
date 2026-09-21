@@ -151,7 +151,7 @@ pub fn main(init: std.process.Init) !void {
     // `cwd` is where billy runs now. A new session records it, and a resumed one
     // keeps the directory it was saved with, so a session continues where it was
     // started rather than wherever it is picked up.
-    var session = billy.Session.open(io, sessions_dir_handle, arena, init.gpa, options.resume_id, cwd) catch |err| switch (err) {
+    var session = billy.Session.open(io, sessions_dir_handle, init.gpa, options.resume_id, cwd) catch |err| switch (err) {
         error.SessionNotFound => {
             std.log.err("no session '{s}' in {s}", .{ options.resume_id.?, sessions_dir });
             return err;

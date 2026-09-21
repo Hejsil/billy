@@ -287,7 +287,7 @@ pub fn run(
     while (true) {
         // Rebuilt for every prompt, so it reflects the tokens and cost of the
         // turns run so far.
-        const header = try sessionHeader(gpa, arena, config, session.id, session.context_tokens, session.cost);
+        const header = try sessionHeader(gpa, arena, config, session.id(), session.context_tokens, session.cost);
         const line = (try editor.readLine(header, prompt)) orelse break;
         if (line.len == 0) continue;
         try session.append(.{ .role = "user", .content = line });
@@ -400,7 +400,7 @@ fn turn(
         defer request_arena.deinit();
         const request = request_arena.allocator();
 
-        const completion = try client.complete(request, session.conversation(), session.tools);
+        const completion = try client.complete(request, session.conversation(), session.toolSet());
         // The totals are recorded first, so the save inside `append` stores them
         // along with the message. Each request is priced as it is made, at the
         // rates in effect then, so a session running through a rate change is
@@ -477,7 +477,7 @@ fn expectTranscript(
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try Session.open(std.testing.io, tmp.dir, arena_state.allocator(), gpa, null, "/work");
+    var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
     for (messages) |message| try session.append(message);
 

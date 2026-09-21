@@ -23,18 +23,6 @@ pub const ToolCall = struct {
     };
 };
 
-pub const Tool = struct {
-    type: []const u8 = "function",
-    function: Function,
-
-    pub const Function = struct {
-        name: []const u8,
-        description: []const u8,
-        /// JSON Schema for the arguments.
-        parameters: std.json.Value,
-    };
-};
-
 /// Token counts for one request, with the provider-specific spellings of the
 /// cached-input split normalized away.
 pub const Usage = struct {
@@ -66,15 +54,16 @@ pub const Completion = struct {
 
 /// The body of one completion request.
 ///
-/// `Messages` is whatever the conversation is held as, which only has to be
-/// able to write itself into the format the API takes. That is what lets a
-/// conversation be sent from where it is stored instead of being resolved into
-/// a second copy of itself first.
-fn Request(comptime Messages: type) type {
+/// `Messages` and `Tools` are whatever the conversation and the tool
+/// definitions are held as, which only have to be able to write themselves into
+/// the format the API takes. That is what lets a conversation and its tools be
+/// sent from where they are stored instead of being resolved into a second copy
+/// of themselves first; the session writes both out of its own pools.
+fn Request(comptime Messages: type, comptime Tools: type) type {
     return struct {
         model: []const u8,
         messages: Messages,
-        tools: []const Tool,
+        tools: Tools,
         stream: bool = false,
     };
 }
@@ -141,7 +130,7 @@ pub const Client = struct {
         client: *Client,
         arena: std.mem.Allocator,
         messages: anytype,
-        tools: []const Tool,
+        tools: anytype,
     ) !Completion {
         const authorization = try std.fmt.allocPrint(client.gpa, "Bearer {s}", .{client.api_key});
         defer client.gpa.free(authorization);
@@ -152,7 +141,7 @@ pub const Client = struct {
         var response_text: std.Io.Writer.Allocating = .init(client.gpa);
         defer response_text.deinit();
 
-        const request: Request(@TypeOf(messages)) = .{
+        const request: Request(@TypeOf(messages), @TypeOf(tools)) = .{
             .model = client.model,
             .messages = messages,
             .tools = tools,
@@ -241,6 +230,10 @@ fn writeBody(writer: *Io.Writer, request: anytype) !void {
     try json.write(request);
 }
 
+/// Stands for the tools of a request that has none. The request is generic over
+/// the tools, so a test that sends none still names a type for them.
+const NoTools = struct {};
+
 test "a request counts out to exactly the body it writes" {
     const gpa = std.testing.allocator;
 
@@ -253,7 +246,7 @@ test "a request counts out to exactly the body it writes" {
         }} },
         .{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;\n" },
     };
-    const request: Request(@TypeOf(&messages)) = .{
+    const request: Request(@TypeOf(&messages), []const NoTools) = .{
         .model = "some-model",
         .messages = &messages,
         .tools = &.{},
@@ -338,7 +331,11 @@ test "a request reaches the wire with the body the head promised" {
     };
     const expected = try std.json.Stringify.valueAlloc(
         gpa,
-        Request(@TypeOf(&messages)){ .model = "some-model", .messages = &messages, .tools = &.{} },
+        Request(@TypeOf(&messages), []const NoTools){
+            .model = "some-model",
+            .messages = &messages,
+            .tools = &.{},
+        },
         .{ .emit_null_optional_fields = false },
     );
     defer gpa.free(expected);
@@ -368,7 +365,7 @@ test "a request reaches the wire with the body the head promised" {
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    const completion = try client.complete(arena_state.allocator(), &messages, &.{});
+    const completion = try client.complete(arena_state.allocator(), &messages, @as([]const NoTools, &.{}));
 
     try group.await(io);
     if (provider.err) |err| return err;

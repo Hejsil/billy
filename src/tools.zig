@@ -6,6 +6,7 @@ const llm = @import("llm.zig");
 const search = @import("search.zig");
 const formatting = @import("format.zig");
 const styling = @import("style.zig");
+const Session = @import("Session.zig");
 
 /// Laying a bash command out for the display.
 pub const Format = formatting.Format;
@@ -96,7 +97,7 @@ pub const Tools = struct {
     /// leaves `web_search` out of `definitions`, so the model is never offered
     /// a tool that could not run.
     search: ?search.Client,
-    definitions: []const llm.Tool,
+    definitions: []const Session.Definition,
 
     /// `arena` holds the definitions, which are sent with every request and so
     /// live as long as the run. Nothing else the tools allocate outlives the
@@ -834,60 +835,36 @@ const specs = [_]Spec{
     .{
         .name = "read",
         .description = "Read a file. Returns the lines with their line numbers.",
-        .parameters =
-        \\{
-        \\  "type": "object",
-        \\  "properties": {
-        \\    "path": {"type": "string", "description": "File to read."},
-        \\    "offset": {"type": "integer", "description": "First line to read, 1-based. Defaults to 1."},
-        \\    "limit": {"type": "integer", "description": "Maximum number of lines. Defaults to 2000."}
-        \\  },
-        \\  "required": ["path"]
-        \\}
-        ,
+        .parameters = "{\"type\":\"object\",\"properties\":{" ++
+            "\"path\":{\"type\":\"string\",\"description\":\"File to read.\"}," ++
+            "\"offset\":{\"type\":\"integer\",\"description\":\"First line to read, 1-based. Defaults to 1.\"}," ++
+            "\"limit\":{\"type\":\"integer\",\"description\":\"Maximum number of lines. Defaults to 2000.\"}}," ++
+            "\"required\":[\"path\"]}",
     },
     .{
         .name = "write",
         .description = "Write a file, creating parent directories and replacing any existing content.",
-        .parameters =
-        \\{
-        \\  "type": "object",
-        \\  "properties": {
-        \\    "path": {"type": "string", "description": "File to write."},
-        \\    "content": {"type": "string", "description": "Complete content of the file."}
-        \\  },
-        \\  "required": ["path", "content"]
-        \\}
-        ,
+        .parameters = "{\"type\":\"object\",\"properties\":{" ++
+            "\"path\":{\"type\":\"string\",\"description\":\"File to write.\"}," ++
+            "\"content\":{\"type\":\"string\",\"description\":\"Complete content of the file.\"}}," ++
+            "\"required\":[\"path\",\"content\"]}",
     },
     .{
         .name = "edit",
         .description = "Replace text in a file. The text is matched exactly when it can be and ignoring whitespace otherwise, so a copied line need not be perfect. Fails unless it is found exactly once, unless replace_all is true.",
-        .parameters =
-        \\{
-        \\  "type": "object",
-        \\  "properties": {
-        \\    "path": {"type": "string", "description": "File to edit."},
-        \\    "old_string": {"type": "string", "description": "Text to replace, one or more whole lines. Matched exactly, or ignoring whitespace when it does not match exactly."},
-        \\    "new_string": {"type": "string", "description": "Replacement text."},
-        \\    "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of requiring a unique match. Defaults to false."}
-        \\  },
-        \\  "required": ["path", "old_string", "new_string"]
-        \\}
-        ,
+        .parameters = "{\"type\":\"object\",\"properties\":{" ++
+            "\"path\":{\"type\":\"string\",\"description\":\"File to edit.\"}," ++
+            "\"old_string\":{\"type\":\"string\",\"description\":\"Text to replace, one or more whole lines. Matched exactly, or ignoring whitespace when it does not match exactly.\"}," ++
+            "\"new_string\":{\"type\":\"string\",\"description\":\"Replacement text.\"}," ++
+            "\"replace_all\":{\"type\":\"boolean\",\"description\":\"Replace every occurrence instead of requiring a unique match. Defaults to false.\"}}," ++
+            "\"required\":[\"path\",\"old_string\",\"new_string\"]}",
     },
     .{
         .name = "bash",
         .description = "Run a shell command with bash -c and return its output and exit code.",
-        .parameters =
-        \\{
-        \\  "type": "object",
-        \\  "properties": {
-        \\    "command": {"type": "string", "description": "Command to run."}
-        \\  },
-        \\  "required": ["command"]
-        \\}
-        ,
+        .parameters = "{\"type\":\"object\",\"properties\":{" ++
+            "\"command\":{\"type\":\"string\",\"description\":\"Command to run.\"}}," ++
+            "\"required\":[\"command\"]}",
     },
 };
 
@@ -897,40 +874,29 @@ const specs = [_]Spec{
 const search_spec = Spec{
     .name = "web_search",
     .description = "Search the web and return the top results: a title, a url and a snippet for each.",
-    .parameters =
-    \\{
-    \\  "type": "object",
-    \\  "properties": {
-    \\    "query": {"type": "string", "description": "What to search for."}
-    \\  },
-    \\  "required": ["query"]
-    \\}
-    ,
+    .parameters = "{\"type\":\"object\",\"properties\":{" ++
+        "\"query\":{\"type\":\"string\",\"description\":\"What to search for.\"}}," ++
+        "\"required\":[\"query\"]}",
 };
 
 /// The tool definitions sent with every request. `web_search` is included only
 /// when `include_search` is set, so a run with no backend never offers the model
 /// a tool that could not run.
-fn definitions(arena: std.mem.Allocator, include_search: bool) ![]const llm.Tool {
-    var tools: std.ArrayList(llm.Tool) = .empty;
-    for (specs) |spec| try tools.append(arena, try buildTool(arena, spec));
-    if (include_search) try tools.append(arena, try buildTool(arena, search_spec));
+fn definitions(arena: std.mem.Allocator, include_search: bool) ![]const Session.Definition {
+    var tools: std.ArrayList(Session.Definition) = .empty;
+    for (specs) |spec| try tools.append(arena, definitionOf(spec));
+    if (include_search) try tools.append(arena, definitionOf(search_spec));
     return tools.toOwnedSlice(arena);
 }
 
-/// Builds one tool definition from its spec, the parameters parsed into the
-/// JSON the request carries.
-fn buildTool(arena: std.mem.Allocator, spec: Spec) !llm.Tool {
-    return .{ .function = .{
+/// The definition of one spec. Its strings are the spec's own, which are
+/// comptime, so nothing is allocated for the text; the session interns it.
+fn definitionOf(spec: Spec) Session.Definition {
+    return .{
         .name = spec.name,
         .description = spec.description,
-        .parameters = try std.json.parseFromSliceLeaky(
-            std.json.Value,
-            arena,
-            spec.parameters,
-            .{},
-        ),
-    } };
+        .parameters = spec.parameters,
+    };
 }
 
 test "exit codes of signals follow the shell convention" {
@@ -1493,7 +1459,8 @@ test "definitions cover every tool the loop dispatches" {
     const defs = try definitions(arena_state.allocator(), false);
     try std.testing.expectEqual(specs.len, defs.len);
     for (defs) |tool| {
-        try std.testing.expect(tool.function.parameters == .object);
+        // The schema is the JSON text it is sent as, which starts with an object.
+        try std.testing.expect(std.mem.startsWith(u8, tool.parameters, "{"));
     }
 }
 
@@ -1507,13 +1474,13 @@ test "web search is offered only when a backend is configured" {
     const without = try definitions(arena_state.allocator(), false);
     try std.testing.expectEqual(specs.len, without.len);
     for (without) |tool| {
-        try std.testing.expect(!std.mem.eql(u8, tool.function.name, "web_search"));
+        try std.testing.expect(!std.mem.eql(u8, tool.name, "web_search"));
     }
 
     // With one it is appended, so a session that gains it keeps the tools it had.
     const with = try definitions(arena_state.allocator(), true);
     try std.testing.expectEqual(specs.len + 1, with.len);
-    try std.testing.expectEqualStrings("web_search", with[with.len - 1].function.name);
+    try std.testing.expectEqualStrings("web_search", with[with.len - 1].name);
 }
 
 test "the tools work in the directory they are given, wherever billy runs" {
