@@ -40,6 +40,7 @@ pub const Opened = struct {
 /// Settings for the tools the agent can call, one group per tool.
 pub const Tools = struct {
     bash: Bash = .{},
+    edit: Edit = .{},
     web_search: WebSearch = .{},
 };
 
@@ -76,6 +77,20 @@ pub const Bash = struct {
     /// the file is meant to say, so it is rejected rather than read as "no
     /// limit"; set a large value for a command that legitimately runs long.
     timeout_s: usize = default_timeout_s,
+};
+
+/// Settings for the edit tool.
+pub const Edit = struct {
+    /// A shell script that lays an edit's diff out for the display: it reads the
+    /// diff on standard input and writes the laid-out diff on standard output,
+    /// such as `delta --paging=never` or `bat -l diff --plain`. The two sides of
+    /// the change are also written to billy's own files, whose paths are passed as
+    /// the script's first two arguments, so a two-file differ can name them, such
+    /// as `difft "$1" "$2"`. Null shows the diff the way billy colours it.
+    ///
+    /// Only the display changes; the file that is written, what a session stores
+    /// and what the model is sent keep the text as it was written.
+    format: ?[]const u8 = null,
 };
 
 /// Settings for the markdown billy shows. Markdown is not a tool: it is the
@@ -396,6 +411,9 @@ test "the file is indented, so it can be read and edited by hand" {
         \\    "bash": {
         \\      "format": null,
         \\      "timeout_s": 120
+        \\    },
+        \\    "edit": {
+        \\      "format": null
         \\    },
         \\    "web_search": {
         \\      "provider": null,

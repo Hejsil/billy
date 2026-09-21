@@ -38,16 +38,17 @@ pub const Config = struct {
     search: ?search.Config = null,
 };
 
-/// How billy lays out and decorates what it shows: the bash command formatter,
-/// the markdown formatter and the terminal style. The three travel together
-/// through the printing, so they are gathered here rather than passed apart as a
-/// run of arguments that had grown hard to read.
+/// How billy lays out and decorates what it shows: the formatter scripts for a
+/// tool's block, the markdown formatter and the terminal style. They travel
+/// together through the printing, so they are gathered here rather than passed
+/// apart as a run of arguments that had grown hard to read.
 ///
 /// The layout is presentation only: the command that runs, what a session stores
 /// and what the model is sent keep the text as it was written.
 pub const Display = struct {
-    /// How a bash command is laid out before it is shown. Null shows it as written.
-    format: Tools.Format = null,
+    /// How a tool's block is laid out before it is shown: a bash command and an
+    /// edit's diff. Null shows each as it was written.
+    formats: Tools.Formats = .{},
     /// How the markdown of a reply and a prompt is laid out before it is shown.
     /// Null shows the text as written.
     markdown: formatting.Format = null,
@@ -290,7 +291,7 @@ pub fn run(
         .dir = work_dir,
         .gpa = gpa,
         .log = out,
-        .format = config.display.format,
+        .formats = config.display.formats,
         .bash_timeout_s = config.bash_timeout_s,
         .style = config.display.style,
         .search = config.search,
@@ -410,9 +411,10 @@ fn printMessage(
         // The result belongs to the message just after the one that asked for
         // it, so the search starts from there.
         try Tools.describe(
+            arena,
             Tools.parseCallNamed(arena, call.name, call.arguments),
             session.toolResult(index + 1, call.id),
-            display.format,
+            display.formats,
             display.style,
             out,
         );
@@ -683,6 +685,26 @@ test "printTranscript gives each call the result that names it" {
             } },
             .{ .role = "tool", .tool_call_id = "call_1", .content = "contents of a" },
             .{ .role = "tool", .tool_call_id = "call_2", .content = "contents of b" },
+        },
+        null,
+        .plain,
+    );
+}
+
+test "printTranscript rebuilds an edit's diff from the stored call" {
+    // The diff is computed from the call, so a replay shows the same one the run
+    // did without the diff having been stored.
+    try expectTranscript(
+        "✎ edit a.zig\n▾ diff\n-old\n+new\n\n",
+        &.{
+            .{ .role = "assistant", .tool_calls = &.{.{
+                .id = "call_1",
+                .function = .{
+                    .name = "edit",
+                    .arguments = "{\"path\":\"a.zig\",\"old_string\":\"old\",\"new_string\":\"new\"}",
+                },
+            }} },
+            .{ .role = "tool", .tool_call_id = "call_1", .content = "replaced 1 occurrence(s) in a.zig" },
         },
         null,
         .plain,

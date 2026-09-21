@@ -26,14 +26,18 @@ const usage =
     \\that is unset, and is created with the defaults on the first run. It holds
     \\the turn limit; under tools.bash.format, a shell script that lays a bash
     \\command out for the display, and under tools.bash.timeout_s, the seconds a
-    \\command may run before it is killed; under markdown.format, one that lays
-    \\out a reply, such as "glow -"; and under tools.web_search, the backend to
-    \\search the web with (only "tavily" for now) and how many results to ask
-    \\for. A format reads the text on standard input and writes it back on
-    \\standard output. The keys are kept in credentials.json in the data
-    \\directory, readable by the owner alone. The context window and the token
-    \\prices the header reports come from a table built into billy, keyed by
-    \\provider and model, since the API reports token counts but neither of those.
+    \\command may run before it is killed; under tools.edit.format, one that lays
+    \\out the diff an edit is shown as, such as "delta --paging=never"; under
+    \\markdown.format, one that lays out a reply, such as "glow -"; and under
+    \\tools.web_search, the backend to search the web with (only "tavily" for now)
+    \\and how many results to ask for. A format reads the text on standard input
+    \\and writes it back on standard output; an edit's script also gets the paths
+    \\of two files billy wrote the sides of the change to, as its first two
+    \\arguments, so a two-file differ can name them "$1" and "$2". The keys are
+    \\kept in credentials.json in the data directory, readable by the owner alone.
+    \\The context window and the token prices the header reports come from a table
+    \\built into billy, keyed by provider and model, since the API reports token
+    \\counts but neither of those.
     \\
 ;
 
@@ -199,20 +203,28 @@ pub fn main(init: std.process.Init) !void {
         // they are looked up by provider and model; an unknown model simply has
         // no gauge and no cost.
         .model_info = billy.models.lookup(billy.models.Provider.fromUrl(base_url), model),
-        // How billy lays out and decorates what it shows. A bash command is
-        // laid out by the format script the configuration sets, when it sets one,
-        // so the user reads the command the way it runs; a reply and a prompt are
-        // laid out by the markdown script; and a terminal gets the block headers
-        // with the name in bold, while a pipe or a redirection, where the escape
-        // codes would only be noise, gets the same text plain. Only the display
-        // changes: the command that runs, the session and the model keep the text
-        // as it was written.
+        // How billy lays out and decorates what it shows. A bash command is laid
+        // out by its format script, so the user reads the command the way it runs;
+        // an edit is shown as a diff, laid out by its own script when one is set;
+        // a reply and a prompt are laid out by the markdown script; and a terminal
+        // gets the block headers with the name in bold, while a pipe or a
+        // redirection, where the escape codes would only be noise, gets the same
+        // text plain. Only the display changes: the command that runs, the file
+        // that is written, the session and the model keep the text as it was
+        // written.
         .display = .{
-            .format = if (settings.config.tools.bash.format) |script| .{
-                .script = script,
-                .io = io,
-                .gpa = init.gpa,
-            } else null,
+            .formats = .{
+                .bash = if (settings.config.tools.bash.format) |script| .{
+                    .script = script,
+                    .io = io,
+                    .gpa = init.gpa,
+                } else null,
+                .edit = if (settings.config.tools.edit.format) |script| .{
+                    .script = script,
+                    .io = io,
+                    .gpa = init.gpa,
+                } else null,
+            },
             .markdown = if (settings.config.markdown.format) |script| .{
                 .script = script,
                 .io = io,
