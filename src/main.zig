@@ -16,20 +16,20 @@ const usage =
     \\
     \\The API key comes from `billy login <service>`, or from DEEPSEEK_API_KEY or
     \\OPENAI_API_KEY when none is stored. BILLY_BASE_URL and BILLY_MODEL override
-    \\the endpoint and the model. Sessions are stored under $XDG_DATA_HOME/billy,
-    \\or ~/.local/share/billy when that is unset. The configuration lives in
-    \\$XDG_CONFIG_HOME/billy/config.json, or ~/.config/billy/config.json when
-    \\that is unset, and is created with the defaults on the first run. It holds
-    \\the turn limit; under tools.bash.format, a shell script that lays a bash
-    \\command out for the display; under markdown.format, one that lays out a
-    \\reply, such as "glow -"; and under tools.web_search, the backend to search
-    \\the web with (only "tavily" for now) and how many results to ask for. A
-    \\format reads the text on standard input and writes it back on standard
-    \\output. The keys are kept in credentials.json in the data directory beside
-    \\the sessions, readable by the owner alone. The context window and the token
-    \\prices the header reports come from a table built into billy, keyed by
-    \\provider and model, since the API reports token counts but neither of
-    \\those.
+    \\the endpoint and the model. Sessions are stored under
+    \\$XDG_DATA_HOME/billy/sessions, or ~/.local/share/billy/sessions when that
+    \\is unset. The configuration lives in $XDG_CONFIG_HOME/billy/config.json,
+    \\or ~/.config/billy/config.json when that is unset, and is created with the
+    \\defaults on the first run. It holds the turn limit; under
+    \\tools.bash.format, a shell script that lays a bash command out for the
+    \\display; under markdown.format, one that lays out a reply, such as
+    \\"glow -"; and under tools.web_search, the backend to search the web with
+    \\(only "tavily" for now) and how many results to ask for. A format reads
+    \\the text on standard input and writes it back on standard output. The keys
+    \\are kept in credentials.json in the data directory, readable by the owner
+    \\alone. The context window and the token prices the header reports come from
+    \\a table built into billy, keyed by provider and model, since the API
+    \\reports token counts but neither of those.
     \\
 ;
 
@@ -68,11 +68,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // billy's own files live under the data directory: the sessions, and the
-    // credentials beside them. The credentials are not kept with the
-    // configuration, which is meant to be shared between machines, and a key is
-    // not. The directory is opened once and used for both.
-    const data_dir = billy.Session.defaultDir(arena, init.environ_map) catch |err| {
+    // billy's own files live under the data directory: the credentials in the
+    // directory itself, and the sessions in a subdirectory of it. The
+    // credentials are not kept with the configuration, which is meant to be
+    // shared between machines, and a key is not.
+    const data_dir = billy.Session.dataDir(arena, init.environ_map) catch |err| {
         std.log.err("cannot find where to store billy's files: {s}", .{@errorName(err)});
         return err;
     };
@@ -190,9 +190,21 @@ pub fn main(init: std.process.Init) !void {
         .style = billy.style.Style.detect(io),
     };
 
-    var session = billy.Session.open(io, data_dir_handle, arena, init.gpa, options.resume_id) catch |err| switch (err) {
+    // The sessions live in a subdirectory of billy's data directory, apart from
+    // the credentials stored in the directory itself.
+    const sessions_dir = billy.Session.defaultDir(arena, init.environ_map) catch |err| {
+        std.log.err("cannot find where to store sessions: {s}", .{@errorName(err)});
+        return err;
+    };
+    var sessions_dir_handle = Io.Dir.cwd().createDirPathOpen(io, sessions_dir, .{}) catch |err| {
+        std.log.err("cannot use {s} for sessions: {s}", .{ sessions_dir, @errorName(err) });
+        return err;
+    };
+    defer sessions_dir_handle.close(io);
+
+    var session = billy.Session.open(io, sessions_dir_handle, arena, init.gpa, options.resume_id) catch |err| switch (err) {
         error.SessionNotFound => {
-            std.log.err("no session '{s}' in {s}", .{ options.resume_id.?, data_dir });
+            std.log.err("no session '{s}' in {s}", .{ options.resume_id.?, sessions_dir });
             return err;
         },
         error.InvalidSessionId => {

@@ -3,10 +3,10 @@
 //! Every service billy talks to needs a key: the model endpoint needs one, and
 //! so does the web search backend. `billy login <service>` reads a key and
 //! stores it, so it does not have to be exported in the environment before every
-//! run. The keys are kept in `credentials.json` under the data directory, beside
-//! the sessions, written so only the owner can read it, since a key is a secret.
-//! They are not kept with the configuration, which is meant to be shared between
-//! machines, and a key is not.
+//! run. The keys are kept in `credentials.json` under the data directory,
+//! written so only the owner can read it, since a key is a secret. They are not
+//! kept with the configuration, which is meant to be shared between machines,
+//! and a key is not.
 //!
 //! The environment still works: a key that is not stored is read from the
 //! service's variable, which is where billy read it before it could store one.
@@ -18,8 +18,7 @@ const Io = std.Io;
 const models = @import("models.zig");
 const search = @import("search.zig");
 
-/// Name of the file the credentials are kept in, under the data directory beside
-/// the sessions.
+/// Name of the file the credentials are kept in, in the billy data directory.
 pub const file_name = "credentials.json";
 /// Layout of the credentials file, bumped when its shape changes.
 const format_version = 1;

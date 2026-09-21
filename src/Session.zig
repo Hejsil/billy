@@ -14,8 +14,11 @@ const llm = @import("llm.zig");
 
 const Session = @This();
 
-/// Directory under the XDG data directory that holds the sessions.
+/// Directory under the XDG data directory that holds billy's files.
 const app_dir = "billy";
+/// Subdirectory of the data directory that holds the sessions, so the session
+/// files sit apart from the credentials billy keeps in the directory itself.
+const sessions_dir = "sessions";
 /// Extension of a session file.
 const extension = ".json";
 /// Layout of a session file, bumped when its shape changes.
@@ -535,11 +538,12 @@ fn stringPtr(session: *const Session, index: StringIndex) ?[*:0]const u8 {
     return session.strings.items[start .. session.strings.items.len - 1 :0].ptr;
 }
 
-/// The directory billy keeps its own files in, under the data directory: the
-/// sessions, and the credentials beside them. It is `$XDG_DATA_HOME/billy`, or
+/// The directory billy keeps its own files in: `$XDG_DATA_HOME/billy`, or
 /// `$HOME/.local/share/billy` when that is unset, as the XDG base directory
-/// specification prescribes.
-pub fn defaultDir(arena: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
+/// specification prescribes. The credentials live in the directory itself, and
+/// the sessions in a subdirectory of it, so a listing of billy's data directory
+/// shows what billy keeps rather than a wall of session files.
+pub fn dataDir(arena: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
     if (environ.get("XDG_DATA_HOME")) |xdg| {
         // The specification says a relative path must be ignored.
         if (xdg.len > 0 and std.fs.path.isAbsolute(xdg)) {
@@ -549,6 +553,12 @@ pub fn defaultDir(arena: std.mem.Allocator, environ: *const std.process.Environ.
 
     const home = environ.get("HOME") orelse return error.HomeNotSet;
     return std.fs.path.join(arena, &.{ home, ".local", "share", app_dir });
+}
+
+/// The directory holding the sessions: the `sessions` subdirectory of `dataDir`,
+/// so that the session files sit apart from what else billy keeps.
+pub fn defaultDir(arena: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
+    return std.fs.path.join(arena, &.{ try dataDir(arena, environ), sessions_dir });
 }
 
 /// An id based on the current UTC time, such as `20250131-120000`, so that ids
@@ -656,16 +666,18 @@ test "defaultDir follows the XDG base directory specification" {
     try std.testing.expectError(error.HomeNotSet, defaultDir(allocator, &environ));
 
     try environ.put("HOME", "/home/user");
-    try std.testing.expectEqualStrings("/home/user/.local/share/billy", try defaultDir(allocator, &environ));
+    try std.testing.expectEqualStrings("/home/user/.local/share/billy/sessions", try defaultDir(allocator, &environ));
+    try std.testing.expectEqualStrings("/home/user/.local/share/billy", try dataDir(allocator, &environ));
 
     try environ.put("XDG_DATA_HOME", "/data");
-    try std.testing.expectEqualStrings("/data/billy", try defaultDir(allocator, &environ));
+    try std.testing.expectEqualStrings("/data/billy/sessions", try defaultDir(allocator, &environ));
+    try std.testing.expectEqualStrings("/data/billy", try dataDir(allocator, &environ));
 
     // An empty or relative XDG_DATA_HOME is ignored.
     try environ.put("XDG_DATA_HOME", "");
-    try std.testing.expectEqualStrings("/home/user/.local/share/billy", try defaultDir(allocator, &environ));
+    try std.testing.expectEqualStrings("/home/user/.local/share/billy/sessions", try defaultDir(allocator, &environ));
     try environ.put("XDG_DATA_HOME", "relative");
-    try std.testing.expectEqualStrings("/home/user/.local/share/billy", try defaultDir(allocator, &environ));
+    try std.testing.expectEqualStrings("/home/user/.local/share/billy/sessions", try defaultDir(allocator, &environ));
 }
 
 test "a session survives a save and resume" {
