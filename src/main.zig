@@ -16,20 +16,22 @@ const usage =
     \\
     \\The API key comes from `billy login <service>`, or from DEEPSEEK_API_KEY or
     \\OPENAI_API_KEY when none is stored. BILLY_BASE_URL and BILLY_MODEL override
-    \\the endpoint and the model. Sessions are stored under
-    \\$XDG_DATA_HOME/billy/sessions, or ~/.local/share/billy/sessions when that
-    \\is unset. The configuration lives in $XDG_CONFIG_HOME/billy/config.json,
-    \\or ~/.config/billy/config.json when that is unset, and is created with the
-    \\defaults on the first run. It holds the turn limit; under
-    \\tools.bash.format, a shell script that lays a bash command out for the
-    \\display; under markdown.format, one that lays out a reply, such as
-    \\"glow -"; and under tools.web_search, the backend to search the web with
-    \\(only "tavily" for now) and how many results to ask for. A format reads
-    \\the text on standard input and writes it back on standard output. The keys
-    \\are kept in credentials.json in the data directory, readable by the owner
-    \\alone. The context window and the token prices the header reports come from
-    \\a table built into billy, keyed by provider and model, since the API
-    \\reports token counts but neither of those.
+    \\the endpoint and the model. The project's own instructions are read from
+    \\AGENTS.md, or CLAUDE.md, in the working directory or the nearest parent up
+    \\to the repository root, and sent with every request. Sessions are stored
+    \\under $XDG_DATA_HOME/billy/sessions, or ~/.local/share/billy/sessions when
+    \\that is unset. The configuration lives in
+    \\$XDG_CONFIG_HOME/billy/config.json, or ~/.config/billy/config.json when
+    \\that is unset, and is created with the defaults on the first run. It holds
+    \\the turn limit; under tools.bash.format, a shell script that lays a bash
+    \\command out for the display; under markdown.format, one that lays out a
+    \\reply, such as "glow -"; and under tools.web_search, the backend to search
+    \\the web with (only "tavily" for now) and how many results to ask for. A
+    \\format reads the text on standard input and writes it back on standard
+    \\output. The keys are kept in credentials.json in the data directory,
+    \\readable by the owner alone. The context window and the token prices the
+    \\header reports come from a table built into billy, keyed by provider and
+    \\model, since the API reports token counts but neither of those.
     \\
 ;
 

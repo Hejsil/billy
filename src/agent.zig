@@ -51,6 +51,54 @@ const system_prompt =
     \\Reply with plain text when the task is done.
 ;
 
+/// The files a project's own instructions are read from, in the order they are
+/// tried. `AGENTS.md` is the open convention; `CLAUDE.md` is accepted after it so
+/// that a project which wrote one for another tool need not rename it.
+const instruction_files = [_][]const u8{ "AGENTS.md", "CLAUDE.md" };
+/// Longest project instructions read back, so an outsize file cannot exhaust
+/// memory.
+const max_instructions_len = 1 << 20;
+
+/// The project's own instructions, read from the working directory or the
+/// nearest parent that has them, and null when the project has none. The search
+/// stops at the repository root, so a file above the project is not read.
+///
+/// The instructions join the system prompt rather than the conversation, so they
+/// are sent with every request and survive whatever context trimming happens
+/// later. That is what keeps the rules a project cares about from being dropped
+/// partway through a long session.
+fn projectInstructions(io: Io, arena: std.mem.Allocator, cwd: []const u8) !?[]const u8 {
+    var dir_path: []const u8 = cwd;
+    while (true) {
+        for (instruction_files) |name| {
+            const path = try std.fs.path.join(arena, &.{ dir_path, name });
+            const text = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_instructions_len)) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            // An empty file is nothing to say, so the search carries on rather
+            // than putting a blank heading in the prompt.
+            const body = std.mem.trimEnd(u8, text, " \t\r\n");
+            if (body.len == 0) continue;
+            return try std.fmt.allocPrint(
+                arena,
+                "The project's instructions follow, read from {s}.\n\n{s}",
+                .{ name, body },
+            );
+        }
+        // The repository root is the last directory searched.
+        if (try exists(io, arena, dir_path, ".git")) return null;
+        dir_path = std.fs.path.dirname(dir_path) orelse return null;
+    }
+}
+
+/// Whether `dir_path` holds an entry named `name`.
+fn exists(io: Io, arena: std.mem.Allocator, dir_path: []const u8, name: []const u8) !bool {
+    const path = try std.fs.path.join(arena, &.{ dir_path, name });
+    _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return true;
+}
+
 /// Printed in front of every line the user types. The transcript reuses it so a
 /// replayed session looks like the run it continues.
 const prompt = "> ";
@@ -186,8 +234,14 @@ pub fn run(
     // on a resume, so the request sent then matches the earlier run byte for byte
     // and hits the prompt cache. They are set only on a session that has none, so
     // a new session gets the current ones while a resumed one keeps what it was
-    // saved with.
-    try session.appendSystemPrompt(system_prompt);
+    // saved with. The project's own instructions are part of the prompt, so they
+    // are sent with every request.
+    const instructions = try projectInstructions(io, arena, config.cwd);
+    const prompt_text = if (instructions) |text|
+        try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ system_prompt, text })
+    else
+        system_prompt;
+    try session.appendSystemPrompt(prompt_text);
     try session.ensureTools(tool_set.definitions);
 
     while (true) {
@@ -739,4 +793,93 @@ test "cost follows the cache hit, miss and output prices" {
         .cache_miss_tokens = 1_000_000,
     };
     try std.testing.expectEqual(3.1, costOf(price, usage));
+}
+
+/// The path of a `tmpDir` as `projectInstructions` takes it, relative to the
+/// working directory the tests run in.
+fn tmpPath(arena: std.mem.Allocator, tmp: *const std.testing.TmpDir) ![]const u8 {
+    return std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+}
+
+test "the project's instructions are read from the working directory" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "Write tests.\n" });
+
+    const text = (try projectInstructions(std.testing.io, arena, try tmpPath(arena, &tmp))).?;
+    // The prompt names where the instructions came from and carries them through.
+    try std.testing.expect(std.mem.indexOf(u8, text, "AGENTS.md") != null);
+    try std.testing.expect(std.mem.endsWith(u8, text, "Write tests."));
+}
+
+test "AGENTS.md is read before CLAUDE.md" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "agents" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "CLAUDE.md", .data = "claude" });
+
+    const text = (try projectInstructions(std.testing.io, arena, try tmpPath(arena, &tmp))).?;
+    try std.testing.expect(std.mem.endsWith(u8, text, "agents"));
+
+    // With no AGENTS.md the other name is read, so a project written for another
+    // tool still works.
+    try tmp.dir.deleteFile(std.testing.io, "AGENTS.md");
+    const claude = (try projectInstructions(std.testing.io, arena, try tmpPath(arena, &tmp))).?;
+    try std.testing.expect(std.mem.indexOf(u8, claude, "CLAUDE.md") != null);
+    try std.testing.expect(std.mem.endsWith(u8, claude, "claude"));
+}
+
+test "the instructions are found in a parent up to the repository root" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A repository root holding the instructions, and a subdirectory to run from.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "root rules" });
+    try tmp.dir.createDirPath(std.testing.io, "a/b");
+
+    const deep = try std.fmt.allocPrint(arena, "{s}/a/b", .{try tmpPath(arena, &tmp)});
+    const text = (try projectInstructions(std.testing.io, arena, deep)).?;
+    try std.testing.expect(std.mem.endsWith(u8, text, "root rules"));
+}
+
+test "a project with no instructions has none" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A repository root, so the search stops here rather than walking above it.
+    try tmp.dir.createDirPath(std.testing.io, ".git");
+
+    try std.testing.expect((try projectInstructions(std.testing.io, arena, try tmpPath(arena, &tmp))) == null);
+}
+
+test "an empty instructions file is not used" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".git");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "  \n\n" });
+
+    try std.testing.expect((try projectInstructions(std.testing.io, arena, try tmpPath(arena, &tmp))) == null);
 }
