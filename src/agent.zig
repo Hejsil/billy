@@ -260,14 +260,31 @@ pub fn run(
     };
     defer work_dir.close(io);
 
+    // One HTTP client for the run, shared by the model requests and the search
+    // backend, so both reuse its connections and share the certificates it scans
+    // once.
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+
     var editor = line_editor.LineEditor.init(io, out, arena);
-    var tool_set = try tools.Tools.init(io, work_dir, arena, gpa, out, config.format, config.style, config.search);
+    var tool_set = try tools.Tools.init(
+        io,
+        work_dir,
+        arena,
+        gpa,
+        out,
+        config.format,
+        config.style,
+        config.search,
+        &http,
+    );
     var client: llm.Client = .{
         .gpa = gpa,
         .io = io,
         .api_key = config.api_key,
         .url = config.url,
         .model = config.model,
+        .http = &http,
     };
 
     // The prompt and the tool definitions are stored with the session and reused

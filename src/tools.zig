@@ -105,6 +105,9 @@ pub const Tools = struct {
     ///
     /// `search_config` is the backend the configuration asked for, with its key
     /// resolved, or null to leave web search out.
+    /// `http` is the run's one HTTP client, borrowed by the search backend when
+    /// one is configured, so a search shares connections and scanned
+    /// certificates with the model requests.
     pub fn init(
         io: Io,
         dir: Io.Dir,
@@ -114,6 +117,7 @@ pub const Tools = struct {
         format: Format,
         style: Style,
         search_config: ?search.Config,
+        http: *std.http.Client,
     ) !Tools {
         return .{
             .io = io,
@@ -128,6 +132,7 @@ pub const Tools = struct {
                 .provider = config.provider,
                 .api_key = config.api_key,
                 .max_results = config.max_results,
+                .http = http,
             } else null,
             .definitions = try definitions(arena, search_config != null),
         };
@@ -1041,8 +1046,10 @@ test "a bash block shows only the streams the command filled" {
 
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
+    var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    defer http.deinit();
 
-    var tool_set = try Tools.init(std.testing.io, Io.Dir.cwd(), arena, gpa, &log.writer, null, .plain, null);
+    var tool_set = try Tools.init(std.testing.io, Io.Dir.cwd(), arena, gpa, &log.writer, null, .plain, null, &http);
     const cases = [_]struct { command: []const u8, expected: []const u8 }{
         // Nothing printed: the status is all there is.
         .{ .command = "true", .expected = "❯ bash\ntrue\n✓ exit 0\n\n" },
@@ -1246,8 +1253,10 @@ test "run logs exactly what describe prints" {
 
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
+    var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    defer http.deinit();
 
-    var tool_set = try Tools.init(std.testing.io, Io.Dir.cwd(), arena, gpa, &log.writer, null, .plain, null);
+    var tool_set = try Tools.init(std.testing.io, Io.Dir.cwd(), arena, gpa, &log.writer, null, .plain, null, &http);
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"true\"}",
@@ -1274,11 +1283,13 @@ test "the format changes what is shown and nothing else" {
 
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
+    var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    defer http.deinit();
 
     // The format script writes the command back upper case, so what is shown is
     // plainly not what runs.
     const format: Format = .{ .script = "tr a-z A-Z", .io = std.testing.io, .gpa = gpa };
-    var tool_set = try Tools.init(std.testing.io, Io.Dir.cwd(), arena, gpa, &log.writer, format, .plain, null);
+    var tool_set = try Tools.init(std.testing.io, Io.Dir.cwd(), arena, gpa, &log.writer, format, .plain, null, &http);
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"echo hi\"}",
@@ -1499,7 +1510,9 @@ test "the tools work in the directory they are given, wherever billy runs" {
 
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
-    var tool_set = try Tools.init(std.testing.io, work, arena, gpa, &log.writer, null, .plain, null);
+    var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    defer http.deinit();
+    var tool_set = try Tools.init(std.testing.io, work, arena, gpa, &log.writer, null, .plain, null, &http);
 
     // A file written by the tool lands in that directory.
     _ = try tool_set.run(arena, .{ .id = "1", .function = .{

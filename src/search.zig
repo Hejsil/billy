@@ -41,6 +41,10 @@ pub const Client = struct {
     provider: Provider,
     api_key: []const u8,
     max_results: usize,
+    /// The one HTTP client of the run, borrowed by pointer so a query shares
+    /// connections and scanned certificates with everything else that makes a
+    /// request. The run owns it and outlives this.
+    http: *std.http.Client,
 
     /// Runs one query and returns the results as the text the model reads: each
     /// result's title, its url and its snippet, in the order the backend ranked
@@ -76,13 +80,10 @@ pub const Client = struct {
         const authorization = try std.fmt.allocPrint(client.gpa, "Bearer {s}", .{client.api_key});
         defer client.gpa.free(authorization);
 
-        var http: std.http.Client = .{ .allocator = client.gpa, .io = client.io };
-        defer http.deinit();
-
         var body_writer: std.Io.Writer.Allocating = .init(client.gpa);
         defer body_writer.deinit();
 
-        const result = try http.fetch(.{
+        const result = try client.http.fetch(.{
             .location = .{ .url = endpoint },
             .method = .POST,
             .payload = body,
@@ -245,12 +246,15 @@ test "a tavily search posts the query and reads the results back" {
     });
     defer gpa.free(endpoint);
 
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
     var client: Client = .{
         .io = io,
         .gpa = gpa,
         .provider = .tavily,
         .api_key = "secret",
         .max_results = 3,
+        .http = &http,
     };
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
