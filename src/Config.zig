@@ -11,6 +11,8 @@ const std = @import("std");
 const Io = std.Io;
 const search = @import("search.zig");
 
+const Config = @This();
+
 /// Directory under the XDG config directory that holds the configuration.
 const app_dir = "billy";
 /// Name of the configuration file inside that directory.
@@ -28,80 +30,11 @@ pub const default_max_results = 5;
 /// nothing else.
 pub const default_timeout_s = 120;
 
-pub const Config = struct {
-    /// Model turns allowed for one request before the harness gives up on it.
-    max_turns: usize = default_max_turns,
-    /// Settings for the tools the agent can call, by tool name.
-    tools: Tools = .{},
-    /// Settings for the markdown billy shows: the replies it writes and the
-    /// prompts the user types.
-    markdown: Markdown = .{},
-
-    /// What `open` found, including whether the file had to be written.
-    pub const Opened = struct {
-        config: Config,
-        /// Whether the file was missing and has just been written with defaults.
-        created: bool,
-    };
-
-    /// Reads the configuration from `dir`, writing `file_name` with the defaults
-    /// when it is missing. `dir` must be the directory holding the file.
-    pub fn open(io: Io, dir: Io.Dir, arena: std.mem.Allocator) !Opened {
-        const text = dir.readFileAlloc(io, file_name, arena, .limited(max_config_bytes)) catch |err| switch (err) {
-            error.FileNotFound => {
-                const config: Config = .{};
-                try config.save(io, dir, arena);
-                return .{ .config = config, .created = true };
-            },
-            else => return err,
-        };
-        const stored = std.json.parseFromSliceLeaky(Stored, arena, text, .{
-            .ignore_unknown_fields = true,
-            .allocate = .alloc_always,
-        }) catch return error.CorruptConfig;
-        if (stored.version > format_version) return error.UnsupportedConfigVersion;
-        // Zero turns would give the model no chance to answer at all, which is
-        // never what the file is meant to say.
-        if (stored.max_turns == 0) return error.InvalidConfig;
-        // A zero timeout would kill every command as it starts, which is never
-        // what the file is meant to say either.
-        if (stored.tools.bash.timeout_s == 0) return error.InvalidConfig;
-        return .{
-            .config = .{
-                .max_turns = stored.max_turns,
-                .tools = stored.tools,
-                .markdown = stored.markdown,
-            },
-            .created = false,
-        };
-    }
-
-    /// Writes the configuration to `file_name` in `dir`. The previous contents
-    /// are replaced in one step, leaving them intact if writing fails part way.
-    ///
-    /// It is written indented rather than compact, unlike a session file: it is
-    /// there to be read and edited by hand, while a session is only ever read
-    /// back as a whole.
-    pub fn save(config: Config, io: Io, dir: Io.Dir, gpa: std.mem.Allocator) !void {
-        const text = try std.json.Stringify.valueAlloc(
-            gpa,
-            Stored{
-                .max_turns = config.max_turns,
-                .tools = config.tools,
-                .markdown = config.markdown,
-            },
-            .{ .whitespace = .indent_2 },
-        );
-        defer gpa.free(text);
-
-        var atomic = try dir.createFileAtomic(io, file_name, .{ .replace = true });
-        defer atomic.deinit(io);
-        var buffer: [4096]u8 = undefined;
-        var file: Io.File.Writer = .init(atomic.file, io, &buffer);
-        try file.interface.writeAll(text);
-        try file.flush();
-        try atomic.replace(io);
-    }
+/// What `open` found, including whether the file had to be written.
+pub const Opened = struct {
+    config: Config,
+    /// Whether the file was missing and has just been written with defaults.
+    created: bool,
 };
 
 /// Settings for the tools the agent can call, one group per tool.
@@ -167,6 +100,73 @@ const Stored = struct {
     tools: Tools = .{},
     markdown: Markdown = .{},
 };
+
+/// Model turns allowed for one request before the harness gives up on it.
+max_turns: usize = default_max_turns,
+/// Settings for the tools the agent can call, by tool name.
+tools: Tools = .{},
+/// Settings for the markdown billy shows: the replies it writes and the
+/// prompts the user types.
+markdown: Markdown = .{},
+
+/// Reads the configuration from `dir`, writing `file_name` with the defaults
+/// when it is missing. `dir` must be the directory holding the file.
+pub fn open(io: Io, dir: Io.Dir, arena: std.mem.Allocator) !Opened {
+    const text = dir.readFileAlloc(io, file_name, arena, .limited(max_config_bytes)) catch |err| switch (err) {
+        error.FileNotFound => {
+            const config: Config = .{};
+            try config.save(io, dir, arena);
+            return .{ .config = config, .created = true };
+        },
+        else => return err,
+    };
+    const stored = std.json.parseFromSliceLeaky(Stored, arena, text, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return error.CorruptConfig;
+    if (stored.version > format_version) return error.UnsupportedConfigVersion;
+    // Zero turns would give the model no chance to answer at all, which is
+    // never what the file is meant to say.
+    if (stored.max_turns == 0) return error.InvalidConfig;
+    // A zero timeout would kill every command as it starts, which is never
+    // what the file is meant to say either.
+    if (stored.tools.bash.timeout_s == 0) return error.InvalidConfig;
+    return .{
+        .config = .{
+            .max_turns = stored.max_turns,
+            .tools = stored.tools,
+            .markdown = stored.markdown,
+        },
+        .created = false,
+    };
+}
+
+/// Writes the configuration to `file_name` in `dir`. The previous contents
+/// are replaced in one step, leaving them intact if writing fails part way.
+///
+/// It is written indented rather than compact, unlike a session file: it is
+/// there to be read and edited by hand, while a session is only ever read
+/// back as a whole.
+pub fn save(config: Config, io: Io, dir: Io.Dir, gpa: std.mem.Allocator) !void {
+    const text = try std.json.Stringify.valueAlloc(
+        gpa,
+        Stored{
+            .max_turns = config.max_turns,
+            .tools = config.tools,
+            .markdown = config.markdown,
+        },
+        .{ .whitespace = .indent_2 },
+    );
+    defer gpa.free(text);
+
+    var atomic = try dir.createFileAtomic(io, file_name, .{ .replace = true });
+    defer atomic.deinit(io);
+    var buffer: [4096]u8 = undefined;
+    var file: Io.File.Writer = .init(atomic.file, io, &buffer);
+    try file.interface.writeAll(text);
+    try file.flush();
+    try atomic.replace(io);
+}
 
 /// The directory holding the configuration: `$XDG_CONFIG_HOME/billy`, or
 /// `$HOME/.config/billy` when that is unset, as the XDG base directory

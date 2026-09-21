@@ -3,10 +3,12 @@
 const std = @import("std");
 const Io = std.Io;
 const llm = @import("llm.zig");
-const search = @import("search.zig");
+const Search = @import("search.zig");
 const formatting = @import("format.zig");
 const styling = @import("style.zig");
 const Session = @import("Session.zig");
+
+const Tools = @This();
 
 /// Laying a bash command out for the display.
 pub const Format = formatting.Format;
@@ -75,263 +77,261 @@ pub const Call = union(enum) {
     };
 };
 
-pub const Tools = struct {
+io: Io,
+/// The directory the tools work in: the one the session was started in, so a
+/// resumed session reads and writes where it did rather than wherever billy
+/// happens to be run from. Every path a tool is given is relative to it.
+dir: Io.Dir,
+/// For temporary buffers.
+gpa: std.mem.Allocator,
+/// Reports tool activity to the user.
+log: *Io.Writer,
+/// How a bash command is laid out for the user. Shared with the transcript,
+/// so a replayed session shows the command the way the run did.
+format: Format,
+/// Longest a bash command may run before it is killed, in seconds. Set by
+/// the configuration, so a runaway command cannot hang the agent forever.
+bash_timeout_s: usize,
+/// How the lines billy prints itself are decorated. Shared with the
+/// transcript, so a replayed session looks like the run it continues.
+style: Style,
+/// The web search client, or null when no backend is configured. A null
+/// leaves `web_search` out of `definitions`, so the model is never offered
+/// a tool that could not run.
+search: ?Search.Client,
+definitions: []const Session.Definition,
+
+/// What a tool set is built from, gathered into one so the constructor reads
+/// as what each value is rather than as a run of positional arguments, which
+/// had grown too long to read at the call site.
+pub const Options = struct {
     io: Io,
-    /// The directory the tools work in: the one the session was started in, so a
-    /// resumed session reads and writes where it did rather than wherever billy
-    /// happens to be run from. Every path a tool is given is relative to it.
+    /// The directory the tools work in. See `Tools.dir`.
     dir: Io.Dir,
+    /// Holds the definitions, which are sent with every request and so live as
+    /// long as the run. Nothing else the tools allocate outlives the call that
+    /// made it, so the rest is asked for per call.
+    arena: std.mem.Allocator,
     /// For temporary buffers.
     gpa: std.mem.Allocator,
     /// Reports tool activity to the user.
     log: *Io.Writer,
-    /// How a bash command is laid out for the user. Shared with the transcript,
-    /// so a replayed session shows the command the way the run did.
-    format: Format,
-    /// Longest a bash command may run before it is killed, in seconds. Set by
-    /// the configuration, so a runaway command cannot hang the agent forever.
+    /// How a bash command is laid out for the user. Null shows it as written.
+    format: Format = null,
+    /// Longest a bash command may run before it is killed, in seconds. No
+    /// default: every caller has one to give, and a missing one is a mistake
+    /// worth catching at the call site rather than papering over with 120.
     bash_timeout_s: usize,
-    /// How the lines billy prints itself are decorated. Shared with the
-    /// transcript, so a replayed session looks like the run it continues.
-    style: Style,
-    /// The web search client, or null when no backend is configured. A null
-    /// leaves `web_search` out of `definitions`, so the model is never offered
-    /// a tool that could not run.
-    search: ?search.Client,
-    definitions: []const Session.Definition,
+    /// How the lines billy prints itself are decorated.
+    style: Style = .plain,
+    /// The backend the configuration asked for, with its key resolved, or null
+    /// to leave web search out. A null also leaves `web_search` out of the
+    /// definitions, so the model is never offered a tool that could not run.
+    search: ?Search.Config = null,
+    /// The run's one HTTP client, borrowed by the search backend when one is
+    /// configured, so a search shares connections and scanned certificates
+    /// with the model requests.
+    http: *std.http.Client,
+};
 
-    /// What a tool set is built from, gathered into one so the constructor reads
-    /// as what each value is rather than as a run of positional arguments, which
-    /// had grown too long to read at the call site.
-    pub const Options = struct {
-        io: Io,
-        /// The directory the tools work in. See `Tools.dir`.
-        dir: Io.Dir,
-        /// Holds the definitions, which are sent with every request and so live as
-        /// long as the run. Nothing else the tools allocate outlives the call that
-        /// made it, so the rest is asked for per call.
-        arena: std.mem.Allocator,
-        /// For temporary buffers.
-        gpa: std.mem.Allocator,
-        /// Reports tool activity to the user.
-        log: *Io.Writer,
-        /// How a bash command is laid out for the user. Null shows it as written.
-        format: Format = null,
-        /// Longest a bash command may run before it is killed, in seconds. No
-        /// default: every caller has one to give, and a missing one is a mistake
-        /// worth catching at the call site rather than papering over with 120.
-        bash_timeout_s: usize,
-        /// How the lines billy prints itself are decorated.
-        style: Style = .plain,
-        /// The backend the configuration asked for, with its key resolved, or null
-        /// to leave web search out. A null also leaves `web_search` out of the
-        /// definitions, so the model is never offered a tool that could not run.
-        search: ?search.Config = null,
-        /// The run's one HTTP client, borrowed by the search backend when one is
-        /// configured, so a search shares connections and scanned certificates
-        /// with the model requests.
-        http: *std.http.Client,
+pub fn init(options: Options) !Tools {
+    return .{
+        .io = options.io,
+        .dir = options.dir,
+        .gpa = options.gpa,
+        .log = options.log,
+        .format = options.format,
+        .bash_timeout_s = options.bash_timeout_s,
+        .style = options.style,
+        .search = if (options.search) |config| .{
+            .io = options.io,
+            .gpa = options.gpa,
+            .provider = config.provider,
+            .api_key = config.api_key,
+            .max_results = config.max_results,
+            .http = options.http,
+        } else null,
+        .definitions = try toolDefinitions(options.arena, options.search != null),
+    };
+}
+
+/// Runs one tool call and returns its result. Tool failures are reported to
+/// the model as text so that it can react to them.
+///
+/// What the user sees comes from `printHead` and `printResult`, which the
+/// transcript reuses, so a replayed session shows exactly what a live one
+/// did. The head goes out before the tool runs, so a slow command shows what
+/// it is doing, and the result follows it.
+///
+/// `arena` holds the parsed call and the result. The result is what the
+/// caller is given, so it has to outlive the call, but no longer than that:
+/// the session interns what it keeps, so an arena dropped with the request
+/// is enough and keeps a long conversation from holding every result.
+pub fn run(tools: *Tools, arena: std.mem.Allocator, call: llm.ToolCall) ![]const u8 {
+    const parsed = parseCall(arena, call);
+    try printHead(parsed, tools.format, tools.style, tools.log);
+    try tools.log.flush();
+
+    const result = switch (parsed) {
+        .read => |args| try tools.read(arena, args),
+        .write => |args| try tools.write(arena, args),
+        .edit => |args| try tools.edit(arena, args),
+        .bash => |args| try tools.bash(arena, args),
+        .web_search => |args| try tools.webSearch(arena, args),
+        .unknown => |name| try fail(arena, "unknown tool '{s}'", .{name}),
+        .malformed => |bad| try fail(
+            arena,
+            "invalid arguments for {s}: {s}",
+            .{ bad.name, @errorName(bad.reason) },
+        ),
     };
 
-    pub fn init(options: Options) !Tools {
-        return .{
-            .io = options.io,
-            .dir = options.dir,
-            .gpa = options.gpa,
-            .log = options.log,
-            .format = options.format,
-            .bash_timeout_s = options.bash_timeout_s,
-            .style = options.style,
-            .search = if (options.search) |config| .{
-                .io = options.io,
-                .gpa = options.gpa,
-                .provider = config.provider,
-                .api_key = config.api_key,
-                .max_results = config.max_results,
-                .http = options.http,
-            } else null,
-            .definitions = try definitions(options.arena, options.search != null),
-        };
+    try printResult(parsed, result, tools.style, tools.log);
+    try tools.log.writeAll("\n");
+    try tools.log.flush();
+    return result;
+}
+
+fn read(tools: *Tools, arena: std.mem.Allocator, args: Call.Read) ![]const u8 {
+    const contents = tools.dir.readFileAlloc(
+        tools.io,
+        args.path,
+        tools.gpa,
+        .limited(16 << 20),
+    ) catch |err| return fail(arena, "cannot read {s}: {s}", .{ args.path, @errorName(err) });
+    defer tools.gpa.free(contents);
+
+    // A trailing newline would otherwise read as a final empty line.
+    const text = std.mem.trimEnd(u8, contents, "\n");
+    if (text.len == 0) return arena.dupe(u8, "(empty file)");
+
+    const first = args.offset orelse 1;
+    const limit = args.limit orelse 2000;
+    var out: std.Io.Writer.Allocating = .init(tools.gpa);
+    defer out.deinit();
+
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var number: usize = 0;
+    var shown: usize = 0;
+    while (lines.next()) |line| {
+        number += 1;
+        if (number < first) continue;
+        if (shown == limit) break;
+        shown += 1;
+        try out.writer.print("{d:>6}\t{s}\n", .{ number, line });
     }
-
-    /// Runs one tool call and returns its result. Tool failures are reported to
-    /// the model as text so that it can react to them.
-    ///
-    /// What the user sees comes from `printHead` and `printResult`, which the
-    /// transcript reuses, so a replayed session shows exactly what a live one
-    /// did. The head goes out before the tool runs, so a slow command shows what
-    /// it is doing, and the result follows it.
-    ///
-    /// `arena` holds the parsed call and the result. The result is what the
-    /// caller is given, so it has to outlive the call, but no longer than that:
-    /// the session interns what it keeps, so an arena dropped with the request
-    /// is enough and keeps a long conversation from holding every result.
-    pub fn run(tools: *Tools, arena: std.mem.Allocator, call: llm.ToolCall) ![]const u8 {
-        const parsed = parseCall(arena, call);
-        try printHead(parsed, tools.format, tools.style, tools.log);
-        try tools.log.flush();
-
-        const result = switch (parsed) {
-            .read => |args| try tools.read(arena, args),
-            .write => |args| try tools.write(arena, args),
-            .edit => |args| try tools.edit(arena, args),
-            .bash => |args| try tools.bash(arena, args),
-            .web_search => |args| try tools.webSearch(arena, args),
-            .unknown => |name| try fail(arena, "unknown tool '{s}'", .{name}),
-            .malformed => |bad| try fail(
-                arena,
-                "invalid arguments for {s}: {s}",
-                .{ bad.name, @errorName(bad.reason) },
-            ),
-        };
-
-        try printResult(parsed, result, tools.style, tools.log);
-        try tools.log.writeAll("\n");
-        try tools.log.flush();
-        return result;
+    if (shown == 0) {
+        return std.fmt.allocPrint(arena, "offset {d} is past the end; {d} lines", .{ first, number });
     }
-
-    fn read(tools: *Tools, arena: std.mem.Allocator, args: Call.Read) ![]const u8 {
-        const contents = tools.dir.readFileAlloc(
-            tools.io,
-            args.path,
-            tools.gpa,
-            .limited(16 << 20),
-        ) catch |err| return fail(arena, "cannot read {s}: {s}", .{ args.path, @errorName(err) });
-        defer tools.gpa.free(contents);
-
-        // A trailing newline would otherwise read as a final empty line.
-        const text = std.mem.trimEnd(u8, contents, "\n");
-        if (text.len == 0) return arena.dupe(u8, "(empty file)");
-
-        const first = args.offset orelse 1;
-        const limit = args.limit orelse 2000;
-        var out: std.Io.Writer.Allocating = .init(tools.gpa);
-        defer out.deinit();
-
-        var lines = std.mem.splitScalar(u8, text, '\n');
-        var number: usize = 0;
-        var shown: usize = 0;
-        while (lines.next()) |line| {
-            number += 1;
-            if (number < first) continue;
-            if (shown == limit) break;
-            shown += 1;
-            try out.writer.print("{d:>6}\t{s}\n", .{ number, line });
-        }
-        if (shown == 0) {
-            return std.fmt.allocPrint(arena, "offset {d} is past the end; {d} lines", .{ first, number });
-        }
-        if (shown == limit) {
-            try out.writer.print("… {d} more lines\n", .{number - first + 1 - shown});
-        }
-        return finish(arena, out.written());
+    if (shown == limit) {
+        try out.writer.print("… {d} more lines\n", .{number - first + 1 - shown});
     }
+    return finish(arena, out.written());
+}
 
-    fn write(tools: *Tools, arena: std.mem.Allocator, args: Call.Write) ![]const u8 {
-        if (std.fs.path.dirname(args.path)) |parent| {
-            tools.dir.createDirPath(tools.io, parent) catch |err|
-                return fail(arena, "cannot create {s}: {s}", .{ parent, @errorName(err) });
-        }
-        tools.dir.writeFile(tools.io, .{ .sub_path = args.path, .data = args.content }) catch |err|
-            return fail(arena, "cannot write {s}: {s}", .{ args.path, @errorName(err) });
-        return std.fmt.allocPrint(arena, "wrote {d} bytes to {s}", .{ args.content.len, args.path });
+fn write(tools: *Tools, arena: std.mem.Allocator, args: Call.Write) ![]const u8 {
+    if (std.fs.path.dirname(args.path)) |parent| {
+        tools.dir.createDirPath(tools.io, parent) catch |err|
+            return fail(arena, "cannot create {s}: {s}", .{ parent, @errorName(err) });
     }
+    tools.dir.writeFile(tools.io, .{ .sub_path = args.path, .data = args.content }) catch |err|
+        return fail(arena, "cannot write {s}: {s}", .{ args.path, @errorName(err) });
+    return std.fmt.allocPrint(arena, "wrote {d} bytes to {s}", .{ args.content.len, args.path });
+}
 
-    fn edit(tools: *Tools, arena: std.mem.Allocator, args: Call.Edit) ![]const u8 {
-        if (args.old_string.len == 0) return fail(arena, "old_string must not be empty", .{});
+fn edit(tools: *Tools, arena: std.mem.Allocator, args: Call.Edit) ![]const u8 {
+    if (args.old_string.len == 0) return fail(arena, "old_string must not be empty", .{});
 
-        const contents = tools.dir.readFileAlloc(
-            tools.io,
-            args.path,
-            tools.gpa,
-            .limited(16 << 20),
-        ) catch |err| return fail(arena, "cannot read {s}: {s}", .{ args.path, @errorName(err) });
-        defer tools.gpa.free(contents);
+    const contents = tools.dir.readFileAlloc(
+        tools.io,
+        args.path,
+        tools.gpa,
+        .limited(16 << 20),
+    ) catch |err| return fail(arena, "cannot read {s}: {s}", .{ args.path, @errorName(err) });
+    defer tools.gpa.free(contents);
 
-        const change = try replaceInFile(
-            tools.gpa,
-            contents,
-            args.old_string,
-            args.new_string,
-            args.replace_all,
-        );
-        switch (change) {
-            .not_found => return fail(arena, "old_string not found in {s}", .{args.path}),
-            .ambiguous => |count| return fail(
-                arena,
-                "old_string appears {d} times in {s}; add context or pass replace_all",
-                .{ count, args.path },
-            ),
-            .applied => |applied| {
-                defer tools.gpa.free(applied.text);
-                tools.dir.writeFile(tools.io, .{
-                    .sub_path = args.path,
-                    .data = applied.text,
-                }) catch |err| return fail(arena, "cannot write {s}: {s}", .{ args.path, @errorName(err) });
-                return std.fmt.allocPrint(arena, "replaced {d} occurrence(s) in {s}", .{
-                    applied.count,
-                    args.path,
-                });
-            },
-        }
+    const change = try replaceInFile(
+        tools.gpa,
+        contents,
+        args.old_string,
+        args.new_string,
+        args.replace_all,
+    );
+    switch (change) {
+        .not_found => return fail(arena, "old_string not found in {s}", .{args.path}),
+        .ambiguous => |count| return fail(
+            arena,
+            "old_string appears {d} times in {s}; add context or pass replace_all",
+            .{ count, args.path },
+        ),
+        .applied => |applied| {
+            defer tools.gpa.free(applied.text);
+            tools.dir.writeFile(tools.io, .{
+                .sub_path = args.path,
+                .data = applied.text,
+            }) catch |err| return fail(arena, "cannot write {s}: {s}", .{ args.path, @errorName(err) });
+            return std.fmt.allocPrint(arena, "replaced {d} occurrence(s) in {s}", .{
+                applied.count,
+                args.path,
+            });
+        },
     }
+}
 
-    fn bash(tools: *Tools, arena: std.mem.Allocator, args: Call.Bash) ![]const u8 {
-        // The count the configuration holds is turned into the signed seconds
-        // the clock takes. A value past what it can express is absurd but must
-        // not overflow the cast, so it is clamped to the longest duration, which
-        // is no limit in practice.
-        const timeout_s = std.math.cast(i64, tools.bash_timeout_s) orelse std.math.maxInt(i64);
-        const result = std.process.run(tools.gpa, tools.io, .{
-            .argv = &.{ "bash", "-c", args.command },
-            // The command runs where the session's tools do, so a resumed session
-            // runs it in the directory the session was started in.
-            .cwd = .{ .dir = tools.dir },
-            .stdout_limit = .limited(max_command_output),
-            .stderr_limit = .limited(max_command_output),
-            // A command that outlives the configured limit is killed, so a
-            // runaway command cannot hang the agent forever.
-            .timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(timeout_s) } },
-        }) catch |err| switch (err) {
-            error.StreamTooLong => return fail(
-                arena,
-                "command produced more than {d} bytes of output",
-                .{max_command_output},
-            ),
-            error.Timeout => return fail(
-                arena,
-                "command did not finish within {d}s and was killed",
-                .{tools.bash_timeout_s},
-            ),
-            else => return fail(arena, "cannot run command: {s}", .{@errorName(err)}),
-        };
-        defer tools.gpa.free(result.stdout);
-        defer tools.gpa.free(result.stderr);
+fn bash(tools: *Tools, arena: std.mem.Allocator, args: Call.Bash) ![]const u8 {
+    // The count the configuration holds is turned into the signed seconds
+    // the clock takes. A value past what it can express is absurd but must
+    // not overflow the cast, so it is clamped to the longest duration, which
+    // is no limit in practice.
+    const timeout_s = std.math.cast(i64, tools.bash_timeout_s) orelse std.math.maxInt(i64);
+    const result = std.process.run(tools.gpa, tools.io, .{
+        .argv = &.{ "bash", "-c", args.command },
+        // The command runs where the session's tools do, so a resumed session
+        // runs it in the directory the session was started in.
+        .cwd = .{ .dir = tools.dir },
+        .stdout_limit = .limited(max_command_output),
+        .stderr_limit = .limited(max_command_output),
+        // A command that outlives the configured limit is killed, so a
+        // runaway command cannot hang the agent forever.
+        .timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(timeout_s) } },
+    }) catch |err| switch (err) {
+        error.StreamTooLong => return fail(
+            arena,
+            "command produced more than {d} bytes of output",
+            .{max_command_output},
+        ),
+        error.Timeout => return fail(
+            arena,
+            "command did not finish within {d}s and was killed",
+            .{tools.bash_timeout_s},
+        ),
+        else => return fail(arena, "cannot run command: {s}", .{@errorName(err)}),
+    };
+    defer tools.gpa.free(result.stdout);
+    defer tools.gpa.free(result.stderr);
 
-        var out: std.Io.Writer.Allocating = .init(tools.gpa);
-        defer out.deinit();
-        try out.writer.print("exit code: {d}\n", .{formatting.exitCode(result.term)});
-        if (result.stdout.len == 0 and result.stderr.len == 0) {
-            try out.writer.writeAll("(no output)\n");
-        }
-        try out.writer.writeAll(result.stdout);
-        if (result.stderr.len > 0) {
-            if (result.stdout.len > 0) try out.writer.writeAll("\n");
-            try out.writer.print("stderr:\n{s}", .{result.stderr});
-        }
-        return finish(arena, out.written());
+    var out: std.Io.Writer.Allocating = .init(tools.gpa);
+    defer out.deinit();
+    try out.writer.print("exit code: {d}\n", .{formatting.exitCode(result.term)});
+    if (result.stdout.len == 0 and result.stderr.len == 0) {
+        try out.writer.writeAll("(no output)\n");
     }
-
-    /// Runs one web search and returns its results as text. No backend is
-    /// configured only when a resumed session carries the tool from a run that
-    /// had one; the model is told so rather than the call failing outright.
-    fn webSearch(tools: *Tools, arena: std.mem.Allocator, args: Call.WebSearch) ![]const u8 {
-        const client = if (tools.search) |*client| client else return fail(arena, "web search is not configured", .{});
-        return client.search(arena, args.query) catch |err|
-            return fail(arena, "search failed: {s}", .{@errorName(err)});
+    try out.writer.writeAll(result.stdout);
+    if (result.stderr.len > 0) {
+        if (result.stdout.len > 0) try out.writer.writeAll("\n");
+        try out.writer.print("stderr:\n{s}", .{result.stderr});
     }
-};
+    return finish(arena, out.written());
+}
+
+/// Runs one web search and returns its results as text. No backend is
+/// configured only when a resumed session carries the tool from a run that
+/// had one; the model is told so rather than the call failing outright.
+fn webSearch(tools: *Tools, arena: std.mem.Allocator, args: Call.WebSearch) ![]const u8 {
+    const client = if (tools.search) |*client| client else return fail(arena, "web search is not configured", .{});
+    return client.search(arena, args.query) catch |err|
+        return fail(arena, "search failed: {s}", .{@errorName(err)});
+}
 
 /// A failure reported to the model as text, so that it can react to it. It is
 /// written into the arena the call's result lives in, since that is where the
@@ -915,7 +915,7 @@ const search_spec = Spec{
 /// The tool definitions sent with every request. `web_search` is included only
 /// when `include_search` is set, so a run with no backend never offers the model
 /// a tool that could not run.
-fn definitions(arena: std.mem.Allocator, include_search: bool) ![]const Session.Definition {
+fn toolDefinitions(arena: std.mem.Allocator, include_search: bool) ![]const Session.Definition {
     var tools: std.ArrayList(Session.Definition) = .empty;
     for (specs) |spec| try tools.append(arena, definitionOf(spec));
     if (include_search) try tools.append(arena, definitionOf(search_spec));
@@ -1404,12 +1404,12 @@ test "parseCall splits known, unknown and malformed calls" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const read = parseCall(arena, .{ .id = "1", .function = .{
+    const read_call = parseCall(arena, .{ .id = "1", .function = .{
         .name = "read",
         .arguments = "{\"path\":\"a.zig\",\"offset\":5}",
     } });
-    try std.testing.expectEqualStrings("a.zig", read.read.path);
-    try std.testing.expectEqual(@as(?usize, 5), read.read.offset);
+    try std.testing.expectEqualStrings("a.zig", read_call.read.path);
+    try std.testing.expectEqual(@as(?usize, 5), read_call.read.offset);
 
     const missing = parseCall(arena, .{ .id = "1", .function = .{
         .name = "bash",
@@ -1554,7 +1554,7 @@ test "definitions cover every tool the loop dispatches" {
     const arena = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(arena);
     defer arena_state.deinit();
-    const defs = try definitions(arena_state.allocator(), false);
+    const defs = try toolDefinitions(arena_state.allocator(), false);
     try std.testing.expectEqual(specs.len, defs.len);
     for (defs) |tool| {
         // The schema is the JSON text it is sent as, which starts with an object.
@@ -1569,14 +1569,14 @@ test "web search is offered only when a backend is configured" {
 
     // Without a backend the tool is not offered at all, and the tools every
     // session has come first so the set only grows.
-    const without = try definitions(arena_state.allocator(), false);
+    const without = try toolDefinitions(arena_state.allocator(), false);
     try std.testing.expectEqual(specs.len, without.len);
     for (without) |tool| {
         try std.testing.expect(!std.mem.eql(u8, tool.name, "web_search"));
     }
 
     // With one it is appended, so a session that gains it keeps the tools it had.
-    const with = try definitions(arena_state.allocator(), true);
+    const with = try toolDefinitions(arena_state.allocator(), true);
     try std.testing.expectEqual(specs.len + 1, with.len);
     try std.testing.expectEqualStrings("web_search", with[with.len - 1].name);
 }

@@ -1,16 +1,16 @@
 //! By convention, root.zig is the root source file when making a package.
 
 pub const agent = @import("agent.zig");
-pub const config = @import("config.zig");
+pub const Config = @import("Config.zig");
 pub const credentials = @import("credentials.zig");
 pub const format = @import("format.zig");
-pub const line_editor = @import("line_editor.zig");
+pub const LineEditor = @import("LineEditor.zig");
 pub const llm = @import("llm.zig");
 pub const models = @import("models.zig");
 pub const search = @import("search.zig");
 pub const Session = @import("Session.zig");
 pub const style = @import("style.zig");
-pub const tools = @import("tools.zig");
+pub const Tools = @import("Tools.zig");
 
 test {
     // `zig build test` only collects the tests declared in the test target's

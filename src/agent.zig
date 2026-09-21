@@ -5,9 +5,9 @@ const std = @import("std");
 const Io = std.Io;
 const llm = @import("llm.zig");
 const models = @import("models.zig");
-const tools = @import("tools.zig");
+const Tools = @import("Tools.zig");
 const search = @import("search.zig");
-const line_editor = @import("line_editor.zig");
+const LineEditor = @import("LineEditor.zig");
 const Session = @import("Session.zig");
 const formatting = @import("format.zig");
 const styling = @import("style.zig");
@@ -47,7 +47,7 @@ pub const Config = struct {
 /// and what the model is sent keep the text as it was written.
 pub const Display = struct {
     /// How a bash command is laid out before it is shown. Null shows it as written.
-    format: tools.Format = null,
+    format: Tools.Format = null,
     /// How the markdown of a reply and a prompt is laid out before it is shown.
     /// Null shows the text as written.
     markdown: formatting.Format = null,
@@ -277,8 +277,8 @@ pub fn run(
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
 
-    var editor = line_editor.LineEditor.init(io, out, arena);
-    var tool_set = try tools.Tools.init(.{
+    var editor = LineEditor.init(io, out, arena);
+    var tool_set = try Tools.init(.{
         .io = io,
         .dir = work_dir,
         .arena = arena,
@@ -336,7 +336,7 @@ pub fn run(
 
 /// Replays a stored conversation as the blocks it was made of, so that
 /// remembering the context of an earlier run is not left to the user. The tool
-/// calls go through `tools.parseCall` and `tools.describe`, and the replies
+/// calls go through `Tools.parseCall` and `Tools.describe`, and the replies
 /// through `printAnswer`, the same as the ones the loop printed.
 ///
 /// A prompt is headed and laid out by `printPrompt` here and in the loop alike,
@@ -395,8 +395,8 @@ fn printMessage(
         const call = session.callAt(message, i);
         // The result belongs to the message just after the one that asked for
         // it, so the search starts from there.
-        try tools.describe(
-            tools.parseCallNamed(arena, call.name, call.arguments),
+        try Tools.describe(
+            Tools.parseCallNamed(arena, call.name, call.arguments),
             session.toolResult(index + 1, call.id),
             display.format,
             display.style,
@@ -409,7 +409,7 @@ fn printMessage(
 fn turn(
     io: Io,
     client: *llm.Client,
-    tool_set: *tools.Tools,
+    tool_set: *Tools,
     out: *Io.Writer,
     config: Config,
     session: *Session,

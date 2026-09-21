@@ -106,7 +106,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const config_dir = billy.config.defaultDir(arena, init.environ_map) catch |err| {
+    const config_dir = billy.Config.defaultDir(arena, init.environ_map) catch |err| {
         std.log.err("cannot find where to store the configuration: {s}", .{@errorName(err)});
         return err;
     };
@@ -116,13 +116,13 @@ pub fn main(init: std.process.Init) !void {
     };
     defer config_dir_handle.close(io);
 
-    const settings = billy.config.Config.open(io, config_dir_handle, arena) catch |err| {
+    const settings = billy.Config.open(io, config_dir_handle, arena) catch |err| {
         std.log.err("cannot read the configuration in {s}: {s}", .{ config_dir, @errorName(err) });
         return err;
     };
     if (settings.created) {
         try out.print("wrote the default configuration to {s}\n", .{
-            try std.fs.path.join(arena, &.{ config_dir, billy.config.file_name }),
+            try std.fs.path.join(arena, &.{ config_dir, billy.Config.file_name }),
         });
     }
 
