@@ -358,6 +358,11 @@ pub fn run(
 /// so a replayed one reads exactly as the one that was typed, without the `> `
 /// the input is typed behind.
 ///
+/// Only the last `blocks` blocks are shown, so resuming a long session is quick
+/// rather than replaying every block it ever printed; what came before is counted
+/// on a line of its own. Zero shows the whole session. A block is one printed
+/// unit: a prompt, a reply, or a tool call with its result.
+///
 /// The conversation is read where it is stored, a message at a time, so replaying
 /// a long session costs no more than the largest message in it. `gpa` is for the
 /// scratch the parsed arguments of a call need, which is dropped between
@@ -367,21 +372,94 @@ pub fn printTranscript(
     out: *Io.Writer,
     session: *const Session,
     display: Display,
+    blocks: usize,
 ) !void {
     var scratch_state = std.heap.ArenaAllocator.init(gpa);
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
 
-    for (session.messages.items, 0..) |message, index| {
-        try printMessage(scratch, out, session, index, message, display);
+    const trim = transcriptTrim(session, blocks);
+    if (trim.elided > 0) try printElided(trim.elided, display.style, out);
+
+    for (session.messages.items[trim.index..], trim.index..) |message, index| {
+        const skip = if (index == trim.index) trim.skip else 0;
+        try printMessage(scratch, out, session, index, message, display, skip);
         _ = scratch_state.reset(.retain_capacity);
     }
     try out.flush();
 }
 
+/// Which message a trimmed transcript starts at, and how much of it to leave out,
+/// so that the last `blocks` blocks are shown. A block is a prompt, a reply, or a
+/// tool call with its result; an assistant message that asks for several tools is
+/// several blocks, so a trim can fall inside one and leave out the calls before
+/// it.
+const Trim = struct {
+    /// The first message to show.
+    index: usize,
+    /// How many of that message's leading tool calls to leave out.
+    skip: usize,
+    /// How many blocks were left out in all, for the count printed in their place.
+    elided: usize,
+};
+
+/// The trim that shows the last `blocks` blocks. Zero shows the whole session,
+/// and so does a count larger than the conversation: either way nothing is left
+/// out.
+fn transcriptTrim(session: *const Session, blocks: usize) Trim {
+    if (blocks == 0) return .{ .index = 0, .skip = 0, .elided = 0 };
+
+    const messages = session.messages.items;
+    var index = messages.len;
+    var skip: usize = 0;
+    var remaining = blocks;
+    while (index > 0 and remaining > 0) {
+        index -= 1;
+        const count = blocksIn(session, messages[index]);
+        if (count <= remaining) {
+            remaining -= count;
+        } else {
+            // The trim falls inside this message, which only a tool-calling
+            // message can, so its later calls are kept and the ones before them
+            // are counted.
+            skip = count - remaining;
+            remaining = 0;
+        }
+    }
+
+    var elided = skip;
+    for (messages[0..index]) |message| elided += blocksIn(session, message);
+    return .{ .index = index, .skip = skip, .elided = elided };
+}
+
+/// How many blocks one message prints: a prompt or a reply is one, a
+/// tool-calling message is one per call, and a tool result is none, since it
+/// shows as part of the call it answers. A system prompt is never shown.
+fn blocksIn(session: *const Session, message: Session.Message) usize {
+    const role = session.roleOf(message);
+    if (std.mem.eql(u8, role, "user")) return 1;
+    if (!std.mem.eql(u8, role, "assistant")) return 0;
+    const calls = session.callCount(message);
+    return if (calls == 0) 1 else calls;
+}
+
+/// Prints how many blocks a trimmed transcript left out, dimmed, so a resume does
+/// not read as the whole session. It is the count a short block gives of the
+/// lines it cut, standing where the blocks it names would have been.
+fn printElided(count: usize, style: styling.Style, out: *Io.Writer) !void {
+    var buffer: [64]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, "… {d} earlier blocks", .{count}) catch "… earlier blocks";
+    try style.dim(line, out);
+    try out.writeAll("\n");
+}
+
 /// Prints one message the way a live session shows it. The system prompt is never
 /// shown while running, so it is left out here too. A tool result is shown as the
 /// output of the call that produced it, and not as a message of its own.
+///
+/// `skip` leaves out the leading that many tool calls of the message, which only
+/// a trimmed transcript does, so a trim can fall inside a message that asks for
+/// several tools; it is zero for every message that is shown whole.
 ///
 /// The message is the one the session stores, so every string printed is read
 /// out of the pool as it is printed and no message is built to print it.
@@ -392,6 +470,7 @@ fn printMessage(
     index: usize,
     message: Session.Message,
     display: Display,
+    skip: usize,
 ) !void {
     const role = session.roleOf(message);
     if (std.mem.eql(u8, role, "user")) {
@@ -406,7 +485,7 @@ fn printMessage(
 
     const calls = session.callCount(message);
     if (calls == 0) return printAnswer(out, session.contentOf(message), display);
-    for (0..calls) |i| {
+    for (skip..calls) |i| {
         const call = session.callAt(message, i);
         // The result belongs to the message just after the one that asked for
         // it, so the search starts from there.
@@ -524,9 +603,55 @@ fn expectTranscript(
     defer out.deinit();
 
     // No bash format: what these cover is how a message is headed and laid out,
-    // which the tool format does not touch.
-    try printTranscript(gpa, &out.writer, &session, .{ .markdown = markdown, .style = style });
+    // which the tool format does not touch. Zero shows the whole conversation.
+    try printTranscript(gpa, &out.writer, &session, .{ .markdown = markdown, .style = style }, 0);
     try std.testing.expectEqualStrings(expected, out.written());
+}
+
+test "printTranscript shows only the last blocks and counts the rest" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    // A prompt, one assistant message that asks for two tools, their results, and
+    // a reply: four blocks, with two of them in the one tool-calling message.
+    try session.append(.{ .role = "user", .content = "one" });
+    try session.append(.{ .role = "assistant", .tool_calls = &.{
+        .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" } },
+        .{ .id = "call_2", .function = .{ .name = "read", .arguments = "{\"path\":\"b.zig\"}" } },
+    } });
+    try session.append(.{ .role = "tool", .tool_call_id = "call_1", .content = "contents a" });
+    try session.append(.{ .role = "tool", .tool_call_id = "call_2", .content = "contents b" });
+    try session.append(.{ .role = "assistant", .content = "done" });
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // The last two blocks are the second call and the reply, so the trim falls
+    // inside the tool-calling message: its first call and everything before it is
+    // counted, and only its second call shows.
+    try printTranscript(gpa, &out.writer, &session, .{}, 2);
+    try std.testing.expectEqualStrings(
+        "… 2 earlier blocks\n" ++
+            "▸ read b.zig\n▾ output\ncontents b\n\n" ++
+            "◆ answer\ndone\n",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+
+    // A count larger than the conversation leaves nothing out, so nothing is
+    // counted and the whole session shows.
+    try printTranscript(gpa, &out.writer, &session, .{}, 10);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "earlier blocks") == null);
+    try std.testing.expect(std.mem.startsWith(u8, out.written(), "\n» prompt\none\n\n"));
+    out.clearRetainingCapacity();
+
+    // Zero shows the whole session too.
+    try printTranscript(gpa, &out.writer, &session, .{}, 0);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "earlier blocks") == null);
+    try std.testing.expect(std.mem.startsWith(u8, out.written(), "\n» prompt\none\n\n"));
 }
 
 test "printTranscript replays a conversation as the blocks it was made of" {

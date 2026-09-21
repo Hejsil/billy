@@ -29,6 +29,8 @@ pub const default_max_results = 5;
 /// Seconds a bash command may run before it is killed when the file asks for
 /// nothing else.
 pub const default_timeout_s = 120;
+/// Blocks a resumed session replays when the file asks for nothing else.
+pub const default_resume_blocks = 10;
 
 /// What `open` found, including whether the file had to be written.
 pub const Opened = struct {
@@ -112,6 +114,8 @@ pub const Markdown = struct {
 const Stored = struct {
     version: u32 = format_version,
     max_turns: usize = default_max_turns,
+    /// Blocks to replay on a resume. Zero shows the whole session.
+    resume_blocks: usize = default_resume_blocks,
     tools: Tools = .{},
     markdown: Markdown = .{},
 };
@@ -124,6 +128,9 @@ arena_state: std.heap.ArenaAllocator,
 
 /// Model turns allowed for one request before the harness gives up on it.
 max_turns: usize = default_max_turns,
+/// How many of the most recent blocks a resumed session replays, so resuming a
+/// long conversation is quick. Zero replays the whole session.
+resume_blocks: usize = default_resume_blocks,
 /// Settings for the tools the agent can call, by tool name.
 tools: Tools = .{},
 /// Settings for the markdown billy shows: the replies it writes and the
@@ -172,6 +179,7 @@ pub fn open(io: Io, dir: Io.Dir, gpa: std.mem.Allocator) !Opened {
     if (stored.tools.bash.timeout_s == 0) return error.InvalidConfig;
 
     config.max_turns = stored.max_turns;
+    config.resume_blocks = stored.resume_blocks;
     config.tools = stored.tools;
     config.markdown = stored.markdown;
     return .{ .config = config, .created = false };
@@ -192,6 +200,7 @@ pub fn save(config: *const Config, io: Io, dir: Io.Dir) !void {
     try std.json.Stringify.value(
         Stored{
             .max_turns = config.max_turns,
+            .resume_blocks = config.resume_blocks,
             .tools = config.tools,
             .markdown = config.markdown,
         },
@@ -272,6 +281,30 @@ test "open reads the max_turns and the bash format from the file" {
     try std.testing.expect(!opened.created);
     try std.testing.expectEqual(7, opened.config.max_turns);
     try std.testing.expectEqualStrings("shfmt | bat -l bash", opened.config.tools.bash.format.?);
+    // A file without a replay count shows the default number of blocks.
+    try std.testing.expectEqual(default_resume_blocks, opened.config.resume_blocks);
+}
+
+test "open reads the block count a resume replays from the file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = file_name,
+        .data = "{\"resume_blocks\":3}",
+    });
+    var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer opened.config.deinit();
+    try std.testing.expectEqual(3, opened.config.resume_blocks);
+
+    // Zero is allowed: it shows the whole session.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = file_name,
+        .data = "{\"resume_blocks\":0}",
+    });
+    var whole = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer whole.config.deinit();
+    try std.testing.expectEqual(0, whole.config.resume_blocks);
 }
 
 test "open reads the markdown format from the file" {
@@ -407,6 +440,7 @@ test "the file is indented, so it can be read and edited by hand" {
         \\{
         \\  "version": 1,
         \\  "max_turns": 3,
+        \\  "resume_blocks": 10,
         \\  "tools": {
         \\    "bash": {
         \\      "format": null,

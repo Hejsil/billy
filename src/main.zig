@@ -24,20 +24,22 @@ const usage =
     \\that is unset. The configuration lives in
     \\$XDG_CONFIG_HOME/billy/config.json, or ~/.config/billy/config.json when
     \\that is unset, and is created with the defaults on the first run. It holds
-    \\the turn limit; under tools.bash.format, a shell script that lays a bash
-    \\command out for the display, and under tools.bash.timeout_s, the seconds a
-    \\command may run before it is killed; under tools.edit.format, one that lays
-    \\out the diff an edit is shown as, such as "delta --paging=never"; under
-    \\markdown.format, one that lays out a reply, such as "glow -"; and under
-    \\tools.web_search, the backend to search the web with (only "tavily" for now)
-    \\and how many results to ask for. A format reads the text on standard input
-    \\and writes it back on standard output; an edit's script also gets the paths
-    \\of two files billy wrote the sides of the change to, as its first two
-    \\arguments, so a two-file differ can name them "$1" and "$2". The keys are
-    \\kept in credentials.json in the data directory, readable by the owner alone.
-    \\The context window and the token prices the header reports come from a table
-    \\built into billy, keyed by provider and model, since the API reports token
-    \\counts but neither of those.
+    \\the turn limit, and resume_blocks, how many of the most recent blocks a
+    \\resumed session replays (a block being a prompt, a reply, or a tool call
+    \\with its result; 0 shows the whole session); under
+    \\tools.bash.format, a shell script that lays a bash command out for the
+    \\display, and under tools.bash.timeout_s, the seconds a command may run
+    \\before it is killed; under tools.edit.format, one that lays out the diff an
+    \\edit is shown as, such as "delta --paging=never"; under markdown.format, one
+    \\that lays out a reply, such as "glow -"; and under tools.web_search, the
+    \\backend to search the web with (only "tavily" for now) and how many results
+    \\to ask for. A format reads the text on standard input and writes it back on
+    \\standard output; an edit's script also gets the paths of two files billy
+    \\wrote the sides of the change to, as its first two arguments, so a two-file
+    \\differ can name them "$1" and "$2". The keys are kept in credentials.json in
+    \\the data directory, readable by the owner alone. The context window and the
+    \\token prices the header reports come from a table built into billy, keyed by
+    \\provider and model, since the API reports token counts but neither of those.
     \\
 ;
 
@@ -239,8 +241,15 @@ pub fn main(init: std.process.Init) !void {
 
     if (options.resume_id != null) {
         // Replay the conversation as a transcript, so the context does not
-        // have to be remembered from the previous run.
-        try billy.agent.printTranscript(init.gpa, out, &session, config.display);
+        // have to be remembered from the previous run. Only the last few blocks
+        // are shown, so resuming a long one is quick.
+        try billy.agent.printTranscript(
+            init.gpa,
+            out,
+            &session,
+            config.display,
+            settings.config.resume_blocks,
+        );
     }
     try billy.agent.run(io, init.gpa, out, config, &session);
 }
