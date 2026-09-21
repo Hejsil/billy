@@ -59,20 +59,25 @@ const instruction_files = [_][]const u8{ "AGENTS.md", "CLAUDE.md" };
 /// memory.
 const max_instructions_len = 1 << 20;
 
-/// The project's own instructions, read from the working directory or the
-/// nearest parent that has them, and null when the project has none. The search
-/// stops at the repository root, so a file above the project is not read.
+/// The project's own instructions, read from `dir` or the nearest parent that
+/// has them, and null when the project has none. The walk stops at the
+/// repository root, so a file above the project is not read, and at the
+/// filesystem root when there is no repository above it.
 ///
 /// The instructions join the system prompt rather than the conversation, so they
 /// are sent with every request and survive whatever context trimming happens
 /// later. That is what keeps the rules a project cares about from being dropped
 /// partway through a long session.
-fn projectInstructions(io: Io, arena: std.mem.Allocator, cwd: []const u8) !?[]const u8 {
-    var dir_path: []const u8 = cwd;
+fn projectInstructions(io: Io, arena: std.mem.Allocator, dir: Io.Dir) !?[]const u8 {
+    var current = dir;
+    // The directory the caller passed is theirs to close; every one opened here
+    // while walking up is this function's.
+    var owned = false;
+    defer if (owned) current.close(io);
+
     while (true) {
         for (instruction_files) |name| {
-            const path = try std.fs.path.join(arena, &.{ dir_path, name });
-            const text = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_instructions_len)) catch |err| switch (err) {
+            const text = current.readFileAlloc(io, name, arena, .limited(max_instructions_len)) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 else => return err,
             };
@@ -87,16 +92,41 @@ fn projectInstructions(io: Io, arena: std.mem.Allocator, cwd: []const u8) !?[]co
             );
         }
         // The repository root is the last directory searched.
-        if (try exists(io, arena, dir_path, ".git")) return null;
-        dir_path = std.fs.path.dirname(dir_path) orelse return null;
+        if (dirHas(io, current, ".git")) return null;
+
+        // The parent is opened rather than derived from a path, so the walk
+        // keeps no path string and follows the filesystem's own notion of a
+        // parent.
+        const parent = current.openDir(io, "..", .{}) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => return null,
+            else => return err,
+        };
+        // At the filesystem root, `..` is the directory itself, which is what
+        // ends the walk when no repository root was found above.
+        if (sameDir(io, current, parent)) {
+            parent.close(io);
+            return null;
+        }
+        if (owned) current.close(io);
+        current = parent;
+        owned = true;
     }
 }
 
-/// Whether `dir_path` holds an entry named `name`.
-fn exists(io: Io, arena: std.mem.Allocator, dir_path: []const u8, name: []const u8) !bool {
-    const path = try std.fs.path.join(arena, &.{ dir_path, name });
-    _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+/// Whether `dir` holds an entry named `name`.
+fn dirHas(io: Io, dir: Io.Dir, name: []const u8) bool {
+    _ = dir.statFile(io, name, .{}) catch return false;
     return true;
+}
+
+/// Whether two handles name the same directory. This is how the walk up knows it
+/// has reached the filesystem root, where `..` names the root itself. Both are
+/// on the same filesystem, being a directory and its own parent, so the inode
+/// tells them apart.
+fn sameDir(io: Io, a: Io.Dir, b: Io.Dir) bool {
+    const one = a.statFile(io, ".", .{}) catch return false;
+    const two = b.statFile(io, ".", .{}) catch return false;
+    return one.inode == two.inode;
 }
 
 /// Printed in front of every line the user types. The transcript reuses it so a
@@ -221,7 +251,9 @@ pub fn run(
     session: *Session,
 ) !void {
     // The tools work in the session's own directory, which for a resumed session
-    // is the one it was started in, wherever billy is run from now.
+    // is the one it was started in, wherever billy is run from now. The project's
+    // instructions are read from there too, so they are the ones of the project
+    // the session belongs to.
     var work_dir = Io.Dir.openDirAbsolute(io, session.cwd, .{}) catch |err| {
         std.log.err("cannot work in {s}: {s}", .{ session.cwd, @errorName(err) });
         return err;
@@ -244,7 +276,7 @@ pub fn run(
     // a new session gets the current ones while a resumed one keeps what it was
     // saved with. The project's own instructions are part of the prompt, so they
     // are sent with every request.
-    const instructions = try projectInstructions(io, arena, config.cwd);
+    const instructions = try projectInstructions(io, arena, work_dir);
     const prompt_text = if (instructions) |text|
         try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ system_prompt, text })
     else
@@ -803,12 +835,6 @@ test "cost follows the cache hit, miss and output prices" {
     try std.testing.expectEqual(3.1, costOf(price, usage));
 }
 
-/// The path of a `tmpDir` as `projectInstructions` takes it, relative to the
-/// working directory the tests run in.
-fn tmpPath(arena: std.mem.Allocator, tmp: *const std.testing.TmpDir) ![]const u8 {
-    return std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-}
-
 test "the project's instructions are read from the working directory" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -819,7 +845,7 @@ test "the project's instructions are read from the working directory" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "Write tests.\n" });
 
-    const text = (try projectInstructions(std.testing.io, arena, try tmpPath(arena, &tmp))).?;
+    const text = (try projectInstructions(std.testing.io, arena, tmp.dir)).?;
     // The prompt names where the instructions came from and carries them through.
     try std.testing.expect(std.mem.indexOf(u8, text, "AGENTS.md") != null);
     try std.testing.expect(std.mem.endsWith(u8, text, "Write tests."));
@@ -836,13 +862,13 @@ test "AGENTS.md is read before CLAUDE.md" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "agents" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "CLAUDE.md", .data = "claude" });
 
-    const text = (try projectInstructions(std.testing.io, arena, try tmpPath(arena, &tmp))).?;
+    const text = (try projectInstructions(std.testing.io, arena, tmp.dir)).?;
     try std.testing.expect(std.mem.endsWith(u8, text, "agents"));
 
     // With no AGENTS.md the other name is read, so a project written for another
     // tool still works.
     try tmp.dir.deleteFile(std.testing.io, "AGENTS.md");
-    const claude = (try projectInstructions(std.testing.io, arena, try tmpPath(arena, &tmp))).?;
+    const claude = (try projectInstructions(std.testing.io, arena, tmp.dir)).?;
     try std.testing.expect(std.mem.indexOf(u8, claude, "CLAUDE.md") != null);
     try std.testing.expect(std.mem.endsWith(u8, claude, "claude"));
 }
@@ -859,7 +885,8 @@ test "the instructions are found in a parent up to the repository root" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "root rules" });
     try tmp.dir.createDirPath(std.testing.io, "a/b");
 
-    const deep = try std.fmt.allocPrint(arena, "{s}/a/b", .{try tmpPath(arena, &tmp)});
+    var deep = try tmp.dir.openDir(std.testing.io, "a/b", .{});
+    defer deep.close(std.testing.io);
     const text = (try projectInstructions(std.testing.io, arena, deep)).?;
     try std.testing.expect(std.mem.endsWith(u8, text, "root rules"));
 }
@@ -875,7 +902,7 @@ test "a project with no instructions has none" {
     // A repository root, so the search stops here rather than walking above it.
     try tmp.dir.createDirPath(std.testing.io, ".git");
 
-    try std.testing.expect((try projectInstructions(std.testing.io, arena, try tmpPath(arena, &tmp))) == null);
+    try std.testing.expect((try projectInstructions(std.testing.io, arena, tmp.dir)) == null);
 }
 
 test "an empty instructions file is not used" {
@@ -889,5 +916,45 @@ test "an empty instructions file is not used" {
     try tmp.dir.createDirPath(std.testing.io, ".git");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "  \n\n" });
 
-    try std.testing.expect((try projectInstructions(std.testing.io, arena, try tmpPath(arena, &tmp))) == null);
+    try std.testing.expect((try projectInstructions(std.testing.io, arena, tmp.dir)) == null);
+}
+
+test "the nearest instructions win over an ancestor's" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "outer" });
+    try tmp.dir.createDirPath(std.testing.io, "inner");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "inner/AGENTS.md", .data = "inner" });
+
+    var inner = try tmp.dir.openDir(std.testing.io, "inner", .{});
+    defer inner.close(std.testing.io);
+
+    const text = (try projectInstructions(std.testing.io, arena, inner)).?;
+    try std.testing.expect(std.mem.endsWith(u8, text, "inner"));
+}
+
+test "sameDir tells a directory from its parent and root from itself" {
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "a/b");
+    var deep = try tmp.dir.openDir(io, "a/b", .{});
+    defer deep.close(io);
+    var up = try deep.openDir(io, "..", .{});
+    defer up.close(io);
+    try std.testing.expect(!sameDir(io, deep, up));
+
+    // At the filesystem root, `..` is the root itself, which is what ends a walk
+    // that found no repository root above it.
+    var root = try Io.Dir.openDirAbsolute(io, "/", .{});
+    defer root.close(io);
+    var root_up = try root.openDir(io, "..", .{});
+    defer root_up.close(io);
+    try std.testing.expect(sameDir(io, root, root_up));
 }
