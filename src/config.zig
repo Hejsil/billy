@@ -72,6 +72,10 @@ pub const Config = struct {
 
     /// Writes the configuration to `file_name` in `dir`. The previous contents
     /// are replaced in one step, leaving them intact if writing fails part way.
+    ///
+    /// It is written indented rather than compact, unlike a session file: it is
+    /// there to be read and edited by hand, while a session is only ever read
+    /// back as a whole.
     pub fn save(config: Config, io: Io, dir: Io.Dir, gpa: std.mem.Allocator) !void {
         const text = try std.json.Stringify.valueAlloc(
             gpa,
@@ -80,7 +84,7 @@ pub const Config = struct {
                 .tools = config.tools,
                 .markdown = config.markdown,
             },
-            .{},
+            .{ .whitespace = .indent_2 },
         );
         defer gpa.free(text);
 
@@ -323,6 +327,38 @@ test "save round-trips a custom max_turns" {
 
     const opened = try Config.open(std.testing.io, tmp.dir, allocator);
     try std.testing.expectEqual(3, opened.config.max_turns);
+}
+
+test "the file is indented, so it can be read and edited by hand" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try (Config{ .max_turns = 3 }).save(std.testing.io, tmp.dir, gpa);
+
+    const text = try tmp.dir.readFileAlloc(std.testing.io, file_name, allocator, .limited(max_config_bytes));
+    try std.testing.expectEqualStrings(
+        \\{
+        \\  "version": 1,
+        \\  "max_turns": 3,
+        \\  "tools": {
+        \\    "bash": {
+        \\      "format": null
+        \\    },
+        \\    "web_search": {
+        \\      "provider": null,
+        \\      "max_results": 5
+        \\    }
+        \\  },
+        \\  "markdown": {
+        \\    "format": null
+        \\  }
+        \\}
+    , text);
 }
 
 test "save round-trips a configured search backend" {

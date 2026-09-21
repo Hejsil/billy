@@ -171,11 +171,14 @@ pub fn load(io: Io, dir: Io.Dir, arena: std.mem.Allocator) !Store {
 /// replaced in one step, leaving them intact if writing fails part way, and the
 /// new file is readable by the owner alone. A service with no stored key is
 /// written as nothing at all, so the file holds the keys there are.
+///
+/// It is written indented rather than compact, like the configuration and unlike
+/// a session file, since a file a user may open to look at is worth reading.
 pub fn save(store: *const Store, io: Io, dir: Io.Dir, gpa: std.mem.Allocator) !void {
     const text = try std.json.Stringify.valueAlloc(
         gpa,
         Stored{ .credentials = store.* },
-        .{ .emit_null_optional_fields = false },
+        .{ .emit_null_optional_fields = false, .whitespace = .indent_2 },
     );
     defer gpa.free(text);
 
@@ -413,11 +416,16 @@ test "the file holds a field per service that has a key, and nothing else" {
 
     const text = try tmp.dir.readFileAlloc(std.testing.io, file_name, allocator, .limited(max_credentials_bytes));
     // The service is a field named after it; a service with no key is left out
-    // rather than written as null.
+    // rather than written as null. The file is indented, so it is readable by
+    // the user it belongs to.
     try std.testing.expectEqualStrings(
-        "{\"version\":1,\"credentials\":{\"tavily\":\"tvly-secret\"}}",
-        text,
-    );
+        \\{
+        \\  "version": 1,
+        \\  "credentials": {
+        \\    "tavily": "tvly-secret"
+        \\  }
+        \\}
+    , text);
 }
 
 test "put replaces the key already stored for a service" {
