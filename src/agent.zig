@@ -31,22 +31,29 @@ pub const Config = struct {
     /// prices. Null for a model billy does not know, in which case the header
     /// leaves out the context gauge and the cost.
     model_info: ?models.Metadata,
-    /// How a bash command is laid out before it is shown to the user, from the
-    /// configuration. This is presentation only: the command that runs and
-    /// everything stored in the session keep the text the model wrote. Null
-    /// shows the command as written.
+    /// How what billy shows is laid out and decorated, from the configuration.
+    display: Display = .{},
+    /// Web search, when the configuration names a backend and its key is set.
+    /// Null leaves `web_search` out of the tools the model is offered.
+    search: ?search.Config = null,
+};
+
+/// How billy lays out and decorates what it shows: the bash command formatter,
+/// the markdown formatter and the terminal style. The three travel together
+/// through the printing, so they are gathered here rather than passed apart as a
+/// run of arguments that had grown hard to read.
+///
+/// The layout is presentation only: the command that runs, what a session stores
+/// and what the model is sent keep the text as it was written.
+pub const Display = struct {
+    /// How a bash command is laid out before it is shown. Null shows it as written.
     format: tools.Format = null,
-    /// How the markdown of a reply and a prompt is laid out before it is shown,
-    /// from the configuration. Presentation only, like `format`: what a session
-    /// stores and what the model is sent keep the text as it was written. Null
-    /// shows the text as written.
+    /// How the markdown of a reply and a prompt is laid out before it is shown.
+    /// Null shows the text as written.
     markdown: formatting.Format = null,
     /// How billy decorates the lines it prints itself, such as a block header.
     /// Plain everywhere the terminal does not take escape codes.
     style: styling.Style = .plain,
-    /// Web search, when the configuration names a backend and its key is set.
-    /// Null leaves `web_search` out of the tools the model is offered.
-    search: ?search.Config = null,
 };
 
 const system_prompt =
@@ -271,18 +278,18 @@ pub fn run(
     defer http.deinit();
 
     var editor = line_editor.LineEditor.init(io, out, arena);
-    var tool_set = try tools.Tools.init(
-        io,
-        work_dir,
-        arena,
-        gpa,
-        out,
-        config.format,
-        config.bash_timeout_s,
-        config.style,
-        config.search,
-        &http,
-    );
+    var tool_set = try tools.Tools.init(.{
+        .io = io,
+        .dir = work_dir,
+        .arena = arena,
+        .gpa = gpa,
+        .log = out,
+        .format = config.display.format,
+        .bash_timeout_s = config.bash_timeout_s,
+        .style = config.display.style,
+        .search = config.search,
+        .http = &http,
+    });
     var client: llm.Client = .{
         .gpa = gpa,
         .io = io,
@@ -317,7 +324,7 @@ pub fn run(
         // prompt is written out now as the block a replay shows: the `> ` belongs
         // to the input, not to what was said. Flushed before the request, which
         // may take a while, so the user sees what was sent.
-        try printPrompt(out, line, config.markdown, config.style);
+        try printPrompt(out, line, config.display);
         try out.flush();
         // A failed request must not end the session: report it and take the
         // next request from the user.
@@ -344,16 +351,14 @@ pub fn printTranscript(
     gpa: std.mem.Allocator,
     out: *Io.Writer,
     session: *const Session,
-    format: tools.Format,
-    markdown: formatting.Format,
-    style: styling.Style,
+    display: Display,
 ) !void {
     var scratch_state = std.heap.ArenaAllocator.init(gpa);
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
 
     for (session.messages.items, 0..) |message, index| {
-        try printMessage(scratch, out, session, index, message, format, markdown, style);
+        try printMessage(scratch, out, session, index, message, display);
         _ = scratch_state.reset(.retain_capacity);
     }
     try out.flush();
@@ -371,9 +376,7 @@ fn printMessage(
     session: *const Session,
     index: usize,
     message: Session.Message,
-    format: tools.Format,
-    markdown: formatting.Format,
-    style: styling.Style,
+    display: Display,
 ) !void {
     const role = session.roleOf(message);
     if (std.mem.eql(u8, role, "user")) {
@@ -382,12 +385,12 @@ fn printMessage(
         // before. The loop prints the same block, without that line, since the
         // prompt it just erased already stood on its own row.
         try out.writeAll("\n");
-        return printPrompt(out, session.contentOf(message) orelse "", markdown, style);
+        return printPrompt(out, session.contentOf(message) orelse "", display);
     }
     if (!std.mem.eql(u8, role, "assistant")) return;
 
     const calls = session.callCount(message);
-    if (calls == 0) return printAnswer(out, session.contentOf(message), markdown, style);
+    if (calls == 0) return printAnswer(out, session.contentOf(message), display);
     for (0..calls) |i| {
         const call = session.callAt(message, i);
         // The result belongs to the message just after the one that asked for
@@ -395,8 +398,8 @@ fn printMessage(
         try tools.describe(
             tools.parseCallNamed(arena, call.name, call.arguments),
             session.toolResult(index + 1, call.id),
-            format,
-            style,
+            display.format,
+            display.style,
             out,
         );
     }
@@ -432,8 +435,8 @@ fn turn(
 
         const message = completion.message;
         const calls = message.tool_calls orelse
-            return printAnswer(out, message.content, config.markdown, config.style);
-        if (calls.len == 0) return printAnswer(out, message.content, config.markdown, config.style);
+            return printAnswer(out, message.content, config.display);
+        if (calls.len == 0) return printAnswer(out, message.content, config.display);
 
         for (calls) |call| {
             try session.append(.{
@@ -461,21 +464,21 @@ fn rateNow(io: Io, config: Config) models.Price {
 ///
 /// The blank line keeps the prompt from reading as the label of the answer or
 /// the tool block that follows it, which begin on the very next row otherwise.
-fn printPrompt(out: *Io.Writer, text: []const u8, markdown: formatting.Format, style: styling.Style) !void {
-    try styling.header(marks.prompt, "prompt", "", style, out);
-    if (!try formatting.apply(markdown, text, out)) try out.writeAll(text);
+fn printPrompt(out: *Io.Writer, text: []const u8, display: Display) !void {
+    try styling.header(marks.prompt, "prompt", "", display.style, out);
+    if (!try formatting.apply(display.markdown, text, out)) try out.writeAll(text);
     try out.writeAll("\n\n");
 }
 
 /// Prints a reply under its own header, the markdown laid out by `markdown` when
 /// one is set and as it was written when there is none or it cannot be used.
 /// Only the display changes; the session and the model keep the text itself.
-fn printAnswer(out: *Io.Writer, content: ?[]const u8, markdown: formatting.Format, style: styling.Style) !void {
-    try styling.header(marks.answer, "answer", "", style, out);
+fn printAnswer(out: *Io.Writer, content: ?[]const u8, display: Display) !void {
+    try styling.header(marks.answer, "answer", "", display.style, out);
     const text = content orelse "";
     if (text.len == 0) {
-        try style.dim("(empty reply)", out);
-    } else if (!try formatting.apply(markdown, text, out)) {
+        try display.style.dim("(empty reply)", out);
+    } else if (!try formatting.apply(display.markdown, text, out)) {
         try out.writeAll(text);
     }
     try out.writeAll("\n");
@@ -508,7 +511,7 @@ fn expectTranscript(
 
     // No bash format: what these cover is how a message is headed and laid out,
     // which the tool format does not touch.
-    try printTranscript(gpa, &out.writer, &session, null, markdown, style);
+    try printTranscript(gpa, &out.writer, &session, .{ .markdown = markdown, .style = style });
     try std.testing.expectEqualStrings(expected, out.written());
 }
 
@@ -614,7 +617,7 @@ test "a prompt is headed by the same block live and replayed" {
 
     // The block a replay shows, but with no blank line in front: it is printed
     // where the line editor left the cursor, on the row the header stood on.
-    try printPrompt(&out.writer, "hello", null, .plain);
+    try printPrompt(&out.writer, "hello", .{ .style = .plain });
     try std.testing.expectEqualStrings("» prompt\nhello\n\n", out.written());
     out.clearRetainingCapacity();
 
@@ -624,12 +627,12 @@ test "a prompt is headed by the same block live and replayed" {
         .io = std.testing.io,
         .gpa = gpa,
     };
-    try printPrompt(&out.writer, "hello", markdown, .plain);
+    try printPrompt(&out.writer, "hello", .{ .markdown = markdown, .style = .plain });
     try std.testing.expectEqualStrings("» prompt\nHELLO\n\n", out.written());
     out.clearRetainingCapacity();
 
     // The `> ` the line was typed behind is not part of the block.
-    try printPrompt(&out.writer, "hello", null, .ansi);
+    try printPrompt(&out.writer, "hello", .{ .style = .ansi });
     try std.testing.expectEqualStrings("\x1b[34m»\x1b[0m \x1b[1mprompt\x1b[0m\nhello\n\n", out.written());
 }
 

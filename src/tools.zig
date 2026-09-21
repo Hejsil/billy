@@ -100,44 +100,57 @@ pub const Tools = struct {
     search: ?search.Client,
     definitions: []const Session.Definition,
 
-    /// `arena` holds the definitions, which are sent with every request and so
-    /// live as long as the run. Nothing else the tools allocate outlives the
-    /// call that made it, so the rest is asked for per call.
-    ///
-    /// `search_config` is the backend the configuration asked for, with its key
-    /// resolved, or null to leave web search out.
-    /// `http` is the run's one HTTP client, borrowed by the search backend when
-    /// one is configured, so a search shares connections and scanned
-    /// certificates with the model requests.
-    pub fn init(
+    /// What a tool set is built from, gathered into one so the constructor reads
+    /// as what each value is rather than as a run of positional arguments, which
+    /// had grown too long to read at the call site.
+    pub const Options = struct {
         io: Io,
+        /// The directory the tools work in. See `Tools.dir`.
         dir: Io.Dir,
+        /// Holds the definitions, which are sent with every request and so live as
+        /// long as the run. Nothing else the tools allocate outlives the call that
+        /// made it, so the rest is asked for per call.
         arena: std.mem.Allocator,
+        /// For temporary buffers.
         gpa: std.mem.Allocator,
+        /// Reports tool activity to the user.
         log: *Io.Writer,
-        format: Format,
+        /// How a bash command is laid out for the user. Null shows it as written.
+        format: Format = null,
+        /// Longest a bash command may run before it is killed, in seconds. No
+        /// default: every caller has one to give, and a missing one is a mistake
+        /// worth catching at the call site rather than papering over with 120.
         bash_timeout_s: usize,
-        style: Style,
-        search_config: ?search.Config,
+        /// How the lines billy prints itself are decorated.
+        style: Style = .plain,
+        /// The backend the configuration asked for, with its key resolved, or null
+        /// to leave web search out. A null also leaves `web_search` out of the
+        /// definitions, so the model is never offered a tool that could not run.
+        search: ?search.Config = null,
+        /// The run's one HTTP client, borrowed by the search backend when one is
+        /// configured, so a search shares connections and scanned certificates
+        /// with the model requests.
         http: *std.http.Client,
-    ) !Tools {
+    };
+
+    pub fn init(options: Options) !Tools {
         return .{
-            .io = io,
-            .dir = dir,
-            .gpa = gpa,
-            .log = log,
-            .format = format,
-            .bash_timeout_s = bash_timeout_s,
-            .style = style,
-            .search = if (search_config) |config| .{
-                .io = io,
-                .gpa = gpa,
+            .io = options.io,
+            .dir = options.dir,
+            .gpa = options.gpa,
+            .log = options.log,
+            .format = options.format,
+            .bash_timeout_s = options.bash_timeout_s,
+            .style = options.style,
+            .search = if (options.search) |config| .{
+                .io = options.io,
+                .gpa = options.gpa,
                 .provider = config.provider,
                 .api_key = config.api_key,
                 .max_results = config.max_results,
-                .http = http,
+                .http = options.http,
             } else null,
-            .definitions = try definitions(arena, search_config != null),
+            .definitions = try definitions(options.arena, options.search != null),
         };
     }
 
@@ -1064,7 +1077,15 @@ test "a bash block shows only the streams the command filled" {
     var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
     defer http.deinit();
 
-    var tool_set = try Tools.init(std.testing.io, Io.Dir.cwd(), arena, gpa, &log.writer, null, 120, .plain, null, &http);
+    var tool_set = try Tools.init(.{
+        .io = std.testing.io,
+        .dir = Io.Dir.cwd(),
+        .arena = arena,
+        .gpa = gpa,
+        .log = &log.writer,
+        .bash_timeout_s = 120,
+        .http = &http,
+    });
     const cases = [_]struct { command: []const u8, expected: []const u8 }{
         // Nothing printed: the status is all there is.
         .{ .command = "true", .expected = "❯ bash\ntrue\n✓ exit 0\n\n" },
@@ -1271,7 +1292,15 @@ test "run logs exactly what describe prints" {
     var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
     defer http.deinit();
 
-    var tool_set = try Tools.init(std.testing.io, Io.Dir.cwd(), arena, gpa, &log.writer, null, 120, .plain, null, &http);
+    var tool_set = try Tools.init(.{
+        .io = std.testing.io,
+        .dir = Io.Dir.cwd(),
+        .arena = arena,
+        .gpa = gpa,
+        .log = &log.writer,
+        .bash_timeout_s = 120,
+        .http = &http,
+    });
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"true\"}",
@@ -1304,7 +1333,16 @@ test "the format changes what is shown and nothing else" {
     // The format script writes the command back upper case, so what is shown is
     // plainly not what runs.
     const format: Format = .{ .script = "tr a-z A-Z", .io = std.testing.io, .gpa = gpa };
-    var tool_set = try Tools.init(std.testing.io, Io.Dir.cwd(), arena, gpa, &log.writer, format, 120, .plain, null, &http);
+    var tool_set = try Tools.init(.{
+        .io = std.testing.io,
+        .dir = Io.Dir.cwd(),
+        .arena = arena,
+        .gpa = gpa,
+        .log = &log.writer,
+        .format = format,
+        .bash_timeout_s = 120,
+        .http = &http,
+    });
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"echo hi\"}",
@@ -1339,7 +1377,15 @@ test "a bash command that outlives the timeout is killed and reported" {
 
     // A one-second limit kills a command that would otherwise run far longer,
     // and the model is told so rather than left waiting for it to finish.
-    var tool_set = try Tools.init(std.testing.io, Io.Dir.cwd(), arena, gpa, &log.writer, null, 1, .plain, null, &http);
+    var tool_set = try Tools.init(.{
+        .io = std.testing.io,
+        .dir = Io.Dir.cwd(),
+        .arena = arena,
+        .gpa = gpa,
+        .log = &log.writer,
+        .bash_timeout_s = 1,
+        .http = &http,
+    });
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"sleep 30\"}",
@@ -1553,7 +1599,15 @@ test "the tools work in the directory they are given, wherever billy runs" {
     defer log.deinit();
     var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
     defer http.deinit();
-    var tool_set = try Tools.init(std.testing.io, work, arena, gpa, &log.writer, null, 120, .plain, null, &http);
+    var tool_set = try Tools.init(.{
+        .io = std.testing.io,
+        .dir = work,
+        .arena = arena,
+        .gpa = gpa,
+        .log = &log.writer,
+        .bash_timeout_s = 120,
+        .http = &http,
+    });
 
     // A file written by the tool lands in that directory.
     _ = try tool_set.run(arena, .{ .id = "1", .function = .{

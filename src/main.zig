@@ -197,44 +197,36 @@ pub fn main(init: std.process.Init) !void {
         // they are looked up by provider and model; an unknown model simply has
         // no gauge and no cost.
         .model_info = billy.models.lookup(billy.models.Provider.fromUrl(base_url), model),
-        // A bash command is laid out by the format script the configuration
-        // sets, when it sets one, so the user reads the command the way it
-        // runs. Only the display changes: the command that runs and the session
-        // keep what the model wrote.
-        .format = if (settings.config.tools.bash.format) |script| .{
-            .script = script,
-            .io = io,
-            .gpa = init.gpa,
-        } else null,
-        // The markdown of a reply and a prompt is laid out by the format script
-        // the configuration sets, when it sets one, so the user reads it the
-        // way it was meant to be shown. Only the display changes: the session
-        // and the model keep the text.
-        .markdown = if (settings.config.markdown.format) |script| .{
-            .script = script,
-            .io = io,
-            .gpa = init.gpa,
-        } else null,
+        // How billy lays out and decorates what it shows. A bash command is
+        // laid out by the format script the configuration sets, when it sets one,
+        // so the user reads the command the way it runs; a reply and a prompt are
+        // laid out by the markdown script; and a terminal gets the block headers
+        // with the name in bold, while a pipe or a redirection, where the escape
+        // codes would only be noise, gets the same text plain. Only the display
+        // changes: the command that runs, the session and the model keep the text
+        // as it was written.
+        .display = .{
+            .format = if (settings.config.tools.bash.format) |script| .{
+                .script = script,
+                .io = io,
+                .gpa = init.gpa,
+            } else null,
+            .markdown = if (settings.config.markdown.format) |script| .{
+                .script = script,
+                .io = io,
+                .gpa = init.gpa,
+            } else null,
+            .style = billy.style.Style.detect(io),
+        },
         // Web search is offered only when the configuration names a backend and
         // its key is set; the tool is left out of the request otherwise.
         .search = search_config,
-        // A terminal gets the block headers with the name in bold; a pipe or a
-        // redirection, where the escape codes would only be noise, gets the
-        // same text plain.
-        .style = billy.style.Style.detect(io),
     };
 
     if (options.resume_id != null) {
         // Replay the conversation as a transcript, so the context does not
         // have to be remembered from the previous run.
-        try billy.agent.printTranscript(
-            init.gpa,
-            out,
-            &session,
-            config.format,
-            config.markdown,
-            config.style,
-        );
+        try billy.agent.printTranscript(init.gpa, out, &session, config.display);
     }
     try billy.agent.run(io, arena, init.gpa, out, config, &session);
 }
