@@ -7,7 +7,8 @@ const usage =
     \\usage: billy [--resume <session>]
     \\       billy login [<service>]
     \\
-    \\  -r, --resume <session>  continue the session with this id
+    \\  -r, --resume <session>  continue the session with this id, in the
+    \\                          directory it was started in
     \\  -h, --help              print this message
     \\
     \\With no service, `login` lists the services billy needs a key for and
@@ -134,6 +135,35 @@ pub fn main(init: std.process.Init) !void {
         std.log.err("cannot find the working directory: {s}", .{@errorName(err)});
         return err;
     };
+
+    // The sessions live in a subdirectory of billy's data directory, apart from
+    // the credentials stored in the directory itself.
+    const sessions_dir = billy.Session.defaultDir(arena, init.environ_map) catch |err| {
+        std.log.err("cannot find where to store sessions: {s}", .{@errorName(err)});
+        return err;
+    };
+    var sessions_dir_handle = Io.Dir.cwd().createDirPathOpen(io, sessions_dir, .{}) catch |err| {
+        std.log.err("cannot use {s} for sessions: {s}", .{ sessions_dir, @errorName(err) });
+        return err;
+    };
+    defer sessions_dir_handle.close(io);
+
+    // `cwd` is where billy runs now. A new session records it, and a resumed one
+    // keeps the directory it was saved with, so a session continues where it was
+    // started rather than wherever it is picked up.
+    var session = billy.Session.open(io, sessions_dir_handle, arena, init.gpa, options.resume_id, cwd) catch |err| switch (err) {
+        error.SessionNotFound => {
+            std.log.err("no session '{s}' in {s}", .{ options.resume_id.?, sessions_dir });
+            return err;
+        },
+        error.InvalidSessionId => {
+            std.log.err("'{s}' cannot be used as a session name", .{options.resume_id.?});
+            return err;
+        },
+        else => return err,
+    };
+    defer session.deinit();
+
     const search_config: ?billy.search.Config = if (settings.config.tools.web_search.provider) |provider| blk: {
         // A backend named without its key is an error rather than a silent "no
         // search": the configuration asked for the tool, and leaving it out
@@ -159,7 +189,7 @@ pub fn main(init: std.process.Init) !void {
         }),
         .model = model,
         .max_turns = settings.config.max_turns,
-        .cwd = cwd,
+        .cwd = session.cwd,
         .home = init.environ_map.get("HOME"),
         // The context window and the prices are not reported by the API, so
         // they are looked up by provider and model; an unknown model simply has
@@ -191,31 +221,6 @@ pub fn main(init: std.process.Init) !void {
         // same text plain.
         .style = billy.style.Style.detect(io),
     };
-
-    // The sessions live in a subdirectory of billy's data directory, apart from
-    // the credentials stored in the directory itself.
-    const sessions_dir = billy.Session.defaultDir(arena, init.environ_map) catch |err| {
-        std.log.err("cannot find where to store sessions: {s}", .{@errorName(err)});
-        return err;
-    };
-    var sessions_dir_handle = Io.Dir.cwd().createDirPathOpen(io, sessions_dir, .{}) catch |err| {
-        std.log.err("cannot use {s} for sessions: {s}", .{ sessions_dir, @errorName(err) });
-        return err;
-    };
-    defer sessions_dir_handle.close(io);
-
-    var session = billy.Session.open(io, sessions_dir_handle, arena, init.gpa, options.resume_id) catch |err| switch (err) {
-        error.SessionNotFound => {
-            std.log.err("no session '{s}' in {s}", .{ options.resume_id.?, sessions_dir });
-            return err;
-        },
-        error.InvalidSessionId => {
-            std.log.err("'{s}' cannot be used as a session name", .{options.resume_id.?});
-            return err;
-        },
-        else => return err,
-    };
-    defer session.deinit();
 
     if (options.resume_id != null) {
         // Replay the conversation as a transcript, so the context does not

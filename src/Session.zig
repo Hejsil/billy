@@ -40,6 +40,9 @@ const Stored = struct {
     context_tokens: usize = 0,
     /// What the session has cost so far, in USD, summed request by request.
     cost: f64 = 0,
+    /// The directory the session was started in. Empty for a session saved
+    /// before it was recorded, which is read as the directory billy runs in.
+    cwd: []const u8 = "",
 };
 
 const StringIndex = enum(u32) {
@@ -176,7 +179,17 @@ context_tokens: usize = 0,
 /// totals alone could not recover.
 cost: f64 = 0,
 
+/// The directory the session was started in. A resumed session keeps it, so
+/// billy works where the session did rather than wherever it is run from now;
+/// a session saved before it was recorded has none, and the run's own directory
+/// is used instead.
+cwd: []const u8,
+
 /// Opens the session called `resume_id`, or starts a new one when it is null.
+///
+/// `cwd` is the directory billy is running in. A new session records it; a
+/// resumed one keeps the directory it was saved with, so a session continues
+/// where it was started.
 ///
 /// Fails with `error.SessionNotFound` when the session is missing, and with
 /// `error.InvalidSessionId` when `resume_id` is not a usable name.
@@ -186,6 +199,7 @@ pub fn open(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
     resume_id: ?[]const u8,
+    cwd: []const u8,
 ) !Session {
     const id = if (resume_id) |name|
         try checkedId(arena, name)
@@ -198,6 +212,7 @@ pub fn open(
         .gpa = gpa,
         .id = id,
         .name = try std.fmt.allocPrint(arena, "{s}{s}", .{ id, extension }),
+        .cwd = cwd,
     };
     // A resume that fails part way leaves the strings it had read behind, since
     // the caller only gets the session on the way out.
@@ -464,6 +479,8 @@ pub fn save(session: *Session) !void {
     try json.write(session.context_tokens);
     try json.objectField("cost");
     try json.write(session.cost);
+    try json.objectField("cwd");
+    try json.write(session.cwd);
     try json.endObject();
 
     var atomic = try session.dir.createFileAtomic(session.io, session.name, .{ .replace = true });
@@ -506,6 +523,9 @@ fn load(session: *Session) !void {
     session.usage = stored.usage;
     session.context_tokens = stored.context_tokens;
     session.cost = stored.cost;
+    // A session saved before the directory was recorded has none, so billy keeps
+    // running in the directory it was started in now.
+    if (stored.cwd.len > 0) session.cwd = stored.cwd;
 }
 
 fn internString(session: *Session, text: ?[]const u8) !StringIndex {
@@ -689,7 +709,7 @@ test "a session survives a save and resume" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null);
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null, "/work");
     defer session.deinit();
 
     try session.append(.{ .role = "system", .content = "be terse" });
@@ -703,7 +723,7 @@ test "a session survives a save and resume" {
     });
     try session.append(.{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;\n" });
 
-    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, session.id);
+    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, session.id, "/work");
     defer resumed.deinit();
 
     try std.testing.expectEqualStrings(session.id, resumed.id);
@@ -742,7 +762,7 @@ test "a conversation writes the messages a request would have carried" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try Session.open(std.testing.io, tmp.dir, allocator, allocator, null);
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, allocator, null, "/work");
     defer session.deinit();
 
     // A message of every shape: an optional left out, one filled in, and a call
@@ -796,7 +816,7 @@ test "a stored message reads back as its parts" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try Session.open(std.testing.io, tmp.dir, allocator, allocator, null);
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, allocator, null, "/work");
     defer session.deinit();
 
     try session.append(.{ .role = "user", .content = "hello" });
@@ -837,7 +857,7 @@ test "a tool result is found only from where the search starts" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try Session.open(std.testing.io, tmp.dir, allocator, allocator, null);
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, allocator, null, "/work");
     defer session.deinit();
 
     try session.append(.{ .role = "assistant", .tool_calls = &.{.{
@@ -868,7 +888,7 @@ test "an equal string is interned once and shared" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null);
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null, "/work");
     defer session.deinit();
 
     try session.append(.{ .role = "user", .content = "hello" });
@@ -914,7 +934,7 @@ test "a stored system prompt is kept when resuming" {
     });
 
     // Resuming keeps the saved prompt even though a newer one is available.
-    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, "one");
+    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, "one", "/work");
     defer resumed.deinit();
 
     try resumed.appendSystemPrompt("new prompt");
@@ -933,7 +953,7 @@ test "appendSystemPrompt only adds the prompt to an empty session" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null);
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null, "/work");
     defer session.deinit();
 
     try session.appendSystemPrompt("current prompt");
@@ -966,13 +986,13 @@ test "ensureTools stores the tools and only sets them once" {
         .parameters = .null,
     } }};
 
-    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null);
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null, "/work");
     try session.ensureTools(&tools);
     try std.testing.expectEqual(1, session.tools.len);
     try std.testing.expectEqualStrings("read", session.tools[0].function.name);
 
     // The stored tools survive a save and resume.
-    const resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, session.id);
+    const resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, session.id, "/work");
     try std.testing.expectEqual(1, resumed.tools.len);
     try std.testing.expectEqualStrings("read", resumed.tools[0].function.name);
     try std.testing.expectEqualStrings("Read a file.", resumed.tools[0].function.description);
@@ -983,7 +1003,7 @@ test "ensureTools stores the tools and only sets them once" {
         .description = "Run a command.",
         .parameters = .null,
     } }};
-    var reopened = try Session.open(std.testing.io, tmp.dir, allocator, arena, session.id);
+    var reopened = try Session.open(std.testing.io, tmp.dir, allocator, arena, session.id, "/work");
     try reopened.ensureTools(&replaced);
     try std.testing.expectEqual(1, reopened.tools.len);
     try std.testing.expectEqualStrings("read", reopened.tools[0].function.name);
@@ -1010,7 +1030,7 @@ test "ensureTools gives tools to a session saved without any" {
         .parameters = .null,
     } }};
 
-    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, "legacy");
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, "legacy", "/work");
     defer session.deinit();
 
     try std.testing.expectEqual(0, session.tools.len);
@@ -1028,7 +1048,7 @@ test "the token totals survive a save and resume" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null);
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null, "/work");
     defer session.deinit();
 
     session.recordUsage(.{
@@ -1049,7 +1069,7 @@ test "the token totals survive a save and resume" {
     }, 0.0002);
     try session.append(.{ .role = "assistant", .content = "hello" });
 
-    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, session.id);
+    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, session.id, "/work");
     defer resumed.deinit();
 
     try std.testing.expectEqual(300, resumed.usage.prompt_tokens);
@@ -1073,19 +1093,19 @@ test "opening an unknown or damaged session is reported" {
 
     try std.testing.expectError(
         error.SessionNotFound,
-        Session.open(std.testing.io, tmp.dir, allocator, arena, "nope"),
+        Session.open(std.testing.io, tmp.dir, allocator, arena, "nope", "/work"),
     );
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad.json", .data = "{" });
     try std.testing.expectError(
         error.CorruptSession,
-        Session.open(std.testing.io, tmp.dir, allocator, arena, "bad"),
+        Session.open(std.testing.io, tmp.dir, allocator, arena, "bad", "/work"),
     );
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "future.json", .data = "{\"version\":99}" });
     try std.testing.expectError(
         error.UnsupportedSessionVersion,
-        Session.open(std.testing.io, tmp.dir, allocator, arena, "future"),
+        Session.open(std.testing.io, tmp.dir, allocator, arena, "future", "/work"),
     );
 }
 
@@ -1098,18 +1118,59 @@ test "a new session does not reuse an id whose file exists" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var first = try Session.open(std.testing.io, tmp.dir, allocator, arena, null);
+    var first = try Session.open(std.testing.io, tmp.dir, allocator, arena, null, "/work");
     defer first.deinit();
     try first.append(.{ .role = "user", .content = "keep me" });
 
-    var second = try Session.open(std.testing.io, tmp.dir, allocator, arena, null);
+    var second = try Session.open(std.testing.io, tmp.dir, allocator, arena, null, "/work");
     defer second.deinit();
     try second.append(.{ .role = "user", .content = "and me" });
 
     try std.testing.expect(!std.mem.eql(u8, first.id, second.id));
 
-    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, first.id);
+    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, first.id, "/work");
     defer resumed.deinit();
 
     try std.testing.expectEqualStrings("keep me", resumed.string(resumed.messages.items[0].content).?);
+}
+
+test "the working directory is stored and restored on resume" {
+    const arena = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(arena);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A session started in one directory.
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, arena, null, "/home/user/project");
+    defer session.deinit();
+    try std.testing.expectEqualStrings("/home/user/project", session.cwd);
+    try session.append(.{ .role = "user", .content = "hello" });
+
+    // Resumed from somewhere else, it keeps the directory it was started in.
+    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, session.id, "/somewhere/else");
+    defer resumed.deinit();
+    try std.testing.expectEqualStrings("/home/user/project", resumed.cwd);
+}
+
+test "a session saved before the directory was recorded uses the run's own" {
+    const arena = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(arena);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A file written before the field existed, with no `cwd`.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "old" ++ extension,
+        .data = "{\"version\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+    });
+
+    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, arena, "old", "/now/here");
+    defer resumed.deinit();
+    try std.testing.expectEqualStrings("/now/here", resumed.cwd);
 }

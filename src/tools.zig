@@ -78,6 +78,10 @@ pub const Call = union(enum) {
 
 pub const Tools = struct {
     io: Io,
+    /// The directory the tools work in: the one the session was started in, so a
+    /// resumed session reads and writes where it did rather than wherever billy
+    /// happens to be run from. Every path a tool is given is relative to it.
+    dir: Io.Dir,
     /// For temporary buffers.
     gpa: std.mem.Allocator,
     /// Reports tool activity to the user.
@@ -102,6 +106,7 @@ pub const Tools = struct {
     /// resolved, or null to leave web search out.
     pub fn init(
         io: Io,
+        dir: Io.Dir,
         arena: std.mem.Allocator,
         gpa: std.mem.Allocator,
         log: *Io.Writer,
@@ -111,6 +116,7 @@ pub const Tools = struct {
     ) !Tools {
         return .{
             .io = io,
+            .dir = dir,
             .gpa = gpa,
             .log = log,
             .format = format,
@@ -164,7 +170,7 @@ pub const Tools = struct {
     }
 
     fn read(tools: *Tools, arena: std.mem.Allocator, args: Call.Read) ![]const u8 {
-        const contents = std.Io.Dir.cwd().readFileAlloc(
+        const contents = tools.dir.readFileAlloc(
             tools.io,
             args.path,
             tools.gpa,
@@ -202,10 +208,10 @@ pub const Tools = struct {
 
     fn write(tools: *Tools, arena: std.mem.Allocator, args: Call.Write) ![]const u8 {
         if (std.fs.path.dirname(args.path)) |parent| {
-            std.Io.Dir.cwd().createDirPath(tools.io, parent) catch |err|
+            tools.dir.createDirPath(tools.io, parent) catch |err|
                 return fail(arena, "cannot create {s}: {s}", .{ parent, @errorName(err) });
         }
-        std.Io.Dir.cwd().writeFile(tools.io, .{ .sub_path = args.path, .data = args.content }) catch |err|
+        tools.dir.writeFile(tools.io, .{ .sub_path = args.path, .data = args.content }) catch |err|
             return fail(arena, "cannot write {s}: {s}", .{ args.path, @errorName(err) });
         return std.fmt.allocPrint(arena, "wrote {d} bytes to {s}", .{ args.content.len, args.path });
     }
@@ -213,7 +219,7 @@ pub const Tools = struct {
     fn edit(tools: *Tools, arena: std.mem.Allocator, args: Call.Edit) ![]const u8 {
         if (args.old_string.len == 0) return fail(arena, "old_string must not be empty", .{});
 
-        const contents = std.Io.Dir.cwd().readFileAlloc(
+        const contents = tools.dir.readFileAlloc(
             tools.io,
             args.path,
             tools.gpa,
@@ -237,7 +243,7 @@ pub const Tools = struct {
             ),
             .applied => |applied| {
                 defer tools.gpa.free(applied.text);
-                std.Io.Dir.cwd().writeFile(tools.io, .{
+                tools.dir.writeFile(tools.io, .{
                     .sub_path = args.path,
                     .data = applied.text,
                 }) catch |err| return fail(arena, "cannot write {s}: {s}", .{ args.path, @errorName(err) });
@@ -252,6 +258,9 @@ pub const Tools = struct {
     fn bash(tools: *Tools, arena: std.mem.Allocator, args: Call.Bash) ![]const u8 {
         const result = std.process.run(tools.gpa, tools.io, .{
             .argv = &.{ "bash", "-c", args.command },
+            // The command runs where the session's tools do, so a resumed session
+            // runs it in the directory the session was started in.
+            .cwd = .{ .dir = tools.dir },
             .stdout_limit = .limited(max_command_output),
             .stderr_limit = .limited(max_command_output),
             .timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(command_timeout_s) } },
@@ -1067,7 +1076,7 @@ test "a bash block shows only the streams the command filled" {
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
 
-    var tool_set = try Tools.init(std.testing.io, arena, gpa, &log.writer, null, .plain, null);
+    var tool_set = try Tools.init(std.testing.io, Io.Dir.cwd(), arena, gpa, &log.writer, null, .plain, null);
     const cases = [_]struct { command: []const u8, expected: []const u8 }{
         // Nothing printed: the status is all there is.
         .{ .command = "true", .expected = "❯ bash\ntrue\n✓ exit 0\n\n" },
@@ -1272,7 +1281,7 @@ test "run logs exactly what describe prints" {
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
 
-    var tool_set = try Tools.init(std.testing.io, arena, gpa, &log.writer, null, .plain, null);
+    var tool_set = try Tools.init(std.testing.io, Io.Dir.cwd(), arena, gpa, &log.writer, null, .plain, null);
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"true\"}",
@@ -1303,7 +1312,7 @@ test "the format changes what is shown and nothing else" {
     // The format script writes the command back upper case, so what is shown is
     // plainly not what runs.
     const format: Format = .{ .script = "tr a-z A-Z", .io = std.testing.io, .gpa = gpa };
-    var tool_set = try Tools.init(std.testing.io, arena, gpa, &log.writer, format, .plain, null);
+    var tool_set = try Tools.init(std.testing.io, Io.Dir.cwd(), arena, gpa, &log.writer, format, .plain, null);
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"echo hi\"}",
@@ -1505,4 +1514,40 @@ test "web search is offered only when a backend is configured" {
     const with = try definitions(arena_state.allocator(), true);
     try std.testing.expectEqual(specs.len + 1, with.len);
     try std.testing.expectEqualStrings("web_search", with[with.len - 1].function.name);
+}
+
+test "the tools work in the directory they are given, wherever billy runs" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A project directory that is not the one the tests run in, which is the
+    // case a resumed session is in: it was started somewhere else.
+    try tmp.dir.createDirPath(std.testing.io, "project");
+    var work = try tmp.dir.openDir(std.testing.io, "project", .{});
+    defer work.close(std.testing.io);
+
+    var log: std.Io.Writer.Allocating = .init(gpa);
+    defer log.deinit();
+    var tool_set = try Tools.init(std.testing.io, work, arena, gpa, &log.writer, null, .plain, null);
+
+    // A file written by the tool lands in that directory.
+    _ = try tool_set.run(arena, .{ .id = "1", .function = .{
+        .name = "write",
+        .arguments = "{\"path\":\"note.txt\",\"content\":\"hi\"}",
+    } });
+    const written = try tmp.dir.readFileAlloc(std.testing.io, "project/note.txt", arena, .limited(64));
+    try std.testing.expectEqualStrings("hi", written);
+
+    // And a command runs there too, so `pwd` reports that directory and not the
+    // one billy was started in.
+    log.clearRetainingCapacity();
+    const result = try tool_set.run(arena, .{ .id = "2", .function = .{
+        .name = "bash",
+        .arguments = "{\"command\":\"pwd\"}",
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, result, "/project\n") != null);
 }

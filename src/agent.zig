@@ -220,8 +220,16 @@ pub fn run(
     config: Config,
     session: *Session,
 ) !void {
+    // The tools work in the session's own directory, which for a resumed session
+    // is the one it was started in, wherever billy is run from now.
+    var work_dir = Io.Dir.openDirAbsolute(io, session.cwd, .{}) catch |err| {
+        std.log.err("cannot work in {s}: {s}", .{ session.cwd, @errorName(err) });
+        return err;
+    };
+    defer work_dir.close(io);
+
     var editor = line_editor.LineEditor.init(io, out, arena);
-    var tool_set = try tools.Tools.init(io, arena, gpa, out, config.format, config.style, config.search);
+    var tool_set = try tools.Tools.init(io, work_dir, arena, gpa, out, config.format, config.style, config.search);
     var client: llm.Client = .{
         .gpa = gpa,
         .io = io,
@@ -437,7 +445,7 @@ fn expectTranscript(
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try Session.open(std.testing.io, tmp.dir, arena_state.allocator(), gpa, null);
+    var session = try Session.open(std.testing.io, tmp.dir, arena_state.allocator(), gpa, null, "/work");
     defer session.deinit();
     for (messages) |message| try session.append(message);
 
