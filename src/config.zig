@@ -108,9 +108,9 @@ pub const WebSearch = struct {
     /// one it does not know makes the file corrupt rather than reading as "no
     /// search".
     ///
-    /// The key a backend needs is read from its environment variable, named by
-    /// `Provider.keyVariable`, and never from this file, which is written to
-    /// disk in the clear.
+    /// The key a backend needs is read from the credential `billy login` stored
+    /// for it, or from its environment variable when none is stored, and never
+    /// from this file, which is written to disk in the clear.
     provider: ?search.Provider = null,
     /// Results asked for per query. The backend may return fewer, and billy caps
     /// it.

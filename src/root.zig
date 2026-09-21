@@ -2,6 +2,7 @@
 
 pub const agent = @import("agent.zig");
 pub const config = @import("config.zig");
+pub const credentials = @import("credentials.zig");
 pub const format = @import("format.zig");
 pub const line_editor = @import("line_editor.zig");
 pub const llm = @import("llm.zig");

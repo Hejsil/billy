@@ -5,25 +5,31 @@ const billy = @import("billy");
 
 const usage =
     \\usage: billy [--resume <session>]
+    \\       billy login [<service>]
     \\
     \\  -r, --resume <session>  continue the session with this id
     \\  -h, --help              print this message
     \\
-    \\The API key comes from DEEPSEEK_API_KEY or OPENAI_API_KEY. BILLY_BASE_URL
-    \\and BILLY_MODEL override the endpoint and the model. Sessions are stored
-    \\under $XDG_DATA_HOME/billy, or ~/.local/share/billy when that is unset.
-    \\The configuration lives in $XDG_CONFIG_HOME/billy/config.json, or
-    \\~/.config/billy/config.json when that is unset, and is created with the
-    \\defaults on the first run. It holds the turn limit; under
-    \\tools.bash.format, a shell script that lays a bash command out for the
-    \\display; under markdown.format, one that lays out a reply, such as
-    \\"glow -"; and under tools.web_search, the backend to search the web with
-    \\(only "tavily" for now) and how many results to ask for. A format reads
-    \\the text on standard input and writes it back on standard output; the
-    \\search key comes from the backend's environment variable, TAVILY_API_KEY.
-    \\The context window and the token prices the header reports come from a
-    \\table built into billy, keyed by provider and model, since the API
-    \\reports token counts but neither of those.
+    \\With no service, `login` lists the services billy needs a key for and
+    \\where each key comes from; `login <service>` reads a key for that service
+    \\and stores it, so it need not be exported before every run.
+    \\
+    \\The API key comes from `billy login <service>`, or from DEEPSEEK_API_KEY or
+    \\OPENAI_API_KEY when none is stored. BILLY_BASE_URL and BILLY_MODEL override
+    \\the endpoint and the model. Sessions are stored under $XDG_DATA_HOME/billy,
+    \\or ~/.local/share/billy when that is unset. The configuration lives in
+    \\$XDG_CONFIG_HOME/billy/config.json, or ~/.config/billy/config.json when
+    \\that is unset, and is created with the defaults on the first run. It holds
+    \\the turn limit; under tools.bash.format, a shell script that lays a bash
+    \\command out for the display; under markdown.format, one that lays out a
+    \\reply, such as "glow -"; and under tools.web_search, the backend to search
+    \\the web with (only "tavily" for now) and how many results to ask for. A
+    \\format reads the text on standard input and writes it back on standard
+    \\output. The keys are kept in credentials.json in the data directory beside
+    \\the sessions, readable by the owner alone. The context window and the token
+    \\prices the header reports come from a table built into billy, keyed by
+    \\provider and model, since the API reports token counts but neither of
+    \\those.
     \\
 ;
 
@@ -32,6 +38,13 @@ const Options = struct {
     resume_id: ?[]const u8 = null,
     /// Whether the user asked for usage instead of a run.
     help: bool = false,
+    /// Set when the `login` subcommand was asked for. The service is the one to
+    /// store a key for, or null to list the services and the keys they have.
+    login: ?Login = null,
+
+    const Login = struct {
+        service: ?[]const u8 = null,
+    };
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -55,13 +68,39 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const api_key = init.environ_map.get("DEEPSEEK_API_KEY") orelse
-        init.environ_map.get("OPENAI_API_KEY") orelse {
-        std.log.err("set DEEPSEEK_API_KEY to your API key", .{});
-        return error.MissingApiKey;
+    // billy's own files live under the data directory: the sessions, and the
+    // credentials beside them. The credentials are not kept with the
+    // configuration, which is meant to be shared between machines, and a key is
+    // not. The directory is opened once and used for both.
+    const data_dir = billy.Session.defaultDir(arena, init.environ_map) catch |err| {
+        std.log.err("cannot find where to store billy's files: {s}", .{@errorName(err)});
+        return err;
     };
-    const base_url = init.environ_map.get("BILLY_BASE_URL") orelse "https://api.deepseek.com";
-    const model = init.environ_map.get("BILLY_MODEL") orelse "deepseek-flash";
+    var data_dir_handle = Io.Dir.cwd().createDirPathOpen(io, data_dir, .{}) catch |err| {
+        std.log.err("cannot use {s} for billy's files: {s}", .{ data_dir, @errorName(err) });
+        return err;
+    };
+    defer data_dir_handle.close(io);
+
+    var credentials = billy.credentials.load(io, data_dir_handle, arena) catch |err| {
+        std.log.err("cannot read the credentials in {s}: {s}", .{ data_dir, @errorName(err) });
+        return err;
+    };
+
+    if (options.login) |login| {
+        try billy.credentials.run(
+            io,
+            out,
+            arena,
+            init.gpa,
+            data_dir_handle,
+            data_dir,
+            &credentials,
+            init.environ_map,
+            login.service,
+        );
+        return;
+    }
 
     const config_dir = billy.config.defaultDir(arena, init.environ_map) catch |err| {
         std.log.err("cannot find where to store the configuration: {s}", .{@errorName(err)});
@@ -83,6 +122,12 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
+    const base_url = init.environ_map.get("BILLY_BASE_URL") orelse "https://api.deepseek.com";
+    const model = init.environ_map.get("BILLY_MODEL") orelse "deepseek-flash";
+    const api_key = billy.credentials.modelKey(&credentials, init.environ_map, base_url) orelse {
+        std.log.err("run `billy login deepseek`, or set DEEPSEEK_API_KEY to your API key", .{});
+        return error.MissingApiKey;
+    };
     const cwd = std.process.currentPathAlloc(io, arena) catch |err| {
         std.log.err("cannot find the working directory: {s}", .{@errorName(err)});
         return err;
@@ -91,9 +136,12 @@ pub fn main(init: std.process.Init) !void {
         // A backend named without its key is an error rather than a silent "no
         // search": the configuration asked for the tool, and leaving it out
         // without a word would look like a bug.
-        const variable = provider.keyVariable();
-        const key = init.environ_map.get(variable) orelse {
-            std.log.err("set {s} to use web search, or clear tools.web_search in the configuration", .{variable});
+        const service = billy.credentials.searchService(provider);
+        const key = billy.credentials.credential(&credentials, init.environ_map, service) orelse {
+            std.log.err(
+                "run `billy login {s}`, or set {s} to use web search, or clear tools.web_search in the configuration",
+                .{ service.name(), service.variable() },
+            );
             return error.MissingApiKey;
         };
         break :blk .{
@@ -142,19 +190,9 @@ pub fn main(init: std.process.Init) !void {
         .style = billy.style.Style.detect(io),
     };
 
-    const directory = billy.Session.defaultDir(arena, init.environ_map) catch |err| {
-        std.log.err("cannot find where to store sessions: {s}", .{@errorName(err)});
-        return err;
-    };
-    var sessions_dir = Io.Dir.cwd().createDirPathOpen(io, directory, .{}) catch |err| {
-        std.log.err("cannot use {s} for sessions: {s}", .{ directory, @errorName(err) });
-        return err;
-    };
-    defer sessions_dir.close(io);
-
-    var session = billy.Session.open(io, sessions_dir, arena, init.gpa, options.resume_id) catch |err| switch (err) {
+    var session = billy.Session.open(io, data_dir_handle, arena, init.gpa, options.resume_id) catch |err| switch (err) {
         error.SessionNotFound => {
-            std.log.err("no session '{s}' in {s}", .{ options.resume_id.?, directory });
+            std.log.err("no session '{s}' in {s}", .{ options.resume_id.?, data_dir });
             return err;
         },
         error.InvalidSessionId => {
@@ -180,8 +218,18 @@ pub fn main(init: std.process.Init) !void {
     try billy.agent.run(io, arena, init.gpa, out, config, &session);
 }
 
-/// Reads the command line, whose first entry is the executable name.
+/// Reads the command line, whose first entry is the executable name. The `login`
+/// subcommand takes the rest of the line, so it is read on its own rather than
+/// mixed with the run options.
 fn parseArgs(args: []const [:0]const u8) error{ InvalidArgument, MissingValue }!Options {
+    if (args.len > 1 and std.mem.eql(u8, args[1], "login")) {
+        if (args.len == 2) return .{ .login = .{} };
+        if (args.len == 3 and args[2].len > 0 and args[2][0] != '-') {
+            return .{ .login = .{ .service = args[2] } };
+        }
+        return error.InvalidArgument;
+    }
+
     var options: Options = .{};
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -219,6 +267,19 @@ test "parseArgs" {
     try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "extra" }));
 }
 
+test "parseArgs reads the login subcommand on its own" {
+    try expectOptions(.{ .login = .{} }, try parseArgs(&.{ "billy", "login" }));
+    try expectOptions(
+        .{ .login = .{ .service = "tavily" } },
+        try parseArgs(&.{ "billy", "login", "tavily" }),
+    );
+    // The subcommand owns the rest of the line, so a run option after it is not
+    // a run option, and a second service is not an argument it takes.
+    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "login", "--help" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "login", "tavily", "extra" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "login", "" }));
+}
+
 /// The slices in `Options` are compared by content rather than by pointer.
 fn expectOptions(expected: Options, actual: Options) !void {
     try std.testing.expectEqual(expected.help, actual.help);
@@ -226,5 +287,15 @@ fn expectOptions(expected: Options, actual: Options) !void {
         try std.testing.expectEqualStrings(id, actual.resume_id.?);
     } else {
         try std.testing.expect(actual.resume_id == null);
+    }
+    if (expected.login) |login| {
+        const actual_login = actual.login.?;
+        if (login.service) |service| {
+            try std.testing.expectEqualStrings(service, actual_login.service.?);
+        } else {
+            try std.testing.expect(actual_login.service == null);
+        }
+    } else {
+        try std.testing.expect(actual.login == null);
     }
 }

@@ -535,7 +535,8 @@ fn stringPtr(session: *const Session, index: StringIndex) ?[*:0]const u8 {
     return session.strings.items[start .. session.strings.items.len - 1 :0].ptr;
 }
 
-/// The directory holding the sessions: `$XDG_DATA_HOME/billy`, or
+/// The directory billy keeps its own files in, under the data directory: the
+/// sessions, and the credentials beside them. It is `$XDG_DATA_HOME/billy`, or
 /// `$HOME/.local/share/billy` when that is unset, as the XDG base directory
 /// specification prescribes.
 pub fn defaultDir(arena: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {

@@ -1,8 +1,9 @@
 //! Web search: one query out to a backend, a short list of results back.
 //!
 //! Only Tavily so far. Which backend is the configuration's choice, so a second
-//! is a variant in `Provider`, its endpoint and key variable beside it, and a
-//! branch in `Client.search`; nothing outside this file names a backend.
+//! is a variant in `Provider`, its endpoint beside it, a branch in
+//! `Client.search`, and the credential it is asked with in `credentials.Service`;
+//! nothing outside those files names a backend.
 
 const std = @import("std");
 const Io = std.Io;
@@ -17,15 +18,6 @@ pub const Provider = enum {
     fn endpoint(provider: Provider) []const u8 {
         return switch (provider) {
             .tavily => "https://api.tavily.com/search",
-        };
-    }
-
-    /// The environment variable holding the key the backend is asked with. The
-    /// key is read from the environment rather than the configuration file,
-    /// which is written to disk in the clear.
-    pub fn keyVariable(provider: Provider) []const u8 {
-        return switch (provider) {
-            .tavily => "TAVILY_API_KEY",
         };
     }
 };
