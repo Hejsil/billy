@@ -6,6 +6,7 @@ const billy = @import("billy");
 const usage =
     \\usage: billy [--resume <session>]
     \\       billy login [<service>]
+    \\       billy config <setting> <value>
     \\
     \\  -r, --resume <session>  continue the session with this id, in the
     \\                          directory it was started in
@@ -14,6 +15,12 @@ const usage =
     \\With no service, `login` lists the services billy needs a key for and
     \\where each key comes from; `login <service>` reads a key for that service
     \\and stores it, so it need not be exported before every run.
+    \\
+    \\`config` sets one setting in the configuration file, named by its dotted
+    \\path, and writes it back, so a setting can be changed without opening the
+    \\file by hand; for example, `billy config tools.bash.format 'shfmt'`. A
+    \\string is taken as it is, a number from its digits, and `null` clears a
+    \\setting that has no value.
     \\
     \\The API key comes from `billy login <service>`, or from DEEPSEEK_API_KEY or
     \\OPENAI_API_KEY when none is stored. BILLY_BASE_URL and BILLY_MODEL override
@@ -51,9 +58,17 @@ const Options = struct {
     /// Set when the `login` subcommand was asked for. The service is the one to
     /// store a key for, or null to list the services and the keys they have.
     login: ?Login = null,
+    /// Set when the `config` subcommand was asked for: the setting to change,
+    /// named by its dotted path, and the text to set it to.
+    config: ?Config = null,
 
     const Login = struct {
         service: ?[]const u8 = null,
+    };
+
+    const Config = struct {
+        path: []const u8,
+        value: []const u8,
     };
 };
 
@@ -75,6 +90,21 @@ pub fn main(init: std.process.Init) !void {
     };
     if (options.help) {
         try out.writeAll(usage);
+        return;
+    }
+
+    // The config subcommand only touches the configuration file, so it runs
+    // before billy's own files and credentials are reached for.
+    if (options.config) |setting| {
+        try billy.Config.run(
+            io,
+            out,
+            arena,
+            init.gpa,
+            init.environ_map,
+            setting.path,
+            setting.value,
+        );
         return;
     }
 
@@ -266,6 +296,15 @@ fn parseArgs(args: []const [:0]const u8) error{ InvalidArgument, MissingValue }!
         return error.InvalidArgument;
     }
 
+    // `config` takes exactly a setting and the value to give it, and owns the
+    // rest of the line, so neither is read as a run option.
+    if (args.len > 1 and std.mem.eql(u8, args[1], "config")) {
+        if (args.len == 4 and args[2].len > 0 and args[2][0] != '-') {
+            return .{ .config = .{ .path = args[2], .value = args[3] } };
+        }
+        return error.InvalidArgument;
+    }
+
     var options: Options = .{};
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -316,6 +355,28 @@ test "parseArgs reads the login subcommand on its own" {
     try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "login", "" }));
 }
 
+test "parseArgs reads the config subcommand on its own" {
+    try expectOptions(
+        .{ .config = .{ .path = "tools.bash.format", .value = "shfmt | bat -l bash" } },
+        try parseArgs(&.{ "billy", "config", "tools.bash.format", "shfmt | bat -l bash" }),
+    );
+    // A value may look like an option or be empty; the path may not.
+    try expectOptions(
+        .{ .config = .{ .path = "tools.bash.format", .value = "--nope" } },
+        try parseArgs(&.{ "billy", "config", "tools.bash.format", "--nope" }),
+    );
+    try expectOptions(
+        .{ .config = .{ .path = "markdown.format", .value = "" } },
+        try parseArgs(&.{ "billy", "config", "markdown.format", "" }),
+    );
+    // A setting without a value, a value without a setting, an option-shaped
+    // setting, and trailing arguments are all refused.
+    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "config" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "config", "max_turns" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "config", "--nope", "1" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "config", "max_turns", "1", "extra" }));
+}
+
 /// The slices in `Options` are compared by content rather than by pointer.
 fn expectOptions(expected: Options, actual: Options) !void {
     try std.testing.expectEqual(expected.help, actual.help);
@@ -333,5 +394,12 @@ fn expectOptions(expected: Options, actual: Options) !void {
         }
     } else {
         try std.testing.expect(actual.login == null);
+    }
+    if (expected.config) |setting| {
+        const actual_setting = actual.config.?;
+        try std.testing.expectEqualStrings(setting.path, actual_setting.path);
+        try std.testing.expectEqualStrings(setting.value, actual_setting.value);
+    } else {
+        try std.testing.expect(actual.config == null);
     }
 }

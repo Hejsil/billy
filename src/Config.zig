@@ -118,6 +118,27 @@ const Stored = struct {
     resume_blocks: usize = default_resume_blocks,
     tools: Tools = .{},
     markdown: Markdown = .{},
+
+    /// Whether the file is one billy can use: a version it knows, a turn limit
+    /// above zero, and a bash timeout above zero. Zero turns would give the model
+    /// no chance to answer at all, and a zero timeout would kill every command as
+    /// it starts, neither of which is ever what the file is meant to say.
+    fn validate(stored: Stored) !void {
+        if (stored.version > format_version) return error.UnsupportedConfigVersion;
+        if (stored.max_turns == 0) return error.InvalidConfig;
+        if (stored.tools.bash.timeout_s == 0) return error.InvalidConfig;
+    }
+
+    /// Reads the settings of the file back into `config`, the same fields the two
+    /// share, by name. The configuration keeps its own arena, which the file does
+    /// not hold.
+    fn toConfig(stored: Stored, config: *Config) void {
+        inline for (std.meta.fields(Stored)) |field| {
+            if (comptime @hasField(Config, field.name)) {
+                @field(config, field.name) = @field(stored, field.name);
+            }
+        }
+    }
 };
 
 /// Backs every string the configuration holds, which is the format scripts read
@@ -148,6 +169,20 @@ pub fn deinit(config: *Config) void {
     config.arena_state.deinit();
 }
 
+/// The settings of the configuration as they are written to disk. Every field
+/// the file and the configuration share is taken across by name, so a setting
+/// added to both is written without a line here; `version` is the file's own and
+/// has no field in the configuration.
+fn toStored(config: *const Config) Stored {
+    var stored: Stored = .{};
+    inline for (std.meta.fields(Stored)) |field| {
+        if (comptime @hasField(Config, field.name)) {
+            @field(stored, field.name) = @field(config, field.name);
+        }
+    }
+    return stored;
+}
+
 /// Reads the configuration from `dir`, writing `file_name` with the defaults
 /// when it is missing. `dir` must be the directory holding the file.
 ///
@@ -170,18 +205,8 @@ pub fn open(io: Io, dir: Io.Dir, gpa: std.mem.Allocator) !Opened {
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     }) catch return error.CorruptConfig;
-    if (stored.version > format_version) return error.UnsupportedConfigVersion;
-    // Zero turns would give the model no chance to answer at all, which is
-    // never what the file is meant to say.
-    if (stored.max_turns == 0) return error.InvalidConfig;
-    // A zero timeout would kill every command as it starts, which is never
-    // what the file is meant to say either.
-    if (stored.tools.bash.timeout_s == 0) return error.InvalidConfig;
-
-    config.max_turns = stored.max_turns;
-    config.resume_blocks = stored.resume_blocks;
-    config.tools = stored.tools;
-    config.markdown = stored.markdown;
+    try stored.validate();
+    stored.toConfig(&config);
     return .{ .config = config, .created = false };
 }
 
@@ -198,17 +223,199 @@ pub fn save(config: *const Config, io: Io, dir: Io.Dir) !void {
     var buffer: [4096]u8 = undefined;
     var file: Io.File.Writer = .init(atomic.file, io, &buffer);
     try std.json.Stringify.value(
-        Stored{
-            .max_turns = config.max_turns,
-            .resume_blocks = config.resume_blocks,
-            .tools = config.tools,
-            .markdown = config.markdown,
-        },
+        config.toStored(),
         .{ .whitespace = .indent_2 },
         &file.interface,
     );
     try file.flush();
     try atomic.replace(io);
+}
+
+// A setting that lives in the configuration but never reaches the file is half
+// a setting, so one added without the other is a mistake worth stopping over.
+// The version belongs to the file alone, and the arena to the configuration.
+comptime {
+    for (std.meta.fields(Config)) |field| {
+        if (std.mem.eql(u8, field.name, "arena_state")) continue;
+        if (!@hasField(Stored, field.name)) {
+            @compileError("Config." ++ field.name ++ " would not be saved: add it to Stored as well");
+        }
+    }
+    for (std.meta.fields(Stored)) |field| {
+        if (std.mem.eql(u8, field.name, "version")) continue;
+        if (!@hasField(Config, field.name)) {
+            @compileError("Stored." ++ field.name ++ " has no field in Config: add one so it is read back");
+        }
+    }
+}
+
+/// Sets the option named by the dotted `path` -- such as `tools.bash.format` --
+/// to `value`, the text a user typed. The path names a field of the settings
+/// and, dot by dot, the sections it lives in; the value is read as that field's
+/// type, a string kept as it is and `null` clearing an optional setting. Every
+/// field the configuration declares is reachable, so a setting added to it is
+/// settable without anything here changing.
+///
+/// The result is checked the way a file read is, and written into the
+/// configuration only once it passes, so a value that would make the
+/// configuration unusable, such as a zero timeout, is refused rather than
+/// stored. Strings are kept in the configuration's own arena.
+pub fn set(config: *Config, path: []const u8, value: []const u8) !void {
+    var stored = config.toStored();
+    try setPath(Stored, &stored, path, config.arena_state.allocator(), value);
+    // A value that would make the configuration one the next read refuses, such
+    // as a zero timeout, is a value this setting does not take.
+    stored.validate() catch |err| switch (err) {
+        error.InvalidConfig => return error.InvalidValue,
+        else => |other| return other,
+    };
+    stored.toConfig(config);
+}
+
+/// Walks `path` into `target` one field at a time and sets the leaf it names.
+/// The field is found by name at run time, but the descent is compiled section
+/// by section, so a field no path can name is skipped rather than walked into.
+fn setPath(
+    comptime T: type,
+    target: *T,
+    path: []const u8,
+    arena: std.mem.Allocator,
+    value: []const u8,
+) !void {
+    const segment = nextSegment(path);
+    if (segment.head.len == 0) return error.UnknownOption;
+
+    inline for (std.meta.fields(T)) |field| {
+        // The version is the file's own, not a setting a path names.
+        if (comptime !std.mem.eql(u8, field.name, "version") and isSettable(field.type)) {
+            if (std.mem.eql(u8, field.name, segment.head)) {
+                if (segment.rest.len == 0) {
+                    if (comptime @typeInfo(field.type) == .@"struct") return error.NotASection;
+                    @field(target, field.name) = try parseValue(field.type, arena, value);
+                    return;
+                }
+                if (comptime @typeInfo(field.type) == .@"struct") {
+                    return setPath(field.type, &@field(target, field.name), segment.rest, arena, value);
+                }
+                return error.NotASection;
+            }
+        }
+    }
+    return error.UnknownOption;
+}
+
+/// The first dotted segment of `path`, and the rest that follows it. The rest is
+/// empty when the segment is the last, which is the value the path names.
+const Segment = struct { head: []const u8, rest: []const u8 };
+
+fn nextSegment(path: []const u8) Segment {
+    if (std.mem.indexOfScalar(u8, path, '.')) |dot| {
+        return .{ .head = path[0..dot], .rest = path[dot + 1 ..] };
+    }
+    return .{ .head = path, .rest = "" };
+}
+
+/// Reads `value` as a `T`: a string as itself, a number from its digits, a
+/// boolean from true or false, an enum from a variant's name, and an optional
+/// as null when it says `null` or as its child otherwise. A string is copied
+/// into `arena`, which owns it.
+fn parseValue(comptime T: type, arena: std.mem.Allocator, value: []const u8) error{ InvalidValue, OutOfMemory }!T {
+    switch (@typeInfo(T)) {
+        .optional => |optional| {
+            if (std.mem.eql(u8, value, "null")) return null;
+            return try parseValue(optional.child, arena, value);
+        },
+        .int => return std.fmt.parseInt(T, value, 10) catch error.InvalidValue,
+        .bool => {
+            if (std.mem.eql(u8, value, "true")) return true;
+            if (std.mem.eql(u8, value, "false")) return false;
+            return error.InvalidValue;
+        },
+        .@"enum" => return std.meta.stringToEnum(T, value) orelse error.InvalidValue,
+        .pointer => |pointer| {
+            if (comptime pointer.size != .slice or pointer.child != u8) {
+                @compileError("cannot set a " ++ @typeName(T) ++ " from the command line");
+            }
+            return arena.dupe(u8, value);
+        },
+        else => @compileError("cannot set a " ++ @typeName(T) ++ " from the command line"),
+    }
+}
+
+/// Whether a value of `T` is one a path can name: a string, a number, a boolean,
+/// an enum, an optional of one of those, or a struct whose fields are all such
+/// values, section by section. Anything else is not a setting the file holds, so
+/// a path never reaches it and the walk leaves it alone.
+fn isSettable(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .optional => |optional| isSettable(optional.child),
+        .int, .bool => true,
+        .@"enum" => true,
+        .pointer => |pointer| pointer.size == .slice and pointer.child == u8,
+        .@"struct" => |structure| blk: {
+            for (structure.fields) |field| {
+                if (!isSettable(field.type)) break :blk false;
+            }
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+/// Runs the `config` command: sets the option named by `path` to `value` and
+/// writes the configuration back, so a setting can be changed without opening
+/// the file by hand. The file is found the way a run finds it, under the
+/// directory `defaultDir` names, and `gpa` backs the configuration's own arena
+/// while it is read and written.
+pub fn run(
+    io: Io,
+    out: *Io.Writer,
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    path: []const u8,
+    value: []const u8,
+) !void {
+    const dir_path = defaultDir(arena, environ) catch |err| {
+        std.log.err("cannot find where to store the configuration: {s}", .{@errorName(err)});
+        return err;
+    };
+    var dir = Io.Dir.cwd().createDirPathOpen(io, dir_path, .{}) catch |err| {
+        std.log.err("cannot use {s} for the configuration: {s}", .{ dir_path, @errorName(err) });
+        return err;
+    };
+    defer dir.close(io);
+
+    var opened = open(io, dir, gpa) catch |err| {
+        std.log.err("cannot read the configuration in {s}: {s}", .{ dir_path, @errorName(err) });
+        return err;
+    };
+    defer opened.config.deinit();
+
+    set(&opened.config, path, value) catch |err| switch (err) {
+        error.UnknownOption => {
+            std.log.err("'{s}' is not a configuration setting", .{path});
+            return err;
+        },
+        error.NotASection => {
+            std.log.err("'{s}' names a section, not a setting", .{path});
+            return err;
+        },
+        error.InvalidValue => {
+            std.log.err("'{s}' is not something {s} takes", .{ value, path });
+            return err;
+        },
+        else => |other| return other,
+    };
+    opened.config.save(io, dir) catch |err| {
+        std.log.err("cannot write the configuration in {s}: {s}", .{ dir_path, @errorName(err) });
+        return err;
+    };
+    try out.print("set {s} to {s} in {s}\n", .{
+        path,
+        value,
+        try std.fs.path.join(arena, &.{ dir_path, file_name }),
+    });
 }
 
 /// The directory holding the configuration: `$XDG_CONFIG_HOME/billy`, or
@@ -498,4 +705,123 @@ test "open rejects damaged, future and unusable configurations" {
         .data = "{\"tools\":{\"bash\":{\"timeout_s\":0}}}",
     });
     try std.testing.expectError(error.InvalidConfig, Config.open(std.testing.io, tmp.dir, std.testing.allocator));
+}
+
+test "set names a setting by its dotted path" {
+    var config = Config.init(std.testing.allocator);
+    defer config.deinit();
+
+    try config.set("tools.bash.format", "shfmt | bat -l bash");
+    try std.testing.expectEqualStrings("shfmt | bat -l bash", config.tools.bash.format.?);
+
+    try config.set("tools.bash.timeout_s", "30");
+    try std.testing.expectEqual(30, config.tools.bash.timeout_s);
+
+    try config.set("tools.edit.format", "delta --paging=never");
+    try std.testing.expectEqualStrings("delta --paging=never", config.tools.edit.format.?);
+
+    try config.set("max_turns", "7");
+    try std.testing.expectEqual(7, config.max_turns);
+
+    try config.set("resume_blocks", "0");
+    try std.testing.expectEqual(0, config.resume_blocks);
+
+    try config.set("tools.web_search.provider", "tavily");
+    try std.testing.expectEqual(search.Provider.tavily, config.tools.web_search.provider.?);
+    try config.set("tools.web_search.max_results", "3");
+    try std.testing.expectEqual(3, config.tools.web_search.max_results);
+
+    try config.set("markdown.format", "glow -");
+    try std.testing.expectEqualStrings("glow -", config.markdown.format.?);
+}
+
+test "set writes null to clear a setting that has no value" {
+    var config = Config.init(std.testing.allocator);
+    defer config.deinit();
+
+    try config.set("tools.edit.format", "delta");
+    try config.set("tools.edit.format", "null");
+    try std.testing.expect(config.tools.edit.format == null);
+
+    try config.set("tools.web_search.provider", "tavily");
+    try config.set("tools.web_search.provider", "null");
+    try std.testing.expect(config.tools.web_search.provider == null);
+}
+
+test "set refuses a setting that is unknown, a section, or a bad value" {
+    var config = Config.init(std.testing.allocator);
+    defer config.deinit();
+
+    // A path that names no field, at the top or inside a section.
+    try std.testing.expectError(error.UnknownOption, config.set("nope", "1"));
+    try std.testing.expectError(error.UnknownOption, config.set("tools.nope", "1"));
+    // The version is the file's own, not a setting.
+    try std.testing.expectError(error.UnknownOption, config.set("version", "2"));
+    // A section is walked into, not set from one string, and a value has nothing
+    // below it.
+    try std.testing.expectError(error.NotASection, config.set("tools", "x"));
+    try std.testing.expectError(error.NotASection, config.set("tools.bash.format.x", "y"));
+    // Text that is not the kind of value the setting takes.
+    try std.testing.expectError(error.InvalidValue, config.set("tools.bash.timeout_s", "soon"));
+    try std.testing.expectError(error.InvalidValue, config.set("tools.web_search.provider", "google"));
+    // A value the file itself would refuse is refused before it is written, and
+    // the setting keeps what it had.
+    try std.testing.expectError(error.InvalidValue, config.set("tools.bash.timeout_s", "0"));
+    try std.testing.expectError(error.InvalidValue, config.set("max_turns", "0"));
+    try std.testing.expectEqual(default_timeout_s, config.tools.bash.timeout_s);
+    try std.testing.expectEqual(default_max_turns, config.max_turns);
+}
+
+test "a setting set by path is written and read back" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var config = Config.init(std.testing.allocator);
+    defer config.deinit();
+    try config.set("tools.bash.format", "shfmt");
+    try config.set("tools.bash.timeout_s", "45");
+    try config.set("tools.web_search.provider", "tavily");
+    try config.set("markdown.format", "glow -");
+    try config.save(std.testing.io, tmp.dir);
+
+    var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer opened.config.deinit();
+    try std.testing.expectEqualStrings("shfmt", opened.config.tools.bash.format.?);
+    try std.testing.expectEqual(45, opened.config.tools.bash.timeout_s);
+    try std.testing.expectEqual(search.Provider.tavily, opened.config.tools.web_search.provider.?);
+    try std.testing.expectEqualStrings("glow -", opened.config.markdown.format.?);
+}
+
+test "run sets a setting in the file, creating it when it is missing" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The configuration is found under XDG_CONFIG_HOME, which is pointed at the
+    // temporary directory so the run writes there rather than at the user's own.
+    const cwd = try std.process.currentPathAlloc(std.testing.io, arena);
+    const xdg = try std.fs.path.join(arena, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    var environ: std.process.Environ.Map = .init(arena);
+    defer environ.deinit();
+    try environ.put("XDG_CONFIG_HOME", xdg);
+
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try run(std.testing.io, &sink.writer, arena, gpa, &environ, "tools.bash.format", "shfmt");
+
+    const dir_path = try std.fs.path.join(arena, &.{ xdg, app_dir });
+    var dir = try Io.Dir.cwd().createDirPathOpen(std.testing.io, dir_path, .{});
+    defer dir.close(std.testing.io);
+    var opened = try Config.open(std.testing.io, dir, gpa);
+    defer opened.config.deinit();
+    try std.testing.expectEqualStrings("shfmt", opened.config.tools.bash.format.?);
+    // The other settings keep their defaults, so the file is a whole one.
+    try std.testing.expectEqual(default_max_turns, opened.config.max_turns);
+    // The message names the setting and the file it was written to.
+    try std.testing.expect(std.mem.indexOf(u8, sink.written(), "tools.bash.format") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sink.written(), file_name) != null);
 }
