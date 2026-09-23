@@ -31,6 +31,10 @@ pub const default_max_results = 5;
 pub const default_timeout_s = 120;
 /// Blocks a resumed session replays when the file asks for nothing else.
 pub const default_resume_blocks = 10;
+/// How full the context window must be, as a whole percentage, before the
+/// conversation is compacted into a summary, when the file asks for nothing
+/// else.
+pub const default_compact_at = 80;
 
 /// What `open` found, including whether the file had to be written.
 pub const Opened = struct {
@@ -116,6 +120,9 @@ const Stored = struct {
     max_turns: usize = default_max_turns,
     /// Blocks to replay on a resume. Zero shows the whole session.
     resume_blocks: usize = default_resume_blocks,
+    /// How full the context window must be, as a whole percentage, before the
+    /// conversation is compacted into a summary. Zero turns compaction off.
+    compact_at: usize = default_compact_at,
     tools: Tools = .{},
     markdown: Markdown = .{},
 
@@ -152,6 +159,10 @@ max_turns: usize = default_max_turns,
 /// How many of the most recent blocks a resumed session replays, so resuming a
 /// long conversation is quick. Zero replays the whole session.
 resume_blocks: usize = default_resume_blocks,
+/// How full the context window must be, as a whole percentage, before the
+/// conversation is compacted into a summary, so a long session keeps going
+/// rather than failing on an overlong request. Zero turns compaction off.
+compact_at: usize = default_compact_at,
 /// Settings for the tools the agent can call, by tool name.
 tools: Tools = .{},
 /// Settings for the markdown billy shows: the replies it writes and the
@@ -514,6 +525,31 @@ test "open reads the block count a resume replays from the file" {
     try std.testing.expectEqual(0, whole.config.resume_blocks);
 }
 
+test "open reads the compaction threshold from the file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = file_name,
+        .data = "{\"compact_at\":50}",
+    });
+    var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer opened.config.deinit();
+    try std.testing.expectEqual(50, opened.config.compact_at);
+
+    // A file without it falls back to the default.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{}" });
+    var bare = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer bare.config.deinit();
+    try std.testing.expectEqual(default_compact_at, bare.config.compact_at);
+
+    // Zero turns compaction off; it is a setting, not a mistake.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{\"compact_at\":0}" });
+    var off = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer off.config.deinit();
+    try std.testing.expectEqual(0, off.config.compact_at);
+}
+
 test "open reads the markdown format from the file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -648,6 +684,7 @@ test "the file is indented, so it can be read and edited by hand" {
         \\  "version": 1,
         \\  "max_turns": 3,
         \\  "resume_blocks": 10,
+        \\  "compact_at": 80,
         \\  "tools": {
         \\    "bash": {
         \\      "format": null,
@@ -725,6 +762,11 @@ test "set names a setting by its dotted path" {
 
     try config.set("resume_blocks", "0");
     try std.testing.expectEqual(0, config.resume_blocks);
+
+    try config.set("compact_at", "60");
+    try std.testing.expectEqual(60, config.compact_at);
+    try config.set("compact_at", "0");
+    try std.testing.expectEqual(0, config.compact_at);
 
     try config.set("tools.web_search.provider", "tavily");
     try std.testing.expectEqual(search.Provider.tavily, config.tools.web_search.provider.?);

@@ -31,6 +31,12 @@ pub const Config = struct {
     /// prices. Null for a model billy does not know, in which case the header
     /// leaves out the context gauge and the cost.
     model_info: ?models.Metadata,
+    /// How full the context window must be, as a whole percentage, before the
+    /// conversation is compacted into a summary. Zero turns compaction off.
+    /// Nothing is compacted for a model whose window is unknown, since there is
+    /// then no threshold to measure the conversation against. The value mirrors
+    /// the configuration's, so a test can leave it out.
+    compact_at: usize = 80,
     /// How what billy shows is laid out and decorated, from the configuration.
     display: Display = .{},
     /// Web search, when the configuration names a backend and its key is set.
@@ -148,11 +154,14 @@ fn sameDir(io: Io, a: Io.Dir, b: Io.Dir) bool {
 /// replayed session looks like the run it continues.
 const prompt = "> ";
 
-/// The marks the two halves of the conversation are headed by. Neither is a
-/// tool, so neither carries a tool's glyph.
+/// The marks the messages of the transcript are headed by. None of them is a
+/// tool, so none carries a tool's glyph.
 const marks = struct {
     const prompt = styling.Mark{ .glyph = "»", .hue = .blue };
     const answer = styling.Mark{ .glyph = "◆", .hue = .green };
+    /// The line a compaction shows as, standing in for the prompt that asked for
+    /// it and the summary it produced.
+    const compacted = styling.Mark{ .glyph = "⊟", .hue = .yellow };
 };
 
 /// Writes the header line shown above the input prompt: the session id, the
@@ -330,6 +339,14 @@ pub fn run(
     var header: std.Io.Writer.Allocating = .init(gpa);
     defer header.deinit();
     while (true) {
+        // The conversation is compacted here, between prompts: the turn before
+        // has finished and the one about to be typed has not started, so the
+        // summary lands where the history it stands in for ended. It runs before
+        // the header is built, so the header then reports the smaller
+        // conversation. Doing nothing is not an error: the prompt goes on with
+        // the conversation as it is.
+        maybeCompact(io, &client, out, config, session) catch |err|
+            std.log.warn("compaction failed: {s}", .{@errorName(err)});
         header.clearRetainingCapacity();
         try sessionHeader(&header.writer, config, session.id(), session.context_tokens, session.cost);
         const line = (try editor.readLine(header.written(), prompt)) orelse break;
@@ -415,7 +432,7 @@ fn transcriptTrim(session: *const Session, blocks: usize) Trim {
     var remaining = blocks;
     while (index > 0 and remaining > 0) {
         index -= 1;
-        const count = blocksIn(session, messages[index]);
+        const count = blocksIn(session, messages, index);
         if (count <= remaining) {
             remaining -= count;
         } else {
@@ -428,18 +445,25 @@ fn transcriptTrim(session: *const Session, blocks: usize) Trim {
     }
 
     var elided = skip;
-    for (messages[0..index]) |message| elided += blocksIn(session, message);
+    for (0..index) |earlier| elided += blocksIn(session, messages, earlier);
     return .{ .index = index, .skip = skip, .elided = elided };
 }
 
 /// How many blocks one message prints: a prompt or a reply is one, a
 /// tool-calling message is one per call, and a tool result is none, since it
 /// shows as part of the call it answers. A system prompt is never shown.
-fn blocksIn(session: *const Session, message: Session.Message) usize {
-    const role = session.roleOf(message);
+///
+/// A compaction shows as one block, at the summary that stands in for it, so the
+/// prompt that asked for it counts as nothing.
+fn blocksIn(session: *const Session, messages: []const Session.Message, index: usize) usize {
+    if (session.isCompaction(index)) return 1;
+    // The message before a summary is the prompt that asked for the compaction
+    // it produced, which shares the summary's one block.
+    if (session.isCompaction(index + 1)) return 0;
+    const role = session.roleOf(messages[index]);
     if (std.mem.eql(u8, role, "user")) return 1;
     if (!std.mem.eql(u8, role, "assistant")) return 0;
-    const calls = session.callCount(message);
+    const calls = session.callCount(messages[index]);
     return if (calls == 0) 1 else calls;
 }
 
@@ -472,6 +496,11 @@ fn printMessage(
     display: Display,
     skip: usize,
 ) !void {
+    // A compaction shows as a single line, printed where the summary that stands
+    // in for it is; the prompt that asked for it, just before, prints nothing.
+    if (session.isCompaction(index)) return printCompacted(out, display.style);
+    if (session.isCompaction(index + 1)) return;
+
     const role = session.roleOf(message);
     if (std.mem.eql(u8, role, "user")) {
         // A prompt from the session opens a block like everything else in the
@@ -510,7 +539,22 @@ fn turn(
     session: *Session,
 ) !void {
     var remaining: usize = config.max_turns;
+    // A compaction that failed is not tried again within the same turn, so a
+    // provider that will not summarize cannot turn every request of a long turn
+    // into a second failed one. The next turn tries afresh.
+    var compact_failed = false;
     while (remaining > 0) : (remaining -= 1) {
+        // A conversation that has outgrown the context window is compacted
+        // before the request that would carry it, so a long session goes on
+        // instead of failing on an overlong request. A failure to compact is not
+        // the turn's: the request goes out with the conversation as it is.
+        if (!compact_failed) {
+            maybeCompact(io, client, out, config, session) catch |err| {
+                std.log.warn("compaction failed: {s}", .{@errorName(err)});
+                compact_failed = true;
+            };
+        }
+
         // The completion owns its parsed reply, and each tool result lives in the
         // tool set's scratch, so the turn allocates nothing of its own: the
         // conversation is written straight onto the connection out of the pool,
@@ -548,6 +592,111 @@ fn turn(
 fn rateNow(io: Io, config: Config) models.Price {
     const info = config.model_info orelse return .{};
     return info.priceAt(@intCast(Io.Clock.now(.real, io).toSeconds()));
+}
+
+/// Sent as the last message of a compaction request, and stored with the summary
+/// it produces so the pair reads as a question and its answer. It is never sent
+/// to the model again: a request starts at the summary, not at the prompt.
+const compact_prompt =
+    \\The conversation above is being compacted to free room in the context
+    \\window. Write a summary of it that lets the work continue as if the
+    \\earlier messages were still here. Cover the user's goals, what was decided
+    \\and why, the files and functions that were changed and their current
+    \\state, anything that was tried and did not work, and what is still to be
+    \\done. Be specific: name the files, the functions and the commands. Reply
+    \\with the summary alone, as plain text.
+;
+
+/// The number of tokens the conversation may reach before it is compacted. Zero
+/// when compaction is off, or when the model's window is unknown and there is
+/// then no threshold to measure a conversation against.
+fn compactThreshold(config: Config) usize {
+    if (config.compact_at == 0) return 0;
+    const info = config.model_info orelse return 0;
+    return info.context_window * config.compact_at / 100;
+}
+
+/// Compacts the conversation into a summary when it has filled the context
+/// window past the threshold, so that a long session goes on rather than failing
+/// on the next request.
+///
+/// The summary is added to the end of the session and recorded in its list of
+/// compactions, and every request from then on carries only that summary and
+/// what follows it (`Session.sentFrom`). The session itself keeps every message,
+/// so the transcript still shows the whole history. Doing nothing here is not an
+/// error: the conversation is left as it was and the request goes out with it,
+/// which is what would have happened without compaction at all.
+fn maybeCompact(
+    io: Io,
+    client: *llm.Client,
+    out: *Io.Writer,
+    config: Config,
+    session: *Session,
+) !void {
+    const threshold = compactThreshold(config);
+    if (threshold == 0 or session.context_tokens < threshold) return;
+
+    // Nothing has been added since the last compaction, so there is nothing new
+    // to fold in: compacting again would only summarize the summary, and would
+    // do so on every request.
+    const start = session.sentFrom();
+    if (session.messages.items.len - start <= 1) return;
+
+    const summary = try summarize(io, client, config, session) orelse return;
+    defer client.gpa.free(summary);
+
+    // The conversation a request now carries is the summary and little else, so
+    // its size is not known until the next request reports one. Clearing the
+    // gauge before the compaction is written means the file records the cleared
+    // size, so a resumed session does not read a stale one and compact again off
+    // it.
+    session.context_tokens = 0;
+    try session.appendCompaction(compact_prompt, summary);
+    try printCompacted(out, config.display.style);
+}
+
+/// One request that asks the model to summarize the conversation it is being
+/// sent, returning the summary text, owned by the caller, or null when the model
+/// answered with no text.
+///
+/// The conversation is sent as a request would carry it, system prompt and tool
+/// calls and results included, so the model reads what actually happened, with
+/// the compacting prompt after it. The request cost real tokens, so it is billed
+/// like any other, but it must not move the context gauge: the conversation it
+/// was sent is about to be replaced by something far smaller.
+fn summarize(
+    io: Io,
+    client: *llm.Client,
+    config: Config,
+    session: *Session,
+) !?[]const u8 {
+    var scratch_state = std.heap.ArenaAllocator.init(client.gpa);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+
+    const sent = try session.resolveSend(scratch);
+    const request = try scratch.alloc(llm.Message, sent.len + 1);
+    @memcpy(request[0..sent.len], sent);
+    request[sent.len] = .{ .role = "user", .content = compact_prompt };
+
+    const completion = try client.complete(client.gpa, request, session.toolSet());
+    defer completion.deinit();
+    session.recordCost(completion.usage, costOf(rateNow(io, config), completion.usage));
+
+    const content = completion.message.content orelse return null;
+    if (content.len == 0) return null;
+    return try client.gpa.dupe(u8, content);
+}
+
+/// Prints the one line that stands in for a compaction: the prompt that asked
+/// for it and the summary it produced are both kept in the session, so a run
+/// that compacts shows the event rather than the two messages. It is headed like
+/// every other block, with its own mark, and opens with the blank line that
+/// separates it from the block before it.
+fn printCompacted(out: *Io.Writer, style: styling.Style) !void {
+    try out.writeAll("\n");
+    try styling.header(marks.compacted, "compacted", "", style, out);
+    try out.flush();
 }
 
 /// Prints a prompt as its own block: the `» prompt` header, then the text, laid
@@ -797,6 +946,76 @@ test "a prompt and a reply are headed alike, in the colours of the display" {
         null,
         .ansi,
     );
+}
+
+test "printTranscript shows a compaction as a single line" {
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    try session.append(.{ .role = "system", .content = "be terse" });
+    try session.append(.{ .role = "user", .content = "one" });
+    try session.append(.{ .role = "assistant", .content = "a1" });
+    try session.appendCompaction("summarize this", "the summary");
+    try session.append(.{ .role = "user", .content = "two" });
+    try session.append(.{ .role = "assistant", .content = "a2" });
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // The prompt that asked for the compaction and the summary it produced show
+    // as one line, headed like every other block, and the rest of the history
+    // shows as it always did.
+    try printTranscript(gpa, &out.writer, &session, .{}, 0);
+    try std.testing.expectEqualStrings(
+        "\n» prompt\none\n\n" ++
+            "◆ answer\na1\n" ++
+            "\n⊟ compacted\n" ++
+            "\n» prompt\ntwo\n\n" ++
+            "◆ answer\na2\n",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+
+    // The pair counts as one block, so a trim that keeps the last three blocks
+    // starts at the compaction and counts what came before it.
+    try printTranscript(gpa, &out.writer, &session, .{}, 3);
+    try std.testing.expectEqualStrings(
+        "… 2 earlier blocks\n" ++
+            "\n⊟ compacted\n" ++
+            "\n» prompt\ntwo\n\n" ++
+            "◆ answer\na2\n",
+        out.written(),
+    );
+}
+
+test "a compaction is headed by its own mark, and hides what it stands for" {
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    try session.append(.{ .role = "system", .content = "s" });
+    try session.append(.{ .role = "user", .content = "hi" });
+    try session.appendCompaction("ASKEDFORTHEcompaction", "THESUMMARYTEXT");
+    try session.append(.{ .role = "user", .content = "next" });
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try printTranscript(gpa, &out.writer, &session, .{ .style = .ansi }, 0);
+
+    // The line carries the compaction mark: the glyph in its colour and the name
+    // in bold, the way every other block header is written.
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b[33m⊟\x1b[0m \x1b[1mcompacted\x1b[0m") != null);
+    // Neither the prompt that asked for the compaction nor the summary it
+    // produced is shown: the one line stands in for both.
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "ASKEDFORTHEcompaction") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "THESUMMARYTEXT") == null);
 }
 
 test "printTranscript gives each call the result that names it" {
@@ -1122,3 +1341,224 @@ test "sameDir tells a directory from its parent and root from itself" {
     defer root_up.close(io);
     try std.testing.expect(sameDir(io, root, root_up));
 }
+
+test "the compaction threshold is the configured share of the window, or off" {
+    // A model without a known window has nothing to measure a conversation
+    // against, so there is no threshold even with compaction on.
+    try std.testing.expectEqual(0, compactThreshold(testConfig("m", "/work", null)));
+
+    var config = testConfig("m", "/work", null);
+    config.model_info = .{
+        .provider = .deepseek,
+        .model = "m",
+        .context_window = 1000,
+        .price = .{},
+    };
+
+    // The default is a share of the window, not the whole of it.
+    try std.testing.expectEqual(800, compactThreshold(config));
+
+    // Zero turns it off.
+    config.compact_at = 0;
+    try std.testing.expectEqual(0, compactThreshold(config));
+
+    // Any share the file names, whether or not it divides the window evenly.
+    config.compact_at = 50;
+    try std.testing.expectEqual(500, compactThreshold(config));
+    config.compact_at = 33;
+    try std.testing.expectEqual(330, compactThreshold(config));
+}
+
+test "maybeCompact folds the conversation into a summary at its end" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    try session.append(.{ .role = "system", .content = "be terse" });
+    try session.append(.{ .role = "user", .content = "OLDPROMPT" });
+    try session.append(.{ .role = "assistant", .tool_calls = &.{.{
+        .id = "call_x",
+        .function = .{ .name = "bash", .arguments = "{}" },
+    }} });
+    try session.append(.{ .role = "tool", .tool_call_id = "call_x", .content = "OLDTOOLOUTPUT" });
+    try session.append(.{ .role = "assistant", .content = "OLDANSWER" });
+
+    var config = testConfig("m", "/work", null);
+    config.model_info = .{
+        .provider = .deepseek,
+        .model = "m",
+        .context_window = 1000,
+        .price = .{},
+    };
+    config.compact_at = 80;
+    // A conversation that has filled the window past the threshold.
+    session.context_tokens = 900;
+
+    // A server standing in for the model, answering the compaction request with
+    // a fixed summary and recording the body it was sent.
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+
+    var provider: SummaryProvider = .{};
+    defer if (provider.body) |body| gpa.free(body);
+
+    var group: Io.Group = .init;
+    try group.concurrent(io, SummaryProvider.serve, .{ io, &listener, &provider });
+
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/chat/completions", .{
+        listener.socket.address.getPort(),
+    });
+    defer gpa.free(url);
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+    var client: llm.Client = .{
+        .gpa = gpa,
+        .io = io,
+        .api_key = "k",
+        .url = url,
+        .model = "m",
+        .http = &http,
+    };
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try maybeCompact(io, &client, &out.writer, config, &session);
+
+    try group.await(io);
+    if (provider.err) |err| return err;
+
+    // The request carried the whole conversation, tool call and result included,
+    // with the compacting prompt after it.
+    const body = provider.body.?;
+    try std.testing.expect(std.mem.indexOf(u8, body, "OLDPROMPT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "call_x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "OLDTOOLOUTPUT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "OLDANSWER") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "free room in the context") != null);
+
+    // The prompt and the summary are added to the end of the session, which keeps
+    // every message it had. The summary is a user message.
+    try std.testing.expectEqual(7, session.messages.items.len);
+    try std.testing.expectEqualStrings("user", session.roleOf(session.messages.items[5]));
+    try std.testing.expectEqualStrings("user", session.roleOf(session.messages.items[6]));
+    try std.testing.expectEqualStrings("the summary", session.contentOf(session.messages.items[6]).?);
+    // A request now starts at the summary, skipping the prompt and everything
+    // the summary stands in for.
+    try std.testing.expectEqual(6, session.sentFrom());
+    try std.testing.expect(session.isCompaction(6));
+
+    // The compaction request was billed, but the gauge it would set is dropped
+    // since the conversation it measured has just been replaced.
+    try std.testing.expectEqual(105, session.usage.total_tokens);
+    try std.testing.expectEqual(0, session.context_tokens);
+
+    // The user is told, in one line, that the conversation was compacted.
+    try std.testing.expectEqualStrings("\n⊟ compacted\n", out.written());
+}
+
+test "maybeCompact does nothing below the threshold, off, or with nothing new" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    try session.append(.{ .role = "system", .content = "s" });
+    try session.append(.{ .role = "user", .content = "hello" });
+
+    var config = testConfig("m", "/work", null);
+    config.model_info = .{ .provider = .deepseek, .model = "m", .context_window = 1000, .price = .{} };
+
+    // There is no client: the function must return before it reaches for one.
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // Below the threshold.
+    session.context_tokens = 100;
+    try maybeCompact(io, undefined, &out.writer, config, &session);
+    // Turned off.
+    session.context_tokens = 999;
+    config.compact_at = 0;
+    try maybeCompact(io, undefined, &out.writer, config, &session);
+    // A model with no known window has no threshold to measure against.
+    config.compact_at = 80;
+    config.model_info = null;
+    try maybeCompact(io, undefined, &out.writer, config, &session);
+
+    // Nothing was added, and nothing was printed.
+    try std.testing.expectEqual(2, session.messages.items.len);
+    try std.testing.expectEqualStrings("", out.written());
+}
+
+test "maybeCompact does not compact a summary that stands alone" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    try session.append(.{ .role = "system", .content = "s" });
+    try session.appendCompaction("p", "a summary");
+
+    var config = testConfig("m", "/work", null);
+    config.model_info = .{ .provider = .deepseek, .model = "m", .context_window = 1000, .price = .{} };
+
+    // Over the threshold, but the last message is the summary itself, so there is
+    // nothing new to fold in and a request would only re-summarize it.
+    session.context_tokens = 999;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try maybeCompact(io, undefined, &out.writer, config, &session);
+
+    try std.testing.expectEqual(3, session.messages.items.len);
+    try std.testing.expectEqualStrings("", out.written());
+}
+
+/// A stand-in for the model on the wire, for the compaction tests: it answers
+/// the one summarization request with a fixed summary, recording the body so the
+/// test can check what was sent. It mirrors the provider the client tests use.
+const SummaryProvider = struct {
+    /// The request body as it arrived, owned by `std.testing.allocator`.
+    body: ?[]u8 = null,
+    /// The first failure the server ran into, so the test reports it rather than
+    /// hanging on the connection.
+    err: ?anyerror = null,
+
+    fn serve(io: Io, listener: *std.Io.net.Server, self: *SummaryProvider) Io.Cancelable!void {
+        self.run(io, listener) catch |err| {
+            self.err = err;
+        };
+    }
+
+    fn run(self: *SummaryProvider, io: Io, listener: *std.Io.net.Server) !void {
+        var stream = try listener.accept(io);
+        defer stream.close(io);
+
+        var in_buffer: [4096]u8 = undefined;
+        var out_buffer: [4096]u8 = undefined;
+        var reader = stream.reader(io, &in_buffer);
+        var writer = stream.writer(io, &out_buffer);
+        var server: std.http.Server = .init(&reader.interface, &writer.interface);
+
+        var request = try server.receiveHead();
+        var body_buffer: [4096]u8 = undefined;
+        const body_reader = request.readerExpectNone(&body_buffer);
+        self.body = try body_reader.allocRemaining(std.testing.allocator, .unlimited);
+
+        try request.respond(
+            "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"the summary\"}}]," ++
+                "\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"total_tokens\":105}}",
+            .{ .keep_alive = false },
+        );
+    }
+};

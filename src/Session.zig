@@ -27,7 +27,7 @@ const extension = ".json";
 /// and is written from the front, so there is always a byte left to end the id.
 const max_id_len = 64;
 /// Layout of a session file, bumped when its shape changes.
-const format_version = 1;
+const format_version = 2;
 /// Longest session file read back, so a damaged file cannot exhaust memory.
 const max_session_bytes = 64 << 20;
 
@@ -51,6 +51,13 @@ const Stored = struct {
     version: u32 = format_version,
     /// The conversation, oldest first.
     messages: []const llm.Message = &.{},
+    /// Indices into `messages`, sorted, of the summaries a compaction produced.
+    /// A request starts at the last of them, so everything before it, which the
+    /// summary stands in for, is left out. The prompt that asked for the
+    /// compaction is the message just before its summary; it is stored so the
+    /// two read as a question and its answer, and shows in the transcript as one
+    /// line along with the summary.
+    compactions: []const usize = &.{},
     /// The tool definitions the conversation was started with.
     tools: []const StoredTool = &.{},
     /// Tokens billed over the whole session, summed over every request.
@@ -203,6 +210,13 @@ tool_calls: std.ArrayList(ToolCall) = .empty,
 /// The conversation, oldest first, starting with the system prompt.
 messages: std.ArrayList(Message) = .empty,
 
+/// Indices into `messages`, sorted and without repeats, of the summaries a
+/// compaction produced. Keeping them as a list rather than a flag on every
+/// message costs four bytes per compaction instead of a byte on every message,
+/// and is what a request and a transcript read to know where the conversation
+/// now starts.
+compactions: std.ArrayList(u32) = .empty,
+
 /// The tool definitions sent with every request. Stored in the session so a
 /// resume offers the model the same tools as the run it continues. The whole set
 /// is one array `deinit` frees; every string in it is interned in the pool.
@@ -268,6 +282,7 @@ pub fn deinit(session: *Session) void {
     session.interned.deinit(session.gpa);
     session.tool_calls.deinit(session.gpa);
     session.messages.deinit(session.gpa);
+    session.compactions.deinit(session.gpa);
     session.gpa.free(session.tools);
     session.gpa.free(session.cwd);
 }
@@ -291,6 +306,11 @@ pub fn name(session: *const Session) []const u8 {
 /// are written straight onto the connection, and the strings are read where they
 /// were stored rather than pointed at from a second array of slices.
 ///
+/// A request carries the system prompt and then only what follows the summary of
+/// the latest compaction. A compacted session keeps its whole history, for the
+/// transcript and a resume, but the messages a compaction stands in for are not
+/// sent to the model.
+///
 /// The field order and the fields left out are the ones `llm.Message` produces,
 /// so the body is the same either way.
 pub const Conversation = struct {
@@ -299,52 +319,100 @@ pub const Conversation = struct {
     pub fn jsonStringify(self: Conversation, json: anytype) !void {
         const session = self.session;
         try json.beginArray();
-        for (session.messages.items) |message| {
-            try json.beginObject();
-            try json.objectField("role");
-            try json.write(session.string(message.role) orelse "");
-
-            if (session.string(message.content)) |content| {
-                try json.objectField("content");
-                try json.write(content);
-            }
-
-            const calls = message.tool_calls.resolve(session);
-            if (calls.len > 0) {
-                try json.objectField("tool_calls");
-                try json.beginArray();
-                for (calls) |call| {
-                    try json.beginObject();
-                    try json.objectField("id");
-                    try json.write(session.string(call.id) orelse "");
-                    try json.objectField("type");
-                    try json.write(session.string(call.type) orelse "");
-                    try json.objectField("function");
-                    try json.beginObject();
-                    try json.objectField("name");
-                    try json.write(session.string(call.function.name) orelse "");
-                    try json.objectField("arguments");
-                    try json.write(session.string(call.function.arguments) orelse "");
-                    try json.endObject();
-                    try json.endObject();
-                }
-                try json.endArray();
-            }
-
-            if (session.string(message.tool_call_id)) |tool_call_id| {
-                try json.objectField("tool_call_id");
-                try json.write(tool_call_id);
-            }
-            try json.endObject();
+        for (session.messages.items[0..session.leadCount()]) |message| {
+            try writeMessage(session, json, message);
+        }
+        for (session.messages.items[session.sendStart()..]) |message| {
+            try writeMessage(session, json, message);
         }
         try json.endArray();
     }
 };
 
+/// Writes one message as the `messages` array of a request holds it, with every
+/// string read out of the pool.
+fn writeMessage(session: *const Session, json: anytype, message: Message) !void {
+    try json.beginObject();
+    try json.objectField("role");
+    try json.write(session.string(message.role) orelse "");
+
+    if (session.string(message.content)) |content| {
+        try json.objectField("content");
+        try json.write(content);
+    }
+
+    const calls = message.tool_calls.resolve(session);
+    if (calls.len > 0) {
+        try json.objectField("tool_calls");
+        try json.beginArray();
+        for (calls) |call| {
+            try json.beginObject();
+            try json.objectField("id");
+            try json.write(session.string(call.id) orelse "");
+            try json.objectField("type");
+            try json.write(session.string(call.type) orelse "");
+            try json.objectField("function");
+            try json.beginObject();
+            try json.objectField("name");
+            try json.write(session.string(call.function.name) orelse "");
+            try json.objectField("arguments");
+            try json.write(session.string(call.function.arguments) orelse "");
+            try json.endObject();
+            try json.endObject();
+        }
+        try json.endArray();
+    }
+
+    if (session.string(message.tool_call_id)) |tool_call_id| {
+        try json.objectField("tool_call_id");
+        try json.write(tool_call_id);
+    }
+    try json.endObject();
+}
+
 /// The conversation as a request carries it, for passing to a client without
 /// resolving it first. The returned value borrows the session.
 pub fn conversation(session: *const Session) Conversation {
     return .{ .session = session };
+}
+
+/// The first message a compaction leaves out of a request: the summary the last
+/// compaction produced, or zero for a conversation that has never been
+/// compacted. The list is sorted, so the last index is the latest compaction.
+///
+/// The session keeps the messages a request skips, so a transcript still shows
+/// the whole history and a resume reads all of it back; only what is sent to the
+/// model is cut down.
+pub fn sentFrom(session: *const Session) usize {
+    if (session.compactions.items.len == 0) return 0;
+    return session.compactions.items[session.compactions.items.len - 1];
+}
+
+/// Whether the message at `index` is a summary a compaction produced. A request
+/// starts at the latest such message, and a transcript shows it as the single
+/// line that stands in for the compaction. False for an index past the
+/// conversation, so a caller can ask about the message after the last one.
+pub fn isCompaction(session: *const Session, index: usize) bool {
+    if (index >= session.messages.items.len) return false;
+    // The list holds one index per compaction, so a scan of it is short.
+    const target: u32 = @intCast(index);
+    return std.mem.indexOfScalar(u32, session.compactions.items, target) != null;
+}
+
+/// How many messages lead every request: the system prompt, which is sent even
+/// when a compaction skips past it. Zero for a session that has none.
+pub fn leadCount(session: *const Session) usize {
+    var count: usize = 0;
+    while (count < session.messages.items.len and
+        std.mem.eql(u8, session.roleOf(session.messages.items[count]), "system")) count += 1;
+    return count;
+}
+
+/// Where the messages a request carries after the system prompt begin: the
+/// summary of the latest compaction, or the first message after the system
+/// prompt when there is none.
+pub fn sendStart(session: *const Session) usize {
+    return @max(session.sentFrom(), session.leadCount());
 }
 
 /// A tool call as the transcript reads it: the id that names the result which
@@ -416,14 +484,56 @@ pub fn resolvedMessages(session: *const Session, allocator: std.mem.Allocator) !
     return messages;
 }
 
+/// The messages a request carries, resolved out of the pool: the system prompt
+/// and then everything from the latest compaction on, the same set `conversation`
+/// writes. `allocator` owns the result, as `resolvedMessages` does. A compaction
+/// request is sent this way, so it summarizes exactly what the model has been
+/// given.
+pub fn resolveSend(session: *const Session, allocator: std.mem.Allocator) ![]const llm.Message {
+    const lead = session.leadCount();
+    const start = session.sendStart();
+    const messages = try allocator.alloc(llm.Message, lead + session.messages.items.len - start);
+    var out: usize = 0;
+    for (session.messages.items[0..lead]) |message| {
+        messages[out] = try message.resolve(session, allocator);
+        out += 1;
+    }
+    for (session.messages.items[start..]) |message| {
+        messages[out] = try message.resolve(session, allocator);
+        out += 1;
+    }
+    return messages;
+}
+
 /// Adds a message to the conversation and writes the session out, so the
 /// next run sees it even if this one is killed.
 pub fn append(session: *Session, message: llm.Message) !void {
-    try session.appendNoSave(message);
+    try session.appendMessage(message);
     try session.save();
 }
 
-pub fn appendNoSave(session: *Session, message: llm.Message) !void {
+/// Adds a compaction to the conversation: the prompt that asked for it and the
+/// summary it produced. The index of the summary is recorded in `compactions`,
+/// so a request from then on starts at it and carries neither the prompt nor
+/// anything the summary stands in for, while the session keeps every message it
+/// always had.
+///
+/// The prompt is stored so the pair reads as a question and its answer, and so
+/// the transcript can show the two as one line; it is never sent to the model.
+/// The summary is a user message, so the model reads it as context handed to it
+/// rather than as something it said. The messages and the index are written out
+/// together, so the session file is never left holding half of a compaction.
+pub fn appendCompaction(session: *Session, prompt: []const u8, summary: []const u8) !void {
+    try session.appendMessage(.{ .role = "user", .content = prompt });
+    const summary_index: u32 = @intCast(session.messages.items.len);
+    try session.appendMessage(.{ .role = "user", .content = summary });
+    try session.compactions.append(session.gpa, summary_index);
+    try session.save();
+}
+
+/// Appends one message to the conversation without writing the session out.
+/// The parts are interned into the pool.
+fn appendMessage(session: *Session, message: llm.Message) !void {
     const tool_calls = message.tool_calls orelse &.{};
     const interned_tool_calls = ToolCallIndex{
         .start = @intCast(session.tool_calls.items.len),
@@ -491,8 +601,17 @@ pub fn ensureTools(session: *Session, definitions: []const Definition) !void {
 /// the request was made; the session only accumulates it, so a session that
 /// spans a rate change is billed at the rates it actually ran under.
 pub fn recordUsage(session: *Session, usage: llm.Usage, cost: f64) void {
-    session.usage = session.usage.plus(usage);
+    session.recordCost(usage, cost);
     session.context_tokens = usage.total_tokens;
+}
+
+/// Adds a request's tokens and cost to the session totals without moving the
+/// context gauge. This is for a request whose conversation is not the one the
+/// session now holds, such as the summary a compaction was made from: the
+/// request was billed, but its size says nothing about how full the context
+/// window is going forward.
+pub fn recordCost(session: *Session, usage: llm.Usage, cost: f64) void {
+    session.usage = session.usage.plus(usage);
     session.cost += cost;
 }
 
@@ -538,6 +657,10 @@ pub fn save(session: *Session) !void {
         try json.endObject();
     }
     try json.endArray();
+    // The indices of the compaction summaries, sorted, so a resume knows where
+    // the conversation a request carries begins.
+    try json.objectField("compactions");
+    try json.write(session.compactions.items);
     try json.objectField("tools");
     try json.write(session.toolSet());
     try json.objectField("usage");
@@ -591,8 +714,26 @@ fn load(session: *Session) !void {
     // The stored messages are kept as they are, system prompt included, so
     // resuming reuses exactly what the earlier run sent.
     for (stored.messages) |message| {
-        try session.appendNoSave(message);
+        try session.appendMessage(message);
     }
+
+    // The compaction indices are read back against the messages just loaded, so
+    // the sorted list a request and a transcript read is sound even if the file
+    // was written by hand: one past the end is dropped rather than trusted, the
+    // list is sorted, and a repeat is collapsed to the one copy of it.
+    for (stored.compactions) |index| {
+        if (index >= session.messages.items.len) continue;
+        try session.compactions.append(session.gpa, std.math.cast(u32, index) orelse continue);
+    }
+    const compactions = session.compactions.items;
+    std.mem.sort(u32, compactions, {}, std.sort.asc(u32));
+    var kept: usize = 0;
+    for (compactions) |index| {
+        if (kept > 0 and compactions[kept - 1] == index) continue;
+        compactions[kept] = index;
+        kept += 1;
+    }
+    session.compactions.shrinkRetainingCapacity(kept);
 
     // The tools are interned like the conversation, so the set is one array and
     // the arguments schema becomes the JSON text the request sends it as.
@@ -1079,6 +1220,130 @@ test "a stored system prompt is kept when resuming" {
     try std.testing.expectEqualStrings("system", resumed.string(resumed.messages.items[0].role).?);
     try std.testing.expectEqualStrings("old prompt", resumed.string(resumed.messages.items[0].content).?);
     try std.testing.expectEqualStrings("user", resumed.string(resumed.messages.items[1].role).?);
+}
+
+test "a compaction is appended and a request starts at its summary" {
+    const arena = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(std.testing.io, tmp.dir, arena, null, "/work");
+    defer session.deinit();
+
+    try session.append(.{ .role = "system", .content = "be terse" });
+    try session.append(.{ .role = "user", .content = "one" });
+    try session.append(.{ .role = "assistant", .content = "first answer" });
+    // Nothing compacted yet, so a request carries the whole conversation.
+    try std.testing.expectEqual(0, session.sentFrom());
+
+    // A compaction adds the prompt and the summary to the end, keeping every
+    // message it stands in for. The summary is a user message, so the model
+    // reads it as context given to it.
+    try session.appendCompaction("summarize this", "what happened so far");
+    try std.testing.expectEqual(5, session.messages.items.len);
+    try std.testing.expectEqualStrings("user", session.roleOf(session.messages.items[3]));
+    try std.testing.expectEqualStrings("summarize this", session.contentOf(session.messages.items[3]).?);
+    try std.testing.expectEqualStrings("user", session.roleOf(session.messages.items[4]));
+    try std.testing.expectEqualStrings("what happened so far", session.contentOf(session.messages.items[4]).?);
+
+    // A request now starts at the summary, skipping the prompt and everything
+    // the summary stands in for.
+    try std.testing.expectEqual(4, session.sentFrom());
+    try std.testing.expect(session.isCompaction(4));
+    // The prompt that asked for the compaction is not itself a summary.
+    try std.testing.expect(!session.isCompaction(3));
+    try std.testing.expect(!session.isCompaction(2));
+    // An index past the conversation is never a compaction.
+    try std.testing.expect(!session.isCompaction(99));
+
+    // The messages after the compaction are sent in full.
+    try session.append(.{ .role = "user", .content = "next" });
+    try std.testing.expectEqual(4, session.sentFrom());
+}
+
+test "a compaction survives a save and resume" {
+    const arena = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(std.testing.io, tmp.dir, arena, null, "/work");
+    defer session.deinit();
+    try session.append(.{ .role = "system", .content = "be terse" });
+    try session.append(.{ .role = "user", .content = "one" });
+    try session.appendCompaction("summarize this", "the summary");
+    try session.append(.{ .role = "user", .content = "next" });
+
+    var resumed = try Session.open(std.testing.io, tmp.dir, arena, session.id(), "/work");
+    defer resumed.deinit();
+
+    // Everything comes back, and the request still starts at the summary.
+    try std.testing.expectEqual(5, resumed.messages.items.len);
+    try std.testing.expectEqual(3, resumed.sentFrom());
+    try std.testing.expectEqualStrings("the summary", resumed.string(resumed.messages.items[3].content).?);
+    try std.testing.expectEqualStrings("next", resumed.string(resumed.messages.items[4].content).?);
+}
+
+test "the compaction list is sorted and cleaned when a session is read" {
+    const arena = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A file written by hand, with the indices out of order, a repeat, and one
+    // past the end of the conversation.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "odd.json",
+        .data = "{\"version\":2,\"messages\":[" ++
+            "{\"role\":\"system\",\"content\":\"s\"}," ++
+            "{\"role\":\"user\",\"content\":\"one\"}," ++
+            "{\"role\":\"user\",\"content\":\"summary\"}," ++
+            "{\"role\":\"user\",\"content\":\"two\"}]," ++
+            "\"compactions\":[2,0,2,99]}",
+    });
+
+    var session = try Session.open(std.testing.io, tmp.dir, arena, "odd", "/work");
+    defer session.deinit();
+
+    // Indices past the end are dropped, the rest are sorted, and the repeat is
+    // collapsed, so the list is the one sorted copy the rest of the session
+    // expects.
+    try std.testing.expectEqualSlices(u32, &.{ 0, 2 }, session.compactions.items);
+    // The latest is therefore the summary, and a request starts there.
+    try std.testing.expectEqual(2, session.sentFrom());
+    try std.testing.expect(session.isCompaction(2));
+}
+
+test "the messages a request carries start at the latest compaction" {
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    try session.append(.{ .role = "system", .content = "s" });
+    try session.append(.{ .role = "user", .content = "old" });
+    // Two compactions: a request starts at the later summary, not the earlier.
+    try session.appendCompaction("p1", "summary one");
+    try session.append(.{ .role = "user", .content = "middle" });
+    try session.appendCompaction("p2", "summary two");
+    try session.append(.{ .role = "user", .content = "latest" });
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{ .emit_null_optional_fields = false } };
+    try json.write(session.conversation());
+
+    // The system prompt, then the latest summary and the prompt after it: the
+    // first compaction and everything before it is left out.
+    try std.testing.expectEqualStrings(
+        "[{\"role\":\"system\",\"content\":\"s\"}," ++
+            "{\"role\":\"user\",\"content\":\"summary two\"}," ++
+            "{\"role\":\"user\",\"content\":\"latest\"}]",
+        out.written(),
+    );
 }
 
 test "appendSystemPrompt only adds the prompt to an empty session" {

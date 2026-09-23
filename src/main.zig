@@ -47,6 +47,13 @@ const usage =
     \\the data directory, readable by the owner alone. The context window and the
     \\token prices the header reports come from a table built into billy, keyed by
     \\provider and model, since the API reports token counts but neither of those.
+    \\When a conversation fills the context window to compact_at percent of it,
+    \\the model is asked to summarize it, and that summary is added to the
+    \\session; every request from then on carries only the summary and what
+    \\follows it, so a long session goes on rather than failing on an overlong
+    \\request. The session keeps the whole history, so the transcript still shows
+    \\everything. Set compact_at to 0 to turn this off; a model billy does not
+    \\know has no window to measure against, so it is never compacted.
     \\
 ;
 
@@ -233,8 +240,10 @@ pub fn main(init: std.process.Init) !void {
         .home = init.environ_map.get("HOME"),
         // The context window and the prices are not reported by the API, so
         // they are looked up by provider and model; an unknown model simply has
-        // no gauge and no cost.
+        // no gauge and no cost, and so no compaction, which needs a window to
+        // measure a conversation against.
         .model_info = billy.models.lookup(billy.models.Provider.fromUrl(base_url), model),
+        .compact_at = settings.config.compact_at,
         // How billy lays out and decorates what it shows. A bash command is laid
         // out by its format script, so the user reads the command the way it runs;
         // an edit is shown as a diff, laid out by its own script when one is set;
