@@ -66,6 +66,12 @@ const Stored = struct {
     /// the system prompt in `system_prompt` rather than as the first message;
     /// version 1 and 2 files hold it in `messages` and are migrated on load.
     version: u32 = 3,
+    /// A short name for the session, for a frontend to show in a list. Null for
+    /// a session that has not been named, which is one that has not been asked
+    /// anything yet, and one saved before titles were kept. It is written first,
+    /// right after `version`, so a listing can read it from the front of the file
+    /// without reading the conversation (`list`).
+    title: ?[]const u8 = null,
     /// The system prompt sent at the front of every request, or null for a
     /// session that has none. It is kept apart from `messages`, which is the
     /// conversation alone, so that the prompt and the tools can be replaced at a
@@ -239,6 +245,11 @@ messages: std.ArrayList(Message) = .empty,
 /// The system prompt sent at the front of every request, interned in the pool
 /// like every other string. `.none` for a session that has none.
 system_prompt: StringIndex = .none,
+
+/// A short name for the session, for a frontend to show in a list, interned in
+/// the pool like every other string. `.none` until the session is named, which
+/// happens on the first turn.
+title_index: StringIndex = .none,
 
 /// Indices into `messages`, sorted and without repeats, of the summaries a
 /// compaction produced. Keeping them as a list rather than a flag on every
@@ -484,6 +495,17 @@ pub fn systemPrompt(session: *const Session) ?[]const u8 {
     return session.string(session.system_prompt);
 }
 
+/// The session's title, a short name for it, or null when it has none.
+pub fn title(session: *const Session) ?[]const u8 {
+    return session.string(session.title_index);
+}
+
+/// Names the session, replacing any title it had. The title is held in the pool
+/// and reaches the file with the next save.
+pub fn setTitle(session: *Session, text: []const u8) !void {
+    session.title_index = try session.internString(text);
+}
+
 /// A tool call as the transcript reads it: the id that names the result which
 /// answers it, and the tool plus the arguments to run the call back through the
 /// parser. Every one is a window into the pool, so reading a call allocates
@@ -708,6 +730,12 @@ pub fn save(session: *Session) !void {
     try json.beginObject();
     try json.objectField("version");
     try json.write(Stored.default.version);
+    // The title is written first, so a listing reads it from the front of the
+    // file with a small read rather than the whole conversation.
+    if (session.string(session.title_index)) |stored_title| {
+        try json.objectField("title");
+        try json.write(stored_title);
+    }
     // The system prompt is kept apart from the conversation, so it is written
     // before it and only when there is one.
     if (session.string(session.system_prompt)) |prompt| {
@@ -796,6 +824,10 @@ fn load(session: *Session) !void {
 
     if (stored.version > Stored.default.version)
         return error.UnsupportedSessionVersion;
+
+    // The title is optional and came after the version, so no migration or bump
+    // was needed for it.
+    if (stored.title) |stored_title| try session.setTitle(stored_title);
 
     // The system prompt is its own field in a version 3 file. An older file
     // instead holds it as the first message, sometimes as a leading run of them;

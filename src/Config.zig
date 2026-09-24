@@ -109,6 +109,10 @@ const Stored = struct {
     /// How full the context window must be, as a whole percentage, before the
     /// conversation is compacted into a summary. Zero turns compaction off.
     compact_at: usize = 80,
+    /// Whether billy asks the model for a short title for a session, after its
+    /// first turn, so the web frontend can list it by name. Off asks for none,
+    /// and a session is then listed by its id.
+    title: bool = true,
     tools: Tools = .{},
     markdown: Markdown = .{},
 
@@ -151,6 +155,10 @@ resume_blocks: usize = Stored.default.resume_blocks,
 /// conversation is compacted into a summary, so a long session keeps going
 /// rather than failing on an overlong request. Zero turns compaction off.
 compact_at: usize = Stored.default.compact_at,
+/// Whether billy asks the model for a short title for a session, after its first
+/// turn, so the web frontend can list it by name. Off leaves sessions listed by
+/// id, and saves a request per session.
+title: bool = Stored.default.title,
 /// Settings for the tools the agent can call, by tool name.
 tools: Tools = Stored.default.tools,
 /// Settings for the markdown billy shows: the replies it writes and the
@@ -673,6 +681,7 @@ test "the file is indented, so it can be read and edited by hand" {
         \\  "max_turns": 3,
         \\  "resume_blocks": 10,
         \\  "compact_at": 80,
+        \\  "title": true,
         \\  "tools": {
         \\    "bash": {
         \\      "format": null,

@@ -201,6 +201,7 @@ pub fn agentConfig(setup: *const Setup, cwd: []const u8, style: styling.Style) a
         .home = setup.environ.get("HOME"),
         .model_info = models.lookup(models.Provider.fromUrl(setup.base_url), setup.model),
         .compact_at = settings.compact_at,
+        .title = settings.title,
         // How billy lays out and decorates what it shows. A bash command is laid
         // out by its format script, so the user reads the command the way it
         // runs; an edit is shown as a diff, laid out by its own script when one

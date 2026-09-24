@@ -37,6 +37,9 @@ pub const Config = struct {
     /// then no threshold to measure the conversation against. The value mirrors
     /// the configuration's, so a test can leave it out.
     compact_at: usize = 80,
+    /// Whether the model is asked for a short title for a session, after its
+    /// first turn, so a frontend can list it by name. Mirrors the configuration.
+    title: bool = true,
     /// How what billy shows is laid out and decorated, from the configuration.
     display: Display = .{},
     /// Web search, when the configuration names a backend and its key is set.
@@ -509,10 +512,25 @@ pub const Runner = struct {
     /// Asks `session` one thing and shows how the answer is reached: the prompt,
     /// the tool calls it makes, and the reply. This is what one prompt of a
     /// session is, whether it was typed at a terminal or sent from a page.
+    ///
+    /// On the first turn the session is given a title: first one derived from
+    /// what was asked, so it is named at once, and then, when the model is asked
+    /// for titles, one it writes, which replaces the first.
     pub fn ask(runner: *Runner, emitter: Emitter, session: *Session, text: []const u8) !void {
+        // The first turn is the session's first message; the system prompt is
+        // kept apart from the conversation, so a session that has been asked
+        // nothing has none.
+        const first_turn = session.messages.items.len == 0;
+        if (session.title() == null) try session.setTitle(provisionalTitle(text));
+
         try session.append(.{ .role = "user", .content = text });
         try emitter.show(.{ .prompt = text });
         try turn(runner.io, &runner.client, &runner.tool_set, emitter, runner.config, session);
+
+        if (first_turn and runner.config.title) {
+            titleSession(runner.io, &runner.client, runner.config, session) catch |err|
+                std.log.warn("could not title the session: {s}", .{@errorName(err)});
+        }
     }
 };
 
@@ -881,6 +899,78 @@ fn refreshLead(
     try session.setSystemPrompt(prompt_text);
     try session.setTools(definitions);
     try session.save();
+}
+
+/// Sent to ask for a title, after a session's first turn: the conversation with
+/// this as the message after it. Like the compacting prompt it is never part of
+/// the conversation -- it is written onto the request on its own (see
+/// `Session.Conversation.extra`) -- so the model reads it as the latest message
+/// while the session keeps only what was really said.
+const title_prompt =
+    \\The conversation above is the start of a session. Write a short title for
+    \\it, so the user can find it again in a list: a few words, no more than
+    \\about eight, naming what the session is about. Reply with the title alone,
+    \\as plain text, with no quotes, no trailing punctuation and no explanation.
+;
+
+/// Longest a title is kept. A model that ignores the instruction is cut here
+/// rather than dropped, and the list cuts it again to fit.
+const max_title_len = 80;
+
+/// Asks the model for a short title for `session` and records it, so a frontend
+/// can list the session by name. It is called after the session's first turn, so
+/// there is an answer to name.
+///
+/// As with compaction, the conversation is sent as a request would carry it with
+/// the titling prompt after it, so the model reads exactly what happened and the
+/// request shares the conversation's cache. A model that answers with nothing
+/// usable leaves the session as it is, so the title it already has (the one
+/// derived from the first prompt) stands.
+fn titleSession(
+    io: Io,
+    client: *llm.Client,
+    config: Config,
+    session: *Session,
+) !void {
+    const extra = [_]llm.Message{.{ .role = "user", .content = title_prompt }};
+    const completion = try client.complete(client.gpa, session.conversation(&extra), session.toolSet());
+    defer completion.deinit();
+    session.recordCost(completion.usage, costOf(rateNow(io, config), completion.usage));
+
+    const raw = completion.message.content orelse return;
+    const title = try cleanTitle(client.gpa, raw) orelse return;
+    defer client.gpa.free(title);
+    try session.setTitle(title);
+    try session.save();
+}
+
+/// The title `raw` holds, cut down to one clean line, or null when nothing
+/// usable is left: the first line, trimmed, with any quotes or backticks the
+/// model wrapped it in taken off, and cut to the longest a title may be.
+fn cleanTitle(gpa: std.mem.Allocator, raw: []const u8) !?[]u8 {
+    const line = std.mem.sliceTo(raw, '\n');
+    const unquoted = std.mem.trim(u8, std.mem.trim(u8, line, " \t\r"), "\"'`");
+    const text = std.mem.trim(u8, unquoted, " \t\r");
+    if (text.len == 0) return null;
+    return try gpa.dupe(u8, utf8Cut(text, max_title_len));
+}
+
+/// A title derived from the first thing asked, so a session is named the moment
+/// it is created, before the model has named it. The model's title replaces it
+/// after the first turn. It is the first line, trimmed and cut to fit, which for
+/// a coding session is usually already a serviceable name.
+fn provisionalTitle(text: []const u8) []const u8 {
+    const line = std.mem.sliceTo(text, '\n');
+    return utf8Cut(std.mem.trim(u8, line, " \t\r"), max_title_len);
+}
+
+/// `text` cut to at most `len` bytes, without splitting a character. A byte that
+/// continues a UTF-8 sequence is not a place to end.
+fn utf8Cut(text: []const u8, len: usize) []const u8 {
+    if (text.len <= len) return text;
+    var end = len;
+    while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
+    return text[0..end];
 }
 
 /// The rates in effect right now. Zero for a model billy does not know, which
@@ -2106,6 +2196,151 @@ test "a turn shows the tool it runs and then the answer" {
         "all done",
         session.contentOf(session.messages.items[session.messages.items.len - 1]).?,
     );
+}
+
+/// A stand-in for the model that answers a turn with text and the titling request
+/// with a title, so a test can watch a session being named without the network.
+const TitleProvider = struct {
+    /// Requests left to answer: the one turn and the one title request.
+    remaining: usize = 2,
+    /// The first failure the server ran into, so the test reports it rather than
+    /// hanging on the connection.
+    err: ?anyerror = null,
+
+    fn serve(io: Io, listener: *std.Io.net.Server, self: *TitleProvider) Io.Cancelable!void {
+        self.run(io, listener) catch |err| {
+            self.err = err;
+        };
+    }
+
+    fn run(self: *TitleProvider, io: Io, listener: *std.Io.net.Server) !void {
+        while (self.remaining > 0) : (self.remaining -= 1) {
+            var stream = try listener.accept(io);
+            defer stream.close(io);
+
+            var in_buffer: [4096]u8 = undefined;
+            var out_buffer: [4096]u8 = undefined;
+            var reader = stream.reader(io, &in_buffer);
+            var writer = stream.writer(io, &out_buffer);
+            var server: std.http.Server = .init(&reader.interface, &writer.interface);
+
+            var request = try server.receiveHead();
+            var body_buffer: [8192]u8 = undefined;
+            const body_reader = request.readerExpectNone(&body_buffer);
+            const body = try body_reader.allocRemaining(std.testing.allocator, .unlimited);
+            defer std.testing.allocator.free(body);
+
+            const content = if (std.mem.indexOf(u8, body, "short title") != null)
+                "Fix the flaky test"
+            else
+                "all done";
+            var reply: std.Io.Writer.Allocating = .init(std.testing.allocator);
+            defer reply.deinit();
+            try std.json.Stringify.value(.{
+                .choices = &.{.{ .message = .{ .role = "assistant", .content = content } }},
+                .usage = .{ .prompt_tokens = 10, .completion_tokens = 1, .total_tokens = 11 },
+            }, .{}, &reply.writer);
+            try request.respond(reply.written(), .{ .keep_alive = false });
+        }
+    }
+};
+
+test "the first turn names the session, and the naming is not part of it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    try session.setSystemPrompt("be terse");
+
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+
+    var provider: TitleProvider = .{};
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, TitleProvider.serve, .{ io, &listener, &provider });
+
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/chat/completions", .{
+        listener.socket.address.getPort(),
+    });
+    defer gpa.free(url);
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+    var config = testConfig("m", "/work", null);
+    config.title = true;
+    // The runner builds the model client from the config, so the config carries
+    // the address of the mock.
+    config.url = url;
+    // `Runner.init` opens the directory it works in, so it has to be one that
+    // exists; the session's recorded directory is separate and stays "/work".
+    const work_dir = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(work_dir);
+    var runner = try Runner.init(io, gpa, config, work_dir, &http);
+    defer runner.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var terminal = testTerminal(&out.writer, .{});
+    try runner.ask(terminal.emitter(), &session, "the flaky test keeps failing, please fix it");
+
+    try group.await(io);
+    if (provider.err) |err| return err;
+
+    // The model's title is kept, and the session was saved with it.
+    try std.testing.expectEqualStrings("Fix the flaky test", session.title().?);
+    var resumed = try Session.open(io, tmp.dir, gpa, session.id(), "/work");
+    defer resumed.deinit();
+    try std.testing.expectEqualStrings("Fix the flaky test", resumed.title().?);
+
+    // The request that asked for the title is not part of the conversation, and
+    // neither is its answer: the session holds the prompt and the reply alone.
+    try std.testing.expectEqual(@as(usize, 2), session.messages.items.len);
+    try std.testing.expectEqualStrings("user", session.roleOf(session.messages.items[0]));
+    try std.testing.expectEqualStrings("assistant", session.roleOf(session.messages.items[1]));
+    for (session.messages.items) |message| {
+        const text = session.contentOf(message) orelse "";
+        try std.testing.expect(std.mem.indexOf(u8, text, "short title") == null);
+    }
+}
+
+test "a title is cut to one clean line, or dropped when there is none" {
+    const gpa = std.testing.allocator;
+
+    // The first line is all that is kept, trimmed, with the quotes or backticks
+    // a model wrapped it in taken off. Each result is `gpa`'s, so it is freed.
+    try expectCleanTitle(gpa, "Fix the parser", "Fix the parser\nand more");
+    try expectCleanTitle(gpa, "Fix it", "  \"Fix it\"  ");
+    try expectCleanTitle(gpa, "Fix it", "`Fix it`");
+    try expectCleanTitle(gpa, "just one line", "just one line\nextra");
+
+    // Nothing usable is no title, so the provisional one stands.
+    try std.testing.expect((try cleanTitle(gpa, "")) == null);
+    try std.testing.expect((try cleanTitle(gpa, "   \n  ")) == null);
+
+    // A title longer than the limit is cut to the limit.
+    const long = (try cleanTitle(gpa, "x" ** 200)).?;
+    defer gpa.free(long);
+    try std.testing.expectEqual(max_title_len, long.len);
+
+    // A provisional title is the first line of what was asked, trimmed and cut.
+    try std.testing.expectEqualStrings(
+        "add a title to sessions",
+        provisionalTitle("add a title to sessions\nand lots of detail follows"),
+    );
+    try std.testing.expectEqualStrings("short", provisionalTitle("   short   "));
+}
+
+/// Checks what `cleanTitle` makes of `raw`, freeing what it allocates.
+fn expectCleanTitle(gpa: std.mem.Allocator, expected: []const u8, raw: []const u8) !void {
+    const title = (try cleanTitle(gpa, raw)).?;
+    defer gpa.free(title);
+    try std.testing.expectEqualStrings(expected, title);
 }
 
 /// A stand-in for the model that asks for one bash command and then answers, so a
