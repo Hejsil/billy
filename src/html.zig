@@ -19,6 +19,7 @@ const std = @import("std");
 const Io = std.Io;
 const agent = @import("agent.zig");
 const diffing = @import("diff.zig");
+const models = @import("models.zig");
 const Session = @import("Session.zig");
 const Tools = @import("Tools.zig");
 
@@ -43,6 +44,43 @@ pub fn escape(text: []const u8, out: *Io.Writer) !void {
     }
     try out.writeAll(text[plain..]);
 }
+
+/// A writer that escapes everything written into it and passes it to another
+/// writer. It is for text that something else has to build: a path the header
+/// shortens, or any other value a helper writes rather than returns. Without it
+/// such text would reach the page as markup, since the helper that wrote it knows
+/// nothing about HTML.
+///
+/// Nothing is buffered, so every write is escaped as it comes. Escaping byte by
+/// byte is safe across calls because each byte is escaped on its own: no entity
+/// is ever split between one call and the next.
+const Escaping = struct {
+    inner: *Io.Writer,
+    writer: Io.Writer,
+
+    fn init(inner: *Io.Writer) Escaping {
+        return .{
+            .inner = inner,
+            .writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+        };
+    }
+
+    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *Escaping = @alignCast(@fieldParentPtr("writer", w));
+
+        // The last slice is the one repeated `splat` times, so it is written
+        // that many times; the rest are written once each. Everything offered is
+        // consumed, whether or not the escaping makes it longer.
+        for (data[0 .. data.len - 1]) |bytes| try escape(bytes, self.inner);
+        const pattern = data[data.len - 1];
+        var left = splat;
+        while (left > 0) : (left -= 1) try escape(pattern, self.inner);
+
+        var offered: usize = pattern.len * splat;
+        for (data[0 .. data.len - 1]) |bytes| offered += bytes.len;
+        return offered;
+    }
+};
 
 /// What is open at the block level: a run of lines that belongs together and is
 /// closed when something else begins.
@@ -951,4 +989,132 @@ test "a whole conversation is rendered, a tool call and a compaction included" {
     try std.testing.expect(std.mem.indexOf(u8, page, "summarize") == null);
     // The system prompt is never shown.
     try std.testing.expect(std.mem.indexOf(u8, page, "be terse") == null);
+}
+
+/// The line above a conversation: the session, the model it runs, the directory
+/// it works in, how full the context window is and what it has cost. It is the
+/// same text the terminal puts above its prompt, laid out for a page.
+pub const Header = struct {
+    /// The session being shown.
+    id: []const u8,
+    /// The model the session runs.
+    model: []const u8,
+    /// The directory the session works in, shortened to `~` when it is inside
+    /// `home`.
+    cwd: []const u8,
+    home: ?[]const u8,
+    /// Tokens in the conversation as of the last request.
+    context_tokens: usize,
+    /// The window and the prices, or null for a model billy does not know, which
+    /// has no gauge and no cost.
+    model_info: ?models.Metadata,
+    /// What the session has cost so far, in USD.
+    cost: f64,
+};
+
+/// Writes the header as HTML. Every count is formatted by the same helpers the
+/// terminal header uses, so the two read the same numbers the same way.
+pub fn header(h: Header, out: *Io.Writer) !void {
+    try out.writeAll("<div class=\"header\">");
+    try part("id", h.id, out);
+    try out.writeAll("<span class=\"sep\">·</span>");
+    try part("model", h.model, out);
+    try out.writeAll("<span class=\"sep\">·</span><span class=\"cwd\">");
+    // The directory is shortened by a helper that writes rather than returns, so
+    // its output is escaped on the way to the page.
+    var path = Escaping.init(out);
+    try agent.displayPath(&path.writer, h.cwd, h.home);
+    try out.writeAll("</span>");
+
+    if (h.model_info) |info| {
+        try out.writeAll("<span class=\"sep\">·</span><span class=\"gauge\">");
+        try agent.formatTokens(out, h.context_tokens);
+        try out.writeAll("/");
+        try agent.formatTokens(out, info.context_window);
+        try out.writeAll(" (");
+        try agent.formatPercent(out, h.context_tokens, info.context_window);
+        try out.writeAll(")</span>");
+        try out.writeAll("<span class=\"sep\">·</span><span class=\"cost\">");
+        try agent.formatMoney(out, h.cost);
+        try out.writeAll("</span>");
+    }
+    try out.writeAll("</div>\n");
+}
+
+/// Writes one part of the header as a span classed by what it is, with the text
+/// escaped. The dot between parts is a part of its own, so a page can space it.
+fn part(class: []const u8, text: []const u8, out: *Io.Writer) !void {
+    try out.print("<span class=\"{s}\">", .{class});
+    try escape(text, out);
+    try out.writeAll("</span>");
+}
+
+test "the header carries the model, the directory and the gauge" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    try header(.{
+        .id = "01HF7YAT000000000000000000",
+        .model = "deepseek-flash",
+        .cwd = "/home/user/repo/billy",
+        .home = "/home/user",
+        .context_tokens = 16_000,
+        .model_info = .{
+            .provider = .deepseek,
+            .model = "deepseek-flash",
+            .context_window = 128_000,
+            .price = .{},
+        },
+        .cost = 0.42,
+    }, &out.writer);
+
+    // The same numbers the terminal header shows, each in a part of its own.
+    try std.testing.expectEqualStrings(
+        "<div class=\"header\">" ++
+            "<span class=\"id\">01HF7YAT000000000000000000</span>" ++
+            "<span class=\"sep\">·</span>" ++
+            "<span class=\"model\">deepseek-flash</span>" ++
+            "<span class=\"sep\">·</span><span class=\"cwd\">~/repo/billy</span>" ++
+            "<span class=\"sep\">·</span><span class=\"gauge\">16k/128k (12%)</span>" ++
+            "<span class=\"sep\">·</span><span class=\"cost\">$0.42</span>" ++
+            "</div>\n",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+
+    // A model billy does not know has no window and no prices, so the gauge and
+    // the cost are left out rather than shown as zero.
+    try header(.{
+        .id = "dev",
+        .model = "who-knows",
+        .cwd = "/work",
+        .home = null,
+        .context_tokens = 5000,
+        .model_info = null,
+        .cost = 12.34,
+    }, &out.writer);
+    try std.testing.expectEqualStrings(
+        "<div class=\"header\">" ++
+            "<span class=\"id\">dev</span>" ++
+            "<span class=\"sep\">·</span>" ++
+            "<span class=\"model\">who-knows</span>" ++
+            "<span class=\"sep\">·</span><span class=\"cwd\">/work</span>" ++
+            "</div>\n",
+        out.written(),
+    );
+
+    // A path a model or a directory could carry is escaped like any other text.
+    out.clearRetainingCapacity();
+    try header(.{
+        .id = "x<y",
+        .model = "m",
+        .cwd = "/a<b",
+        .home = null,
+        .context_tokens = 0,
+        .model_info = null,
+        .cost = 0,
+    }, &out.writer);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "x&lt;y") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "/a&lt;b") != null);
 }

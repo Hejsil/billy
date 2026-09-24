@@ -335,8 +335,8 @@ pub fn costOf(price: models.Price, usage: llm.Usage) f64 {
 }
 
 /// Writes a token count in a short form, such as `16k` or `128k`, with no
-/// decimals.
-fn formatTokens(out: *Io.Writer, count: usize) !void {
+/// decimals. Shared with the web header, so both show a count the same way.
+pub fn formatTokens(out: *Io.Writer, count: usize) !void {
     if (count < 1000) return out.print("{d}", .{count});
     if (count < 1_000_000) return formatScaled(out, count, 1000, 'k');
     return formatScaled(out, count, 1_000_000, 'M');
@@ -354,8 +354,9 @@ fn formatScaled(out: *Io.Writer, count: usize, unit: usize, suffix: u8) !void {
 
 /// Writes how full the context window is, as a whole percentage. A conversation
 /// that has started but is under one percent is reported as `<1%`, so the gauge
-/// does not read as empty.
-fn formatPercent(out: *Io.Writer, used: usize, total: usize) !void {
+/// does not read as empty. Shared with the web header, so both read it the same
+/// way.
+pub fn formatPercent(out: *Io.Writer, used: usize, total: usize) !void {
     if (total == 0) return out.writeAll("0%");
     const percent = used * 100 / total;
     if (percent == 0 and used > 0) return out.writeAll("<1%");
@@ -366,7 +367,8 @@ fn formatPercent(out: *Io.Writer, used: usize, total: usize) !void {
 /// so that `$1.5` and `$0` read the same way `1.5k` does, without padding to a
 /// fixed number of places. The digits are formatted into a stack buffer first,
 /// since the trimmed amount is written before the ones it dropped are known.
-fn formatMoney(out: *Io.Writer, amount: f64) !void {
+/// Shared with the web header, so both show the cost the same way.
+pub fn formatMoney(out: *Io.Writer, amount: f64) !void {
     var buffer: [64]u8 = undefined;
     var formatted: std.Io.Writer = .fixed(&buffer);
     try formatted.print("{d:.2}", .{amount});
@@ -380,9 +382,10 @@ fn formatMoney(out: *Io.Writer, amount: f64) !void {
     try out.print("${s}", .{digits[0..end]});
 }
 
-/// Writes the working directory as shown in the header. A path inside the home
-/// directory is shortened to `~` so a long path stays readable.
-fn displayPath(out: *Io.Writer, cwd: []const u8, home: ?[]const u8) !void {
+/// Writes the working directory as shown in the header: shortened to `~` when it
+/// is inside the home directory, so a long path stays readable. Shared with the
+/// web header.
+pub fn displayPath(out: *Io.Writer, cwd: []const u8, home: ?[]const u8) !void {
     if (home) |dir| {
         // Require a component boundary, so `/home/user2` is not shortened by a
         // `/home/user` home directory.
