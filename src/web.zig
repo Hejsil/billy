@@ -607,6 +607,41 @@ test "the page the browser is given is the one that was written" {
     try std.testing.expect(std.mem.indexOf(u8, page, "/api/sessions") != null);
 }
 
+test "an event leaves the stream as it is written, without filling a buffer" {
+    const gpa = std.testing.allocator;
+
+    // The body writer an event is written through, over a sink that keeps what
+    // it is given. Only the protocol output is watched: an event that has been
+    // flushed has reached it, and one still sitting in the body writer's buffer
+    // has not.
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    var body_buffer: [4096]u8 = undefined;
+    var body: std.http.BodyWriter = .{
+        .http_protocol_output = &sink.writer,
+        .state = .init_chunked,
+        .writer = .{
+            .buffer = &body_buffer,
+            .vtable = &.{
+                .drain = std.http.BodyWriter.chunkedDrain,
+                .sendFile = std.http.BodyWriter.chunkedSendFile,
+            },
+        },
+    };
+    var stream = Stream{ .body = &body, .gpa = gpa };
+
+    // A frame small enough to sit in the buffer whole, so it reaches the sink
+    // only because the event is flushed. Without that flush it would wait there
+    // until enough events filled the buffer, which is what made a page see them
+    // in batches rather than as they happened.
+    try stream.write("block", "{\"html\":\"<p>hi</p>\"}");
+    try std.testing.expect(std.mem.indexOf(u8, sink.written(), "event: block") != null);
+
+    // A second event reaches the sink too, each as a chunk of its own.
+    try stream.write("done", "{}");
+    try std.testing.expect(std.mem.count(u8, sink.written(), "event: ") == 2);
+}
+
 test "the address to listen on is read from what was asked for" {
     // An address is taken as itself, and the port carried through.
     const anywhere = try listenAddress("0.0.0.0", 8787);
@@ -781,8 +816,18 @@ const Stream = struct {
     /// Writes one event frame: its name, its data on one line, and the blank
     /// line that ends it. The data is JSON, which never holds a newline, so a
     /// frame is always what it should be.
+    ///
+    /// The two flushes are both needed and are in this order. The body writer
+    /// gathers what is written to it in a buffer of its own, and only pushes that
+    /// into `http_protocol_output` when it is flushed or full; `BodyWriter.flush`
+    /// flushes `http_protocol_output` and *not* that buffer. Flushing the buffer
+    /// first sends this event into the protocol output, and flushing the body
+    /// then sends it down the socket. Without the first, an event sits in the
+    /// buffer until enough of them fill it, so a page sees them in batches rather
+    /// than as they happen.
     fn write(self: *Stream, event: []const u8, data: []const u8) !void {
         try self.body.writer.print("event: {s}\ndata: {s}\n\n", .{ event, data });
+        try self.body.writer.flush();
         try self.body.flush();
     }
 };
