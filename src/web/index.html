@@ -138,9 +138,21 @@ let selected = null;
 let working = false;
 
 // The sessions are listed again when a new one is started and when a turn ends,
-// since which session was written to last is what orders them.
+// since which session was written to last is what orders them. The list is
+// returned, or null when it could not be read, so a caller can tell an empty
+// list from a server it could not reach.
 async function refresh(select) {
-  const sessions = (await (await fetch('/api/sessions')).json()).sessions;
+  let sessions;
+  try {
+    const res = await fetch('/api/sessions');
+    if (!res.ok) throw new Error('the server answered ' + res.status);
+    sessions = (await res.json()).sessions;
+  } catch (err) {
+    // The list is left as it was rather than wiped, so a hiccup does not empty
+    // what is on screen.
+    console.error('could not list the sessions:', err);
+    return null;
+  }
   list.replaceChildren();
   if (sessions.length === 0) {
     const empty = document.createElement('li');
@@ -167,11 +179,20 @@ async function open(id) {
   // Switching sessions while a turn is streaming would clear the conversation
   // the turn is still appending to, so it waits for the turn to end.
   if (working) return;
+  let body;
+  try {
+    const res = await fetch('/api/sessions/' + encodeURIComponent(id));
+    if (!res.ok) {
+      note('could not open the session (' + res.status + ')');
+      return;
+    }
+    body = await res.json();
+  } catch (err) {
+    note('lost the connection: ' + err.message);
+    return;
+  }
   selected = id;
   for (const item of list.children) item.classList.toggle('selected', item.dataset.id === id);
-  const res = await fetch('/api/sessions/' + encodeURIComponent(id));
-  if (!res.ok) return;
-  const body = await res.json();
   headerBox.innerHTML = body.header;
   conversation.innerHTML = body.blocks;
   scrollToEnd();
@@ -271,15 +292,25 @@ document.getElementById('new').onclick = async () => {
   // A new session may not be started mid-turn either: it would take the view
   // away from the turn that is still running.
   if (working) return;
-  const started = await (await fetch('/api/sessions', { method: 'POST' })).json();
-  await refresh(started.id);
-  await open(started.id);
+  try {
+    const res = await fetch('/api/sessions', { method: 'POST' });
+    if (!res.ok) {
+      note('could not start a session (' + res.status + ')');
+      return;
+    }
+    const started = await res.json();
+    await refresh(started.id);
+    await open(started.id);
+  } catch (err) {
+    note('lost the connection: ' + err.message);
+  }
 };
 
 // Open the newest session there is, so the page is not blank when there is one.
 (async () => {
   const sessions = await refresh();
-  if (sessions.length > 0) await open(sessions[0].id);
+  if (sessions === null) note('could not reach the server');
+  else if (sessions.length > 0) await open(sessions[0].id);
   else input.focus();
 })();
 </script>
