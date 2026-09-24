@@ -89,6 +89,10 @@ pub const Block = union(enum) {
     compacted: Compacted,
     /// A line billy writes itself, such as why a run stopped.
     notice: []const u8,
+    /// How many blocks a shortened conversation left out, shown where they would
+    /// have been. Zero is never shown, since a conversation with nothing left out
+    /// has nothing to say.
+    elided: usize,
 
     pub const Tool = struct {
         /// The call as it was parsed, which is what a frontend shows to say what
@@ -137,6 +141,10 @@ const Terminal = struct {
     /// For what showing a block builds, such as an edit's diff. Each block frees
     /// what it takes, so nothing is kept between them.
     scratch: std.mem.Allocator,
+    /// Whether a prompt opens with the blank line that sets it off from what came
+    /// before. Replaying a stored conversation wants it; a live prompt does not,
+    /// since the line editor has already ended the line the prompt is typed on.
+    replay: bool = false,
 
     fn emitter(self: *Terminal) Emitter {
         return .{ .context = self, .vtable = &.{ .block = show } };
@@ -145,7 +153,10 @@ const Terminal = struct {
     fn show(context: *anyopaque, block: Block) anyerror!void {
         const self = selfOf(context);
         switch (block) {
-            .prompt => |text| try printPrompt(self.out, text, self.display),
+            .prompt => |text| {
+                if (self.replay) try self.out.writeAll("\n");
+                try printPrompt(self.out, text, self.display);
+            },
             .answer => |content| try printAnswer(self.out, content, self.display),
             // The header goes out as the call begins, so a command that runs
             // long has it on screen while it runs.
@@ -167,6 +178,7 @@ const Terminal = struct {
                 try self.out.print("{s}\n", .{text});
                 try self.out.flush();
             },
+            .elided => |count| try printElided(count, self.display.style, self.out),
         }
     }
 
@@ -268,12 +280,15 @@ const prompt = "> ";
 
 /// The marks the messages of the transcript are headed by. None of them is a
 /// tool, so none carries a tool's glyph.
-const marks = struct {
-    const prompt = styling.Mark{ .glyph = "»", .hue = .blue };
-    const answer = styling.Mark{ .glyph = "◆", .hue = .green };
+/// The marks the blocks of a run are headed by, which is the vocabulary both
+/// frontends show a block in: the terminal colours them and the web gives them
+/// classes, but a prompt is a prompt in either.
+pub const marks = struct {
+    pub const prompt = styling.Mark{ .glyph = "»", .hue = .blue };
+    pub const answer = styling.Mark{ .glyph = "◆", .hue = .green };
     /// The line a compaction shows as, standing in for the prompt that asked for
     /// it and the summary it produced.
-    const compacted = styling.Mark{ .glyph = "⊟", .hue = .yellow };
+    pub const compacted = styling.Mark{ .glyph = "⊟", .hue = .yellow };
 };
 
 /// Writes the header line shown above the input prompt: the session id, the
@@ -506,19 +521,88 @@ pub fn printTranscript(
     display: Display,
     blocks: usize,
 ) !void {
+    // A replay is what the terminal is shown when a session is picked up again,
+    // so a prompt opens with the blank line a live one does not need.
+    var terminal = Terminal{ .out = out, .display = display, .scratch = gpa, .replay = true };
+    try walk(gpa, session, blocks, terminal.emitter());
+    try out.flush();
+}
+
+/// Shows the blocks of a stored conversation, oldest first, through `emitter`.
+/// This is what a replay and a web page are both made of, so a conversation reads
+/// the same however it is shown.
+///
+/// Only the last `blocks` blocks are shown, and the count of what was left out is
+/// shown where they would have been; zero shows the whole conversation. A block is
+/// one unit: a prompt, a reply, a tool call with its result, or a compaction.
+///
+/// `gpa` is for the scratch the parsed arguments of a call need, which is dropped
+/// between messages, so walking a long conversation costs no more than the largest
+/// message in it.
+pub fn walk(gpa: std.mem.Allocator, session: *const Session, blocks: usize, emitter: Emitter) !void {
     var scratch_state = std.heap.ArenaAllocator.init(gpa);
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
 
     const trim = transcriptTrim(session, blocks);
-    if (trim.elided > 0) try printElided(trim.elided, display.style, out);
+    // A conversation with nothing left out has nothing to count.
+    if (trim.elided > 0) try emitter.show(.{ .elided = trim.elided });
 
     for (session.messages.items[trim.index..], trim.index..) |message, index| {
         const skip = if (index == trim.index) trim.skip else 0;
-        try printMessage(scratch, out, session, index, message, display, skip);
+        try emitMessage(scratch, session, index, message, skip, emitter);
         _ = scratch_state.reset(.retain_capacity);
     }
-    try out.flush();
+}
+
+/// Shows the blocks one stored message is made of. The system prompt is never
+/// shown while running, so it is left out here too. A tool result is shown as the
+/// output of the call that produced it, and not as a block of its own.
+///
+/// `skip` leaves out the leading that many tool calls of the message, which only
+/// a shortened conversation does, so a trim can fall inside a message that asks
+/// for several tools; it is zero for every message that is shown whole.
+///
+/// The message is the one the session stores, so every string shown is read out
+/// of the pool as it is shown and no message is built to show it.
+fn emitMessage(
+    arena: std.mem.Allocator,
+    session: *const Session,
+    index: usize,
+    message: Session.Message,
+    skip: usize,
+    emitter: Emitter,
+) !void {
+    // A compaction shows as the summary that stands in for the messages before
+    // it, with the prompt that asked for it; the prompt shows nothing of its own.
+    if (session.isCompaction(index)) {
+        const asked = if (index > 0) session.messages.items[index - 1] else null;
+        return emitter.show(.{ .compacted = .{
+            .prompt = if (asked) |before| session.contentOf(before) orelse "" else "",
+            .summary = session.contentOf(message) orelse "",
+        } });
+    }
+    if (session.isCompaction(index + 1)) return;
+
+    const role = session.roleOf(message);
+    if (std.mem.eql(u8, role, "user")) {
+        return emitter.show(.{ .prompt = session.contentOf(message) orelse "" });
+    }
+    if (!std.mem.eql(u8, role, "assistant")) return;
+
+    const calls = session.callCount(message);
+    if (calls == 0) return emitter.show(.{ .answer = session.contentOf(message) orelse "" });
+    for (skip..calls) |i| {
+        const call = session.callAt(message, i);
+        const parsed = Tools.parseCallNamed(arena, call.name, call.arguments);
+        // The result belongs to the message just after the one that asked for
+        // it, so the search starts from there.
+        const result = session.toolResult(index + 1, call.id);
+        // A call is shown as it begins and again with what it produced, which is
+        // what lets a frontend show a slow call's header while it runs.
+        try emitter.show(.{ .tool_begin = parsed });
+        try emitter.show(.{ .tool_end = .{ .call = parsed, .result = result } });
+    }
 }
 
 /// Which message a trimmed transcript starts at, and how much of it to leave out,
@@ -590,58 +674,6 @@ fn printElided(count: usize, style: styling.Style, out: *Io.Writer) !void {
     const line = std.fmt.bufPrint(&buffer, "… {d} earlier blocks", .{count}) catch "… earlier blocks";
     try style.dim(line, out);
     try out.writeAll("\n");
-}
-
-/// Prints one message the way a live session shows it. The system prompt is never
-/// shown while running, so it is left out here too. A tool result is shown as the
-/// output of the call that produced it, and not as a message of its own.
-///
-/// `skip` leaves out the leading that many tool calls of the message, which only
-/// a trimmed transcript does, so a trim can fall inside a message that asks for
-/// several tools; it is zero for every message that is shown whole.
-///
-/// The message is the one the session stores, so every string printed is read
-/// out of the pool as it is printed and no message is built to print it.
-fn printMessage(
-    arena: std.mem.Allocator,
-    out: *Io.Writer,
-    session: *const Session,
-    index: usize,
-    message: Session.Message,
-    display: Display,
-    skip: usize,
-) !void {
-    // A compaction shows as a single line, printed where the summary that stands
-    // in for it is; the prompt that asked for it, just before, prints nothing.
-    if (session.isCompaction(index)) return printCompacted(out, display.style);
-    if (session.isCompaction(index + 1)) return;
-
-    const role = session.roleOf(message);
-    if (std.mem.eql(u8, role, "user")) {
-        // A prompt from the session opens a block like everything else in the
-        // transcript, after the blank line that separates it from what came
-        // before. The loop prints the same block, without that line, since the
-        // prompt it just erased already stood on its own row.
-        try out.writeAll("\n");
-        return printPrompt(out, session.contentOf(message) orelse "", display);
-    }
-    if (!std.mem.eql(u8, role, "assistant")) return;
-
-    const calls = session.callCount(message);
-    if (calls == 0) return printAnswer(out, session.contentOf(message), display);
-    for (skip..calls) |i| {
-        const call = session.callAt(message, i);
-        // The result belongs to the message just after the one that asked for
-        // it, so the search starts from there.
-        try Tools.describe(
-            arena,
-            Tools.parseCallNamed(arena, call.name, call.arguments),
-            session.toolResult(index + 1, call.id),
-            display.formats,
-            display.style,
-            out,
-        );
-    }
 }
 
 /// Runs the model until it replies with text instead of tool calls, showing what
@@ -1780,6 +1812,7 @@ const Recorder = struct {
         tool_end: struct { name: []const u8, result: []const u8 },
         compacted: Block.Compacted,
         notice: []const u8,
+        elided: usize,
     };
 
     fn emitter(self: *Recorder) Emitter {
@@ -1801,6 +1834,7 @@ const Recorder = struct {
                 .summary = try self.keeper(compaction.summary),
             } },
             .notice => |text| .{ .notice = try self.keeper(text) },
+            .elided => |count| .{ .elided = count },
         };
         try self.seen.append(self.arena, seen);
     }
