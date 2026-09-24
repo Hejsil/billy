@@ -398,6 +398,116 @@ pub fn displayPath(out: *Io.Writer, cwd: []const u8, home: ?[]const u8) !void {
     return out.writeAll(cwd);
 }
 
+/// A session being asked things: the model client and the tools it runs with,
+/// working in the session's own directory. Both frontends need the same of this,
+/// so it is built in one place and neither can drift from the other.
+///
+/// The HTTP client is the run's own, borrowed by pointer, so every request of
+/// every session shares its connections and the certificates it scanned once.
+pub const Runner = struct {
+    io: Io,
+    gpa: std.mem.Allocator,
+    config: Config,
+    /// The directory the session works in. For a resumed session it is the one
+    /// the session was started in, wherever billy runs from now.
+    work_dir: Io.Dir,
+    /// The tools, working in `work_dir`.
+    tool_set: Tools,
+    /// The model client, sending the conversation to `config.url`.
+    client: llm.Client,
+
+    /// Opens a session for asking things, working in `cwd` and sharing `http`.
+    pub fn init(
+        io: Io,
+        gpa: std.mem.Allocator,
+        config: Config,
+        cwd: []const u8,
+        http: *std.http.Client,
+    ) !Runner {
+        var work_dir = Io.Dir.openDirAbsolute(io, cwd, .{}) catch |err| {
+            std.log.err("cannot work in {s}: {s}", .{ cwd, @errorName(err) });
+            return err;
+        };
+        errdefer work_dir.close(io);
+
+        const tool_set = try Tools.init(.{
+            .io = io,
+            .dir = work_dir,
+            .gpa = gpa,
+            .formats = config.display.formats,
+            .bash_timeout_s = config.bash_timeout_s,
+            .style = config.display.style,
+            .search = config.search,
+            .http = http,
+        });
+
+        return .{
+            .io = io,
+            .gpa = gpa,
+            .config = config,
+            .work_dir = work_dir,
+            .tool_set = tool_set,
+            .client = .{
+                .gpa = gpa,
+                .io = io,
+                .api_key = config.api_key,
+                .url = config.url,
+                .model = config.model,
+                .http = http,
+            },
+        };
+    }
+
+    pub fn deinit(runner: *Runner) void {
+        runner.work_dir.close(runner.io);
+    }
+
+    /// Gives `session` the system prompt and the tools it runs with, if it has
+    /// none of its own.
+    ///
+    /// The prompt and the tools are stored with the session and reused on a
+    /// resume, so the request sent then matches the earlier run byte for byte and
+    /// hits the prompt cache. Both are therefore set only on a session that has
+    /// neither, so a new session gets the current ones while a resumed one keeps
+    /// what it was saved with. The project's own instructions are read from the
+    /// session's directory and are part of the prompt, so they are sent with
+    /// every request.
+    pub fn prepare(runner: *Runner, session: *Session) !void {
+        const instructions = try projectInstructions(runner.io, runner.gpa, runner.work_dir);
+        defer if (instructions) |text| runner.gpa.free(text);
+        const prompt_text = if (instructions) |text|
+            try std.fmt.allocPrint(runner.gpa, "{s}\n\n{s}", .{ system_prompt, text })
+        else
+            try runner.gpa.dupe(u8, system_prompt);
+        defer runner.gpa.free(prompt_text);
+
+        try session.appendSystemPrompt(prompt_text);
+        try session.ensureTools(runner.tool_set.definitions());
+    }
+
+    /// Compacts the conversation if it has outgrown the context window, so that
+    /// a long session goes on rather than failing on an overlong request.
+    ///
+    /// A frontend calls this before it adds a prompt and, on a terminal, before
+    /// it shows the header, so the prompt is not folded into the summary it
+    /// triggers and the header reports the smaller conversation. A failure is
+    /// not fatal: the conversation is left as it is and the request goes out with
+    /// it, which is what would have happened without compaction at all.
+    pub fn compactIfNeeded(runner: *Runner, emitter: Emitter, session: *Session) void {
+        maybeCompact(runner.io, &runner.client, emitter, runner.config, session) catch |err|
+            std.log.warn("compaction failed: {s}", .{@errorName(err)});
+    }
+
+    /// Asks `session` one thing and shows how the answer is reached: the prompt,
+    /// the tool calls it makes, and the reply. This is what one prompt of a
+    /// session is, whether it was typed at a terminal or sent from a page.
+    pub fn ask(runner: *Runner, emitter: Emitter, session: *Session, text: []const u8) !void {
+        try session.append(.{ .role = "user", .content = text });
+        try emitter.show(.{ .prompt = text });
+        try turn(runner.io, &runner.client, &runner.tool_set, emitter, runner.config, session);
+    }
+};
+
 pub fn run(
     io: Io,
     gpa: std.mem.Allocator,
@@ -405,61 +515,22 @@ pub fn run(
     config: Config,
     session: *Session,
 ) !void {
-    // The tools work in the session's own directory, which for a resumed session
-    // is the one it was started in, wherever billy is run from now. The project's
-    // instructions are read from there too, so they are the ones of the project
-    // the session belongs to.
-    var work_dir = Io.Dir.openDirAbsolute(io, session.cwd, .{}) catch |err| {
-        std.log.err("cannot work in {s}: {s}", .{ session.cwd, @errorName(err) });
-        return err;
-    };
-    defer work_dir.close(io);
-
     // One HTTP client for the run, shared by the model requests and the search
     // backend, so both reuse its connections and share the certificates it scans
-    // once.
+    // once. Every session asked in this run borrows it.
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
+
+    var runner = try Runner.init(io, gpa, config, session.cwd, &http);
+    defer runner.deinit();
+    // The conversation this session already has, or the system prompt and tools
+    // a new one starts with.
+    try runner.prepare(session);
 
     // The editor holds the lines it returns and its history in an arena of its
     // own, over `gpa`, so the run need not keep an allocator for them.
     var editor = LineEditor.init(io, out, gpa);
     defer editor.deinit();
-    var tool_set = try Tools.init(.{
-        .io = io,
-        .dir = work_dir,
-        .gpa = gpa,
-        .formats = config.display.formats,
-        .bash_timeout_s = config.bash_timeout_s,
-        .style = config.display.style,
-        .search = config.search,
-        .http = &http,
-    });
-    var client: llm.Client = .{
-        .gpa = gpa,
-        .io = io,
-        .api_key = config.api_key,
-        .url = config.url,
-        .model = config.model,
-        .http = &http,
-    };
-
-    // The prompt and the tool definitions are stored with the session and reused
-    // on a resume, so the request sent then matches the earlier run byte for byte
-    // and hits the prompt cache. They are set only on a session that has none, so
-    // a new session gets the current ones while a resumed one keeps what it was
-    // saved with. The project's own instructions are part of the prompt, so they
-    // are sent with every request. Both are dropped once the session has copied
-    // them.
-    const instructions = try projectInstructions(io, gpa, work_dir);
-    defer if (instructions) |text| gpa.free(text);
-    const prompt_text = if (instructions) |text|
-        try std.fmt.allocPrint(gpa, "{s}\n\n{s}", .{ system_prompt, text })
-    else
-        try gpa.dupe(u8, system_prompt);
-    defer gpa.free(prompt_text);
-    try session.appendSystemPrompt(prompt_text);
-    try session.ensureTools(tool_set.definitions());
 
     // The blocks of the run are shown on the terminal, the way billy has always
     // shown them.
@@ -476,25 +547,22 @@ pub fn run(
         // has finished and the one about to be typed has not started, so the
         // summary lands where the history it stands in for ended. It runs before
         // the header is built, so the header then reports the smaller
-        // conversation. Doing nothing is not an error: the prompt goes on with
-        // the conversation as it is.
-        maybeCompact(io, &client, emitter, config, session) catch |err|
-            std.log.warn("compaction failed: {s}", .{@errorName(err)});
+        // conversation.
+        runner.compactIfNeeded(emitter, session);
         header.clearRetainingCapacity();
         try sessionHeader(&header.writer, config, session.id(), session.context_tokens, session.cost);
         const line = (try editor.readLine(header.written(), prompt)) orelse break;
         if (line.len == 0) continue;
-        try session.append(.{ .role = "user", .content = line });
         // The line editor has erased the prompt it was typed behind, so the
         // prompt is written out now as the block a replay shows: the `> ` belongs
         // to the input, not to what was said. Flushed before the request, which
         // may take a while, so the user sees what was sent.
-        try emitter.show(.{ .prompt = line });
-        try out.flush();
-        // A failed request must not end the session: report it and take the
-        // next request from the user.
-        turn(io, &client, &tool_set, emitter, config, session) catch |err|
+        //
+        // A failed request must not end the session: report it and take the next
+        // request from the user.
+        runner.ask(emitter, session, line) catch |err|
             std.log.err("request failed: {s}", .{@errorName(err)});
+        try out.flush();
     }
     try out.flush();
 }
