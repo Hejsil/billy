@@ -7,6 +7,11 @@
 //! conversation and reused when the session is resumed, so a resume resends the
 //! exact request of the run it continues and hits the prompt cache. A changed
 //! prompt or tool therefore takes effect in new sessions only.
+//!
+//! A kill that lands while a tool runs can leave the last turn of a session
+//! without the results of its tool calls, which the API rejects on the next
+//! request. A resume completes that turn before anything else reads it, so a
+//! session a kill left half written is still one that can continue.
 
 const std = @import("std");
 const Io = std.Io;
@@ -32,6 +37,11 @@ const max_id_len = 64;
 
 /// Longest session file read back, so a damaged file cannot exhaust memory.
 const max_session_bytes = 64 << 20;
+
+/// The result given a tool call a kill left open. It restores a conversation the
+/// API will take, and tells the model the call did not finish so it can try
+/// again.
+const interrupted_result = "Error: the tool call was interrupted before it produced a result.";
 
 /// A tool definition as the API takes it, which is how a session file holds
 /// one, so a file written before a session kept its own tools still reads. The
@@ -740,6 +750,11 @@ fn load(session: *Session) !void {
     }
     session.compactions.shrinkRetainingCapacity(kept);
 
+    // A run killed while a tool ran can leave the last turn without the results
+    // of its calls, which the API rejects on the next request. The turn is
+    // completed before anything reads the conversation.
+    try session.repairTail();
+
     // The tools are interned like the conversation, so the set is one array and
     // the arguments schema becomes the JSON text the request sends it as.
     const tools = try session.gpa.alloc(Tool, stored.tools.len);
@@ -761,6 +776,71 @@ fn load(session: *Session) !void {
         session.gpa.free(session.cwd);
         session.cwd = owned;
     }
+}
+
+/// Completes the last turn of a conversation a kill left half written.
+///
+/// A run killed while a tool ran can stop after the assistant message that asked
+/// for the calls was written and before the results were, so the last turn of a
+/// resumed session can hold calls with no message answering them, which the API
+/// rejects: every turn before it finished and is left alone, and only the calls
+/// the kill left open are answered here, each by a message saying the call was
+/// interrupted so the model can carry on.
+fn repairTail(session: *Session) !void {
+    // The last message that asks for tools is where a kill leaves off. A
+    // conversation with none, or whose last such message is answered in full, is
+    // one the earlier run finished.
+    const tail = session.lastCall() orelse return;
+    const calls = session.callCount(session.messages.items[tail]);
+
+    // The results that follow the message, which is where they were written.
+    var answered: usize = 0;
+    while (answered < calls and tail + 1 + answered < session.messages.items.len and
+        std.mem.eql(u8, session.roleOf(session.messages.items[tail + 1 + answered]), "tool"))
+        answered += 1;
+    if (answered >= calls) return;
+
+    // The calls with no result are answered right after the results the file
+    // holds, in the order the calls were made, so the assistant message is
+    // followed by one result per call.
+    //
+    // The id that names each result is the one the call already carries, taken
+    // as its index into the pool rather than as the text it names: interning
+    // the other strings grows the pool, which would leave a copy of that text
+    // dangling, while an index survives the pool moving.
+    const at = tail + 1 + answered;
+    const missing = calls - answered;
+    var k: usize = answered;
+    while (k < calls) : (k += 1) {
+        const call_id = session.messages.items[tail].tool_calls.resolve(session)[k].id;
+        const result: Message = .{
+            .role = try session.internString("tool"),
+            .content = try session.internString(interrupted_result),
+            .tool_call_id = call_id,
+        };
+        try session.messages.insert(session.gpa, at + (k - answered), result);
+    }
+
+    // A compaction records where its summary sits by index, and the answers push
+    // every message from `at` on along, so a summary at or past `at` moves with
+    // them. Only a file written by hand holds a summary behind an unfinished
+    // turn; it is moved so that such a file still reads soundly.
+    for (session.compactions.items) |*index| {
+        if (index.* >= at) index.* += @intCast(missing);
+    }
+}
+
+/// The index of the last message that asks for tools, or null when the
+/// conversation asks for none.
+fn lastCall(session: *const Session) ?usize {
+    var i = session.messages.items.len;
+    while (i > 0) {
+        i -= 1;
+        const message = session.messages.items[i];
+        if (std.mem.eql(u8, session.roleOf(message), "assistant") and session.callCount(message) > 0)
+            return i;
+    }
+    return null;
 }
 
 /// Interns `text` into the pool and returns its index, or `.none` for null.
@@ -1050,6 +1130,146 @@ test "a session survives a save and resume" {
             try std.testing.expectEqualStrings(expected_call.function.arguments, actual_call.function.arguments);
         }
     }
+}
+
+test "a resume answers a tool call a killed run left open" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, null, "/work");
+    defer session.deinit();
+
+    try session.append(.{ .role = "user", .content = "hello" });
+    // The assistant asked for a tool, and the run was killed before its result
+    // was written, so the session ends on the call with no message answering it.
+    try session.append(.{ .role = "assistant", .tool_calls = &.{.{
+        .id = "call_1",
+        .function = .{ .name = "bash", .arguments = "{}" },
+    }} });
+
+    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, session.id(), "/work");
+    defer resumed.deinit();
+
+    // The call now has an answer, so the request the session builds is one the
+    // API takes: the assistant message is followed by the result of its call.
+    const messages = try resumed.resolvedMessages(allocator);
+    try std.testing.expectEqual(@as(usize, 3), messages.len);
+    try std.testing.expectEqualStrings("assistant", messages[1].role);
+    try std.testing.expectEqualStrings("tool", messages[2].role);
+    try std.testing.expectEqualStrings("call_1", messages[2].tool_call_id.?);
+    try std.testing.expectEqualStrings(interrupted_result, messages[2].content.?);
+}
+
+test "a resume answers every call a kill left open, in the order made" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, null, "/work");
+    defer session.deinit();
+
+    try session.append(.{ .role = "user", .content = "go" });
+    try session.append(.{ .role = "assistant", .tool_calls = &.{
+        .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{}" } },
+        .{ .id = "call_2", .function = .{ .name = "read", .arguments = "{}" } },
+    } });
+    try session.append(.{ .role = "tool", .tool_call_id = "call_1", .content = "the first result" });
+    // Killed before the second result, and the user typed on afterwards, so the
+    // message that follows the run is not a result at all.
+    try session.append(.{ .role = "user", .content = "still there?" });
+
+    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, session.id(), "/work");
+    defer resumed.deinit();
+
+    // user, the assistant message, its two results, then the user message: the
+    // result the file held stays with its call, and the call it lost is answered
+    // in the place it was made rather than after the user message.
+    const messages = try resumed.resolvedMessages(allocator);
+    try std.testing.expectEqual(@as(usize, 5), messages.len);
+    try std.testing.expectEqualStrings("tool", messages[2].role);
+    try std.testing.expectEqualStrings("call_1", messages[2].tool_call_id.?);
+    try std.testing.expectEqualStrings("the first result", messages[2].content.?);
+    try std.testing.expectEqualStrings("tool", messages[3].role);
+    try std.testing.expectEqualStrings("call_2", messages[3].tool_call_id.?);
+    try std.testing.expectEqualStrings(interrupted_result, messages[3].content.?);
+    try std.testing.expectEqualStrings("user", messages[4].role);
+    try std.testing.expectEqualStrings("still there?", messages[4].content.?);
+}
+
+test "a resume leaves a finished conversation alone" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, null, "/work");
+    defer session.deinit();
+
+    // A run that finished leaves every call answered and its compaction in
+    // place, which is what the repair must not disturb.
+    try session.append(.{ .role = "system", .content = "be terse" });
+    try session.append(.{ .role = "user", .content = "go" });
+    try session.append(.{ .role = "assistant", .tool_calls = &.{
+        .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{}" } },
+        .{ .id = "call_2", .function = .{ .name = "read", .arguments = "{}" } },
+    } });
+    try session.append(.{ .role = "tool", .tool_call_id = "call_1", .content = "one" });
+    try session.append(.{ .role = "tool", .tool_call_id = "call_2", .content = "two" });
+    try session.appendCompaction("summarize this", "the summary");
+    try session.append(.{ .role = "assistant", .content = "done" });
+
+    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, session.id(), "/work");
+    defer resumed.deinit();
+
+    try std.testing.expectEqual(session.messages.items.len, resumed.messages.items.len);
+    try std.testing.expectEqual(session.sentFrom(), resumed.sentFrom());
+    try std.testing.expect(resumed.isCompaction(resumed.sentFrom()));
+}
+
+test "a repair moves a compaction that sits behind the turn it completes" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(std.testing.io, tmp.dir, allocator, null, "/work");
+    defer session.deinit();
+
+    // A file that holds a compaction right behind a call with no result, as one
+    // written by hand can: the answer the repair inserts lands in front of both
+    // the prompt and the summary.
+    try session.append(.{ .role = "user", .content = "go" });
+    try session.append(.{ .role = "assistant", .tool_calls = &.{.{
+        .id = "call_1",
+        .function = .{ .name = "read", .arguments = "{}" },
+    }} });
+    try session.appendCompaction("summarize this", "the summary");
+
+    var resumed = try Session.open(std.testing.io, tmp.dir, allocator, session.id(), "/work");
+    defer resumed.deinit();
+
+    // user, the assistant message, its answer, then the prompt and the summary:
+    // the summary the file recorded at index 3 moves to 4 with the message it
+    // names, so a request still starts at the summary rather than at the prompt.
+    try std.testing.expectEqual(@as(usize, 5), resumed.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 4), resumed.sentFrom());
+    try std.testing.expect(resumed.isCompaction(resumed.sentFrom()));
+    try std.testing.expectEqualStrings("the summary", resumed.contentOf(resumed.messages.items[4]).?);
 }
 
 test "a conversation writes the messages a request would have carried" {
