@@ -252,6 +252,16 @@ fn handle(
     var send_buffer: [4096]u8 = undefined;
     var reader = stream.reader(setup.io, &recv_buffer);
     var writer = stream.writer(setup.io, &send_buffer);
+    // A `Server` is per-connection, not per-listener: it wraps this connection's
+    // reader and writer and holds the protocol state for them, so it is built
+    // here, once for the connection, over this connection's buffers. The shared
+    // thing is `listener`, the socket that is accepted on. A single `Server`
+    // handed to every connection would be shared mutable state over one reader,
+    // and could only ever serve one of them.
+    //
+    // One request is served and the connection closed (`keep_alive = false`
+    // everywhere), so `receiveHead` is called once; the same `Server` could
+    // serve further requests on this connection if some reply asked to keep it.
     var server: std.http.Server = .init(&reader.interface, &writer.interface);
 
     var request = server.receiveHead() catch return;
