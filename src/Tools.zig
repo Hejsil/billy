@@ -772,27 +772,56 @@ const marks = struct {
     const unknown = Mark{ .glyph = "?", .hue = .red };
 };
 
+/// How a call is headed: the glyph its tool is marked with, the name of the tool
+/// and what the call acts on. This is what a frontend needs to open a call's
+/// block; the terminal colours the glyph and dims the target, and the web gives
+/// each an element of its own.
+pub const Heading = struct {
+    /// The glyph the tool is marked with.
+    glyph: []const u8,
+    /// The colour the terminal shows the glyph in. The web has its own.
+    hue: Color,
+    /// The name of the tool the call names.
+    name: []const u8,
+    /// What the call acts on, such as a read's path or a search's query, or
+    /// nothing when the call names nothing to act on.
+    target: []const u8,
+
+    /// The heading of `call`: the mark of the tool it names, the name, and what
+    /// the call acts on. A call billy cannot run still has a name, so it is
+    /// headed by that; the reason it could not run reaches the user as its output.
+    pub fn of(call: Call) Heading {
+        return switch (call) {
+            .read => |args| .marked(marks.read, "read", args.path),
+            .write => |args| .marked(marks.write, "write", args.path),
+            .edit => |args| .marked(marks.edit, "edit", args.path),
+            .bash => .marked(marks.bash, "bash", ""),
+            .web_search => |args| .marked(marks.search, "web_search", args.query),
+            .unknown => |name| .marked(marks.unknown, name, ""),
+            .malformed => |bad| .marked(marks.unknown, bad.name, ""),
+        };
+    }
+
+    /// The heading of a call to the tool `mark` stands for: the mark's glyph, the
+    /// tool's name, and what the call acts on.
+    fn marked(mark: Mark, name: []const u8, target: []const u8) Heading {
+        return .{ .glyph = mark.glyph, .hue = mark.hue, .name = name, .target = target };
+    }
+};
+
 /// Prints the header block of a call: which tool it is and what it acts on. A
 /// bash command is laid out by the bash formatter, so it reads the way it runs;
 /// an edit is shown as the diff of the strings it works on; and a search shows
 /// the query it ran.
 pub fn printHead(scratch: std.mem.Allocator, call: Call, formats: Formats, style: Style, out: *Io.Writer) !void {
+    const head = Heading.of(call);
+    try styling.header(.{ .glyph = head.glyph, .hue = head.hue }, head.name, head.target, style, out);
+    // What a call shows under its header: the change it means to make, or the
+    // command it runs. Every other call is its header alone.
     switch (call) {
-        .read => |args| try styling.header(marks.read, "read", args.path, style, out),
-        .write => |args| try styling.header(marks.write, "write", args.path, style, out),
-        .edit => |args| {
-            try styling.header(marks.edit, "edit", args.path, style, out);
-            try printDiff(scratch, args.old_string, args.new_string, formats.edit, style, out);
-        },
-        .bash => |args| {
-            try styling.header(marks.bash, "bash", "", style, out);
-            try printScript(args.command, formats.bash, out);
-        },
-        .web_search => |args| try styling.header(marks.search, "web_search", args.query, style, out),
-        // Only the name is known, so that is all there is to show; the reason it
-        // could not run reaches the user through the output.
-        .unknown => |name| try styling.header(marks.unknown, name, "", style, out),
-        .malformed => |bad| try styling.header(marks.unknown, bad.name, "", style, out),
+        .edit => |args| try printDiff(scratch, args.old_string, args.new_string, formats.edit, style, out),
+        .bash => |args| try printScript(args.command, formats.bash, out),
+        else => {},
     }
 }
 
