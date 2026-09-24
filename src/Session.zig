@@ -16,18 +16,20 @@ const Session = @This();
 
 /// Directory under the XDG data directory that holds billy's files.
 const app_dir = "billy";
+
 /// Subdirectory of the data directory that holds the sessions, so the session
 /// files sit apart from the credentials billy keeps in the directory itself.
 const sessions_dir = "sessions";
+
 /// Extension of a session file.
 const extension = ".json";
+
 /// Most a session id may be. A generated one is the 15 characters of
 /// `YYYYMMDD-HHMMSS`; the room is for a `-N` suffix on a second run in the same
 /// second, or a name typed on the command line. The buffer holds this many bytes
 /// and is written from the front, so there is always a byte left to end the id.
 const max_id_len = 64;
-/// Layout of a session file, bumped when its shape changes.
-const format_version = 2;
+
 /// Longest session file read back, so a damaged file cannot exhaust memory.
 const max_session_bytes = 64 << 20;
 
@@ -48,7 +50,8 @@ const StoredTool = struct {
 
 /// A session file as it is written to and read from disk.
 const Stored = struct {
-    version: u32 = format_version,
+    /// Layout of a session file, bumped when its shape changes.
+    version: u32 = 2,
     /// The conversation, oldest first.
     messages: []const llm.Message = &.{},
     /// Indices into `messages`, sorted, of the summaries a compaction produced.
@@ -70,6 +73,8 @@ const Stored = struct {
     /// The directory the session was started in. Empty for a session saved
     /// before it was recorded, which is read as the directory billy runs in.
     cwd: []const u8 = "",
+
+    const default = Stored{};
 };
 
 const StringIndex = enum(u32) {
@@ -627,7 +632,7 @@ pub fn save(session: *Session) !void {
     };
     try json.beginObject();
     try json.objectField("version");
-    try json.write(format_version);
+    try json.write(Stored.default.version);
     try json.objectField("messages");
     try json.beginArray();
     for (session.messages.items) |message| {
@@ -708,7 +713,7 @@ fn load(session: *Session) !void {
     defer parsed.deinit();
     const stored = parsed.value;
 
-    if (stored.version > format_version)
+    if (stored.version > Stored.default.version)
         return error.UnsupportedSessionVersion;
 
     // The stored messages are kept as they are, system prompt included, so
