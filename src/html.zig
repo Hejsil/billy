@@ -1186,8 +1186,9 @@ test "a whole conversation is rendered, a tool call and a compaction included" {
     defer session.deinit();
 
     // A prompt and a reply, a tool call with its result, an edit with its diff,
-    // and a compaction standing in for the conversation before it.
-    try session.append(.{ .role = "system", .content = "be terse" });
+    // and a compaction standing in for the conversation before it. The system
+    // prompt is its own field, which the conversation does not show.
+    try session.setSystemPrompt("be terse");
     try session.append(.{ .role = "user", .content = "read it" });
     try session.append(.{ .role = "assistant", .tool_calls = &.{.{
         .id = "call_1",

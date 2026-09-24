@@ -473,20 +473,18 @@ pub const Runner = struct {
     /// session's directory and are part of the prompt, so they are sent with
     /// every request.
     pub fn prepare(runner: *Runner, session: *Session) !void {
-        const instructions = try projectInstructions(runner.io, runner.gpa, runner.work_dir);
-        defer if (instructions) |text| runner.gpa.free(text);
-        const prompt_text = if (instructions) |text|
-            try std.fmt.allocPrint(runner.gpa, "{s}\n\n{s}", .{ system_prompt, text })
-        else
-            try runner.gpa.dupe(u8, system_prompt);
-        defer runner.gpa.free(prompt_text);
-
-        try session.appendSystemPrompt(prompt_text);
+        if (!session.hasSystemPrompt()) {
+            const prompt_text = try leadPrompt(runner.io, runner.gpa, runner.work_dir);
+            defer runner.gpa.free(prompt_text);
+            try session.setSystemPrompt(prompt_text);
+        }
         try session.ensureTools(runner.tool_set.definitions());
     }
 
     /// Compacts the conversation if it has outgrown the context window, so that
-    /// a long session goes on rather than failing on an overlong request.
+    /// a long session goes on rather than failing on an overlong request. When it
+    /// compacts, the session's prompt and tools are refreshed, so the next
+    /// request carries the current ones (see `refreshLead`).
     ///
     /// A frontend calls this before it adds a prompt and, on a terminal, before
     /// it shows the header, so the prompt is not folded into the summary it
@@ -494,8 +492,18 @@ pub const Runner = struct {
     /// not fatal: the conversation is left as it is and the request goes out with
     /// it, which is what would have happened without compaction at all.
     pub fn compactIfNeeded(runner: *Runner, emitter: Emitter, session: *Session) void {
-        maybeCompact(runner.io, &runner.client, emitter, runner.config, session) catch |err|
+        const compacted = maybeCompact(runner.io, &runner.client, emitter, runner.config, session) catch |err| {
             std.log.warn("compaction failed: {s}", .{@errorName(err)});
+            return;
+        };
+        if (!compacted) return;
+        refreshLead(
+            runner.io,
+            runner.gpa,
+            runner.work_dir,
+            runner.tool_set.definitions(),
+            session,
+        ) catch |err| std.log.warn("could not refresh the prompt and tools: {s}", .{@errorName(err)});
     }
 
     /// Asks `session` one thing and shows how the answer is reached: the prompt,
@@ -773,12 +781,19 @@ fn turn(
         // A conversation that has outgrown the context window is compacted
         // before the request that would carry it, so a long session goes on
         // instead of failing on an overlong request. A failure to compact is not
-        // the turn's: the request goes out with the conversation as it is.
+        // the turn's: the request goes out with the conversation as it is. A
+        // compaction refreshes the prompt and tools before the next request, so
+        // the turn picks up the current ones.
         if (!compact_failed) {
-            maybeCompact(io, client, emitter, config, session) catch |err| {
+            const compacted = maybeCompact(io, client, emitter, config, session) catch |err| blk: {
                 std.log.warn("compaction failed: {s}", .{@errorName(err)});
                 compact_failed = true;
+                break :blk false;
             };
+            if (compacted) {
+                refreshLead(io, tool_set.gpa, tool_set.dir, tool_set.definitions(), session) catch |err|
+                    std.log.warn("could not refresh the prompt and tools: {s}", .{@errorName(err)});
+            }
         }
 
         // The completion owns its parsed reply, and each tool result lives in the
@@ -832,6 +847,42 @@ fn turn(
     try emitter.show(.{ .notice = stopped });
 }
 
+/// The system prompt a session runs with: billy's own, and the project's
+/// instructions when it has any, which are read from the session's directory and
+/// are part of the prompt. The caller owns the text and frees it.
+fn leadPrompt(io: Io, gpa: std.mem.Allocator, dir: Io.Dir) ![]u8 {
+    const instructions = try projectInstructions(io, gpa, dir);
+    defer if (instructions) |text| gpa.free(text);
+    if (instructions) |text|
+        return std.fmt.allocPrint(gpa, "{s}\n\n{s}", .{ system_prompt, text });
+    return gpa.dupe(u8, system_prompt);
+}
+
+/// Refreshes the prompt and the tools a session opens its requests with, so a
+/// session that has been running a while picks up a changed prompt, project
+/// instructions or tool set. The refreshed session is written out, since a
+/// compaction is the only caller and the file has just been rewritten with the
+/// summary.
+///
+/// This runs after a compaction, which is the one moment replacing the front of a
+/// request costs no cache that was not already being thrown away: the
+/// conversation before the compaction is being replaced by a summary in any case,
+/// so the only shared prefix left to lose is the prompt and the tools
+/// themselves.
+fn refreshLead(
+    io: Io,
+    gpa: std.mem.Allocator,
+    dir: Io.Dir,
+    definitions: []const Session.Definition,
+    session: *Session,
+) !void {
+    const prompt_text = try leadPrompt(io, gpa, dir);
+    defer gpa.free(prompt_text);
+    try session.setSystemPrompt(prompt_text);
+    try session.setTools(definitions);
+    try session.save();
+}
+
 /// The rates in effect right now. Zero for a model billy does not know, which
 /// has no prices to cost its tokens at.
 fn rateNow(io: Io, config: Config) models.Price {
@@ -871,23 +922,26 @@ fn compactThreshold(config: Config) usize {
 /// so the transcript still shows the whole history. Doing nothing here is not an
 /// error: the conversation is left as it was and the request goes out with it,
 /// which is what would have happened without compaction at all.
+/// Compacts `session` when its context has outgrown the window, and says whether
+/// it did. The caller refreshes the session's prompt and tools when it did, which
+/// is why the answer is reported rather than swallowed.
 fn maybeCompact(
     io: Io,
     client: *llm.Client,
     emitter: Emitter,
     config: Config,
     session: *Session,
-) !void {
+) !bool {
     const threshold = compactThreshold(config);
-    if (threshold == 0 or session.context_tokens < threshold) return;
+    if (threshold == 0 or session.context_tokens < threshold) return false;
 
     // Nothing has been added since the last compaction, so there is nothing new
     // to fold in: compacting again would only summarize the summary, and would
     // do so on every request.
     const start = session.sentFrom();
-    if (session.messages.items.len - start <= 1) return;
+    if (session.messages.items.len - start <= 1) return false;
 
-    const summary = try summarize(io, client, config, session) orelse return;
+    const summary = try summarize(io, client, config, session) orelse return false;
     defer client.gpa.free(summary);
 
     // The conversation a request now carries is the summary and little else, so
@@ -898,6 +952,7 @@ fn maybeCompact(
     session.context_tokens = 0;
     try session.appendCompaction(compact_prompt, summary);
     try emitter.show(.{ .compacted = .{ .prompt = compact_prompt, .summary = summary } });
+    return true;
 }
 
 /// One request that asks the model to summarize the conversation it is being
@@ -1201,7 +1256,7 @@ test "printTranscript shows a compaction as a single line" {
 
     var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
-    try session.append(.{ .role = "system", .content = "be terse" });
+    try session.setSystemPrompt("be terse");
     try session.append(.{ .role = "user", .content = "one" });
     try session.append(.{ .role = "assistant", .content = "a1" });
     try session.appendCompaction("summarize this", "the summary");
@@ -1245,7 +1300,7 @@ test "a compaction is headed by its own mark, and hides what it stands for" {
 
     var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
-    try session.append(.{ .role = "system", .content = "s" });
+    try session.setSystemPrompt("s");
     try session.append(.{ .role = "user", .content = "hi" });
     try session.appendCompaction("ASKEDFORTHEcompaction", "THESUMMARYTEXT");
     try session.append(.{ .role = "user", .content = "next" });
@@ -1630,7 +1685,7 @@ test "maybeCompact folds the conversation into a summary at its end" {
 
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
-    try session.append(.{ .role = "system", .content = "be terse" });
+    try session.setSystemPrompt("be terse");
     try session.append(.{ .role = "user", .content = "OLDPROMPT" });
     try session.append(.{ .role = "assistant", .tool_calls = &.{.{
         .id = "call_x",
@@ -1681,7 +1736,7 @@ test "maybeCompact folds the conversation into a summary at its end" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var terminal = testTerminal(&out.writer, .{});
-    try maybeCompact(io, &client, terminal.emitter(), config, &session);
+    try std.testing.expect(try maybeCompact(io, &client, terminal.emitter(), config, &session));
 
     try group.await(io);
     if (provider.err) |err| return err;
@@ -1697,14 +1752,14 @@ test "maybeCompact folds the conversation into a summary at its end" {
 
     // The prompt and the summary are added to the end of the session, which keeps
     // every message it had. The summary is a user message.
-    try std.testing.expectEqual(7, session.messages.items.len);
+    try std.testing.expectEqual(6, session.messages.items.len);
+    try std.testing.expectEqualStrings("user", session.roleOf(session.messages.items[4]));
     try std.testing.expectEqualStrings("user", session.roleOf(session.messages.items[5]));
-    try std.testing.expectEqualStrings("user", session.roleOf(session.messages.items[6]));
-    try std.testing.expectEqualStrings("the summary", session.contentOf(session.messages.items[6]).?);
-    // A request now starts at the summary, skipping the prompt and everything
-    // the summary stands in for.
-    try std.testing.expectEqual(6, session.sentFrom());
-    try std.testing.expect(session.isCompaction(6));
+    try std.testing.expectEqualStrings("the summary", session.contentOf(session.messages.items[5]).?);
+    // A request now starts at the summary, skipping everything the summary stands
+    // in for.
+    try std.testing.expectEqual(5, session.sentFrom());
+    try std.testing.expect(session.isCompaction(5));
 
     // The compaction request was billed, but the gauge it would set is dropped
     // since the conversation it measured has just been replaced.
@@ -1724,7 +1779,7 @@ test "maybeCompact does nothing below the threshold, off, or with nothing new" {
 
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
-    try session.append(.{ .role = "system", .content = "s" });
+    try session.setSystemPrompt("s");
     try session.append(.{ .role = "user", .content = "hello" });
 
     var config = testConfig("m", "/work", null);
@@ -1738,18 +1793,18 @@ test "maybeCompact does nothing below the threshold, off, or with nothing new" {
 
     // Below the threshold.
     session.context_tokens = 100;
-    try maybeCompact(io, undefined, emitter, config, &session);
+    try std.testing.expect(!try maybeCompact(io, undefined, emitter, config, &session));
     // Turned off.
     session.context_tokens = 999;
     config.compact_at = 0;
-    try maybeCompact(io, undefined, emitter, config, &session);
+    try std.testing.expect(!try maybeCompact(io, undefined, emitter, config, &session));
     // A model with no known window has no threshold to measure against.
     config.compact_at = 80;
     config.model_info = null;
-    try maybeCompact(io, undefined, emitter, config, &session);
+    try std.testing.expect(!try maybeCompact(io, undefined, emitter, config, &session));
 
     // Nothing was added, and nothing was printed.
-    try std.testing.expectEqual(2, session.messages.items.len);
+    try std.testing.expectEqual(1, session.messages.items.len);
     try std.testing.expectEqualStrings("", out.written());
 }
 
@@ -1762,7 +1817,7 @@ test "maybeCompact does not compact a summary that stands alone" {
 
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
-    try session.append(.{ .role = "system", .content = "s" });
+    try session.setSystemPrompt("s");
     try session.appendCompaction("p", "a summary");
 
     var config = testConfig("m", "/work", null);
@@ -1774,10 +1829,61 @@ test "maybeCompact does not compact a summary that stands alone" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var terminal = testTerminal(&out.writer, .{});
-    try maybeCompact(io, undefined, terminal.emitter(), config, &session);
+    try std.testing.expect(!try maybeCompact(io, undefined, terminal.emitter(), config, &session));
 
-    try std.testing.expectEqual(3, session.messages.items.len);
+    try std.testing.expectEqual(2, session.messages.items.len);
     try std.testing.expectEqualStrings("", out.written());
+}
+
+test "refreshLead replaces the prompt, the project instructions and the tools" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The project has instructions of its own, which are part of the prompt.
+    try tmp.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "PROJECT RULES" });
+
+    const old_tools = [_]Session.Definition{.{
+        .name = "old",
+        .description = "A tool from when the session started.",
+        .parameters = "{}",
+    }};
+    const new_tools = [_]Session.Definition{
+        .{ .name = "read", .description = "Read a file.", .parameters = "{}" },
+        .{ .name = "bash", .description = "Run a command.", .parameters = "{}" },
+    };
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    // A session that has been running a while, carrying the prompt and tools it
+    // started with.
+    try session.setSystemPrompt("OLD PROMPT");
+    try session.setTools(&old_tools);
+
+    try refreshLead(io, gpa, tmp.dir, &new_tools, &session);
+
+    // The prompt is the current one: billy's own text with the project's
+    // instructions after it, and none of the old prompt left.
+    const prompt_text = session.systemPrompt().?;
+    try std.testing.expect(std.mem.indexOf(u8, prompt_text, system_prompt) != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt_text, "PROJECT RULES") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt_text, "OLD PROMPT") == null);
+
+    // The tools are the current set, replacing the one the session started with.
+    var tools: std.Io.Writer.Allocating = .init(gpa);
+    defer tools.deinit();
+    try std.json.Stringify.value(session.toolSet(), .{}, &tools.writer);
+    try std.testing.expect(std.mem.indexOf(u8, tools.written(), "\"name\":\"read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools.written(), "\"name\":\"bash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools.written(), "\"name\":\"old\"") == null);
+
+    // The refreshed session is written out, so a resume carries the current lead.
+    var resumed = try Session.open(io, tmp.dir, gpa, session.id(), "/work");
+    defer resumed.deinit();
+    try std.testing.expectEqualStrings(prompt_text, resumed.systemPrompt().?);
+    try std.testing.expectEqual(2, resumed.tools.len);
 }
 
 /// A stand-in for the model on the wire, for the compaction tests: it answers
@@ -1946,7 +2052,7 @@ test "a turn shows the tool it runs and then the answer" {
 
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
-    try session.appendSystemPrompt("be terse");
+    try session.setSystemPrompt("be terse");
 
     var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = try address.listen(io, .{ .reuse_address = true });

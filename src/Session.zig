@@ -3,10 +3,12 @@
 //!
 //! Every session is one JSON file named after its id. The file is rewritten
 //! after each message, so killing the process loses at most the message being
-//! written. The system prompt and the tool definitions are stored with the
-//! conversation and reused when the session is resumed, so a resume resends the
-//! exact request of the run it continues and hits the prompt cache. A changed
-//! prompt or tool therefore takes effect in new sessions only.
+//! written. The system prompt and the tool definitions are kept with the
+//! session, apart from the conversation, and reused when it is resumed, so a
+//! resume resends the exact request of the run it continues and hits the prompt
+//! cache. They are refreshed when the conversation is compacted, which is the
+//! one time replacing the front of a request costs no cache that was not already
+//! being thrown away; see `agent.Runner.refreshLead`.
 //!
 //! A kill that lands while a tool runs can leave the last turn of a session
 //! without the results of its tool calls, which the API rejects on the next
@@ -60,8 +62,15 @@ const StoredTool = struct {
 
 /// A session file as it is written to and read from disk.
 const Stored = struct {
-    /// Layout of a session file, bumped when its shape changes.
-    version: u32 = 2,
+    /// Layout of a session file, bumped when its shape changes. Version 3 keeps
+    /// the system prompt in `system_prompt` rather than as the first message;
+    /// version 1 and 2 files hold it in `messages` and are migrated on load.
+    version: u32 = 3,
+    /// The system prompt sent at the front of every request, or null for a
+    /// session that has none. It is kept apart from `messages`, which is the
+    /// conversation alone, so that the prompt and the tools can be replaced at a
+    /// compaction without rewriting the conversation the model has seen.
+    system_prompt: ?[]const u8 = null,
     /// The conversation, oldest first.
     messages: []const llm.Message = &.{},
     /// Indices into `messages`, sorted, of the summaries a compaction produced.
@@ -222,8 +231,14 @@ interned: std.HashMapUnmanaged(StringIndex, void, Interned, std.hash_map.default
 
 tool_calls: std.ArrayList(ToolCall) = .empty,
 
-/// The conversation, oldest first, starting with the system prompt.
+/// The conversation, oldest first. The system prompt is not part of it: it is
+/// sent at the front of every request, from `system_prompt`, and kept out of the
+/// conversation so the two can be replaced apart from each other.
 messages: std.ArrayList(Message) = .empty,
+
+/// The system prompt sent at the front of every request, interned in the pool
+/// like every other string. `.none` for a session that has none.
+system_prompt: StringIndex = .none,
 
 /// Indices into `messages`, sorted and without repeats, of the summaries a
 /// compaction produced. Keeping them as a list rather than a flag on every
@@ -354,10 +369,17 @@ pub const Conversation = struct {
     pub fn jsonStringify(self: Conversation, json: anytype) !void {
         const session = self.session;
         try json.beginArray();
-        for (session.messages.items[0..session.leadCount()]) |message| {
-            try writeMessage(session, json, message);
+        // The system prompt leads every request, and is the one message that is
+        // not part of the conversation.
+        if (session.string(session.system_prompt)) |prompt| {
+            try json.beginObject();
+            try json.objectField("role");
+            try json.write("system");
+            try json.objectField("content");
+            try json.write(prompt);
+            try json.endObject();
         }
-        for (session.messages.items[session.sendStart()..]) |message| {
+        for (session.messages.items[session.sentFrom()..]) |message| {
             try writeMessage(session, json, message);
         }
         try json.endArray();
@@ -434,20 +456,17 @@ pub fn isCompaction(session: *const Session, index: usize) bool {
     return std.mem.indexOfScalar(u32, session.compactions.items, target) != null;
 }
 
-/// How many messages lead every request: the system prompt, which is sent even
-/// when a compaction skips past it. Zero for a session that has none.
-pub fn leadCount(session: *const Session) usize {
-    var count: usize = 0;
-    while (count < session.messages.items.len and
-        std.mem.eql(u8, session.roleOf(session.messages.items[count]), "system")) count += 1;
-    return count;
+/// Whether the session has a system prompt of its own, which every request
+/// carries at its front. False for a session saved before the prompt was kept
+/// apart from the conversation and for one opened but not yet prepared.
+pub fn hasSystemPrompt(session: *const Session) bool {
+    return session.system_prompt != .none;
 }
 
-/// Where the messages a request carries after the system prompt begin: the
-/// summary of the latest compaction, or the first message after the system
-/// prompt when there is none.
-pub fn sendStart(session: *const Session) usize {
-    return @max(session.sentFrom(), session.leadCount());
+/// The system prompt sent at the front of every request, or null when the
+/// session has none.
+pub fn systemPrompt(session: *const Session) ?[]const u8 {
+    return session.string(session.system_prompt);
 }
 
 /// A tool call as the transcript reads it: the id that names the result which
@@ -504,17 +523,25 @@ pub fn toolResult(session: *const Session, from: usize, call: []const u8) []cons
 }
 
 /// The conversation as plain API messages, every string resolved out of the
-/// pool. `allocator` owns the result, since resolving a message has to piece its
-/// tool calls back together into a slice of its own.
+/// pool: the system prompt, when there is one, and then the whole conversation.
+/// `allocator` owns the result, since resolving a message has to piece its tool
+/// calls back together into a slice of its own.
 ///
 /// Nothing that shows or sends a conversation needs this: a request is built
 /// from `conversation`, and the transcript reads the session a message at a
 /// time. It is for a caller that wants the conversation as messages, which is
 /// what comparing two of them takes.
 pub fn resolvedMessages(session: *const Session, allocator: std.mem.Allocator) ![]const llm.Message {
-    const messages = try allocator.alloc(llm.Message, session.messages.items.len);
-    for (session.messages.items, messages) |message, *out| {
-        out.* = try message.resolve(session, allocator);
+    const lead: usize = if (session.hasSystemPrompt()) 1 else 0;
+    const messages = try allocator.alloc(llm.Message, lead + session.messages.items.len);
+    var out: usize = 0;
+    if (session.string(session.system_prompt)) |prompt| {
+        messages[0] = .{ .role = "system", .content = prompt };
+        out = 1;
+    }
+    for (session.messages.items) |message| {
+        messages[out] = try message.resolve(session, allocator);
+        out += 1;
     }
     return messages;
 }
@@ -525,13 +552,13 @@ pub fn resolvedMessages(session: *const Session, allocator: std.mem.Allocator) !
 /// request is sent this way, so it summarizes exactly what the model has been
 /// given.
 pub fn resolveSend(session: *const Session, allocator: std.mem.Allocator) ![]const llm.Message {
-    const lead = session.leadCount();
-    const start = session.sendStart();
+    const start = session.sentFrom();
+    const lead: usize = if (session.hasSystemPrompt()) 1 else 0;
     const messages = try allocator.alloc(llm.Message, lead + session.messages.items.len - start);
     var out: usize = 0;
-    for (session.messages.items[0..lead]) |message| {
-        messages[out] = try message.resolve(session, allocator);
-        out += 1;
+    if (session.string(session.system_prompt)) |prompt| {
+        messages[0] = .{ .role = "system", .content = prompt };
+        out = 1;
     }
     for (session.messages.items[start..]) |message| {
         messages[out] = try message.resolve(session, allocator);
@@ -598,31 +625,31 @@ fn appendMessage(session: *Session, message: llm.Message) !void {
     });
 }
 
-/// Appends `system_prompt` to an empty conversation, leaving one that has any
-/// messages alone. Calling it before the first turn puts the prompt first; a
-/// resumed session already carries the prompt it was saved with, which is
-/// kept so the messages sent match the earlier run byte for byte and hit the
-/// prompt cache.
+/// Records `system_prompt` as what every request opens with, replacing any prompt
+/// the session already had.
 ///
-/// The prompt is held in memory and reaches the file with the session's first
-/// message, like the tools. A new session is therefore not written out until it
-/// is first asked something, so a run that is started and left alone leaves no
-/// session file behind.
-pub fn appendSystemPrompt(session: *Session, system_prompt: []const u8) !void {
-    if (session.messages.items.len != 0) return;
-    try session.appendMessage(.{ .role = "system", .content = system_prompt });
+/// This is what a compaction uses to refresh the front of a request; `prepare`
+/// uses `ensureSystemPrompt` so that a resumed session keeps the prompt it was
+/// saved with and hits its prompt cache. The prompt is held in the pool and
+/// reaches the file with the next save, like the tools.
+pub fn setSystemPrompt(session: *Session, system_prompt: []const u8) !void {
+    session.system_prompt = try session.internString(system_prompt);
 }
 
-/// Records the tool definitions to send with every request, unless the session
-/// already has some. A resumed session carries the tools it was saved with,
-/// which are kept so the request matches the earlier run and hits the prompt
-/// cache; a new session, or one saved before the tools were stored, gets the
-/// current definitions instead.
+/// Records `system_prompt` unless the session already has one. A resumed session
+/// carries the prompt it was saved with, which is kept so the request it sends
+/// matches the earlier run byte for byte; a new session gets the current one.
+pub fn ensureSystemPrompt(session: *Session, system_prompt: []const u8) !void {
+    if (session.hasSystemPrompt()) return;
+    try session.setSystemPrompt(system_prompt);
+}
+
+/// Records the tool definitions to send with every request, replacing any the
+/// session already had.
 ///
-/// Like the system prompt, the set is held in memory and written out with the
-/// session's first message.
-pub fn ensureTools(session: *Session, definitions: []const Definition) !void {
-    if (session.tools.len != 0) return;
+/// Like the prompt, this is what a compaction uses to refresh the tools, and
+/// what a new session is given; `ensureTools` is the guarded form a resume uses.
+pub fn setTools(session: *Session, definitions: []const Definition) !void {
     // The strings are interned into the pool, so the set costs one array and
     // frees with the pool. Nothing is copied per string and there is no parsed
     // document to keep alive: the arguments schema is stored as the JSON text it
@@ -636,7 +663,20 @@ pub fn ensureTools(session: *Session, definitions: []const Definition) !void {
             .parameters = try session.internString(definition.parameters),
         };
     }
+    session.gpa.free(session.tools);
     session.tools = tools;
+}
+
+/// Records the tool definitions unless the session already has some. A resumed
+/// session carries the tools it was saved with, which are kept so the request
+/// matches the earlier run and hits the prompt cache; a new session, or one saved
+/// before the tools were stored, gets the current definitions instead.
+///
+/// Like the system prompt, the set is held in memory and written out with the
+/// session's first message.
+pub fn ensureTools(session: *Session, definitions: []const Definition) !void {
+    if (session.tools.len != 0) return;
+    try session.setTools(definitions);
 }
 
 /// Adds a request's tokens and cost to the session totals and remembers how
@@ -674,6 +714,12 @@ pub fn save(session: *Session) !void {
     try json.beginObject();
     try json.objectField("version");
     try json.write(Stored.default.version);
+    // The system prompt is kept apart from the conversation, so it is written
+    // before it and only when there is one.
+    if (session.string(session.system_prompt)) |prompt| {
+        try json.objectField("system_prompt");
+        try json.write(prompt);
+    }
     try json.objectField("messages");
     try json.beginArray();
     for (session.messages.items) |message| {
@@ -757,19 +803,37 @@ fn load(session: *Session) !void {
     if (stored.version > Stored.default.version)
         return error.UnsupportedSessionVersion;
 
-    // The stored messages are kept as they are, system prompt included, so
-    // resuming reuses exactly what the earlier run sent.
-    for (stored.messages) |message| {
+    // The system prompt is its own field in a version 3 file. An older file
+    // instead holds it as the first message, sometimes as a leading run of them;
+    // that run is lifted out into the prompt and left out of the conversation, so
+    // a request built from the session opens the way it did before. The first of
+    // the run is the prompt, which is the one billy ever wrote.
+    var lead: usize = 0;
+    if (stored.system_prompt) |prompt| {
+        try session.setSystemPrompt(prompt);
+    } else {
+        while (lead < stored.messages.len and
+            std.mem.eql(u8, stored.messages[lead].role, "system")) lead += 1;
+        if (lead > 0) try session.setSystemPrompt(stored.messages[0].content orelse "");
+    }
+
+    // The conversation is kept as it is, so resuming reuses exactly what the
+    // earlier run sent.
+    for (stored.messages[lead..]) |message| {
         try session.appendMessage(message);
     }
 
-    // The compaction indices are read back against the messages just loaded, so
-    // the sorted list a request and a transcript read is sound even if the file
-    // was written by hand: one past the end is dropped rather than trusted, the
-    // list is sorted, and a repeat is collapsed to the one copy of it.
+    // The compaction indices are read back against the conversation just loaded,
+    // so the sorted list a request and a transcript read is sound even if the
+    // file was written by hand: one past the end is dropped rather than trusted,
+    // the list is sorted, and a repeat is collapsed to the one copy of it. A
+    // migrated file's indices name the messages as they were stored, so each is
+    // shifted by the lead lifted out of the front of them.
     for (stored.compactions) |index| {
-        if (index >= session.messages.items.len) continue;
-        try session.compactions.append(session.gpa, std.math.cast(u32, index) orelse continue);
+        if (index < lead) continue;
+        const at = index - lead;
+        if (at >= session.messages.items.len) continue;
+        try session.compactions.append(session.gpa, std.math.cast(u32, at) orelse continue);
     }
     const compactions = session.compactions.items;
     std.mem.sort(u32, compactions, {}, std.sort.asc(u32));
@@ -1180,7 +1244,7 @@ test "a new session is written out by its first message" {
     // Setting a session up -- its prompt and its tools -- is held in memory, so
     // a run that is started and left alone leaves nothing behind. This is what
     // keeps an untouched `billy` from littering the sessions directory.
-    try session.appendSystemPrompt("be terse");
+    try session.setSystemPrompt("be terse");
     try session.ensureTools(&tools);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, session.name(), .{}));
 
@@ -1191,11 +1255,13 @@ test "a new session is written out by its first message" {
     var resumed = try Session.open(std.testing.io, tmp.dir, arena, session.id(), "/work");
     defer resumed.deinit();
     try std.testing.expectEqual(1, resumed.tools.len);
-    try std.testing.expectEqual(2, resumed.messages.items.len);
-    try std.testing.expectEqualStrings("system", resumed.roleOf(resumed.messages.items[0]));
-    try std.testing.expectEqualStrings("be terse", resumed.contentOf(resumed.messages.items[0]).?);
-    try std.testing.expectEqualStrings("user", resumed.roleOf(resumed.messages.items[1]));
-    try std.testing.expectEqualStrings("hello", resumed.contentOf(resumed.messages.items[1]).?);
+    // The prompt is its own field, apart from the conversation, which is the
+    // message alone.
+    try std.testing.expect(resumed.hasSystemPrompt());
+    try std.testing.expectEqualStrings("be terse", resumed.string(resumed.system_prompt).?);
+    try std.testing.expectEqual(1, resumed.messages.items.len);
+    try std.testing.expectEqualStrings("user", resumed.roleOf(resumed.messages.items[0]));
+    try std.testing.expectEqualStrings("hello", resumed.contentOf(resumed.messages.items[0]).?);
 }
 
 test "ids made one after another differ" {
@@ -1405,7 +1471,7 @@ test "a session survives a save and resume" {
     var session = try Session.open(std.testing.io, tmp.dir, arena, null, "/work");
     defer session.deinit();
 
-    try session.append(.{ .role = "system", .content = "be terse" });
+    try session.setSystemPrompt("be terse");
     try session.append(.{ .role = "user", .content = "hello" });
     try session.append(.{
         .role = "assistant",
@@ -1420,7 +1486,9 @@ test "a session survives a save and resume" {
     defer resumed.deinit();
 
     try std.testing.expectEqualStrings(session.id(), resumed.id());
-    // The system prompt is stored too, so everything comes back.
+    // The system prompt comes back in its own field, and the conversation beside
+    // it, so everything is there.
+    try std.testing.expectEqualStrings("be terse", resumed.string(resumed.system_prompt).?);
     try std.testing.expectEqual(session.messages.items.len, resumed.messages.items.len);
 
     // Resolving both sides is what makes them comparable: the indices a session
@@ -1533,7 +1601,7 @@ test "a resume leaves a finished conversation alone" {
 
     // A run that finished leaves every call answered and its compaction in
     // place, which is what the repair must not disturb.
-    try session.append(.{ .role = "system", .content = "be terse" });
+    try session.setSystemPrompt("be terse");
     try session.append(.{ .role = "user", .content = "go" });
     try session.append(.{ .role = "assistant", .tool_calls = &.{
         .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{}" } },
@@ -1599,8 +1667,9 @@ test "a conversation writes the messages a request would have carried" {
     defer session.deinit();
 
     // A message of every shape: an optional left out, one filled in, and a call
-    // alongside the result that answers it.
-    try session.append(.{ .role = "system", .content = "be terse" });
+    // alongside the result that answers it. The system prompt is its own field,
+    // which the request opens with.
+    try session.setSystemPrompt("be terse");
     try session.append(.{ .role = "user", .content = "hello" });
     try session.append(.{ .role = "assistant", .tool_calls = &.{.{
         .id = "call_1",
@@ -1806,28 +1875,34 @@ test "an equal string is interned once and shared" {
     try std.testing.expect(calls[0].function.arguments != calls[1].function.arguments);
 }
 
-test "a stored system prompt is kept when resuming" {
+test "a version 2 file's system prompt is lifted into its own field" {
     const arena = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    // A file from before the prompt was kept apart from the conversation holds it
+    // as the first message.
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "one.json",
-        .data = "{\"version\":1,\"messages\":[" ++
+        .data = "{\"version\":2,\"messages\":[" ++
             "{\"role\":\"system\",\"content\":\"old prompt\"}," ++
             "{\"role\":\"user\",\"content\":\"hi\"}]}",
     });
 
-    // Resuming keeps the saved prompt even though a newer one is available.
     var resumed = try Session.open(std.testing.io, tmp.dir, arena, "one", "/work");
     defer resumed.deinit();
 
-    try resumed.appendSystemPrompt("new prompt");
-    try std.testing.expectEqual(2, resumed.messages.items.len);
-    try std.testing.expectEqualStrings("system", resumed.string(resumed.messages.items[0].role).?);
-    try std.testing.expectEqualStrings("old prompt", resumed.string(resumed.messages.items[0].content).?);
-    try std.testing.expectEqualStrings("user", resumed.string(resumed.messages.items[1].role).?);
+    // The prompt comes back as its own field and is no longer a message, so the
+    // conversation is the user message alone.
+    try std.testing.expectEqualStrings("old prompt", resumed.string(resumed.system_prompt).?);
+    try std.testing.expectEqual(1, resumed.messages.items.len);
+    try std.testing.expectEqualStrings("user", resumed.roleOf(resumed.messages.items[0]));
+    try std.testing.expectEqualStrings("hi", resumed.contentOf(resumed.messages.items[0]).?);
+
+    // A resume keeps it rather than taking a newer one.
+    try resumed.ensureSystemPrompt("new prompt");
+    try std.testing.expectEqualStrings("old prompt", resumed.string(resumed.system_prompt).?);
 }
 
 test "a compaction is appended and a request starts at its summary" {
@@ -1839,7 +1914,7 @@ test "a compaction is appended and a request starts at its summary" {
     var session = try Session.open(std.testing.io, tmp.dir, arena, null, "/work");
     defer session.deinit();
 
-    try session.append(.{ .role = "system", .content = "be terse" });
+    try session.setSystemPrompt("be terse");
     try session.append(.{ .role = "user", .content = "one" });
     try session.append(.{ .role = "assistant", .content = "first answer" });
     // Nothing compacted yet, so a request carries the whole conversation.
@@ -1849,25 +1924,25 @@ test "a compaction is appended and a request starts at its summary" {
     // message it stands in for. The summary is a user message, so the model
     // reads it as context given to it.
     try session.appendCompaction("summarize this", "what happened so far");
-    try std.testing.expectEqual(5, session.messages.items.len);
+    try std.testing.expectEqual(4, session.messages.items.len);
+    try std.testing.expectEqualStrings("user", session.roleOf(session.messages.items[2]));
+    try std.testing.expectEqualStrings("summarize this", session.contentOf(session.messages.items[2]).?);
     try std.testing.expectEqualStrings("user", session.roleOf(session.messages.items[3]));
-    try std.testing.expectEqualStrings("summarize this", session.contentOf(session.messages.items[3]).?);
-    try std.testing.expectEqualStrings("user", session.roleOf(session.messages.items[4]));
-    try std.testing.expectEqualStrings("what happened so far", session.contentOf(session.messages.items[4]).?);
+    try std.testing.expectEqualStrings("what happened so far", session.contentOf(session.messages.items[3]).?);
 
-    // A request now starts at the summary, skipping the prompt and everything
-    // the summary stands in for.
-    try std.testing.expectEqual(4, session.sentFrom());
-    try std.testing.expect(session.isCompaction(4));
+    // A request now starts at the summary, skipping everything the summary stands
+    // in for. The prompt is not a message, so it is not part of the count.
+    try std.testing.expectEqual(3, session.sentFrom());
+    try std.testing.expect(session.isCompaction(3));
     // The prompt that asked for the compaction is not itself a summary.
-    try std.testing.expect(!session.isCompaction(3));
     try std.testing.expect(!session.isCompaction(2));
+    try std.testing.expect(!session.isCompaction(1));
     // An index past the conversation is never a compaction.
     try std.testing.expect(!session.isCompaction(99));
 
     // The messages after the compaction are sent in full.
     try session.append(.{ .role = "user", .content = "next" });
-    try std.testing.expectEqual(4, session.sentFrom());
+    try std.testing.expectEqual(3, session.sentFrom());
 }
 
 test "a compaction survives a save and resume" {
@@ -1878,7 +1953,7 @@ test "a compaction survives a save and resume" {
 
     var session = try Session.open(std.testing.io, tmp.dir, arena, null, "/work");
     defer session.deinit();
-    try session.append(.{ .role = "system", .content = "be terse" });
+    try session.setSystemPrompt("be terse");
     try session.append(.{ .role = "user", .content = "one" });
     try session.appendCompaction("summarize this", "the summary");
     try session.append(.{ .role = "user", .content = "next" });
@@ -1887,10 +1962,11 @@ test "a compaction survives a save and resume" {
     defer resumed.deinit();
 
     // Everything comes back, and the request still starts at the summary.
-    try std.testing.expectEqual(5, resumed.messages.items.len);
-    try std.testing.expectEqual(3, resumed.sentFrom());
-    try std.testing.expectEqualStrings("the summary", resumed.string(resumed.messages.items[3].content).?);
-    try std.testing.expectEqualStrings("next", resumed.string(resumed.messages.items[4].content).?);
+    try std.testing.expectEqualStrings("be terse", resumed.string(resumed.system_prompt).?);
+    try std.testing.expectEqual(4, resumed.messages.items.len);
+    try std.testing.expectEqual(2, resumed.sentFrom());
+    try std.testing.expectEqualStrings("the summary", resumed.string(resumed.messages.items[2].content).?);
+    try std.testing.expectEqualStrings("next", resumed.string(resumed.messages.items[3].content).?);
 }
 
 test "the compaction list is sorted and cleaned when a session is read" {
@@ -1899,8 +1975,9 @@ test "the compaction list is sorted and cleaned when a session is read" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A file written by hand, with the indices out of order, a repeat, and one
-    // past the end of the conversation.
+    // A file written by hand, with the indices out of order, a repeat, one past
+    // the end of the conversation, and one naming the prompt a version 2 file
+    // held as the first message.
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "odd.json",
         .data = "{\"version\":2,\"messages\":[" ++
@@ -1914,13 +1991,15 @@ test "the compaction list is sorted and cleaned when a session is read" {
     var session = try Session.open(std.testing.io, tmp.dir, arena, "odd", "/work");
     defer session.deinit();
 
-    // Indices past the end are dropped, the rest are sorted, and the repeat is
-    // collapsed, so the list is the one sorted copy the rest of the session
-    // expects.
-    try std.testing.expectEqualSlices(u32, &.{ 0, 2 }, session.compactions.items);
+    // The prompt is lifted out of the conversation, so the indices shift down by
+    // one. One that named the prompt is dropped, one past the end is dropped, the
+    // rest are sorted, and the repeat is collapsed, so the list is the one sorted
+    // copy the rest of the session expects.
+    try std.testing.expectEqualStrings("s", session.string(session.system_prompt).?);
+    try std.testing.expectEqualSlices(u32, &.{1}, session.compactions.items);
     // The latest is therefore the summary, and a request starts there.
-    try std.testing.expectEqual(2, session.sentFrom());
-    try std.testing.expect(session.isCompaction(2));
+    try std.testing.expectEqual(1, session.sentFrom());
+    try std.testing.expect(session.isCompaction(1));
 }
 
 test "the messages a request carries start at the latest compaction" {
@@ -1931,7 +2010,7 @@ test "the messages a request carries start at the latest compaction" {
 
     var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
-    try session.append(.{ .role = "system", .content = "s" });
+    try session.setSystemPrompt("s");
     try session.append(.{ .role = "user", .content = "old" });
     // Two compactions: a request starts at the later summary, not the earlier.
     try session.appendCompaction("p1", "summary one");
@@ -1954,7 +2033,7 @@ test "the messages a request carries start at the latest compaction" {
     );
 }
 
-test "appendSystemPrompt only adds the prompt to an empty session" {
+test "the system prompt is kept apart from the conversation and is not replaced" {
     const arena = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1963,19 +2042,22 @@ test "appendSystemPrompt only adds the prompt to an empty session" {
     var session = try Session.open(std.testing.io, tmp.dir, arena, null, "/work");
     defer session.deinit();
 
-    try session.appendSystemPrompt("current prompt");
-    try std.testing.expectEqual(1, session.messages.items.len);
-    try std.testing.expectEqualStrings("system", session.string(session.messages.items[0].role).?);
-    try std.testing.expectEqualStrings("current prompt", session.string(session.messages.items[0].content).?);
+    // Setting the prompt does not put a message in the conversation: it is its own
+    // field, sent at the front of every request.
+    try session.setSystemPrompt("current prompt");
+    try std.testing.expect(session.hasSystemPrompt());
+    try std.testing.expectEqualStrings("current prompt", session.string(session.system_prompt).?);
+    try std.testing.expectEqual(0, session.messages.items.len);
 
-    // A conversation that already has messages is never touched, even when it
-    // has no system prompt of its own.
+    // A session that already has one keeps it, which is what a resume relies on.
     try session.append(.{ .role = "user", .content = "hi" });
-    try session.appendSystemPrompt("a different prompt");
-    try std.testing.expectEqual(2, session.messages.items.len);
-    try std.testing.expectEqualStrings("system", session.string(session.messages.items[0].role).?);
-    try std.testing.expectEqualStrings("current prompt", session.string(session.messages.items[0].content).?);
-    try std.testing.expectEqualStrings("user", session.string(session.messages.items[1].role).?);
+    try session.ensureSystemPrompt("a different prompt");
+    try std.testing.expectEqualStrings("current prompt", session.string(session.system_prompt).?);
+    try std.testing.expectEqual(1, session.messages.items.len);
+
+    // Setting it outright replaces it, which is what a compaction does.
+    try session.setSystemPrompt("a different prompt");
+    try std.testing.expectEqualStrings("a different prompt", session.string(session.system_prompt).?);
 }
 
 test "the tools are written out with the schema as the JSON it is" {
