@@ -176,13 +176,38 @@ const Registry = struct {
         return false;
     }
 
-    /// Adds the reserved ids to `sessions`, oldest first. The ids are borrowed,
-    /// which is safe because a reserved id is never freed while the server runs;
-    /// the lock is held for the walk, so the list cannot move under it.
-    fn appendReserved(registry: *Registry, sessions: *std.ArrayList(Listed), gpa: std.mem.Allocator) !void {
+    /// Adds the reserved ids that have no file yet to `sessions`, oldest first,
+    /// and forgets the ones that do.
+    ///
+    /// A session that has been asked something is written out, so it is listed
+    /// from disk like every other; keeping it reserved as well would list it
+    /// twice. Forgetting it is also what keeps the reserved list from growing
+    /// without bound as sessions are started.
+    ///
+    /// The ids are borrowed, which is safe because a reserved id is never freed
+    /// while it is listed and the lock is held for the walk.
+    fn takeReserved(
+        registry: *Registry,
+        dir: Io.Dir,
+        io: Io,
+        sessions: *std.ArrayList(Listed),
+        gpa: std.mem.Allocator,
+    ) !void {
         registry.mutex.lockUncancelable(registry.io);
         defer registry.mutex.unlock(registry.io);
-        for (registry.reserved.items) |id| try sessions.append(gpa, .{ .id = id });
+
+        var index: usize = 0;
+        while (index < registry.reserved.items.len) {
+            const id = registry.reserved.items[index];
+            if (Session.exists(dir, io, id)) {
+                // Written out, so it is listed from disk and no longer reserved.
+                registry.gpa.free(id);
+                _ = registry.reserved.orderedRemove(index);
+                continue;
+            }
+            try sessions.append(gpa, .{ .id = id });
+            index += 1;
+        }
     }
 };
 
@@ -274,7 +299,7 @@ fn listSessions(setup: *Setup, registry: *Registry, request: *std.http.Server.Re
 
     var sessions: std.ArrayList(Listed) = .empty;
     defer sessions.deinit(gpa);
-    try registry.appendReserved(&sessions, gpa);
+    try registry.takeReserved(setup.sessions, setup.io, &sessions, gpa);
     for (stored) |id| try sessions.append(gpa, .{ .id = id });
 
     var body: std.Io.Writer.Allocating = .init(gpa);
@@ -441,7 +466,9 @@ test "a session that is handed out is listed before it is written" {
     // before what is already on disk.
     var sessions: std.ArrayList(Listed) = .empty;
     defer sessions.deinit(gpa);
-    try registry.appendReserved(&sessions, gpa);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try registry.takeReserved(tmp.dir, std.testing.io, &sessions, gpa);
     try sessions.append(gpa, .{ .id = "on-disk" });
 
     var body: std.Io.Writer.Allocating = .init(gpa);
