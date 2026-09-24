@@ -37,6 +37,14 @@ pub const default_host = "127.0.0.1";
 /// script in it, so the server serves it as it is and there is nothing to build.
 const page = @embedFile("web/index.html");
 
+/// The most connections billy serves at once.
+///
+/// Each connection is handled on its own task, so without a bound a server
+/// listening beyond this machine could be asked for tasks until memory ran out.
+/// A browser opens only a handful of connections, so this leaves room to spare
+/// while keeping a stranger from taking the machine down.
+const max_connections = 64;
+
 /// Serves the frontend on the address `host` at `port`, until the process is
 /// stopped. Zero asks the system for a free port, which is what a test uses.
 ///
@@ -74,14 +82,22 @@ pub fn serve(setup: *Setup, out: *Io.Writer, host: []const u8, port: u16) !void 
     // loop ends, as they all share the listener's lifetime.
     var group: Io.Group = .init;
     defer group.cancel(setup.io);
+
+    // At most `max_connections` are served at once. A permit is taken before a
+    // connection is accepted, so one that arrives while the server is full waits
+    // in the socket's backlog rather than being given a task of its own; the
+    // permit is given back when the connection is answered and its task ends.
+    var slots: Io.Semaphore = .{ .permits = max_connections };
     while (true) {
-        const stream = listener.accept(setup.io) catch |err| switch (err) {
-            error.Canceled => return err,
-            else => |other| return other,
+        try slots.wait(setup.io);
+        const stream = listener.accept(setup.io) catch |err| {
+            slots.post(setup.io);
+            return err;
         };
-        group.concurrent(setup.io, handle, .{ setup, &registry, &http, stream }) catch |err| {
+        group.concurrent(setup.io, handle, .{ setup, &registry, &http, stream, &slots }) catch |err| {
             // A connection that cannot be given a task is one to let go of,
             // rather than one to bring the server down over.
+            slots.post(setup.io);
             std.log.err("cannot serve a connection: {s}", .{@errorName(err)});
             var copy = stream;
             copy.close(setup.io);
@@ -214,7 +230,17 @@ const Registry = struct {
 /// Answers one connection, and closes it. Nothing a request or a reply does is
 /// allowed to reach the caller: a connection that goes wrong is logged and
 /// dropped, since the server outlives it.
-fn handle(setup: *Setup, registry: *Registry, http: *std.http.Client, stream: Io.net.Stream) void {
+///
+/// `slots` is the permit the connection was accepted under, given back when the
+/// connection is done so that the next one may be accepted.
+fn handle(
+    setup: *Setup,
+    registry: *Registry,
+    http: *std.http.Client,
+    stream: Io.net.Stream,
+    slots: *Io.Semaphore,
+) void {
+    defer slots.post(setup.io);
     defer {
         // `Stream.close` overwrites its argument with undefined, which it cannot
         // do to a parameter that was not declared mutable.
