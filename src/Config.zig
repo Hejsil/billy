@@ -15,26 +15,12 @@ const Config = @This();
 
 /// Directory under the XDG config directory that holds the configuration.
 const app_dir = "billy";
+
 /// Name of the configuration file inside that directory.
 pub const file_name = "config.json";
-/// Layout of the configuration file, bumped when its shape changes.
-const format_version = 1;
+
 /// Longest configuration file read back, so a damaged file cannot exhaust memory.
 const max_config_bytes = 1 << 20;
-
-/// Turns the model is allowed per request when the file asks for nothing else.
-pub const default_max_turns = 100;
-/// Results asked for per search query when the file asks for nothing else.
-pub const default_max_results = 5;
-/// Seconds a bash command may run before it is killed when the file asks for
-/// nothing else.
-pub const default_timeout_s = 120;
-/// Blocks a resumed session replays when the file asks for nothing else.
-pub const default_resume_blocks = 10;
-/// How full the context window must be, as a whole percentage, before the
-/// conversation is compacted into a summary, when the file asks for nothing
-/// else.
-pub const default_compact_at = 80;
 
 /// What `open` found, including whether the file had to be written.
 pub const Opened = struct {
@@ -64,7 +50,7 @@ pub const WebSearch = struct {
     provider: ?search.Provider = null,
     /// Results asked for per query. The backend may return fewer, and billy caps
     /// it.
-    max_results: usize = default_max_results,
+    max_results: usize = 5,
 };
 
 /// Settings for the bash tool.
@@ -82,7 +68,7 @@ pub const Bash = struct {
     /// forever. Zero would kill every command as it starts, which is never what
     /// the file is meant to say, so it is rejected rather than read as "no
     /// limit"; set a large value for a command that legitimately runs long.
-    timeout_s: usize = default_timeout_s,
+    timeout_s: usize = 120,
 };
 
 /// Settings for the edit tool.
@@ -116,22 +102,24 @@ pub const Markdown = struct {
 /// The configuration file as it is written to and read from disk. The settings
 /// are the configuration's own, since the file holds exactly those.
 const Stored = struct {
-    version: u32 = format_version,
-    max_turns: usize = default_max_turns,
+    version: u32 = 1,
+    max_turns: usize = 100,
     /// Blocks to replay on a resume. Zero shows the whole session.
-    resume_blocks: usize = default_resume_blocks,
+    resume_blocks: usize = 10,
     /// How full the context window must be, as a whole percentage, before the
     /// conversation is compacted into a summary. Zero turns compaction off.
-    compact_at: usize = default_compact_at,
+    compact_at: usize = 80,
     tools: Tools = .{},
     markdown: Markdown = .{},
+
+    const default = Stored{};
 
     /// Whether the file is one billy can use: a version it knows, a turn limit
     /// above zero, and a bash timeout above zero. Zero turns would give the model
     /// no chance to answer at all, and a zero timeout would kill every command as
     /// it starts, neither of which is ever what the file is meant to say.
     fn validate(stored: Stored) !void {
-        if (stored.version > format_version) return error.UnsupportedConfigVersion;
+        if (stored.version > Stored.default.version) return error.UnsupportedConfigVersion;
         if (stored.max_turns == 0) return error.InvalidConfig;
         if (stored.tools.bash.timeout_s == 0) return error.InvalidConfig;
     }
@@ -155,19 +143,19 @@ const Stored = struct {
 arena_state: std.heap.ArenaAllocator,
 
 /// Model turns allowed for one request before the harness gives up on it.
-max_turns: usize = default_max_turns,
+max_turns: usize = Stored.default.max_turns,
 /// How many of the most recent blocks a resumed session replays, so resuming a
 /// long conversation is quick. Zero replays the whole session.
-resume_blocks: usize = default_resume_blocks,
+resume_blocks: usize = Stored.default.resume_blocks,
 /// How full the context window must be, as a whole percentage, before the
 /// conversation is compacted into a summary, so a long session keeps going
 /// rather than failing on an overlong request. Zero turns compaction off.
-compact_at: usize = default_compact_at,
+compact_at: usize = Stored.default.compact_at,
 /// Settings for the tools the agent can call, by tool name.
-tools: Tools = .{},
+tools: Tools = Stored.default.tools,
 /// Settings for the markdown billy shows: the replies it writes and the
 /// prompts the user types.
-markdown: Markdown = .{},
+markdown: Markdown = Stored.default.markdown,
 
 /// An empty configuration, with the arena a file read fills in. Its settings
 /// are the defaults, which is what a missing file is written with.
@@ -474,13 +462,13 @@ test "open writes the defaults when the file is missing" {
     var first = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
     defer first.config.deinit();
     try std.testing.expect(first.created);
-    try std.testing.expectEqual(default_max_turns, first.config.max_turns);
+    try std.testing.expectEqual(Stored.default.max_turns, first.config.max_turns);
 
     // The file is now there, so a second open leaves it alone and reads it back.
     var second = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
     defer second.config.deinit();
     try std.testing.expect(!second.created);
-    try std.testing.expectEqual(default_max_turns, second.config.max_turns);
+    try std.testing.expectEqual(Stored.default.max_turns, second.config.max_turns);
 }
 
 test "open reads the max_turns and the bash format from the file" {
@@ -500,7 +488,7 @@ test "open reads the max_turns and the bash format from the file" {
     try std.testing.expectEqual(7, opened.config.max_turns);
     try std.testing.expectEqualStrings("shfmt | bat -l bash", opened.config.tools.bash.format.?);
     // A file without a replay count shows the default number of blocks.
-    try std.testing.expectEqual(default_resume_blocks, opened.config.resume_blocks);
+    try std.testing.expectEqual(Stored.default.resume_blocks, opened.config.resume_blocks);
 }
 
 test "open reads the block count a resume replays from the file" {
@@ -541,7 +529,7 @@ test "open reads the compaction threshold from the file" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{}" });
     var bare = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
     defer bare.config.deinit();
-    try std.testing.expectEqual(default_compact_at, bare.config.compact_at);
+    try std.testing.expectEqual(Stored.default.compact_at, bare.config.compact_at);
 
     // Zero turns compaction off; it is a setting, not a mistake.
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{\"compact_at\":0}" });
@@ -585,7 +573,7 @@ test "open leaves the bash format unset when the file does not set one" {
     defer older.config.deinit();
     try std.testing.expect(older.config.tools.bash.format == null);
     // The timeout the setting was added with is the default for a file without one.
-    try std.testing.expectEqual(default_timeout_s, older.config.tools.bash.timeout_s);
+    try std.testing.expectEqual(Stored.default.tools.bash.timeout_s, older.config.tools.bash.timeout_s);
 
     // A format of null is the same as not setting one.
     try tmp.dir.writeFile(std.testing.io, .{
@@ -618,7 +606,7 @@ test "open reads the bash timeout from the file" {
     });
     var bare = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
     defer bare.config.deinit();
-    try std.testing.expectEqual(default_timeout_s, bare.config.tools.bash.timeout_s);
+    try std.testing.expectEqual(Stored.default.tools.bash.timeout_s, bare.config.tools.bash.timeout_s);
 }
 
 test "open reads the web search provider and result count from the file" {
@@ -640,7 +628,7 @@ test "open reads the web search provider and result count from the file" {
     var bare = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
     defer bare.config.deinit();
     try std.testing.expect(bare.config.tools.web_search.provider == null);
-    try std.testing.expectEqual(default_max_results, bare.config.tools.web_search.max_results);
+    try std.testing.expectEqual(Stored.default.tools.web_search.max_results, bare.config.tools.web_search.max_results);
 
     // A name that is not a backend makes the file unusable rather than reading
     // as "no search", so a typo is not silently dropped.
@@ -810,8 +798,8 @@ test "set refuses a setting that is unknown, a section, or a bad value" {
     // the setting keeps what it had.
     try std.testing.expectError(error.InvalidValue, config.set("tools.bash.timeout_s", "0"));
     try std.testing.expectError(error.InvalidValue, config.set("max_turns", "0"));
-    try std.testing.expectEqual(default_timeout_s, config.tools.bash.timeout_s);
-    try std.testing.expectEqual(default_max_turns, config.max_turns);
+    try std.testing.expectEqual(Stored.default.tools.bash.timeout_s, config.tools.bash.timeout_s);
+    try std.testing.expectEqual(Stored.default.max_turns, config.max_turns);
 }
 
 test "a setting set by path is written and read back" {
@@ -862,7 +850,7 @@ test "run sets a setting in the file, creating it when it is missing" {
     defer opened.config.deinit();
     try std.testing.expectEqualStrings("shfmt", opened.config.tools.bash.format.?);
     // The other settings keep their defaults, so the file is a whole one.
-    try std.testing.expectEqual(default_max_turns, opened.config.max_turns);
+    try std.testing.expectEqual(Stored.default.max_turns, opened.config.max_turns);
     // The message names the setting and the file it was written to.
     try std.testing.expect(std.mem.indexOf(u8, sink.written(), "tools.bash.format") != null);
     try std.testing.expect(std.mem.indexOf(u8, sink.written(), file_name) != null);
