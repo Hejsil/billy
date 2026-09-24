@@ -57,6 +57,10 @@
   #text {
     flex: 1; background: var(--panel); border: 1px solid var(--line);
     color: var(--text); border-radius: 6px; padding: 8px 10px; font: inherit;
+    /* A prompt is a textarea so a newline can be typed into it. It starts one
+       line tall and grows with what is written, up to a share of the window,
+       after which it scrolls. */
+    resize: none; overflow-y: auto; min-height: 0; max-height: 40vh;
   }
   #text:disabled { color: var(--dim); }
 
@@ -122,7 +126,7 @@
     <div id="header"></div>
     <div id="conversation"></div>
     <form id="prompt">
-      <input id="text" placeholder="ask billy something" autocomplete="off">
+      <textarea id="text" rows="1" placeholder="ask billy something (shift+enter for a newline)" autocomplete="off"></textarea>
     </form>
   </main>
 
@@ -207,6 +211,7 @@ async function send(text) {
   form.classList.add('working');
   input.disabled = true;
   input.value = '';
+  grow();
 
   try {
     const res = await fetch('/api/sessions/' + encodeURIComponent(selected) + '/message', {
@@ -287,6 +292,24 @@ form.onsubmit = (event) => {
   send(input.value);
   return false;
 };
+
+// A prompt box is a textarea, so a newline can be typed into it. It is one line
+// tall to begin with and grows to fit what is written, up to the height the
+// stylesheet caps it at; past that it scrolls.
+function grow() {
+  input.style.height = 'auto';
+  input.style.height = input.scrollHeight + 'px';
+}
+input.addEventListener('input', grow);
+input.addEventListener('keydown', (event) => {
+  // Enter sends, the way it does in a chat box. Shift+Enter is the newline, so a
+  // prompt can still be written over several lines; every other key is left to
+  // the textarea.
+  if (event.key === 'Enter' && !event.shiftKey) {
+    event.preventDefault();
+    form.requestSubmit();
+  }
+});
 
 document.getElementById('new').onclick = async () => {
   // A new session may not be started mid-turn either: it would take the view
