@@ -164,6 +164,9 @@ async function refresh(select) {
 // Opens a session: the header above the conversation, and the conversation
 // itself, both of which the server rendered.
 async function open(id) {
+  // Switching sessions while a turn is streaming would clear the conversation
+  // the turn is still appending to, so it waits for the turn to end.
+  if (working) return;
   selected = id;
   for (const item of list.children) item.classList.toggle('selected', item.dataset.id === id);
   const res = await fetch('/api/sessions/' + encodeURIComponent(id));
@@ -265,6 +268,9 @@ form.onsubmit = (event) => {
 };
 
 document.getElementById('new').onclick = async () => {
+  // A new session may not be started mid-turn either: it would take the view
+  // away from the turn that is still running.
+  if (working) return;
   const started = await (await fetch('/api/sessions', { method: 'POST' })).json();
   await refresh(started.id);
   await open(started.id);
