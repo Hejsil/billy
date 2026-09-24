@@ -36,10 +36,21 @@
   #list { list-style: none; margin: 0; padding: 6px; overflow-y: auto; flex: 1; }
   #list li {
     padding: 6px 8px; border-radius: 6px; cursor: pointer; color: var(--dim);
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    overflow: hidden;
   }
   #list li:hover { background: #22242c; color: var(--text); }
   #list li.selected { background: #262a35; color: var(--text); }
+  /* A session is shown by its title, with the id it can be resumed by under it
+     in a smaller, dimmer line. A session that has not been named shows its id
+     alone, in the place of the title. */
+  #list li .title {
+    color: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #list li .ident {
+    color: #5f6675; font-size: 11px; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  #list li:not(.selected):hover .ident { color: var(--dim); }
   #list .empty { color: var(--dim); cursor: default; padding: 6px 8px; }
   #list .empty:hover { background: none; }
 
@@ -205,9 +216,21 @@ async function refresh(select) {
   }
   for (const session of sessions) {
     const item = document.createElement('li');
-    // The id is shown and sent back verbatim, so it is set as text.
-    item.textContent = session.id;
+    // Every value is set as text, since an id or a title could be anything.
     item.dataset.id = session.id;
+    const name = document.createElement('div');
+    name.className = 'title';
+    // The title is the name to show; a session that has not been named yet is
+    // shown by its id instead.
+    name.textContent = session.title || session.id;
+    item.append(name);
+    if (session.title) {
+      // The id, which is what `billy --resume` takes, stays under the title.
+      const ident = document.createElement('div');
+      ident.className = 'ident';
+      ident.textContent = session.id;
+      item.append(ident);
+    }
     if (session.id === select) item.classList.add('selected');
     item.onclick = () => open(session.id);
     list.append(item);
@@ -328,6 +351,10 @@ function handleFrame(frame) {
     scrollToEnd();
   } else if (event === 'header') {
     headerBox.innerHTML = JSON.parse(data).html;
+  } else if (event === 'title') {
+    // The session was just named; the list is asked for again so it shows the
+    // title. The turn is over by now, so this does not disturb it.
+    refresh(selected);
   } else if (event === 'error') {
     note(JSON.parse(data).message);
   }

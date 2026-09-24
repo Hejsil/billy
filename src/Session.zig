@@ -10,6 +10,11 @@
 //! one time replacing the front of a request costs no cache that was not already
 //! being thrown away; see `agent.Runner.refreshLead`.
 //!
+//! A session also carries a title, a short name for it that a frontend lists it
+//! by. It is written first in the file, so a listing reads it without reading the
+//! conversation, and it is optional, so a session saved before titles were kept
+//! simply has none (`list`).
+//!
 //! A kill that lands while a tool runs can leave the last turn of a session
 //! without the results of its tool calls, which the API rejects on the next
 //! request. A resume completes that turn before anything else reads it, so a
@@ -1104,7 +1109,7 @@ fn usableName(text: []const u8) bool {
 }
 
 /// The ids of the sessions in the directory at `path`, the one most recently
-/// written to first.
+/// written to first, each with its title.
 ///
 /// The order is the time each session file was last written, so the session
 /// being worked in is at the top and stays there as it grows. The time is asked
@@ -1113,8 +1118,8 @@ fn usableName(text: []const u8) bool {
 /// does not sort against a ULID at all.
 ///
 /// Only files that could be a session are listed, so a file that is not one is
-/// passed over rather than reported as a session. The ids are `gpa`'s, and the
-/// caller frees each of them and then the list.
+/// passed over rather than reported as a session. The ids and titles are `gpa`'s,
+/// and the caller frees each of them and then the list.
 ///
 /// The directory is opened here, one handle per listing, rather than taken from
 /// the caller. Reading a directory keeps its place in the handle it was opened
@@ -1122,21 +1127,31 @@ fn usableName(text: []const u8) bool {
 /// part of the directory; a server with several connections asking at once needs
 /// each to have its own. Opening it here is what makes that impossible to get
 /// wrong.
-pub fn list(io: Io, path: []const u8, gpa: std.mem.Allocator) ![][]const u8 {
+pub fn list(io: Io, path: []const u8, gpa: std.mem.Allocator) ![]Named {
     var dir = try Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
     defer dir.close(io);
     return listIn(dir, io, gpa);
 }
 
+/// One session as a listing shows it: the id that names it, and its title, which
+/// is "" for a session that has not been named.
+pub const Named = struct {
+    id: []const u8,
+    title: []const u8,
+};
+
 /// The ids of the sessions in `dir`, which must be a handle this listing has to
 /// itself. See `list`, which opens one.
-fn listIn(dir: Io.Dir, io: Io, gpa: std.mem.Allocator) ![][]const u8 {
-    // The ids and the times they were written are two lists kept in step: the
-    // times are only there to order the ids by, so sorting has to move both.
-    var ids: std.ArrayList([]const u8) = .empty;
+fn listIn(dir: Io.Dir, io: Io, gpa: std.mem.Allocator) ![]Named {
+    // The names and the times they were written are two lists kept in step: the
+    // times are only there to order the names by, so sorting has to move both.
+    var names: std.ArrayList(Named) = .empty;
     errdefer {
-        for (ids.items) |made| gpa.free(made);
-        ids.deinit(gpa);
+        for (names.items) |made| {
+            gpa.free(made.id);
+            gpa.free(made.title);
+        }
+        names.deinit(gpa);
     }
     var written: std.ArrayList(i64) = .empty;
     defer written.deinit(gpa);
@@ -1153,24 +1168,93 @@ fn listIn(dir: Io.Dir, io: Io, gpa: std.mem.Allocator) ![][]const u8 {
         try written.append(gpa, stat.mtime.toMilliseconds());
         // The name is a window into the iterator, which the next entry moves on,
         // so the id is copied out before it can go.
-        const owned = try gpa.dupe(u8, stem);
+        const owned_id = try gpa.dupe(u8, stem);
         // A failed append leaves the copy unheld, so it is freed on the way out.
-        errdefer gpa.free(owned);
-        try ids.append(gpa, owned);
+        errdefer gpa.free(owned_id);
+        // The title is read from the front of the file, which keeps a listing
+        // cheap however large the conversations are.
+        const stored_title = try readTitle(io, gpa, dir, entry.name);
+        errdefer gpa.free(stored_title);
+        try names.append(gpa, .{ .id = owned_id, .title = stored_title });
     }
 
-    std.mem.sortUnstableContext(0, ids.items.len, Ordering{
-        .ids = ids.items,
+    std.mem.sortUnstableContext(0, names.items.len, Ordering{
+        .names = names.items,
         .written = written.items,
     });
-    return ids.toOwnedSlice(gpa);
+    return names.toOwnedSlice(gpa);
 }
 
-/// Orders ids by when their session files were written, newest first, carrying
-/// the times along with them. The two lists are one list of pairs that the
-/// sorting cannot see, so a swap has to move both.
+/// Longest a title stored in a file is read as. A title is a short line, so a
+/// value longer than this is not one billy wrote and is not read.
+const max_stored_title_len = 512;
+
+/// The title stored in the session file `file_name`, or "" when it has none.
+///
+/// Only the front of the file is read, and only as far as the title: the fields
+/// it opens with are stepped over a token at a time, so a listing reads a few
+/// dozen bytes rather than the whole conversation, however large the file is.
+fn readTitle(io: Io, gpa: std.mem.Allocator, dir: Io.Dir, file_name: []const u8) ![]const u8 {
+    var file = dir.openFile(io, file_name, .{}) catch return gpa.dupe(u8, "");
+    defer file.close(io);
+
+    var buffer: [64]u8 = undefined;
+    var reader = file.reader(io, &buffer);
+    return (try titleFrom(&reader.interface, gpa)) orelse gpa.dupe(u8, "");
+}
+
+/// Reads the title out of the front of a session file, or null when it has none.
+///
+/// It leans on the order `save` writes: the title is the second field, right
+/// after the version. So only those two are looked at, and a file that does not
+/// name the session -- one saved before titles, or hand-written -- is recognized
+/// and left alone after a few bytes rather than scanned to its end.
+fn titleFrom(reader: *Io.Reader, gpa: std.mem.Allocator) !?[]u8 {
+    // `{"version":` up to the quote that closes the key.
+    const opening = reader.takeDelimiter('"') catch return null;
+    _ = opening orelse return null;
+    const first_key = reader.takeDelimiter('"') catch return null;
+    if (!std.mem.eql(u8, first_key orelse return null, "version")) return null;
+
+    // The version's own value and the quote that opens the next key.
+    const between = reader.takeDelimiter('"') catch return null;
+    _ = between orelse return null;
+    const key = reader.takeDelimiter('"') catch return null;
+    if (!std.mem.eql(u8, key orelse return null, "title")) return null;
+
+    // The colon and the quote that opens the value; then the value itself.
+    const colon = reader.takeDelimiter('"') catch return null;
+    _ = colon orelse return null;
+    return try takeString(reader, gpa);
+}
+
+/// Reads a JSON string value, undoing its escapes, up to the quote that closes
+/// it. Null when the stream ends inside it, or when it runs past the length a
+/// title may be -- either way it is not a title billy wrote.
+fn takeString(reader: *Io.Reader, gpa: std.mem.Allocator) !?[]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var escaped = false;
+    while (out.items.len <= max_stored_title_len) {
+        const byte = reader.takeByte() catch break;
+        if (escaped) {
+            try out.append(gpa, byte);
+            escaped = false;
+        } else switch (byte) {
+            '\\' => escaped = true,
+            '"' => return try out.toOwnedSlice(gpa),
+            else => try out.append(gpa, byte),
+        }
+    }
+    out.deinit(gpa);
+    return null;
+}
+
+/// Orders sessions by when their files were written, newest first, carrying the
+/// times along with them. The two lists are one list of pairs that the sorting
+/// cannot see, so a swap has to move both.
 const Ordering = struct {
-    ids: [][]const u8,
+    names: []Named,
     written: []i64,
 
     pub fn lessThan(self: Ordering, a: usize, b: usize) bool {
@@ -1178,11 +1262,11 @@ const Ordering = struct {
         // which is the order they were made in, so the order is total and a
         // listing does not shuffle between calls.
         if (self.written[a] != self.written[b]) return self.written[a] > self.written[b];
-        return std.mem.order(u8, self.ids[a], self.ids[b]) == .gt;
+        return std.mem.order(u8, self.names[a].id, self.names[b].id) == .gt;
     }
 
     pub fn swap(self: Ordering, a: usize, b: usize) void {
-        std.mem.swap([]const u8, &self.ids[a], &self.ids[b]);
+        std.mem.swap(Named, &self.names[a], &self.names[b]);
         std.mem.swap(i64, &self.written[a], &self.written[b]);
     }
 };
@@ -1305,9 +1389,12 @@ test "ids made one after another differ" {
 }
 
 /// Frees what `list` returned: the ids it copied out, and the list itself.
-fn freeList(ids: [][]const u8, gpa: std.mem.Allocator) void {
-    for (ids) |made| gpa.free(made);
-    gpa.free(ids);
+fn freeList(names: []Named, gpa: std.mem.Allocator) void {
+    for (names) |made| {
+        gpa.free(made.id);
+        gpa.free(made.title);
+    }
+    gpa.free(names);
 }
 
 test "the sessions in a directory are listed by when they were written" {
@@ -1353,9 +1440,9 @@ test "the sessions in a directory are listed by when they were written" {
     const ids = try listIn(tmp.dir, std.testing.io, std.testing.allocator);
     defer freeList(ids, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 3), ids.len);
-    try std.testing.expectEqualStrings("dev", ids[0]);
-    try std.testing.expectEqualStrings(newest_id, ids[1]);
-    try std.testing.expectEqualStrings(oldest, ids[2]);
+    try std.testing.expectEqualStrings("dev", ids[0].id);
+    try std.testing.expectEqualStrings(newest_id, ids[1].id);
+    try std.testing.expectEqualStrings(oldest, ids[2].id);
 }
 
 test "the ordering keeps each id with the time it was written at" {
@@ -1392,7 +1479,7 @@ test "the ordering keeps each id with the time it was written at" {
     // the order they were made in, each still with the time it was written at.
     try std.testing.expectEqual(@as(usize, count), ids.len);
     for (ids, 0..) |listed, position| {
-        try std.testing.expectEqualStrings(buffers[position][0..ulid.length], listed);
+        try std.testing.expectEqualStrings(buffers[position][0..ulid.length], listed.id);
     }
 }
 
@@ -1421,8 +1508,8 @@ test "sessions written at the same moment are ordered by their ids" {
     const ids = try listIn(tmp.dir, std.testing.io, std.testing.allocator);
     defer freeList(ids, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), ids.len);
-    try std.testing.expectEqualStrings(newer_buf[0..ulid.length], ids[0]);
-    try std.testing.expectEqualStrings(older_buf[0..ulid.length], ids[1]);
+    try std.testing.expectEqualStrings(newer_buf[0..ulid.length], ids[0].id);
+    try std.testing.expectEqualStrings(older_buf[0..ulid.length], ids[1].id);
 }
 
 test "an empty sessions directory lists nothing" {
@@ -1434,6 +1521,80 @@ test "an empty sessions directory lists nothing" {
     const ids = try listIn(tmp.dir, std.testing.io, std.testing.allocator);
     defer freeList(ids, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), ids.len);
+}
+
+test "a listing carries each session's title" {
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // One session that has been named with a title longer than the buffer the
+    // reader reads a file with, so the title has to be read over more than one
+    // read; one named with a short title; and one that has not been named.
+    const long_title = "a title long enough that it does not fit in the reader's small buffer at once";
+    var long = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    defer long.deinit();
+    try long.setTitle(long_title);
+    try long.append(.{ .role = "user", .content = "hi" });
+
+    var titled = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    defer titled.deinit();
+    try titled.setTitle("Fix the parser");
+    try titled.append(.{ .role = "user", .content = "hi" });
+
+    var unnamed = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    defer unnamed.deinit();
+    try unnamed.append(.{ .role = "user", .content = "hi" });
+
+    const listed = try listIn(tmp.dir, std.testing.io, gpa);
+    defer freeList(listed, gpa);
+    try std.testing.expectEqual(@as(usize, 3), listed.len);
+
+    // Each entry carries the title the file holds, or "" for the session that
+    // has none.
+    for (listed) |entry| {
+        if (std.mem.eql(u8, entry.id, long.id())) {
+            try std.testing.expectEqualStrings(long_title, entry.title);
+        } else if (std.mem.eql(u8, entry.id, titled.id())) {
+            try std.testing.expectEqualStrings("Fix the parser", entry.title);
+        } else {
+            try std.testing.expectEqualStrings(unnamed.id(), entry.id);
+            try std.testing.expectEqualStrings("", entry.title);
+        }
+    }
+}
+
+test "the title is read from the front of a session file, unescaped" {
+    const gpa = std.testing.allocator;
+
+    // The title sits right after the version, and the reader stops there rather
+    // than reading the rest of the file.
+    try expectTitle(gpa, "Fix it", "{\"version\":3,\"title\":\"Fix it\",\"system_prompt\":\"x\"}");
+    // The escapes the writer produces are undone.
+    try expectTitle(gpa, "a \"quoted\" \\ title", "{\"version\":3,\"title\":\"a \\\"quoted\\\" \\\\ title\"}");
+
+    // A session with no title -- one saved before titles, or hand-written -- is
+    // recognized by the field after the version and left alone.
+    try std.testing.expect((try titleOf(gpa, "{\"version\":3,\"system_prompt\":\"be terse\",\"messages\":[]}")) == null);
+    try std.testing.expect((try titleOf(gpa, "{\"version\":3,\"messages\":[]}")) == null);
+    // A stream that ends inside the title, and one that is not a session at all.
+    try std.testing.expect((try titleOf(gpa, "{\"version\":3,\"title\":\"Fix it")) == null);
+    try std.testing.expect((try titleOf(gpa, "not json at all")) == null);
+}
+
+/// Reads the title out of `front`, which stands in for the start of a session
+/// file. The reader is fixed over `front`, so the whole of it is available.
+fn titleOf(gpa: std.mem.Allocator, front: []const u8) !?[]u8 {
+    var reader: std.Io.Reader = .fixed(front);
+    return titleFrom(&reader, gpa);
+}
+
+/// Checks what `titleFrom` reads, freeing what it allocates.
+fn expectTitle(gpa: std.mem.Allocator, expected: []const u8, front: []const u8) !void {
+    const got = (try titleOf(gpa, front)).?;
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings(expected, got);
 }
 
 test "setCheckedId rejects names that could escape the session directory" {

@@ -221,7 +221,8 @@ const Registry = struct {
                 _ = registry.reserved.orderedRemove(index);
                 continue;
             }
-            try sessions.append(gpa, .{ .id = id });
+            // Handed out but not written, so it has no file and no title.
+            try sessions.append(gpa, .{ .id = id, .title = "" });
             index += 1;
         }
     }
@@ -339,7 +340,12 @@ fn route(
 }
 
 /// One session as the listing shows it: just its id, which is what names it.
-const Listed = struct { id: []const u8 };
+const Listed = struct {
+    id: []const u8,
+    /// The session's title, shown in the list; "" for one that has not been named
+    /// yet, which the page falls back to showing the id for.
+    title: []const u8,
+};
 
 /// The body of `GET /api/sessions`: every session, in the order the page shows
 /// them.
@@ -350,19 +356,22 @@ const Listing = struct { sessions: []const Listed };
 fn listSessions(setup: *Setup, registry: *Registry, request: *std.http.Server.Request, answered: *bool) !void {
     const gpa = setup.gpa;
 
-    // What is on disk. Each id is its own allocation, freed once the reply is
-    // built from them. The listing opens the directory itself, so a listing here
-    // and one on another connection do not read over each other.
+    // What is on disk. Each id and title is its own allocation, freed once the
+    // reply is built from them. The listing opens the directory itself, so a
+    // listing here and one on another connection do not read over each other.
     const stored = try Session.list(setup.io, setup.sessions_path, gpa);
     defer {
-        for (stored) |id| gpa.free(id);
+        for (stored) |named| {
+            gpa.free(named.id);
+            gpa.free(named.title);
+        }
         gpa.free(stored);
     }
 
     var sessions: std.ArrayList(Listed) = .empty;
     defer sessions.deinit(gpa);
     try registry.takeReserved(setup.sessions, setup.io, &sessions, gpa);
-    for (stored) |id| try sessions.append(gpa, .{ .id = id });
+    for (stored) |named| try sessions.append(gpa, .{ .id = named.id, .title = named.title });
 
     var body: std.Io.Writer.Allocating = .init(gpa);
     defer body.deinit();
@@ -482,7 +491,7 @@ fn startSession(setup: *Setup, registry: *Registry, request: *std.http.Server.Re
 
     var body: std.Io.Writer.Allocating = .init(gpa);
     defer body.deinit();
-    try std.json.Stringify.value(Listed{ .id = id }, .{}, &body.writer);
+    try std.json.Stringify.value(Listed{ .id = id, .title = "" }, .{}, &body.writer);
     return reply(request, .json, body.written(), .created, answered);
 }
 
@@ -540,13 +549,13 @@ test "a session that is handed out is listed before it is written" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try registry.takeReserved(tmp.dir, std.testing.io, &sessions, gpa);
-    try sessions.append(gpa, .{ .id = "on-disk" });
+    try sessions.append(gpa, .{ .id = "on-disk", .title = "" });
 
     var body: std.Io.Writer.Allocating = .init(gpa);
     defer body.deinit();
     try std.json.Stringify.value(Listing{ .sessions = sessions.items }, .{}, &body.writer);
     try std.testing.expectEqualStrings(
-        "{\"sessions\":[{\"id\":\"later\"},{\"id\":\"on-disk\"}]}",
+        "{\"sessions\":[{\"id\":\"later\",\"title\":\"\"},{\"id\":\"on-disk\",\"title\":\"\"}]}",
         body.written(),
     );
 }
@@ -737,10 +746,19 @@ fn askSession(
     var stream = Stream{ .body = &body_writer, .gpa = gpa };
     const emitter = stream.emitter();
 
+    // A session asked for the first time is named during the turn (see
+    // `Runner.ask`), so the page is told the title afterwards to put in its list.
+    const first_turn = session.messages.items.len == 0;
+
     runner.compactIfNeeded(emitter, &session);
     runner.ask(emitter, &session, parsed.value.text) catch |err| {
         std.log.err("a request failed: {s}", .{@errorName(err)});
         try stream.fail(@errorName(err));
+    };
+
+    // The title, when the session was just named, so the page's list picks it up.
+    if (first_turn) if (session.title()) |title| {
+        try stream.send("title", TitleEvent{ .title = title });
     };
 
     // What the run left the session at, so the page shows the new gauge and
@@ -766,6 +784,10 @@ const HtmlEvent = struct { html: []const u8 };
 
 /// What a failure is sent as, so the page can show why a turn stopped.
 const FailedEvent = struct { message: []const u8 };
+
+/// What a new title is sent as, once a session's first turn has named it, so the
+/// page can show it in the list without asking for the list again.
+const TitleEvent = struct { title: []const u8 };
 
 /// Turns the blocks of a run into the events of a stream as they happen.
 ///
