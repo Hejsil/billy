@@ -750,24 +750,15 @@ const Stream = struct {
         var rendered: std.Io.Writer.Allocating = .init(self.gpa);
         defer rendered.deinit();
 
+        // Both halves of a tool call are whole elements on their own, so the page
+        // can replace the call it is showing with the finished one. Everything
+        // else is a single `block`.
         const event: []const u8 = switch (b) {
-            // The two halves of a tool call go out as events of their own, so the
-            // page can put the result into the call it already has on screen.
-            // Everything else is one `block`.
             .tool_begin => "tool_begin",
             .tool_end => "tool_end",
             else => "block",
         };
-        switch (b) {
-            // The whole element, with an empty body: the head a collapsed call
-            // shows while it runs. The page adds the body to it when the result
-            // arrives, so the element is complete here rather than left open.
-            .tool_begin => |call| try html.toolOpened(call, &rendered.writer),
-            // Only the body, which the page adds to the call already on screen;
-            // the element around it is there and is not written again.
-            .tool_end => |tool| try html.toolBody(self.gpa, tool.call, tool.result, &rendered.writer),
-            else => try html.block(self.gpa, b, &rendered.writer),
-        }
+        try html.block(self.gpa, b, &rendered.writer);
         try self.send(event, HtmlEvent{ .html = rendered.written() });
     }
 

@@ -110,6 +110,11 @@
   details.tool[open] summary.tool-head::before { transform: rotate(90deg); }
   .tool-head .name { color: var(--text); font-weight: 600; }
   .tool-head .target { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  /* The exit status, shown once the call has run. It stays in the summary's one
+     line, after what the call acted on. */
+  .tool-head .exit { flex: none; }
+  .tool-head .exit.ok { color: var(--add); }
+  .tool-head .exit.failed { color: var(--del); }
   .tool-head .glyph { color: var(--dim); }
   .tool-head .glyph.hue-blue { color: var(--accent); }
   .tool-head .glyph.hue-green { color: var(--add); }
@@ -295,19 +300,21 @@ function handleFrame(frame) {
     conversation.insertAdjacentHTML('beforeend', JSON.parse(data).html);
     scrollToEnd();
   } else if (event === 'tool_begin') {
-    // The call arrives whole -- head and an empty body -- and collapsed, since
-    // the element is not opened; the result below fills its body.
+    // The whole call, collapsed, while it runs: its body is empty and its exit
+    // status is not known yet.
     conversation.insertAdjacentHTML('beforeend', JSON.parse(data).html);
     openCall = conversation.lastElementChild;
     scrollToEnd();
   } else if (event === 'tool_end') {
-    const html = JSON.parse(data).html;
-    const body = openCall && openCall.querySelector('.tool-body');
-    // The body goes into the call on screen; if none is open -- the events are
-    // always a pair, so this is only a stream that went wrong -- it is shown as
-    // a block of its own rather than lost.
-    if (body) body.insertAdjacentHTML('beforeend', html);
-    else conversation.insertAdjacentHTML('beforeend', html);
+    // The whole call again, now with its body and its exit status. It replaces
+    // the one on screen, which keeps its place in the conversation and whether
+    // the user had opened it.
+    conversation.insertAdjacentHTML('beforeend', JSON.parse(data).html);
+    const finished = conversation.lastElementChild;
+    if (openCall) {
+      finished.open = openCall.open;
+      conversation.replaceChild(finished, openCall);
+    }
     openCall = null;
     scrollToEnd();
   } else if (event === 'header') {

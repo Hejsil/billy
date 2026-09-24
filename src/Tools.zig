@@ -974,14 +974,30 @@ fn printBash(result: []const u8, style: Style, out: *Io.Writer) !void {
 /// did not. The stored line reads `exit code: N` for the model; only the line
 /// the user sees is marked and shortened.
 fn printExit(status: []const u8, style: Style, out: *Io.Writer) !void {
+    const exit = parseExit(status);
+    const mark = if (exit.ok) exit_marks.ok else exit_marks.failed;
+    var buffer: [64]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, "{s} exit {s}", .{ mark, exit.code }) catch status;
+    try style.boldColor(if (exit.ok) .green else .red, line, out);
+    try out.writeAll("\n");
+}
+
+/// The status a bash command exited with, as the user is shown it: the code, and
+/// whether it means the command succeeded.
+pub const Exit = struct {
+    /// The status billy wrote, which is the exit code as text, or the signal a
+    /// killed command died from.
+    code: []const u8,
+    /// Whether the command succeeded, which is an exit code of zero.
+    ok: bool,
+};
+
+/// Reads the status out of a stored status line, which reads `exit code: N`.
+/// A line of some other shape is taken as the code itself, so nothing is lost.
+fn parseExit(status: []const u8) Exit {
     const prefix = "exit code: ";
     const code = if (std.mem.startsWith(u8, status, prefix)) status[prefix.len..] else status;
-    const ok = std.mem.eql(u8, code, "0");
-    const mark = if (ok) exit_marks.ok else exit_marks.failed;
-    var buffer: [64]u8 = undefined;
-    const line = std.fmt.bufPrint(&buffer, "{s} exit {s}", .{ mark, code }) catch status;
-    try style.boldColor(if (ok) .green else .red, line, out);
-    try out.writeAll("\n");
+    return .{ .code = code, .ok = std.mem.eql(u8, code, "0") };
 }
 
 /// A bash result split back into the status line billy wrote and what the
@@ -992,6 +1008,25 @@ const BashResult = struct {
     stdout: []const u8,
     stderr: []const u8,
 };
+
+/// A bash result as a caller that shows it wants it: the status on its own, and
+/// the two streams without the markers that separated them in the stored text.
+pub const BashOutput = struct {
+    exit: Exit,
+    stdout: []const u8,
+    stderr: []const u8,
+};
+
+/// Splits a stored bash result into the status and the streams, for a frontend
+/// that shows them apart. Null when the result is not one billy wrote.
+pub fn bashOutput(result: []const u8) ?BashOutput {
+    const parts = splitBash(result) orelse return null;
+    return .{
+        .exit = parseExit(parts.status),
+        .stdout = parts.stdout,
+        .stderr = parts.stderr,
+    };
+}
 
 /// Splits a stored bash result. The shape is the one `bash` writes: the status
 /// on its own line, `(no output)` when the command printed nothing at all, the
@@ -1305,6 +1340,31 @@ test "a bash result with no status line is shown as it is" {
         "❯ bash\nmake\n▾ output\nbuilt\nnothing to do\n\n",
         out.written(),
     );
+    // The split a frontend showing the status apart reads it with is null for
+    // the same result, so such a frontend falls back to showing it whole.
+    try std.testing.expect(bashOutput("built\nnothing to do") == null);
+}
+
+test "a bash result splits into its status and its streams" {
+    // The status is the code and whether it means success, and the two streams
+    // come back without the markers that separated them in the stored text.
+    const failed = bashOutput("exit code: 2\nbuilt\nstderr:\nboom\n").?;
+    try std.testing.expectEqualStrings("2", failed.exit.code);
+    try std.testing.expect(!failed.exit.ok);
+    try std.testing.expectEqualStrings("built", failed.stdout);
+    try std.testing.expectEqualStrings("boom\n", failed.stderr);
+
+    const ok = bashOutput("exit code: 0\nhello\n").?;
+    try std.testing.expectEqualStrings("0", ok.exit.code);
+    try std.testing.expect(ok.exit.ok);
+    try std.testing.expectEqualStrings("hello\n", ok.stdout);
+    try std.testing.expectEqualStrings("", ok.stderr);
+
+    // A command that printed nothing has no streams, and `(no output)` is not
+    // one of them.
+    const quiet = bashOutput("exit code: 0\n(no output)\n").?;
+    try std.testing.expectEqualStrings("", quiet.stdout);
+    try std.testing.expectEqualStrings("", quiet.stderr);
 }
 
 test "what a call failed with is shown red, and what it left out is dimmed" {
