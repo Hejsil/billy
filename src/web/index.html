@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>billy</title>
+<style>
+  :root {
+    --bg: #14151a; --panel: #1b1d24; --line: #2a2d37;
+    --text: #d7dae0; --dim: #8b90a0; --accent: #7aa2f7;
+    --add: #9ece6a; --del: #f7768e;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex; background: var(--bg); color: var(--text);
+    font: 14px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  /* The list of sessions down the left, and the button that starts a new one. */
+  #sidebar {
+    width: 250px; flex: none; display: flex; flex-direction: column;
+    background: var(--panel); border-right: 1px solid var(--line);
+  }
+  #sidebar header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 9px 12px; border-bottom: 1px solid var(--line);
+  }
+  #sidebar h1 { margin: 0; font-size: 14px; font-weight: 600; }
+  #new {
+    background: none; border: 1px solid var(--line); color: var(--accent);
+    border-radius: 6px; width: 26px; height: 26px; line-height: 1;
+    font: inherit; font-size: 17px; cursor: pointer;
+  }
+  #new:hover { border-color: var(--accent); }
+  #list { list-style: none; margin: 0; padding: 6px; overflow-y: auto; flex: 1; }
+  #list li {
+    padding: 6px 8px; border-radius: 6px; cursor: pointer; color: var(--dim);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #list li:hover { background: #22242c; color: var(--text); }
+  #list li.selected { background: #262a35; color: var(--text); }
+  #list .empty { color: var(--dim); cursor: default; padding: 6px 8px; }
+  #list .empty:hover { background: none; }
+
+  /* The conversation in the middle, with the prompt box under it. */
+  main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #header {
+    padding: 7px 16px; border-bottom: 1px solid var(--line);
+    color: var(--dim); font-size: 12px; display: flex; gap: 6px; flex-wrap: wrap;
+  }
+  #header:empty { display: none; }
+  #header .sep { color: #3a3f4b; }
+  #header .id { color: #6f7688; }
+  #conversation { flex: 1; overflow-y: auto; padding: 16px; }
+  #prompt { display: flex; padding: 12px 16px; border-top: 1px solid var(--line); }
+  #text {
+    flex: 1; background: var(--panel); border: 1px solid var(--line);
+    color: var(--text); border-radius: 6px; padding: 8px 10px; font: inherit;
+  }
+  #text:disabled { color: var(--dim); }
+
+  /* A prompt or a reply: a headed block of markdown. */
+  .block { margin-bottom: 16px; }
+  .block .head { color: var(--dim); font-size: 12px; margin-bottom: 5px; }
+  .block .head .name { color: var(--text); font-weight: 600; }
+  .block.prompt .head .glyph { color: var(--accent); }
+  .block.answer .head .glyph { color: var(--add); }
+  .block :first-child { margin-top: 0; }
+  .block p { margin: 0 0 8px; }
+  .block ul, .block ol { margin: 0 0 8px; padding-left: 22px; }
+  .block h1, .block h2, .block h3 { font-size: 15px; margin: 12px 0 6px; }
+  .block blockquote {
+    margin: 0 0 8px; padding-left: 10px; border-left: 2px solid var(--line);
+    color: var(--dim);
+  }
+  .block hr { border: none; border-top: 1px solid var(--line); margin: 10px 0; }
+
+  /* Code: inline, in a block of markdown, and as a tool's own output. */
+  code {
+    background: #22242c; border-radius: 3px; padding: 1px 4px; font: inherit;
+  }
+  pre {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    padding: 8px 10px; overflow-x: auto; margin: 0 0 8px;
+  }
+  pre code { background: none; padding: 0; }
+  pre.error { color: var(--del); }
+
+  /* A tool call: its head, then what it ran and what came back. */
+  .tool-head { color: var(--dim); font-size: 12px; margin-bottom: 5px; }
+  .tool-head .name { color: var(--text); font-weight: 600; }
+  .tool-head .glyph { color: var(--dim); }
+  .tool-head .glyph.hue-blue { color: var(--accent); }
+  .tool-head .glyph.hue-green { color: var(--add); }
+  .tool-head .glyph.hue-yellow { color: #e0af68; }
+  .tool-head .glyph.hue-cyan { color: #7dcfff; }
+  .tool-head .glyph.hue-magenta { color: #bb9af7; }
+  .tool-head .glyph.hue-red { color: var(--del); }
+  pre.diff .removed { color: var(--del); }
+  pre.diff .added { color: var(--add); }
+  pre.diff .context, pre.diff .elided { color: var(--dim); }
+
+  /* The lines billy writes itself. */
+  .compacted, .notice, .elided {
+    color: var(--dim); font-size: 12px; margin-bottom: 16px;
+  }
+</style>
+</head>
+<body>
+  <aside id="sidebar">
+    <header>
+      <h1>billy</h1>
+      <button id="new" title="new session">&plus;</button>
+    </header>
+    <ul id="list"></ul>
+  </aside>
+
+  <main>
+    <div id="header"></div>
+    <div id="conversation"></div>
+    <form id="prompt" onsubmit="return false">
+      <input id="text" placeholder="not wired up yet" disabled>
+    </form>
+  </main>
+
+<script>
+// The page is a shell: every block of a conversation is rendered by the server
+// and put in whole, so nothing here lays out an answer or escapes a file.
+const list = document.getElementById('list');
+const headerBox = document.getElementById('header');
+const conversation = document.getElementById('conversation');
+let selected = null;
+
+// The sessions are listed again after a new one is started, so the sidebar shows
+// it; nothing else changes the list.
+async function refresh(select) {
+  const sessions = (await (await fetch('/api/sessions')).json()).sessions;
+  list.replaceChildren();
+  if (sessions.length === 0) {
+    const empty = document.createElement('li');
+    empty.className = 'empty';
+    empty.textContent = 'no sessions';
+    list.append(empty);
+    return sessions;
+  }
+  for (const session of sessions) {
+    const item = document.createElement('li');
+    // The id is shown and sent back verbatim, so it is set as text.
+    item.textContent = session.id;
+    item.dataset.id = session.id;
+    if (session.id === select) item.classList.add('selected');
+    item.onclick = () => open(session.id);
+    list.append(item);
+  }
+  return sessions;
+}
+
+// Opens a session: the header above the conversation, and the conversation
+// itself, both of which the server rendered.
+async function open(id) {
+  selected = id;
+  for (const item of list.children) item.classList.toggle('selected', item.dataset.id === id);
+  const res = await fetch('/api/sessions/' + encodeURIComponent(id));
+  if (!res.ok) return;
+  const body = await res.json();
+  headerBox.innerHTML = body.header;
+  conversation.innerHTML = body.blocks;
+  conversation.scrollTop = conversation.scrollHeight;
+}
+
+document.getElementById('new').onclick = async () => {
+  const started = await (await fetch('/api/sessions', { method: 'POST' })).json();
+  await refresh(started.id);
+  await open(started.id);
+};
+
+// Open the newest session there is, so the page is not blank when there is one.
+(async () => {
+  const sessions = await refresh();
+  if (sessions.length > 0) await open(sessions[0].id);
+})();
+</script>
+</body>
+</html>
