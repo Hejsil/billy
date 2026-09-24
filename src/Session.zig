@@ -763,14 +763,24 @@ fn load(session: *Session) !void {
     }
 }
 
+/// Interns `text` into the pool and returns its index, or `.none` for null.
+///
+/// The pool holds text, and text is what a request and the session file carry
+/// as a JSON string. A tool's output, what the user typed and a file read back
+/// are arbitrary bytes, though, and Zig writes a byte slice that is not valid
+/// UTF-8 as an array of numbers, which the API rejects. The text is therefore
+/// written through `fmtUtf8`, which passes well-formed text through unchanged
+/// and repairs anything ill-formed, so every string the pool holds, and
+/// everything written from it, is text a request and a session file can carry.
 fn internString(session: *Session, text: ?[]const u8) !StringIndex {
     const value = text orelse return .none;
 
     // The candidate is put in the pool before it is looked up, since a key has
     // to name a string the pool already holds. A duplicate is rolled back as
-    // soon as the lookup finds the copy that was there already.
+    // soon as the lookup finds the copy that was there already. The text is
+    // written straight into the pool, so nothing else is allocated for it.
     const start: u32 = @intCast(session.strings.items.len);
-    try session.strings.appendSlice(session.gpa, value);
+    try session.strings.print(session.gpa, "{f}", .{std.unicode.fmtUtf8(value)});
     try session.strings.append(session.gpa, 0);
     const candidate: StringIndex = @enumFromInt(start);
 
@@ -1094,6 +1104,65 @@ test "a conversation writes the messages a request would have carried" {
             "{\"role\":\"tool\",\"content\":\"1\\tconst x = 1;\\n\",\"tool_call_id\":\"call_1\"}]",
         via_conversation,
     );
+}
+
+test "a string that is not valid UTF-8 is repaired on the way into the pool" {
+    const arena = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(std.testing.io, tmp.dir, arena, null, "/work");
+    defer session.deinit();
+
+    // A command's output and a file read back are arbitrary bytes, so a result
+    // holds a stray continuation byte and a cut-off sequence, neither of which
+    // is UTF-8.
+    try session.append(.{ .role = "tool", .tool_call_id = "call_1", .content = "a\x80b\xffc" });
+
+    // The pool holds text, so a request writes the content as a string. Left as
+    // bytes, Zig would write it as an array of numbers the API rejects.
+    var out: std.Io.Writer.Allocating = .init(arena);
+    defer out.deinit();
+    var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{ .emit_null_optional_fields = false } };
+    try json.write(session.conversation());
+    try std.testing.expectEqualStrings(
+        "[{\"role\":\"tool\",\"content\":\"a\u{FFFD}b\u{FFFD}c\",\"tool_call_id\":\"call_1\"}]",
+        out.written(),
+    );
+
+    // The repaired text is what the session keeps, so a resume reads it back
+    // the same rather than the bytes that could not be sent.
+    try std.testing.expectEqualStrings("a\u{FFFD}b\u{FFFD}c", session.contentOf(session.messages.items[0]).?);
+}
+
+test "a message a session read back with bytes that are not UTF-8 is repaired" {
+    const arena = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A session file written before a result was repaired holds the content as
+    // the array of numbers Zig writes for bytes that are not UTF-8, which is
+    // how the bytes "a\xffb" were stored.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "bytes.json",
+        .data = "{\"version\":2,\"messages\":[{\"role\":\"tool\"," ++
+            "\"content\":[97,255,98],\"tool_call_id\":\"call_1\"}]}",
+    });
+
+    var session = try Session.open(std.testing.io, tmp.dir, arena, "bytes", "/work");
+    defer session.deinit();
+
+    try std.testing.expectEqualStrings("a\u{FFFD}b", session.contentOf(session.messages.items[0]).?);
+
+    // Saving it back writes the content as a string, so the bytes are gone for
+    // good and the file is one a later resume reads as text.
+    try session.save();
+    const text = try tmp.dir.readFileAlloc(std.testing.io, "bytes.json", arena, .limited(1 << 16));
+    defer arena.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[97,255,98]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"content\":\"a\u{FFFD}b\"") != null);
 }
 
 test "a stored message reads back as its parts" {
