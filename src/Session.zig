@@ -524,6 +524,10 @@ pub fn resolveSend(session: *const Session, allocator: std.mem.Allocator) ![]con
 
 /// Adds a message to the conversation and writes the session out, so the
 /// next run sees it even if this one is killed.
+///
+/// This is what brings a new session into being: opening one only reserves its
+/// id, and the id, the system prompt, the tools and the conversation all reach
+/// the file together with the first message added.
 pub fn append(session: *Session, message: llm.Message) !void {
     try session.appendMessage(message);
     try session.save();
@@ -581,9 +585,14 @@ fn appendMessage(session: *Session, message: llm.Message) !void {
 /// resumed session already carries the prompt it was saved with, which is
 /// kept so the messages sent match the earlier run byte for byte and hit the
 /// prompt cache.
+///
+/// The prompt is held in memory and reaches the file with the session's first
+/// message, like the tools. A new session is therefore not written out until it
+/// is first asked something, so a run that is started and left alone leaves no
+/// session file behind.
 pub fn appendSystemPrompt(session: *Session, system_prompt: []const u8) !void {
     if (session.messages.items.len != 0) return;
-    try session.append(.{ .role = "system", .content = system_prompt });
+    try session.appendMessage(.{ .role = "system", .content = system_prompt });
 }
 
 /// Records the tool definitions to send with every request, unless the session
@@ -591,6 +600,9 @@ pub fn appendSystemPrompt(session: *Session, system_prompt: []const u8) !void {
 /// which are kept so the request matches the earlier run and hits the prompt
 /// cache; a new session, or one saved before the tools were stored, gets the
 /// current definitions instead.
+///
+/// Like the system prompt, the set is held in memory and written out with the
+/// session's first message.
 pub fn ensureTools(session: *Session, definitions: []const Definition) !void {
     if (session.tools.len != 0) return;
     // The strings are interned into the pool, so the set costs one array and
@@ -607,7 +619,6 @@ pub fn ensureTools(session: *Session, definitions: []const Definition) !void {
         };
     }
     session.tools = tools;
-    try session.save();
 }
 
 /// Adds a request's tokens and cost to the session totals and remembers how
@@ -987,6 +998,42 @@ test "a new session is given a ULID, and nothing is written yet" {
     // Opening a new session records an id and nothing else, so the first write
     // is the first message. Nothing is named after the id until then.
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, session.name(), .{}));
+}
+
+test "a new session is written out by its first message" {
+    const arena = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tools = [_]Definition{.{
+        .name = "read",
+        .description = "Read a file.",
+        .parameters = "{}",
+    }};
+
+    var session = try Session.open(std.testing.io, tmp.dir, arena, null, "/work");
+    defer session.deinit();
+
+    // Setting a session up -- its prompt and its tools -- is held in memory, so
+    // a run that is started and left alone leaves nothing behind. This is what
+    // keeps an untouched `billy` from littering the sessions directory.
+    try session.appendSystemPrompt("be terse");
+    try session.ensureTools(&tools);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, session.name(), .{}));
+
+    // The first message is what brings the session into being, and everything
+    // set up before it lands in the file with it.
+    try session.append(.{ .role = "user", .content = "hello" });
+
+    var resumed = try Session.open(std.testing.io, tmp.dir, arena, session.id(), "/work");
+    defer resumed.deinit();
+    try std.testing.expectEqual(1, resumed.tools.len);
+    try std.testing.expectEqual(2, resumed.messages.items.len);
+    try std.testing.expectEqualStrings("system", resumed.roleOf(resumed.messages.items[0]));
+    try std.testing.expectEqualStrings("be terse", resumed.contentOf(resumed.messages.items[0]).?);
+    try std.testing.expectEqualStrings("user", resumed.roleOf(resumed.messages.items[1]));
+    try std.testing.expectEqualStrings("hello", resumed.contentOf(resumed.messages.items[1]).?);
 }
 
 test "ids made one after another differ" {
@@ -1685,6 +1732,14 @@ test "ensureTools stores the tools and only sets them once" {
     try session.ensureTools(&tools);
     try std.testing.expectEqual(1, session.tools.len);
     try std.testing.expectEqualStrings("read", session.string(session.tools[0].name).?);
+
+    // The tools are held in memory until the session's first message, which is
+    // what writes the session out.
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(std.testing.io, session.name(), .{}),
+    );
+    try session.append(.{ .role = "user", .content = "hi" });
 
     // The stored tools survive a save and resume.
     var resumed = try Session.open(std.testing.io, tmp.dir, arena, session.id(), "/work");
