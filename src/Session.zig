@@ -1187,7 +1187,12 @@ fn listIn(dir: Io.Dir, io: Io, gpa: std.mem.Allocator) ![]Named {
 
 /// Longest a title stored in a file is read as. A title is a short line, so a
 /// value longer than this is not one billy wrote and is not read.
-const max_stored_title_len = 512;
+const max_stored_title_len = 256;
+
+/// The reader a session file's title is read with. It is big enough to hold a
+/// whole title, so the quote that closes one is found within a single read
+/// rather than the reader having to grow.
+const title_read_buffer_len = 1024;
 
 /// The title stored in the session file `file_name`, or "" when it has none.
 ///
@@ -1198,7 +1203,7 @@ fn readTitle(io: Io, gpa: std.mem.Allocator, dir: Io.Dir, file_name: []const u8)
     var file = dir.openFile(io, file_name, .{}) catch return gpa.dupe(u8, "");
     defer file.close(io);
 
-    var buffer: [64]u8 = undefined;
+    var buffer: [title_read_buffer_len]u8 = undefined;
     var reader = file.reader(io, &buffer);
     return (try titleFrom(&reader.interface, gpa)) orelse gpa.dupe(u8, "");
 }
@@ -1228,26 +1233,59 @@ fn titleFrom(reader: *Io.Reader, gpa: std.mem.Allocator) !?[]u8 {
     return try takeString(reader, gpa);
 }
 
-/// Reads a JSON string value, undoing its escapes, up to the quote that closes
-/// it. Null when the stream ends inside it, or when it runs past the length a
-/// title may be -- either way it is not a title billy wrote.
+/// Reads a JSON string value, undoing its escapes. Null when it runs past the
+/// length a title may be, or the stream ends before a value is read: either way
+/// it is not a title billy wrote.
+///
+/// The value is read a run of bytes at a time, up to the next quote. That quote
+/// closes the string only when it is not escaped, so a run that ends just before
+/// an escaped quote is read on: it stops at the first quote that is not escaped,
+/// which is the one that ends the value.
 fn takeString(reader: *Io.Reader, gpa: std.mem.Allocator) !?[]u8 {
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(gpa);
+    while (raw.items.len <= max_stored_title_len) {
+        const run = (reader.takeDelimiter('"') catch return null) orelse return null;
+        try raw.appendSlice(gpa, run);
+        if (endsEscaped(raw.items)) {
+            // The run ended on an escaped quote, so that quote is part of the
+            // value and the string goes on.
+            try raw.append(gpa, '"');
+            continue;
+        }
+        const value = try unescape(gpa, raw.items);
+        if (value.len > max_stored_title_len) {
+            gpa.free(value);
+            return null;
+        }
+        return value;
+    }
+    return null;
+}
+
+/// Whether `bytes` ends in an odd number of backslashes, so the byte after it --
+/// the quote a run was read up to -- is escaped rather than ending the string.
+/// Two backslashes are one escaped backslash with nothing escaping the quote
+/// after them, so the count matters, not just the last byte.
+fn endsEscaped(bytes: []const u8) bool {
+    var backslashes: usize = 0;
+    var i = bytes.len;
+    while (i > 0 and bytes[i - 1] == '\\') : (i -= 1) backslashes += 1;
+    return backslashes % 2 == 1;
+}
+
+/// A JSON string's contents with its escapes undone: a backslash and the byte
+/// after it stand for that byte. A title is one clean line, so the only escapes
+/// the writer produces are `\"` and `\\`.
+fn unescape(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
-    var escaped = false;
-    while (out.items.len <= max_stored_title_len) {
-        const byte = reader.takeByte() catch break;
-        if (escaped) {
-            try out.append(gpa, byte);
-            escaped = false;
-        } else switch (byte) {
-            '\\' => escaped = true,
-            '"' => return try out.toOwnedSlice(gpa),
-            else => try out.append(gpa, byte),
-        }
+    var i: usize = 0;
+    while (i < raw.len) : (i += 1) {
+        if (raw[i] == '\\' and i + 1 < raw.len) i += 1;
+        try out.append(gpa, raw[i]);
     }
-    out.deinit(gpa);
-    return null;
+    return out.toOwnedSlice(gpa);
 }
 
 /// Orders sessions by when their files were written, newest first, carrying the
@@ -1529,10 +1567,9 @@ test "a listing carries each session's title" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    // One session that has been named with a title longer than the buffer the
-    // reader reads a file with, so the title has to be read over more than one
-    // read; one named with a short title; and one that has not been named.
-    const long_title = "a title long enough that it does not fit in the reader's small buffer at once";
+    // One session named with a long title, one with a short title, and one that
+    // has not been named.
+    const long_title = "a long title, close to the most a title may be, so the reader has to read well past the fields before it";
     var long = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer long.deinit();
     try long.setTitle(long_title);
@@ -1573,14 +1610,29 @@ test "the title is read from the front of a session file, unescaped" {
     try expectTitle(gpa, "Fix it", "{\"version\":3,\"title\":\"Fix it\",\"system_prompt\":\"x\"}");
     // The escapes the writer produces are undone.
     try expectTitle(gpa, "a \"quoted\" \\ title", "{\"version\":3,\"title\":\"a \\\"quoted\\\" \\\\ title\"}");
+    // A title that ends in an escaped backslash, which the quote after it does
+    // not close.
+    try expectTitle(gpa, "ends with a backslash \\", "{\"version\":3,\"title\":\"ends with a backslash \\\\\",\"messages\":[]}");
+    // A title that is a single escaped quote.
+    try expectTitle(gpa, "\"", "{\"version\":3,\"title\":\"\\\"\"}");
+    // An empty title is read as empty, not as "no title".
+    try expectTitle(gpa, "", "{\"version\":3,\"title\":\"\",\"messages\":[]}");
 
     // A session with no title -- one saved before titles, or hand-written -- is
     // recognized by the field after the version and left alone.
     try std.testing.expect((try titleOf(gpa, "{\"version\":3,\"system_prompt\":\"be terse\",\"messages\":[]}")) == null);
     try std.testing.expect((try titleOf(gpa, "{\"version\":3,\"messages\":[]}")) == null);
-    // A stream that ends inside the title, and one that is not a session at all.
-    try std.testing.expect((try titleOf(gpa, "{\"version\":3,\"title\":\"Fix it")) == null);
+    // Something that is not a session at all.
     try std.testing.expect((try titleOf(gpa, "not json at all")) == null);
+
+    // A value longer than a title may be is not one billy wrote, so it is not
+    // read: neither a long value the reader can still hold, nor one it cannot.
+    const too_long = "x" ** (max_stored_title_len + 1);
+    var over: std.Io.Writer.Allocating = .init(gpa);
+    defer over.deinit();
+    try over.writer.print("{{\"version\":3,\"title\":\"{s}\",\"messages\":[]}}", .{too_long});
+    try std.testing.expect((try titleOf(gpa, over.written())) == null);
+    try std.testing.expect((try titleOf(gpa, "{\"version\":3,\"title\":\"" ++ ("y" ** 4096) ++ "\"}")) == null);
 }
 
 /// Reads the title out of `front`, which stands in for the start of a session

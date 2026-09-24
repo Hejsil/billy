@@ -746,19 +746,19 @@ fn askSession(
     var stream = Stream{ .body = &body_writer, .gpa = gpa };
     const emitter = stream.emitter();
 
-    // A session asked for the first time is named during the turn (see
-    // `Runner.ask`), so the page is told the title afterwards to put in its list.
-    const first_turn = session.messages.items.len == 0;
+    // A session asked for the first time is named at once, from what was asked,
+    // so the page's list shows a name before the model has answered; the model's
+    // own title, if it gives one, arrives with the list the page refreshes when
+    // the turn ends.
+    if (session.messages.items.len == 0) {
+        _ = try agent.nameFromPrompt(&session, parsed.value.text);
+        if (session.title()) |title| try stream.send("title", TitleEvent{ .title = title });
+    }
 
     runner.compactIfNeeded(emitter, &session);
     runner.ask(emitter, &session, parsed.value.text) catch |err| {
         std.log.err("a request failed: {s}", .{@errorName(err)});
         try stream.fail(@errorName(err));
-    };
-
-    // The title, when the session was just named, so the page's list picks it up.
-    if (first_turn) if (session.title()) |title| {
-        try stream.send("title", TitleEvent{ .title = title });
     };
 
     // What the run left the session at, so the page shows the new gauge and

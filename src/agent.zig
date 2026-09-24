@@ -521,7 +521,7 @@ pub const Runner = struct {
         // kept apart from the conversation, so a session that has been asked
         // nothing has none.
         const first_turn = session.messages.items.len == 0;
-        if (session.title() == null) try session.setTitle(provisionalTitle(text));
+        _ = try nameFromPrompt(session, text);
 
         try session.append(.{ .role = "user", .content = text });
         try emitter.show(.{ .prompt = text });
@@ -971,6 +971,19 @@ fn utf8Cut(text: []const u8, len: usize) []const u8 {
     var end = len;
     while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
     return text[0..end];
+}
+
+/// Names `session` from `text`, the first thing asked, if it has no title yet,
+/// so a session is named the moment it starts rather than only once the model has
+/// answered. Returns whether it named it.
+///
+/// This is the name the model's title later replaces; a frontend calls it at the
+/// start of the first turn, so its list shows a name at once, and `ask` calls it
+/// too so a session named anywhere is named the same way.
+pub fn nameFromPrompt(session: *Session, text: []const u8) !bool {
+    if (session.title() != null) return false;
+    try session.setTitle(provisionalTitle(text));
+    return true;
 }
 
 /// The rates in effect right now. Zero for a model billy does not know, which

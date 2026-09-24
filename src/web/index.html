@@ -216,26 +216,31 @@ async function refresh(select) {
   }
   for (const session of sessions) {
     const item = document.createElement('li');
-    // Every value is set as text, since an id or a title could be anything.
     item.dataset.id = session.id;
-    const name = document.createElement('div');
-    name.className = 'title';
-    // The title is the name to show; a session that has not been named yet is
-    // shown by its id instead.
-    name.textContent = session.title || session.id;
-    item.append(name);
-    if (session.title) {
-      // The id, which is what `billy --resume` takes, stays under the title.
-      const ident = document.createElement('div');
-      ident.className = 'ident';
-      ident.textContent = session.id;
-      item.append(ident);
-    }
+    setListedName(item, session.title);
     if (session.id === select) item.classList.add('selected');
     item.onclick = () => open(session.id);
     list.append(item);
   }
   return sessions;
+}
+
+// Shows a session's name in its list item: the title, with the id it can be
+// resumed by under it in a smaller, dimmer line. A session that has not been
+// named shows its id in the title's place. Every value is set as text, since an
+// id or a title could be anything.
+function setListedName(item, title) {
+  item.replaceChildren();
+  const name = document.createElement('div');
+  name.className = 'title';
+  name.textContent = title || item.dataset.id;
+  item.append(name);
+  if (title) {
+    const ident = document.createElement('div');
+    ident.className = 'ident';
+    ident.textContent = item.dataset.id;
+    item.append(ident);
+  }
 }
 
 // Opens a session: the header above the conversation, and the conversation
@@ -352,9 +357,12 @@ function handleFrame(frame) {
   } else if (event === 'header') {
     headerBox.innerHTML = JSON.parse(data).html;
   } else if (event === 'title') {
-    // The session was just named; the list is asked for again so it shows the
-    // title. The turn is over by now, so this does not disturb it.
-    refresh(selected);
+    // The session being asked was just named; its list item is updated in place,
+    // rather than the whole list asked for again, since the name is here.
+    const title = JSON.parse(data).title;
+    for (const item of list.children) {
+      if (item.dataset.id === selected) setListedName(item, title);
+    }
   } else if (event === 'error') {
     note(JSON.parse(data).message);
   }
