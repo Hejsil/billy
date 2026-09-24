@@ -1,19 +1,19 @@
 //! The web frontend: billy served over HTTP instead of in a terminal.
 //!
-//! The server binds the loopback address only, so it is reachable from this
-//! machine and not from the network. Every connection is handled on its own task,
-//! so a slow request does not hold up the rest, and a connection that cannot be
-//! served is closed rather than taking the server down with it.
+//! The server listens where it is asked to, this machine only unless another
+//! address is given. Every connection is handled on its own task, so a slow
+//! request does not hold up the rest, and a connection that cannot be served is
+//! closed rather than taking the server down with it.
 //!
 //! What a route answers with is rendered here but built by `html.zig` and read
 //! out of a session, so the page shows the same blocks the terminal does. Every
 //! string that comes from outside billy passes through `html.escape`, so nothing
 //! a model, a file or a request writes can become markup.
 //!
-//! Nothing is authenticated. Any process on this machine, and any page the
-//! browser loads, can reach these routes, and the routes can run commands as the
-//! user. That is accepted for now; it is why the address is loopback and not
-//! something routable.
+//! Nothing is authenticated. Any process that can reach the address, and any
+//! page the browser loads, can reach these routes, and the routes can run
+//! commands as the user. That is why the address is this machine only unless
+//! something else is asked for, and why the help says so.
 
 const std = @import("std");
 const Io = std.Io;
@@ -26,17 +26,29 @@ const Setup = @import("Setup.zig");
 /// The port billy serves on when nothing else is asked for.
 pub const default_port = 8787;
 
+/// The address billy serves on when nothing else is asked for: this machine
+/// only. Anywhere else may be asked for, but billy has no authentication and its
+/// routes run commands as the user, so the help says what listening elsewhere
+/// means.
+pub const default_host = "127.0.0.1";
+
 /// The page the browser is given at `/`: one file, with its styles and its
 /// script in it, so the server serves it as it is and there is nothing to build.
 const page = @embedFile("web/index.html");
 
-/// Serves the frontend on the loopback address at `port`, until the process is
+/// Serves the frontend on the address `host` at `port`, until the process is
 /// stopped. Zero asks the system for a free port, which is what a test uses.
 ///
 /// The URL is printed once the socket is bound, so what is printed is the port
 /// that was actually taken, and not the one that was asked for.
-pub fn serve(setup: *Setup, out: *Io.Writer, port: u16) !void {
-    var address = try Io.net.IpAddress.parse("127.0.0.1", port);
+pub fn serve(setup: *Setup, out: *Io.Writer, host: []const u8, port: u16) !void {
+    const address = listenAddress(host, port) catch |err| {
+        std.log.err(
+            "cannot listen on '{s}': {s}; give an address such as 127.0.0.1, 0.0.0.0 or 192.168.1.5",
+            .{ host, @errorName(err) },
+        );
+        return err;
+    };
     var listener = try address.listen(setup.io, .{ .reuse_address = true });
     defer listener.deinit(setup.io);
 
@@ -45,7 +57,8 @@ pub fn serve(setup: *Setup, out: *Io.Writer, port: u16) !void {
     var registry = Registry{ .io = setup.io, .gpa = setup.gpa };
     defer registry.deinit();
 
-    try out.print("billy serve is listening on http://127.0.0.1:{d}/\n", .{
+    try out.print("billy serve is listening on http://{s}:{d}/\n", .{
+        host,
         listener.socket.address.getPort(),
     });
     try out.flush();
@@ -68,6 +81,18 @@ pub fn serve(setup: *Setup, out: *Io.Writer, port: u16) !void {
             continue;
         };
     }
+}
+
+/// The address `host` and `port` name.
+///
+/// `localhost` is taken as the loopback address, which is what it means
+/// everywhere. Anything else has to be an address, since billy does not resolve
+/// names: `0.0.0.0` for every interface, or the address of one of them.
+fn listenAddress(host: []const u8, port: u16) !Io.net.IpAddress {
+    if (std.mem.eql(u8, host, "localhost")) return .{ .ip4 = Io.net.Ip4Address.loopback(port) };
+    // What was asked for that is not an address comes back as one error, since
+    // what billy does not do is resolve a name; the caller says so.
+    return Io.net.IpAddress.parse(host, port) catch error.InvalidHost;
 }
 
 /// What the server knows about sessions that their files do not say.
@@ -394,4 +419,22 @@ test "the page the browser is given is the one that was written" {
     // built to serve it.
     try std.testing.expect(std.mem.indexOf(u8, page, "<!doctype html>") == 0);
     try std.testing.expect(std.mem.indexOf(u8, page, "/api/sessions") != null);
+}
+
+test "the address to listen on is read from what was asked for" {
+    // An address is taken as itself, and the port carried through.
+    const anywhere = try listenAddress("0.0.0.0", 8787);
+    try std.testing.expect(anywhere.eql(&(try Io.net.IpAddress.parse("0.0.0.0", 8787))));
+
+    // `localhost` is the one name taken, and it names loopback.
+    const here = try listenAddress("localhost", 8787);
+    try std.testing.expect(here.eql(&(try Io.net.IpAddress.parse("127.0.0.1", 8787))));
+
+    // A v6 address, and a port of zero, which asks the system for a free one.
+    const v6 = try listenAddress("::1", 0);
+    try std.testing.expect(v6.eql(&(try Io.net.IpAddress.parse("::1", 0))));
+
+    // A name billy does not resolve is refused rather than left to fail later.
+    try std.testing.expectError(error.InvalidHost, listenAddress("example.com", 8787));
+    try std.testing.expectError(error.InvalidHost, listenAddress("", 8787));
 }
