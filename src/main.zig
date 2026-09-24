@@ -117,8 +117,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // A subcommand asked for its usage is answered before billy's own files are
-    // reached for, so its help works even when nothing else can be read. Neither
-    // subcommand has subcommands of its own, so neither lists any.
+    // reached for, so its help works even when nothing else can be read. None of
+    // them has subcommands of its own, so none lists any.
     if (options.login) |login| {
         if (login.help) return printHelp(out, "billy login [<service>]", login_about, null, command_options);
     }
@@ -141,11 +141,26 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // billy's own files live under the data directory: the credentials in the
-    // directory itself, and the sessions in a subdirectory of it. The
-    // credentials are not kept with the configuration, which is meant to be
-    // shared between machines, and a key is not.
-    const data_dir = billy.Session.dataDir(arena, init.environ_map) catch |err| {
+    // The login subcommand needs the credentials and nothing else, so it is
+    // handled on its own rather than through the setup a run needs.
+    if (options.login) |login| return runLogin(init, out, login.service);
+
+    // Everything else needs the whole of what billy reads in: the configuration,
+    // the credentials and the directories it keeps its files in.
+    var setup = try billy.Setup.open(init, out);
+    defer setup.deinit();
+
+    return runSession(init, out, &setup, options.resume_id);
+}
+
+/// Reads a key for a service, or lists the services, so a run need not have the
+/// key exported. Only the credentials are read, since nothing else is touched.
+fn runLogin(init: std.process.Init, out: *Io.Writer, service: ?[]const u8) !void {
+    const io = init.io;
+    const arena = init.arena.allocator();
+    const environ = init.environ_map;
+
+    const data_dir = billy.Session.dataDir(arena, environ) catch |err| {
         std.log.err("cannot find where to store billy's files: {s}", .{@errorName(err)});
         return err;
     };
@@ -159,152 +174,53 @@ pub fn main(init: std.process.Init) !void {
         std.log.err("cannot read the credentials in {s}: {s}", .{ data_dir, @errorName(err) });
         return err;
     };
+    try billy.credentials.run(
+        io,
+        out,
+        arena,
+        data_dir_handle,
+        data_dir,
+        &credentials,
+        environ,
+        service,
+    );
+}
 
-    if (options.login) |login| {
-        try billy.credentials.run(
-            io,
-            out,
-            arena,
-            data_dir_handle,
-            data_dir,
-            &credentials,
-            init.environ_map,
-            login.service,
-        );
-        return;
-    }
+/// Runs one session in the terminal, resuming `resume_id` or starting a new one.
+fn runSession(
+    init: std.process.Init,
+    out: *Io.Writer,
+    setup: *billy.Setup,
+    resume_id: ?[]const u8,
+) !void {
+    const io = init.io;
 
-    const config_dir = billy.Config.defaultDir(arena, init.environ_map) catch |err| {
-        std.log.err("cannot find where to store the configuration: {s}", .{@errorName(err)});
-        return err;
-    };
-    var config_dir_handle = Io.Dir.cwd().createDirPathOpen(io, config_dir, .{}) catch |err| {
-        std.log.err("cannot use {s} for the configuration: {s}", .{ config_dir, @errorName(err) });
-        return err;
-    };
-    defer config_dir_handle.close(io);
-
-    // The configuration owns an arena of its own for the strings it reads, so it
-    // is freed when the run is over rather than with the process arena.
-    var settings = billy.Config.open(io, config_dir_handle, init.gpa) catch |err| {
-        std.log.err("cannot read the configuration in {s}: {s}", .{ config_dir, @errorName(err) });
-        return err;
-    };
-    defer settings.config.deinit();
-    if (settings.created) {
-        try out.print("wrote the default configuration to {s}\n", .{
-            try std.fs.path.join(arena, &.{ config_dir, billy.Config.file_name }),
-        });
-    }
-
-    const base_url = init.environ_map.get("BILLY_BASE_URL") orelse "https://api.deepseek.com";
-    const model = init.environ_map.get("BILLY_MODEL") orelse "deepseek-flash";
-    const api_key = billy.credentials.modelKey(&credentials, init.environ_map, base_url) orelse {
-        std.log.err("run `billy login deepseek`, or set DEEPSEEK_API_KEY to your API key", .{});
-        return error.MissingApiKey;
-    };
-    const cwd = std.process.currentPathAlloc(io, arena) catch |err| {
-        std.log.err("cannot find the working directory: {s}", .{@errorName(err)});
-        return err;
-    };
-
-    // The sessions live in a subdirectory of billy's data directory, apart from
-    // the credentials stored in the directory itself.
-    const sessions_dir = billy.Session.defaultDir(arena, init.environ_map) catch |err| {
-        std.log.err("cannot find where to store sessions: {s}", .{@errorName(err)});
-        return err;
-    };
-    var sessions_dir_handle = Io.Dir.cwd().createDirPathOpen(io, sessions_dir, .{}) catch |err| {
-        std.log.err("cannot use {s} for sessions: {s}", .{ sessions_dir, @errorName(err) });
-        return err;
-    };
-    defer sessions_dir_handle.close(io);
-
-    // `cwd` is where billy runs now. A new session records it, and a resumed one
-    // keeps the directory it was saved with, so a session continues where it was
-    // started rather than wherever it is picked up.
-    var session = billy.Session.open(io, sessions_dir_handle, init.gpa, options.resume_id, cwd) catch |err| switch (err) {
+    // A resumed session keeps the directory it was saved with, so a session
+    // continues where it was started rather than wherever it is picked up.
+    var session = billy.Session.open(
+        io,
+        setup.sessions,
+        init.gpa,
+        resume_id,
+        setup.cwd,
+    ) catch |err| switch (err) {
         error.SessionNotFound => {
-            std.log.err("no session '{s}' in {s}", .{ options.resume_id.?, sessions_dir });
+            std.log.err("no session '{s}' in {s}", .{ resume_id.?, setup.sessions_path });
             return err;
         },
         error.InvalidSessionId => {
-            std.log.err("'{s}' cannot be used as a session name", .{options.resume_id.?});
+            std.log.err("'{s}' cannot be used as a session name", .{resume_id.?});
             return err;
         },
         else => return err,
     };
     defer session.deinit();
 
-    const search_config: ?billy.search.Config = if (settings.config.tools.web_search.provider) |provider| blk: {
-        // A backend named without its key is an error rather than a silent "no
-        // search": the configuration asked for the tool, and leaving it out
-        // without a word would look like a bug.
-        const service = billy.credentials.searchService(provider);
-        const key = billy.credentials.credential(&credentials, init.environ_map, service) orelse {
-            std.log.err(
-                "run `billy login {s}`, or set {s} to use web search, or clear tools.web_search in the configuration",
-                .{ service.name(), service.variable() },
-            );
-            return error.MissingApiKey;
-        };
-        break :blk .{
-            .provider = provider,
-            .api_key = key,
-            .max_results = settings.config.tools.web_search.max_results,
-        };
-    } else null;
-    const config: billy.agent.Config = .{
-        .api_key = api_key,
-        .url = try std.fmt.allocPrint(arena, "{s}/chat/completions", .{
-            std.mem.trimEnd(u8, base_url, "/"),
-        }),
-        .model = model,
-        .max_turns = settings.config.max_turns,
-        .bash_timeout_s = settings.config.tools.bash.timeout_s,
-        .cwd = session.cwd,
-        .home = init.environ_map.get("HOME"),
-        // The context window and the prices are not reported by the API, so
-        // they are looked up by provider and model; an unknown model simply has
-        // no gauge and no cost, and so no compaction, which needs a window to
-        // measure a conversation against.
-        .model_info = billy.models.lookup(billy.models.Provider.fromUrl(base_url), model),
-        .compact_at = settings.config.compact_at,
-        // How billy lays out and decorates what it shows. A bash command is laid
-        // out by its format script, so the user reads the command the way it runs;
-        // an edit is shown as a diff, laid out by its own script when one is set;
-        // a reply and a prompt are laid out by the markdown script; and a terminal
-        // gets the block headers with the name in bold, while a pipe or a
-        // redirection, where the escape codes would only be noise, gets the same
-        // text plain. Only the display changes: the command that runs, the file
-        // that is written, the session and the model keep the text as it was
-        // written.
-        .display = .{
-            .formats = .{
-                .bash = if (settings.config.tools.bash.format) |script| .{
-                    .script = script,
-                    .io = io,
-                    .gpa = init.gpa,
-                } else null,
-                .edit = if (settings.config.tools.edit.format) |script| .{
-                    .script = script,
-                    .io = io,
-                    .gpa = init.gpa,
-                } else null,
-            },
-            .markdown = if (settings.config.markdown.format) |script| .{
-                .script = script,
-                .io = io,
-                .gpa = init.gpa,
-            } else null,
-            .style = billy.style.Style.detect(io),
-        },
-        // Web search is offered only when the configuration names a backend and
-        // its key is set; the tool is left out of the request otherwise.
-        .search = search_config,
-    };
+    // The terminal lays its blocks out for the terminal it is on, which the
+    // escape codes of a pipe or a redirection would only be noise in.
+    const config = try setup.agentConfig(session.cwd, billy.style.Style.detect(io));
 
-    if (options.resume_id != null) {
+    if (resume_id != null) {
         // Replay the conversation as a transcript, so the context does not
         // have to be remembered from the previous run. Only the last few blocks
         // are shown, so resuming a long one is quick.
@@ -313,7 +229,7 @@ pub fn main(init: std.process.Init) !void {
             out,
             &session,
             config.display,
-            settings.config.resume_blocks,
+            setup.settings.resume_blocks,
         );
     }
     try billy.agent.run(io, init.gpa, out, config, &session);

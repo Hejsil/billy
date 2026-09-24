@@ -10,6 +10,7 @@ pub const LineEditor = @import("LineEditor.zig");
 pub const llm = @import("llm.zig");
 pub const models = @import("models.zig");
 pub const search = @import("search.zig");
+pub const Setup = @import("Setup.zig");
 pub const Session = @import("Session.zig");
 pub const style = @import("style.zig");
 pub const Tools = @import("Tools.zig");
