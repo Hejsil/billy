@@ -22,11 +22,19 @@ const config_about =
     \\has no value.
 ;
 
+/// What the `serve` subcommand is for, shown in its help.
+const serve_about =
+    \\Run billy as a server with a web frontend instead of in the terminal. It
+    \\listens on the loopback address only, so it is reachable from this machine
+    \\and not from the network.
+;
+
 /// The subcommands billy itself has, and what each is for, shown in billy's own
 /// help.
 const billy_commands =
     \\  login [<service>]         store an API key, or list the services
     \\  config <setting> <value>  set a configuration setting by its path
+    \\  serve                     run the web frontend
 ;
 
 /// The options billy itself takes.
@@ -35,10 +43,15 @@ const run_options =
     \\  -h, --help              print this message
 ;
 
-/// The options a subcommand takes. None takes an argument yet, so the only one
-/// is the usage itself.
+/// The options a subcommand takes, when it takes none but the usage itself.
 const command_options =
     \\  -h, --help  print this message
+;
+
+/// The options the `serve` subcommand takes.
+const serve_options =
+    \\  -p, --port <port>  the port to listen on, by default 8787
+    \\  -h, --help         print this message
 ;
 
 /// Prints a help message: how the command is invoked, what it is for, the
@@ -76,6 +89,8 @@ const Options = struct {
     /// Set when the `config` subcommand was asked for: the setting to change,
     /// named by its dotted path, and the text to set it to.
     config: ?Config = null,
+    /// Set when the `serve` subcommand was asked for: where it listens.
+    serve: ?Serve = null,
 
     const Login = struct {
         service: ?[]const u8 = null,
@@ -90,6 +105,13 @@ const Options = struct {
         /// The text to set the setting to. Null when only the usage was asked
         /// for.
         value: ?[]const u8 = null,
+        /// Whether the user asked for this subcommand's usage.
+        help: bool = false,
+    };
+
+    const Serve = struct {
+        /// The port to listen on. Zero asks the system for a free one.
+        port: u16 = billy.web.default_port,
         /// Whether the user asked for this subcommand's usage.
         help: bool = false,
     };
@@ -125,6 +147,9 @@ pub fn main(init: std.process.Init) !void {
     if (options.config) |setting| {
         if (setting.help) return printHelp(out, "billy config <setting> <value>", config_about, null, command_options);
     }
+    if (options.serve) |serve| {
+        if (serve.help) return printHelp(out, "billy serve [--port <port>]", serve_about, null, serve_options);
+    }
 
     // The config subcommand only touches the configuration file, so it runs
     // before billy's own files and credentials are reached for.
@@ -150,6 +175,7 @@ pub fn main(init: std.process.Init) !void {
     var setup = try billy.Setup.open(init, out);
     defer setup.deinit();
 
+    if (options.serve) |serve| return billy.web.serve(&setup, out, serve.port);
     return runSession(init, out, &setup, options.resume_id);
 }
 
@@ -258,6 +284,12 @@ fn parseArgs(args: []const [:0]const u8) error{ InvalidArgument, MissingValue }!
         return error.InvalidArgument;
     }
 
+    // `serve` takes an optional port and nothing else, and owns the rest of the
+    // line, so an option that follows it is not read as a run option.
+    if (args.len > 1 and std.mem.eql(u8, args[1], "serve")) {
+        return parseServe(args[2..]);
+    }
+
     var options: Options = .{};
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -275,6 +307,27 @@ fn parseArgs(args: []const [:0]const u8) error{ InvalidArgument, MissingValue }!
         }
     }
     return options;
+}
+
+/// Reads the arguments of the `serve` subcommand: nothing, a usage, or a port.
+fn parseServe(rest: []const [:0]const u8) error{ InvalidArgument, MissingValue }!Options {
+    var serve: Options.Serve = .{};
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const arg = rest[i];
+        if (isHelp(arg)) {
+            serve.help = true;
+        } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--port")) {
+            i += 1;
+            if (i == rest.len) return error.MissingValue;
+            serve.port = std.fmt.parseInt(u16, rest[i], 10) catch return error.InvalidArgument;
+        } else if (std.mem.startsWith(u8, arg, "--port=")) {
+            serve.port = std.fmt.parseInt(u16, arg["--port=".len..], 10) catch return error.InvalidArgument;
+        } else {
+            return error.InvalidArgument;
+        }
+    }
+    return .{ .serve = serve };
 }
 
 test "parseArgs" {
@@ -311,6 +364,37 @@ test "parseArgs reads the login subcommand on its own" {
     try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "login", "--resume" }));
     try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "login", "tavily", "extra" }));
     try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "login", "" }));
+}
+
+test "parseArgs reads the serve subcommand on its own" {
+    // No port: the default, and no help.
+    try expectOptions(.{ .serve = .{} }, try parseArgs(&.{ "billy", "serve" }));
+
+    // The port is read, however it is written.
+    try expectServe(9000, try parseArgs(&.{ "billy", "serve", "--port", "9000" }));
+    try expectServe(9000, try parseArgs(&.{ "billy", "serve", "-p", "9000" }));
+    try expectServe(9000, try parseArgs(&.{ "billy", "serve", "--port=9000" }));
+    try expectServe(0, try parseArgs(&.{ "billy", "serve", "--port", "0" }));
+
+    // The subcommand has its own usage.
+    try expectOptions(.{ .serve = .{ .help = true } }, try parseArgs(&.{ "billy", "serve", "-h" }));
+    try expectOptions(.{ .serve = .{ .help = true } }, try parseArgs(&.{ "billy", "serve", "--help" }));
+
+    // A port that is missing, or not a number, or out of range, is refused.
+    try std.testing.expectError(error.MissingValue, parseArgs(&.{ "billy", "serve", "--port" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "serve", "--port", "abc" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "serve", "--port", "70000" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "serve", "--port=-1" }));
+    // The subcommand owns the rest of the line, so a run option after it is not
+    // a run option.
+    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "serve", "--resume", "x" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "serve", "extra" }));
+}
+
+/// Checks the port a serve parse read, since `expectOptions` cannot compare it.
+fn expectServe(expected: u16, actual: Options) !void {
+    try std.testing.expect(actual.serve != null);
+    try std.testing.expectEqual(expected, actual.serve.?.port);
 }
 
 test "parseArgs reads the config subcommand on its own" {
@@ -356,6 +440,13 @@ fn expectOptions(expected: Options, actual: Options) !void {
         }
     } else {
         try std.testing.expect(actual.login == null);
+    }
+    if (expected.serve) |serve| {
+        const actual_serve = actual.serve.?;
+        try std.testing.expectEqual(serve.help, actual_serve.help);
+        try std.testing.expectEqual(serve.port, actual_serve.port);
+    } else {
+        try std.testing.expect(actual.serve == null);
     }
     if (expected.config) |setting| {
         const actual_setting = actual.config.?;

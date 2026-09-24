@@ -14,6 +14,7 @@ pub const Setup = @import("Setup.zig");
 pub const Session = @import("Session.zig");
 pub const style = @import("style.zig");
 pub const Tools = @import("Tools.zig");
+pub const web = @import("web.zig");
 pub const ulid = @import("ulid.zig");
 
 test {
