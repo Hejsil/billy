@@ -1075,9 +1075,9 @@ const off_peak_utc = 1789732800; // Friday 2026-09-18 12:00 UTC
 /// Peak on a Friday, when DeepSeek doubles its rates.
 const peak_utc = 1789696800; // Friday 2026-09-18 02:00 UTC
 
-/// The id the header tests run under. A real one is the UTC timestamp of the
-/// session, but the header only prints it, so the same id serves every test.
-const test_session_id = "20250131-120000";
+/// The id the header tests run under. A real one is a ULID, but the header only
+/// prints it, so the same id serves every test.
+const test_session_id = "01HF7YAT000000000000000000";
 
 /// Writes the header for `config` and compares it to `expected`, so a header
 /// test reads as the line it produces rather than as the buffer around it.
@@ -1106,7 +1106,7 @@ fn expectMoney(expected: []const u8, amount: f64) !void {
 
 test "header names the session, the model and the working directory" {
     try expectHeader(
-        "billy · 20250131-120000 · deepseek-flash · /work",
+        "billy · 01HF7YAT000000000000000000 · deepseek-flash · /work",
         testConfig("deepseek-flash", "/work", null),
         0,
         0,
@@ -1115,21 +1115,21 @@ test "header names the session, the model and the working directory" {
 
 test "header shortens a path inside the home directory" {
     try expectHeader(
-        "billy · 20250131-120000 · m · ~/repo/billy",
+        "billy · 01HF7YAT000000000000000000 · m · ~/repo/billy",
         testConfig("m", "/home/user/repo/billy", "/home/user"),
         0,
         0,
     );
     // The home directory itself becomes just `~`.
     try expectHeader(
-        "billy · 20250131-120000 · m · ~",
+        "billy · 01HF7YAT000000000000000000 · m · ~",
         testConfig("m", "/home/user", "/home/user"),
         0,
         0,
     );
     // A sibling that merely shares the prefix is left alone.
     try expectHeader(
-        "billy · 20250131-120000 · m · /home/user2",
+        "billy · 01HF7YAT000000000000000000 · m · /home/user2",
         testConfig("m", "/home/user2", "/home/user"),
         0,
         0,
@@ -1147,13 +1147,13 @@ test "header shows how full the context window is" {
     };
 
     // A fresh session has used nothing.
-    try expectHeader("billy · 20250131-120000 · m · /work · 0/128k (0%) · $0", config, 0, 0);
+    try expectHeader("billy · 01HF7YAT000000000000000000 · m · /work · 0/128k (0%) · $0", config, 0, 0);
     // A rounded-to-zero percentage still shows the conversation is not empty.
-    try expectHeader("billy · 20250131-120000 · m · /work · 500/128k (<1%) · $0", config, 500, 0);
-    try expectHeader("billy · 20250131-120000 · m · /work · 16k/128k (12%) · $0", config, 16_000, 0);
+    try expectHeader("billy · 01HF7YAT000000000000000000 · m · /work · 500/128k (<1%) · $0", config, 500, 0);
+    try expectHeader("billy · 01HF7YAT000000000000000000 · m · /work · 16k/128k (12%) · $0", config, 16_000, 0);
     // A full window, and a count that rounds to a whole thousand.
-    try expectHeader("billy · 20250131-120000 · m · /work · 128k/128k (100%) · $0", config, 128_000, 0);
-    try expectHeader("billy · 20250131-120000 · m · /work · 13k/128k (9%) · $0", config, 12_500, 0);
+    try expectHeader("billy · 01HF7YAT000000000000000000 · m · /work · 128k/128k (100%) · $0", config, 128_000, 0);
+    try expectHeader("billy · 01HF7YAT000000000000000000 · m · /work · 13k/128k (9%) · $0", config, 12_500, 0);
 }
 
 test "header shows the accumulated session cost" {
@@ -1177,11 +1177,11 @@ test "header shows the accumulated session cost" {
         .cache_miss_tokens = 1_000_000,
     };
     const off_peak_cost = costOf(info.priceAt(off_peak_utc), usage);
-    try expectHeader("billy · 20250131-120000 · deepseek-flash · /work · 3M/4M (75%) · $0.75", config, 3_000_000, off_peak_cost);
+    try expectHeader("billy · 01HF7YAT000000000000000000 · deepseek-flash · /work · 3M/4M (75%) · $0.75", config, 3_000_000, off_peak_cost);
     // A request made in peak hours cost double, which stays on the total even if
     // the header is shown later, off-peak.
     const peak_cost = costOf(info.priceAt(peak_utc), usage);
-    try expectHeader("billy · 20250131-120000 · deepseek-flash · /work · 3M/4M (75%) · $1.51", config, 3_000_000, peak_cost);
+    try expectHeader("billy · 01HF7YAT000000000000000000 · deepseek-flash · /work · 3M/4M (75%) · $1.51", config, 3_000_000, peak_cost);
 }
 
 test "token counts are whole and prices keep at most two decimals" {
@@ -1205,7 +1205,7 @@ test "token counts are whole and prices keep at most two decimals" {
 test "header leaves out the gauge and cost for an unknown model" {
     const config = testConfig("who-knows", "/work", null);
     try std.testing.expect(config.model_info == null);
-    try expectHeader("billy · 20250131-120000 · who-knows · /work", config, 5000, 12.34);
+    try expectHeader("billy · 01HF7YAT000000000000000000 · who-knows · /work", config, 5000, 12.34);
 }
 
 test "cost follows the cache hit, miss and output prices" {

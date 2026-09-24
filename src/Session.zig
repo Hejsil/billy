@@ -16,6 +16,7 @@
 const std = @import("std");
 const Io = std.Io;
 const llm = @import("llm.zig");
+const ulid = @import("ulid.zig");
 
 const Session = @This();
 
@@ -29,9 +30,8 @@ const sessions_dir = "sessions";
 /// Extension of a session file.
 const extension = ".json";
 
-/// Most a session id may be. A generated one is the 15 characters of
-/// `YYYYMMDD-HHMMSS`; the room is for a `-N` suffix on a second run in the same
-/// second, or a name typed on the command line. The buffer holds this many bytes
+/// Most a session id may be. A generated one is the 26 characters of a ULID; the
+/// room is for a name typed on the command line. The buffer holds this many bytes
 /// and is written from the front, so there is always a byte left to end the id.
 const max_id_len = 64;
 
@@ -203,7 +203,7 @@ gpa: std.mem.Allocator,
 
 /// The id, in a fixed buffer written once from the front. The buffer is
 /// zero-filled, so what is written ends in NUL and the id is a NUL-terminated
-/// string with no length kept beside it. A generated id is a timestamp; a resume
+/// string with no length kept beside it. A generated id is a ULID; a resume
 /// takes one from the command line.
 id_buf: [max_id_len]u8 = [_]u8{0} ** max_id_len,
 
@@ -277,12 +277,14 @@ pub fn open(
 
     // The id is written into its buffer; the file name is the id with the
     // extension, built from it once so every read and write goes through one
-    // place. Both buffers are zero-filled, so both end in NUL.
-    const session_id = if (resume_id) |given|
-        try setCheckedId(&session.id_buf, given)
-    else
-        try unusedId(io, dir, &session.id_buf);
-    _ = try std.fmt.bufPrint(&session.name_buf, "{s}{s}", .{ session_id, extension });
+    // place. Both buffers are zero-filled, so both end in NUL, which is what
+    // says where an id ends.
+    if (resume_id) |given| {
+        _ = try setCheckedId(&session.id_buf, given);
+    } else {
+        ulid.generate(io, session.id_buf[0..ulid.length]);
+    }
+    _ = try std.fmt.bufPrint(&session.name_buf, "{s}{s}", .{ session.id(), extension });
 
     // The session owns its directory rather than pointing into the caller's
     // memory, which it may outlive.
@@ -959,45 +961,6 @@ pub fn toolSet(session: *const Session) ToolSet {
     return .{ .session = session };
 }
 
-/// Formats a Unix timestamp as `YYYYMMDD-HHMMSS` in UTC, written into `buf` and
-/// returned as the slice it filled, which is 15 characters.
-fn formatId(buf: []u8, secs: u64) ![]const u8 {
-    const seconds = std.time.epoch.EpochSeconds{ .secs = secs };
-    const day = seconds.getEpochDay().calculateYearDay();
-    const date = day.calculateMonthDay();
-    const time = seconds.getDaySeconds();
-    return std.fmt.bufPrint(buf, "{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}", .{
-        day.year,
-        date.month.numeric(),
-        date.day_index + 1,
-        time.getHoursIntoDay(),
-        time.getMinutesIntoHour(),
-        time.getSecondsIntoMinute(),
-    });
-}
-
-/// An id based on the current UTC time, such as `20250131-120000`, whose session
-/// file does not exist yet, written into `buf` and returned as a slice of it, so
-/// that starting two runs in the same second cannot overwrite the first session.
-fn unusedId(io: Io, dir: Io.Dir, buf: []u8) ![]const u8 {
-    const base = try formatId(buf, @intCast(Io.Clock.now(.real, io).toSeconds()));
-    var attempt: usize = 0;
-    while (true) : (attempt += 1) {
-        // A second run in the same second appends `-N` to the timestamp, growing
-        // the id in place after the base.
-        const candidate = if (attempt == 0) base else candidate: {
-            const suffix = try std.fmt.bufPrint(buf[base.len..], "-{d}", .{attempt});
-            break :candidate buf[0 .. base.len + suffix.len];
-        };
-        var file_buf: [max_id_len + extension.len]u8 = undefined;
-        const file = try std.fmt.bufPrint(&file_buf, "{s}{s}", .{ candidate, extension });
-        _ = dir.statFile(io, file, .{}) catch |err| switch (err) {
-            error.FileNotFound => return candidate,
-            else => return err,
-        };
-    }
-}
-
 /// Copies an id given on the command line into `buf`, rejecting anything that
 /// could name another file or directory or that does not fit. Returns the id as
 /// a slice of `buf`; the buffer is zero-filled, so the copy ends in NUL.
@@ -1013,33 +976,43 @@ fn setCheckedId(buf: []u8, given: []const u8) ![]const u8 {
     return buf[0..given.len];
 }
 
-test "formatId writes a UTC timestamp" {
-    var buf: [max_id_len]u8 = undefined;
+test "a new session is given a ULID, and nothing is written yet" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    try std.testing.expectEqualStrings("19700101-000000", try formatId(&buf, 0));
-    try std.testing.expectEqualStrings("19700102-000000", try formatId(&buf, 86400));
-    try std.testing.expectEqualStrings("20000229-000000", try formatId(&buf, 951782400)); // leap day
-    try std.testing.expectEqualStrings("20231114-221320", try formatId(&buf, 1700000000));
-    try std.testing.expectEqualStrings("20240301-000000", try formatId(&buf, 1709251200)); // day after a leap day
+    var session = try Session.open(std.testing.io, tmp.dir, std.testing.allocator, null, "/work");
+    defer session.deinit();
+
+    try std.testing.expect(ulid.isId(session.id()));
+    // Opening a new session records an id and nothing else, so the first write
+    // is the first message. Nothing is named after the id until then.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, session.name(), .{}));
 }
 
-test "a generated id has the shape of a timestamp" {
-    var buf: [max_id_len]u8 = undefined;
-    const stamp = try formatId(&buf, 1700000000);
+test "ids made one after another differ" {
+    var first: [ulid.length]u8 = undefined;
+    var second: [ulid.length]u8 = undefined;
+    ulid.generate(std.testing.io, &first);
+    ulid.generate(std.testing.io, &second);
 
-    try std.testing.expectEqual(15, stamp.len);
-    try std.testing.expectEqual('-', stamp[8]);
-    for (stamp, 0..) |byte, i| {
-        if (i == 8) continue;
-        try std.testing.expect(std.ascii.isDigit(byte));
-    }
+    // Two sessions made one after the other never share an id. The clock alone
+    // cannot promise that, which is what the random bits are for; that the
+    // timestamp makes them sort is `ulid.zig`'s to prove.
+    try std.testing.expect(ulid.isId(&first));
+    try std.testing.expect(ulid.isId(&second));
+    try std.testing.expect(!std.mem.eql(u8, &first, &second));
 }
 
 test "setCheckedId rejects names that could escape the session directory" {
     var buf: [max_id_len]u8 = undefined;
 
-    try std.testing.expectEqualStrings("20250131-120000", try setCheckedId(&buf, "20250131-120000"));
+    // A name typed on the command line, and an id this module would make.
     try std.testing.expectEqualStrings("dev", try setCheckedId(&buf, "dev"));
+    try std.testing.expectEqualStrings("20250131-120000", try setCheckedId(&buf, "20250131-120000"));
+    try std.testing.expectEqualStrings(
+        "01HF7YAT000000000000000000",
+        try setCheckedId(&buf, "01HF7YAT000000000000000000"),
+    );
 
     try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, ""));
     try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, ".."));
@@ -1903,8 +1876,8 @@ test "the id and file name read back from their fixed buffers" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A session with a short name typed on the command line, shorter than the
-    // generated timestamp, so the NUL that ends it is what sets its length.
+    // A session with a short name typed on the command line, shorter than a
+    // generated id, so the NUL that ends it is what sets its length.
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "dev" ++ extension,
         .data = "{\"version\":1,\"messages\":[]}",
@@ -1914,10 +1887,11 @@ test "the id and file name read back from their fixed buffers" {
     try std.testing.expectEqualStrings("dev", resumed.id());
     try std.testing.expectEqualStrings("dev" ++ extension, resumed.name());
 
-    // A new session gets a generated timestamp id of its own.
+    // A new session gets a generated ULID of its own.
     var fresh = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer fresh.deinit();
-    try std.testing.expectEqual(15, fresh.id().len);
+    try std.testing.expectEqual(ulid.length, fresh.id().len);
+    try std.testing.expect(ulid.isId(fresh.id()));
     // The file name is that id with the extension.
     try std.testing.expect(std.mem.endsWith(u8, fresh.name(), extension));
     try std.testing.expectEqualStrings(

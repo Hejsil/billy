@@ -12,6 +12,7 @@ pub const search = @import("search.zig");
 pub const Session = @import("Session.zig");
 pub const style = @import("style.zig");
 pub const Tools = @import("Tools.zig");
+pub const ulid = @import("ulid.zig");
 
 test {
     // `zig build test` only collects the tests declared in the test target's
