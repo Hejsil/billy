@@ -29,7 +29,7 @@ pub const Kind = enum {
 
     /// The single character a line of this kind opens with, as a unified diff
     /// does. A line left out carries no mark of its own.
-    fn mark(kind: Kind) u8 {
+    pub fn mark(kind: Kind) u8 {
         return switch (kind) {
             .context => ' ',
             .removed => '-',

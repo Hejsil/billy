@@ -5,6 +5,7 @@ pub const Config = @import("Config.zig");
 pub const credentials = @import("credentials.zig");
 pub const diff = @import("diff.zig");
 pub const format = @import("format.zig");
+pub const html = @import("html.zig");
 pub const LineEditor = @import("LineEditor.zig");
 pub const llm = @import("llm.zig");
 pub const models = @import("models.zig");
