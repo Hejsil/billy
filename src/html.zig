@@ -17,7 +17,10 @@
 
 const std = @import("std");
 const Io = std.Io;
+const agent = @import("agent.zig");
 const diffing = @import("diff.zig");
+const Session = @import("Session.zig");
+const Tools = @import("Tools.zig");
 
 /// Writes `text` with the characters that mean something in HTML replaced by the
 /// entities that mean the characters themselves. This is what every string
@@ -636,4 +639,316 @@ test "a diff of code is escaped like any other text" {
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "a &gt; b") != null);
     // The tags of the diff itself are still tags.
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "<span class=\"removed\">") != null);
+}
+
+/// Writes an element holding `text`, with the text escaped. The tag and the
+/// class are billy's own, written as they are; only the text comes from outside.
+fn element(comptime tag: []const u8, class: []const u8, text: []const u8, out: *Io.Writer) !void {
+    try out.print("<{s} class=\"{s}\">", .{ tag, class });
+    try escape(text, out);
+    try out.print("</{s}>\n", .{tag});
+}
+
+/// Writes the head of a tool call's block: the glyph of the tool, its name and
+/// what the call acts on, and then what the call shows under that -- an edit's
+/// diff, or the command a bash call runs.
+///
+/// A call's block is two pieces, this and `toolEnd`, rather than one element
+/// opened here and closed there. A piece that is opened and never closed would
+/// swallow whatever follows it, and a live call shows its head long before its
+/// result; two pieces written next to each other are safe either way, and the
+/// frontend styles them as one block.
+pub fn toolBegin(gpa: std.mem.Allocator, call: Tools.Call, out: *Io.Writer) !void {
+    const head = Tools.Heading.of(call);
+    try out.writeAll("<div class=\"tool-head\">");
+    try out.print("<span class=\"glyph hue-{s}\">", .{@tagName(head.hue)});
+    try escape(head.glyph, out);
+    try out.writeAll("</span> <span class=\"name\">");
+    try escape(head.name, out);
+    try out.writeAll("</span>");
+    if (head.target.len > 0) {
+        try out.writeAll(" <span class=\"target\">");
+        try escape(head.target, out);
+        try out.writeAll("</span>");
+    }
+    try out.writeAll("</div>\n");
+
+    switch (call) {
+        // The change the call means to make, from the call alone, so a replayed
+        // session shows the same diff the run did.
+        .edit => |args| {
+            const lines = try diffing.lines(gpa, args.old_string, args.new_string);
+            defer gpa.free(lines);
+            if (lines.len > 0) try diff(lines, out);
+        },
+        // A bash call shows the command it runs, as the model wrote it. The
+        // terminal lays it out with a format script; a page has no need of one.
+        .bash => |args| try element("pre", "command", std.mem.trimEnd(u8, args.command, "\n"), out),
+        else => {},
+    }
+}
+
+/// Writes the body of a tool call's block: what the call produced.
+///
+/// A write shows the content it put in the file rather than its result, since
+/// that content is what it produced; an edit shows nothing, since its result
+/// would only repeat the diff above it; and a call that failed shows billy's
+/// message for the failure whatever it was asked to do. Anything else shows the
+/// text the call returned.
+pub fn toolEnd(call: Tools.Call, result: []const u8, out: *Io.Writer) !void {
+    const text = std.mem.trimEnd(u8, result, "\n");
+    if (std.mem.startsWith(u8, result, "error: ")) {
+        return element("pre", "error", text, out);
+    }
+    switch (call) {
+        .write => |args| try element("pre", "result", std.mem.trimEnd(u8, args.content, "\n"), out),
+        .edit => {},
+        else => try element("pre", "result", text, out),
+    }
+}
+
+/// Writes one block of a run as HTML. This is where the web's rendering of a
+/// session comes together: the blocks a run is made of, each as the element a
+/// page shows it as.
+///
+/// The text of a prompt and a reply is markdown, so it is laid out; everything
+/// else is the text it is, escaped. The classes name what a block is, so the
+/// page can style each kind without the renderer saying how it should look.
+///
+/// `gpa` is for what showing a block builds, which is an edit's diff; it is the
+/// caller's, freed before this returns.
+pub fn block(gpa: std.mem.Allocator, b: agent.Block, out: *Io.Writer) !void {
+    switch (b) {
+        .prompt => |text| try titled(agent.marks.prompt.glyph, "prompt", text, out),
+        .answer => |text| try titled(agent.marks.answer.glyph, "answer", text, out),
+        .tool_begin => |call| try toolBegin(gpa, call, out),
+        .tool_end => |tool| try toolEnd(tool.call, tool.result, out),
+        // A compaction stands in for the messages it replaced. What it holds is
+        // the ask and the summary, which a page could show; for now it is the
+        // line the terminal shows it as.
+        .compacted => try element("div", "compacted", agent.marks.compacted.glyph ++ " compacted", out),
+        .notice => |text| try element("div", "notice", text, out),
+        .elided => |count| {
+            var buffer: [64]u8 = undefined;
+            const line = std.fmt.bufPrint(&buffer, "… {d} earlier blocks", .{count}) catch "… earlier blocks";
+            try element("div", "elided", line, out);
+        },
+    }
+}
+
+/// Writes a block that is headed by a mark and holds markdown: a prompt or a
+/// reply.
+fn titled(glyph: []const u8, name: []const u8, text: []const u8, out: *Io.Writer) !void {
+    try out.print("<div class=\"block {s}\"><div class=\"head\">", .{name});
+    try out.print("<span class=\"glyph\">", .{});
+    try escape(glyph, out);
+    try out.writeAll("</span> <span class=\"name\">");
+    try escape(name, out);
+    try out.writeAll("</span></div>\n");
+    try markdown(text, out);
+    try out.writeAll("</div>\n");
+}
+
+test "a tool call is rendered as a head and a body" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // A read: the head names the tool and its path, the body is what came back.
+    try toolBegin(arena, Tools.parse(arena, .{ .id = "1", .function = .{
+        .name = "read",
+        .arguments = "{\"path\":\"a.zig\"}",
+    } }), &out.writer);
+    try toolEnd(.{ .read = .{ .path = "a.zig" } }, "1\tconst x = 1;", &out.writer);
+    try std.testing.expectEqualStrings(
+        "<div class=\"tool-head\"><span class=\"glyph hue-blue\">▸</span> " ++
+            "<span class=\"name\">read</span> <span class=\"target\">a.zig</span></div>\n" ++
+            "<pre class=\"result\">1\tconst x = 1;</pre>\n",
+        out.written(),
+    );
+}
+
+test "a bash call shows its command, and a write shows what it wrote" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    const bash = Tools.parse(arena, .{ .id = "1", .function = .{
+        .name = "bash",
+        .arguments = "{\"command\":\"ls -la <x>\"}",
+    } });
+    try toolBegin(arena, bash, &out.writer);
+    // The command is escaped like any other text, and its trailing newline does
+    // not add a blank line.
+    try std.testing.expectEqualStrings(
+        "<div class=\"tool-head\"><span class=\"glyph hue-cyan\">❯</span> " ++
+            "<span class=\"name\">bash</span></div>\n" ++
+            "<pre class=\"command\">ls -la &lt;x&gt;</pre>\n",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+
+    // A write shows the content it put in the file, not the result that says it
+    // did, which is what the terminal shows too.
+    const write = Tools.parse(arena, .{ .id = "1", .function = .{
+        .name = "write",
+        .arguments = "{\"path\":\"a.zig\",\"content\":\"hello\"}",
+    } });
+    try toolEnd(write, "wrote 5 bytes to a.zig", &out.writer);
+    try std.testing.expectEqualStrings("<pre class=\"result\">hello</pre>\n", out.written());
+    out.clearRetainingCapacity();
+
+    // A failure is shown as billy's message for it, whatever the call was.
+    try toolEnd(write, "error: cannot write a.zig: AccessDenied", &out.writer);
+    try std.testing.expectEqualStrings(
+        "<pre class=\"error\">error: cannot write a.zig: AccessDenied</pre>\n",
+        out.written(),
+    );
+}
+
+test "an edit is shown as the diff of the strings it worked on" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    const edit = Tools.parse(arena, .{ .id = "1", .function = .{
+        .name = "edit",
+        .arguments = "{\"path\":\"a.zig\",\"old_string\":\"old\",\"new_string\":\"new\"}",
+    } });
+    try toolBegin(arena, edit, &out.writer);
+    // The diff is right under the header, and its result shows nothing.
+    try std.testing.expectEqualStrings(
+        "<div class=\"tool-head\"><span class=\"glyph hue-yellow\">✎</span> " ++
+            "<span class=\"name\">edit</span> <span class=\"target\">a.zig</span></div>\n" ++
+            "<pre class=\"diff\"><span class=\"removed\">-old</span>\n" ++
+            "<span class=\"added\">+new</span>\n</pre>\n",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+
+    try toolEnd(edit, "replaced 1 occurrence(s) in a.zig", &out.writer);
+    try std.testing.expectEqualStrings("", out.written());
+}
+
+test "the blocks of a run are each rendered as what they are" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // A prompt and a reply are markdown, so they are laid out.
+    try block(gpa, .{ .prompt = "hi <there>" }, &out.writer);
+    try std.testing.expectEqualStrings(
+        "<div class=\"block prompt\"><div class=\"head\"><span class=\"glyph\">»</span> " ++
+            "<span class=\"name\">prompt</span></div>\n<p>hi &lt;there&gt;</p>\n</div>\n",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+
+    try block(gpa, .{ .answer = "**done**" }, &out.writer);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "<strong>done</strong>") != null);
+    out.clearRetainingCapacity();
+
+    // A compaction, a line billy writes, and the count of what a trimmed
+    // conversation left out.
+    try block(gpa, .{ .compacted = .{ .prompt = "ask", .summary = "sum" } }, &out.writer);
+    try std.testing.expectEqualStrings("<div class=\"compacted\">⊟ compacted</div>\n", out.written());
+    out.clearRetainingCapacity();
+
+    try block(gpa, .{ .notice = "stopped after 3 turns" }, &out.writer);
+    try std.testing.expectEqualStrings("<div class=\"notice\">stopped after 3 turns</div>\n", out.written());
+    out.clearRetainingCapacity();
+
+    try block(gpa, .{ .elided = 7 }, &out.writer);
+    try std.testing.expectEqualStrings("<div class=\"elided\">… 7 earlier blocks</div>\n", out.written());
+}
+
+/// Writes a whole stored conversation as HTML, oldest block first: what the web
+/// page shows when a session is opened. `gpa` is the run's, for the scratch each
+/// block needs while it is written.
+pub fn conversation(gpa: std.mem.Allocator, session: *const Session, out: *Io.Writer) !void {
+    var page = Page{ .gpa = gpa, .out = out };
+    try agent.walk(gpa, session, 0, page.emitter());
+}
+
+/// Shows each block of a conversation as its element. It is the emitter `walk`
+/// takes, so a conversation is rendered by the same walk a terminal replay is.
+const Page = struct {
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+
+    fn emitter(self: *Page) agent.Emitter {
+        return .{ .context = self, .vtable = &.{ .block = show } };
+    }
+
+    fn show(context: *anyopaque, b: agent.Block) anyerror!void {
+        const page: *Page = @ptrCast(@alignCast(context));
+        return block(page.gpa, b, page.out);
+    }
+};
+
+test "a whole conversation is rendered, a tool call and a compaction included" {
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+
+    // A prompt and a reply, a tool call with its result, an edit with its diff,
+    // and a compaction standing in for the conversation before it.
+    try session.append(.{ .role = "system", .content = "be terse" });
+    try session.append(.{ .role = "user", .content = "read it" });
+    try session.append(.{ .role = "assistant", .tool_calls = &.{.{
+        .id = "call_1",
+        .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" },
+    }} });
+    try session.append(.{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;" });
+    try session.append(.{ .role = "assistant", .tool_calls = &.{.{
+        .id = "call_2",
+        .function = .{
+            .name = "edit",
+            .arguments = "{\"path\":\"a.zig\",\"old_string\":\"old\",\"new_string\":\"new\"}",
+        },
+    }} });
+    try session.append(.{ .role = "tool", .tool_call_id = "call_2", .content = "replaced 1 occurrence(s) in a.zig" });
+    try session.append(.{ .role = "assistant", .content = "done **now**" });
+    try session.appendCompaction("summarize", "the summary so far");
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try conversation(gpa, &session, &out.writer);
+    const page = out.written();
+
+    // The prompt is a block of its own, and its text is laid out as markdown.
+    try std.testing.expect(std.mem.indexOf(u8, page, "<div class=\"block prompt\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<p>read it</p>") != null);
+    // The read call is headed and its result is the body.
+    try std.testing.expect(std.mem.indexOf(u8, page, "<span class=\"name\">read</span>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<pre class=\"result\">1\tconst x = 1;</pre>") != null);
+    // The edit is shown as its diff, and no result of its own.
+    try std.testing.expect(std.mem.indexOf(u8, page, "<span class=\"removed\">-old</span>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<span class=\"added\">+new</span>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "replaced 1 occurrence") == null);
+    // The reply's markdown is laid out.
+    try std.testing.expect(std.mem.indexOf(u8, page, "<p>done <strong>now</strong></p>") != null);
+    // The compaction is one line, and neither the ask nor the summary is shown
+    // as a block of its own.
+    try std.testing.expect(std.mem.indexOf(u8, page, "<div class=\"compacted\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "the summary so far") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "summarize") == null);
+    // The system prompt is never shown.
+    try std.testing.expect(std.mem.indexOf(u8, page, "be terse") == null);
 }
