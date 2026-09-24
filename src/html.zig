@@ -781,12 +781,12 @@ fn toolSummary(call: Tools.Call, exit: ?Tools.Exit, out: *Io.Writer) !void {
     try out.writeAll("</span> <span class=\"name\">");
     try escape(head.name, out);
     try out.writeAll("</span>");
-    // What the call acts on. A bash call's heading names nothing, so what it acts
-    // on is the command, and its first line goes here: a collapsed call then says
-    // what it ran rather than only that it ran something. The body shows the
-    // command whole, so what is here is the beginning of it and no more.
+    // What the call acts on. A bash call's heading carries the model's
+    // description of what the command does, so a collapsed call says what it is
+    // for. A call from before the tool asked for one has no description, so the
+    // first line of the command stands in, which at least names something.
     const target = if (head.target.len > 0) head.target else switch (call) {
-        .bash => |args| firstLine(args.command),
+        .bash => |args| Tools.headerLine(args.command),
         else => "",
     };
     if (target.len > 0) {
@@ -803,15 +803,6 @@ fn toolSummary(call: Tools.Call, exit: ?Tools.Exit, out: *Io.Writer) !void {
         try out.writeAll("</span>");
     }
     try out.writeAll("</summary>\n");
-}
-
-/// The first line of `text`, with the whitespace around it taken off: what a
-/// collapsed bash call shows of its command. A command over several lines shows
-/// its first line only, and a long one is cut off by the page, which keeps the
-/// summary to one line.
-fn firstLine(text: []const u8) []const u8 {
-    const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
-    return std.mem.trim(u8, text[0..end], " \t\r");
 }
 
 /// Writes the body of a tool call: what a page shows once the call is expanded.
@@ -1054,6 +1045,20 @@ test "a bash call shows its command, and a write shows what it wrote" {
     try std.testing.expectEqualStrings(
         "<summary class=\"tool-head\"><span class=\"glyph hue-cyan\">❯</span> " ++
             "<span class=\"name\">bash</span> <span class=\"target\">cd /tmp</span></summary>\n",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+
+    // The description the model gave stands in front of the command, so a
+    // collapsed call says what it is for; the command is no longer in the head.
+    const described = Tools.parse(arena, .{ .id = "1", .function = .{
+        .name = "bash",
+        .arguments = "{\"command\":\"cargo test --all\",\"description\":\"run the test suite\"}",
+    } });
+    try toolSummary(described, null, &out.writer);
+    try std.testing.expectEqualStrings(
+        "<summary class=\"tool-head\"><span class=\"glyph hue-cyan\">❯</span> " ++
+            "<span class=\"name\">bash</span> <span class=\"target\">run the test suite</span></summary>\n",
         out.written(),
     );
     out.clearRetainingCapacity();

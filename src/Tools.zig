@@ -80,6 +80,11 @@ pub const Call = union(enum) {
 
     pub const Bash = struct {
         command: []const u8,
+        /// A short, one-line description of what the command does, written by the
+        /// model. It is shown in the call's header, so a collapsed call says what
+        /// it is for rather than only what it ran. Null when the model gave none,
+        /// which is every stored call from before the tool asked for one.
+        description: ?[]const u8 = null,
     };
 
     pub const WebSearch = struct {
@@ -795,7 +800,12 @@ pub const Heading = struct {
             .read => |args| .marked(marks.read, "read", args.path),
             .write => |args| .marked(marks.write, "write", args.path),
             .edit => |args| .marked(marks.edit, "edit", args.path),
-            .bash => .marked(marks.bash, "bash", ""),
+            // A bash call names nothing it acts on, so its heading carries the
+            // description of what the command does, which is what a reader wants
+            // in front of a command it has not read. The command itself is shown
+            // under the header, whole. A call from before the tool asked for a
+            // description has none, and its heading comes out with no target.
+            .bash => |args| .marked(marks.bash, "bash", headerLine(args.description orelse "")),
             .web_search => |args| .marked(marks.search, "web_search", args.query),
             .unknown => |name| .marked(marks.unknown, name, ""),
             .malformed => |bad| .marked(marks.unknown, bad.name, ""),
@@ -808,6 +818,15 @@ pub const Heading = struct {
         return .{ .glyph = mark.glyph, .hue = mark.hue, .name = name, .target = target };
     }
 };
+
+/// The first line of `text`, with the whitespace around it taken off: what a
+/// header shows of a string that may run over several lines, such as a command or
+/// a description. A header is one line, so only the first is taken; what the
+/// string holds in full is shown under the header, or in the call's body.
+pub fn headerLine(text: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    return std.mem.trim(u8, text[0..end], " \t\r");
+}
 
 /// Prints the header block of a call: which tool it is and what it acts on. A
 /// bash command is laid out by the bash formatter, so it reads the way it runs;
@@ -1112,10 +1131,12 @@ const specs = [_]Session.Definition{
     },
     .{
         .name = "bash",
-        .description = "Run a shell command with bash -c and return its output and exit code.",
+        .description = "Run a shell command with bash -c and return its output and exit code. " ++
+            "Give a short description of what the command does, so the user can see the intent at a glance.",
         .parameters = "{\"type\":\"object\",\"properties\":{" ++
-            "\"command\":{\"type\":\"string\",\"description\":\"Command to run.\"}}," ++
-            "\"required\":[\"command\"]}",
+            "\"command\":{\"type\":\"string\",\"description\":\"Command to run.\"}," ++
+            "\"description\":{\"type\":\"string\",\"description\":\"A short, one-line description of what the command does, so the user can tell at a glance without reading the command, e.g. \\\"run the test suite\\\".\"}}," ++
+            "\"required\":[\"command\",\"description\"]}",
     },
 };
 
@@ -1236,6 +1257,45 @@ test "a block header names the tool, its colour, the bold name and the target" {
         .arguments = "{\"path\":\"a.zig\"}",
     } }), "", .{}, .plain, &out.writer);
     try std.testing.expectEqualStrings("▸ read a.zig\n▾ output\n\n", out.written());
+}
+
+test "a bash call's description is shown in its header" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // The description the model gave is the header's target, and the command it
+    // describes is still shown whole under it.
+    try describe(arena, parse(arena, .{ .id = "1", .function = .{
+        .name = "bash",
+        .arguments = "{\"command\":\"cargo test\",\"description\":\"run the test suite\"}",
+    } }), "exit code: 0\n", .{}, .plain, &out.writer);
+    try std.testing.expectEqualStrings(
+        "❯ bash run the test suite\ncargo test\n✓ exit 0\n\n",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+
+    // A call from before the tool asked for a description has none, so the header
+    // names only the tool; the command is still shown under it.
+    try describe(arena, parse(arena, .{ .id = "1", .function = .{
+        .name = "bash",
+        .arguments = "{\"command\":\"cargo test\"}",
+    } }), "exit code: 0\n", .{}, .plain, &out.writer);
+    try std.testing.expectEqualStrings("❯ bash\ncargo test\n✓ exit 0\n\n", out.written());
+    out.clearRetainingCapacity();
+
+    // A description that runs over several lines is shown by its first line only,
+    // since a header is one line.
+    try printHead(arena, parse(arena, .{ .id = "1", .function = .{
+        .name = "bash",
+        .arguments = "{\"command\":\"make\",\"description\":\"build the project\\nand its docs\"}",
+    } }), .{}, .plain, &out.writer);
+    try std.testing.expectEqualStrings("❯ bash build the project\nmake\n", out.written());
 }
 
 test "the exit status of a bash call is shown green or red" {
@@ -1739,6 +1799,22 @@ test "parseCall splits known, unknown and malformed calls" {
     } });
     try std.testing.expectEqualStrings("bash", missing.malformed.name);
 
+    // A bash call carries the description the model wrote when there is one, and
+    // none when there is not, which is how a call stored before the tool asked
+    // for one reads.
+    const described = parse(arena, .{ .id = "1", .function = .{
+        .name = "bash",
+        .arguments = "{\"command\":\"make\",\"description\":\"build it\"}",
+    } });
+    try std.testing.expectEqualStrings("make", described.bash.command);
+    try std.testing.expectEqualStrings("build it", described.bash.description.?);
+
+    const bare = parse(arena, .{ .id = "1", .function = .{
+        .name = "bash",
+        .arguments = "{\"command\":\"make\"}",
+    } });
+    try std.testing.expect(bare.bash.description == null);
+
     const unknown = parse(arena, .{ .id = "1", .function = .{
         .name = "frobnicate",
         .arguments = "{}",
@@ -1909,8 +1985,12 @@ test "the definitions cover every tool the loop dispatches" {
     try std.testing.expectEqual(expected.len, offered.len);
     for (offered, expected) |definition, name| {
         try std.testing.expectEqualStrings(name, definition.name);
-        // The schema is the JSON text it is sent as, which starts with an object.
-        try std.testing.expect(std.mem.startsWith(u8, definition.parameters, "{"));
+        // The schema is the JSON text it is sent as, so it has to be JSON: it is
+        // built by hand, and a mistyped escape would make every request carrying
+        // it invalid. Parsing it here is what catches that.
+        const schema = try std.json.parseFromSlice(std.json.Value, gpa, definition.parameters, .{});
+        defer schema.deinit();
+        try std.testing.expect(schema.value == .object);
     }
 }
 
