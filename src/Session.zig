@@ -270,16 +270,36 @@ pub fn open(
     resume_id: ?[]const u8,
     cwd: []const u8,
 ) !Session {
-    var session: Session = .{ .io = io, .dir = dir, .gpa = gpa };
     // A resume that fails part way leaves what it had read behind, since the
     // caller only gets the session on the way out.
+    var session = try named(io, dir, gpa, resume_id, cwd);
+    errdefer session.deinit();
+    if (resume_id != null) try session.load();
+    return session;
+}
+
+/// Starts a session named `id`, which is not read from disk even if a file of
+/// that name is there.
+///
+/// This is for an id handed out before the session exists: the id is what names
+/// it, and nothing is read because there is nothing to read. Nothing is written
+/// either, so the session comes into being with its first message; a run that
+/// is started and left alone leaves no file behind.
+pub fn create(io: Io, dir: Io.Dir, gpa: std.mem.Allocator, named_id: []const u8, cwd: []const u8) !Session {
+    return named(io, dir, gpa, named_id, cwd);
+}
+
+/// A session named `named_id`, or one given a fresh id when it is null, with
+/// nothing read from disk and nothing written.
+fn named(io: Io, dir: Io.Dir, gpa: std.mem.Allocator, named_id: ?[]const u8, cwd: []const u8) !Session {
+    var session: Session = .{ .io = io, .dir = dir, .gpa = gpa };
     errdefer session.deinit();
 
     // The id is written into its buffer; the file name is the id with the
     // extension, built from it once so every read and write goes through one
     // place. Both buffers are zero-filled, so both end in NUL, which is what
     // says where an id ends.
-    if (resume_id) |given| {
+    if (named_id) |given| {
         _ = try setCheckedId(&session.id_buf, given);
     } else {
         ulid.generate(io, session.id_buf[0..ulid.length]);
@@ -289,8 +309,6 @@ pub fn open(
     // The session owns its directory rather than pointing into the caller's
     // memory, which it may outlive.
     session.cwd = try gpa.dupe(u8, cwd);
-
-    if (resume_id != null) try session.load();
     return session;
 }
 
@@ -1083,6 +1101,33 @@ test "a new session is given a ULID, and nothing is written yet" {
     // Opening a new session records an id and nothing else, so the first write
     // is the first message. Nothing is named after the id until then.
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, session.name(), .{}));
+}
+
+test "a session can be started for an id that has no file yet" {
+    const arena = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // An id handed out before the session exists: the id is what names it, and
+    // nothing is read, since there is nothing to read.
+    var session = try Session.create(std.testing.io, tmp.dir, arena, "made-by-hand", "/work");
+    defer session.deinit();
+    try std.testing.expectEqualStrings("made-by-hand", session.id());
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, session.name(), .{}));
+
+    // The first message is what writes it, exactly as for a generated id.
+    try session.append(.{ .role = "user", .content = "hello" });
+    var resumed = try Session.open(std.testing.io, tmp.dir, arena, "made-by-hand", "/work");
+    defer resumed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), resumed.messages.items.len);
+    try std.testing.expectEqualStrings("hello", resumed.contentOf(resumed.messages.items[0]).?);
+
+    // An id that could not name a session is refused rather than written.
+    try std.testing.expectError(
+        error.InvalidSessionId,
+        Session.create(std.testing.io, tmp.dir, arena, "../escape", "/work"),
+    );
 }
 
 test "a new session is written out by its first message" {

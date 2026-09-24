@@ -21,6 +21,7 @@ const agent = @import("agent.zig");
 const html = @import("html.zig");
 const models = @import("models.zig");
 const Session = @import("Session.zig");
+const Runner = @import("agent.zig").Runner;
 const Setup = @import("Setup.zig");
 
 /// The port billy serves on when nothing else is asked for.
@@ -52,6 +53,12 @@ pub fn serve(setup: *Setup, out: *Io.Writer, host: []const u8, port: u16) !void 
     var listener = try address.listen(setup.io, .{ .reuse_address = true });
     defer listener.deinit(setup.io);
 
+    // One HTTP client for the whole server, shared by every request of every
+    // session, so they reuse its connections and share the certificates it scans
+    // once.
+    var http: std.http.Client = .{ .allocator = setup.gpa, .io = setup.io };
+    defer http.deinit();
+
     // What the server knows about sessions beyond their files. It outlives every
     // connection, which is why it is here and not in the handler.
     var registry = Registry{ .io = setup.io, .gpa = setup.gpa };
@@ -72,7 +79,7 @@ pub fn serve(setup: *Setup, out: *Io.Writer, host: []const u8, port: u16) !void 
             error.Canceled => return err,
             else => |other| return other,
         };
-        group.concurrent(setup.io, handle, .{ setup, &registry, stream }) catch |err| {
+        group.concurrent(setup.io, handle, .{ setup, &registry, &http, stream }) catch |err| {
             // A connection that cannot be given a task is one to let go of,
             // rather than one to bring the server down over.
             std.log.err("cannot serve a connection: {s}", .{@errorName(err)});
@@ -110,10 +117,43 @@ const Registry = struct {
     mutex: Io.Mutex = .init,
     /// The ids of sessions handed out but not written yet, oldest first.
     reserved: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// The ids of sessions a turn is running for right now, each with the id
+    /// that names it owned as the key. A session can only be asked one thing at
+    /// a time, so a second ask while one runs is refused.
+    busy: std.StringHashMapUnmanaged(void) = .empty,
 
     fn deinit(registry: *Registry) void {
         for (registry.reserved.items) |id| registry.gpa.free(id);
         registry.reserved.deinit(registry.gpa);
+        var running = registry.busy.keyIterator();
+        while (running.next()) |id| registry.gpa.free(id.*);
+        registry.busy.deinit(registry.gpa);
+    }
+
+    /// Takes the session `id` for a turn, and says whether it was free. A
+    /// session already taken is one a turn is running for, which is refused
+    /// rather than queued: what a second ask would mean is not clear, and the
+    /// page can say the session is busy.
+    ///
+    /// A taken session must be released with `release`, whatever happens in
+    /// between, or it stays busy until the server stops.
+    fn claim(registry: *Registry, id: []const u8) !bool {
+        registry.mutex.lockUncancelable(registry.io);
+        defer registry.mutex.unlock(registry.io);
+
+        if (registry.busy.contains(id)) return false;
+        // The key is the id itself, which the caller only has for this request,
+        // so it is copied and the copy is the one freed on release.
+        const owned = try registry.gpa.dupe(u8, id);
+        errdefer registry.gpa.free(owned);
+        try registry.busy.put(registry.gpa, owned, {});
+        return true;
+    }
+
+    fn release(registry: *Registry, id: []const u8) void {
+        registry.mutex.lockUncancelable(registry.io);
+        defer registry.mutex.unlock(registry.io);
+        if (registry.busy.fetchRemove(id)) |removed| registry.gpa.free(removed.key);
     }
 
     /// Records `id` as a session that has been handed out and has no file yet.
@@ -149,7 +189,7 @@ const Registry = struct {
 /// Answers one connection, and closes it. Nothing a request or a reply does is
 /// allowed to reach the caller: a connection that goes wrong is logged and
 /// dropped, since the server outlives it.
-fn handle(setup: *Setup, registry: *Registry, stream: Io.net.Stream) void {
+fn handle(setup: *Setup, registry: *Registry, http: *std.http.Client, stream: Io.net.Stream) void {
     defer {
         // `Stream.close` overwrites its argument with undefined, which it cannot
         // do to a parameter that was not declared mutable.
@@ -164,14 +204,14 @@ fn handle(setup: *Setup, registry: *Registry, stream: Io.net.Stream) void {
     var server: std.http.Server = .init(&reader.interface, &writer.interface);
 
     var request = server.receiveHead() catch return;
-    route(setup, registry, &request) catch |err| {
+    route(setup, registry, http, &request) catch |err| {
         std.log.err("cannot answer a request: {s}", .{@errorName(err)});
     };
 }
 
 /// The routes there are. Everything else is a 404, so a request billy does not
 /// understand is answered rather than left hanging.
-fn route(setup: *Setup, registry: *Registry, request: *std.http.Server.Request) !void {
+fn route(setup: *Setup, registry: *Registry, http: *std.http.Client, request: *std.http.Server.Request) !void {
     // The path is the target up to a query, which none of these routes take.
     const target = request.head.target;
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
@@ -183,11 +223,27 @@ fn route(setup: *Setup, registry: *Registry, request: *std.http.Server.Request) 
             .keep_alive = false,
         });
         if (std.mem.eql(u8, path, "/api/sessions")) return listSessions(setup, registry, request);
-        if (std.mem.startsWith(u8, path, "/api/sessions/"))
-            return openSession(setup, registry, request, path["/api/sessions/".len..]);
+        if (std.mem.startsWith(u8, path, "/api/sessions/")) {
+            const rest = path["/api/sessions/".len..];
+            // `{id}/message` is a prompt, which is a POST; everything under the
+            // id otherwise is the session itself.
+            if (std.mem.endsWith(u8, rest, "/message")) {
+                return reply(request, .text, "method not allowed\n", .method_not_allowed);
+            }
+            return openSession(setup, registry, request, rest);
+        }
     }
-    if (request.head.method == .POST and std.mem.eql(u8, path, "/api/sessions"))
-        return startSession(setup, registry, request);
+    if (request.head.method == .POST) {
+        if (std.mem.eql(u8, path, "/api/sessions")) return startSession(setup, registry, request);
+        const prefix = "/api/sessions/";
+        if (std.mem.startsWith(u8, path, prefix)) {
+            const rest = path[prefix.len..];
+            if (std.mem.endsWith(u8, rest, "/message")) {
+                const id = rest[0 .. rest.len - "/message".len];
+                return askSession(setup, registry, http, request, id);
+            }
+        }
+    }
 
     return request.respond("not found\n", .{
         .status = .not_found,
@@ -342,6 +398,7 @@ const ContentType = enum {
     html,
     json,
     text,
+    events,
 
     fn header(content_type: ContentType) std.http.Header {
         return .{
@@ -350,6 +407,7 @@ const ContentType = enum {
                 .html => "text/html; charset=utf-8",
                 .json => "application/json; charset=utf-8",
                 .text => "text/plain; charset=utf-8",
+                .events => "text/event-stream; charset=utf-8",
             },
         };
     }
@@ -395,6 +453,36 @@ test "a session that is handed out is listed before it is written" {
     );
 }
 
+test "a session is taken for a turn, and refused while one runs" {
+    const gpa = std.testing.allocator;
+    var registry = Registry{ .io = std.testing.io, .gpa = gpa };
+    defer registry.deinit();
+
+    // Free to begin with, so the first ask takes it.
+    try std.testing.expect(try registry.claim("one"));
+    // A second ask while the turn runs is refused rather than queued.
+    try std.testing.expect(!try registry.claim("one"));
+    // Another session is its own, so it is free.
+    try std.testing.expect(try registry.claim("two"));
+
+    // Giving one back frees only that one.
+    registry.release("one");
+    try std.testing.expect(try registry.claim("one"));
+    try std.testing.expect(!try registry.claim("two"));
+    registry.release("one");
+    registry.release("two");
+
+    // The keys were copied, so the id a claim was made with need not outlive it:
+    // what is freed on release is the copy, not the caller's slice.
+    var short: [4]u8 = "take".*;
+    try std.testing.expect(try registry.claim(&short));
+    @memset(&short, 'x');
+    try std.testing.expect(!try registry.claim("take"));
+    registry.release("take");
+    try std.testing.expect(try registry.claim("take"));
+    registry.release("take");
+}
+
 test "a session's page is written as the JSON the page reads" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -438,3 +526,152 @@ test "the address to listen on is read from what was asked for" {
     try std.testing.expectError(error.InvalidHost, listenAddress("example.com", 8787));
     try std.testing.expectError(error.InvalidHost, listenAddress("", 8787));
 }
+
+/// The prompt a page sends: what the user typed.
+const Prompt = struct { text: []const u8 };
+
+/// `POST /api/sessions/{id}/message`: asks the session `text`, answering with the
+/// run as it happens.
+///
+/// The answer is `text/event-stream`, one event per thing the run shows: a
+/// `block` for each finished block (the prompt, a tool call with its result, the
+/// reply), a `header` with the new gauge and cost, an `error` when the run
+/// fails, and `done` at the end. Each is written and flushed as it happens, so
+/// the page fills in while the model works rather than after it has finished.
+///
+/// A session a turn is already running for answers 409: one thing at a time.
+fn askSession(
+    setup: *Setup,
+    registry: *Registry,
+    http: *std.http.Client,
+    request: *std.http.Server.Request,
+    id: []const u8,
+) !void {
+    const gpa = setup.gpa;
+
+    // The prompt is read first, so a request with nothing usable in it is
+    // refused before the session is taken.
+    var body_buffer: [4096]u8 = undefined;
+    const body_reader = request.readerExpectNone(&body_buffer);
+    const body = body_reader.allocRemaining(gpa, .limited(1 << 20)) catch
+        return reply(request, .text, "cannot read the prompt\n", .bad_request);
+    defer gpa.free(body);
+
+    const parsed = std.json.parseFromSlice(Prompt, gpa, body, .{
+        .ignore_unknown_fields = true,
+    }) catch return reply(request, .text, "the prompt is not JSON\n", .bad_request);
+    defer parsed.deinit();
+    if (parsed.value.text.len == 0)
+        return reply(request, .text, "the prompt is empty\n", .bad_request);
+
+    // Taken for the whole turn, and given back however the turn ends.
+    if (!try registry.claim(id))
+        return reply(request, .text, "the session is busy\n", .conflict);
+    defer registry.release(id);
+
+    // The session is opened fresh for this turn and dropped at the end, so it is
+    // always what is on disk; a session changed by another billy in between is
+    // read rather than overwritten. A session started but not written yet has no
+    // file, which is not an error: opening it here is what writes it.
+    var session = Session.open(setup.io, setup.sessions, gpa, id, setup.cwd) catch |err| switch (err) {
+        error.SessionNotFound => if (!registry.isReserved(id))
+            return reply(request, .text, "no such session\n", .not_found)
+        else
+            try Session.create(setup.io, setup.sessions, gpa, id, setup.cwd),
+        else => return err,
+    };
+    defer session.deinit();
+
+    var runner = try Runner.init(setup.io, gpa, try setup.agentConfig(session.cwd, .plain), session.cwd, http);
+    defer runner.deinit();
+    try runner.prepare(&session);
+
+    // The head of the reply goes out before the run starts, so the page can read
+    // the stream while the model is working.
+    var stream_buffer: [4096]u8 = undefined;
+    var body_writer = try request.respondStreaming(&stream_buffer, .{
+        .respond_options = .{
+            .extra_headers = &.{ContentType.events.header()},
+            .keep_alive = false,
+        },
+    });
+    defer body_writer.end() catch {};
+
+    var stream = Stream{ .body = &body_writer, .gpa = gpa };
+    const emitter = stream.emitter();
+
+    runner.compactIfNeeded(emitter, &session);
+    runner.ask(emitter, &session, parsed.value.text) catch |err| {
+        std.log.err("a request failed: {s}", .{@errorName(err)});
+        try stream.fail(@errorName(err));
+    };
+
+    // What the run left the session at, so the page shows the new gauge and
+    // cost, and knows the turn is over.
+    var header: std.Io.Writer.Allocating = .init(gpa);
+    defer header.deinit();
+    try html.header(.{
+        .id = session.id(),
+        .model = setup.model,
+        .cwd = session.cwd,
+        .home = setup.environ.get("HOME"),
+        .context_tokens = session.context_tokens,
+        .model_info = models.lookup(models.Provider.fromUrl(setup.base_url), setup.model),
+        .cost = session.cost,
+    }, &header.writer);
+    try stream.send("header", HtmlEvent{ .html = header.written() });
+    try stream.done();
+}
+
+/// The event a block and a header are sent as: the HTML of one piece of the
+/// page, which the page puts in whole.
+const HtmlEvent = struct { html: []const u8 };
+
+/// What a failure is sent as, so the page can show why a turn stopped.
+const FailedEvent = struct { message: []const u8 };
+
+/// Turns the blocks of a run into the events of a stream as they happen.
+///
+/// The events are written and flushed one at a time rather than gathered, which
+/// is the whole point: a page sees each block the moment it is done, and sees a
+/// slow tool call start long before it finishes.
+const Stream = struct {
+    body: *std.http.BodyWriter,
+    gpa: std.mem.Allocator,
+
+    fn emitter(self: *Stream) agent.Emitter {
+        return .{ .context = self, .vtable = &.{ .block = show } };
+    }
+
+    fn show(context: *anyopaque, b: agent.Block) anyerror!void {
+        const self: *Stream = @ptrCast(@alignCast(context));
+        var rendered: std.Io.Writer.Allocating = .init(self.gpa);
+        defer rendered.deinit();
+        try html.block(self.gpa, b, &rendered.writer);
+        try self.send("block", HtmlEvent{ .html = rendered.written() });
+    }
+
+    fn fail(self: *Stream, message: []const u8) !void {
+        try self.send("error", FailedEvent{ .message = message });
+    }
+
+    fn done(self: *Stream) !void {
+        try self.write("done", "{}");
+    }
+
+    /// Writes one event, and flushes it, so the page has it now.
+    fn send(self: *Stream, event: []const u8, payload: anytype) !void {
+        var data: std.Io.Writer.Allocating = .init(self.gpa);
+        defer data.deinit();
+        try std.json.Stringify.value(payload, .{}, &data.writer);
+        try self.write(event, data.written());
+    }
+
+    /// Writes one event frame: its name, its data on one line, and the blank
+    /// line that ends it. The data is JSON, which never holds a newline, so a
+    /// frame is always what it should be.
+    fn write(self: *Stream, event: []const u8, data: []const u8) !void {
+        try self.body.writer.print("event: {s}\ndata: {s}\n\n", .{ event, data });
+        try self.body.flush();
+    }
+};

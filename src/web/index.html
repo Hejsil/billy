@@ -101,10 +101,12 @@
   pre.diff .added { color: var(--add); }
   pre.diff .context, pre.diff .elided { color: var(--dim); }
 
-  /* The lines billy writes itself. */
+  /* The lines billy writes itself, and what the page adds of its own. */
   .compacted, .notice, .elided {
     color: var(--dim); font-size: 12px; margin-bottom: 16px;
   }
+  .failed { color: var(--del); }
+  #prompt.working #text { color: var(--dim); }
 </style>
 </head>
 <body>
@@ -119,8 +121,8 @@
   <main>
     <div id="header"></div>
     <div id="conversation"></div>
-    <form id="prompt" onsubmit="return false">
-      <input id="text" placeholder="not wired up yet" disabled>
+    <form id="prompt">
+      <input id="text" placeholder="ask billy something" autocomplete="off">
     </form>
   </main>
 
@@ -130,10 +132,13 @@
 const list = document.getElementById('list');
 const headerBox = document.getElementById('header');
 const conversation = document.getElementById('conversation');
+const form = document.getElementById('prompt');
+const input = document.getElementById('text');
 let selected = null;
+let working = false;
 
-// The sessions are listed again after a new one is started, so the sidebar shows
-// it; nothing else changes the list.
+// The sessions are listed again when a new one is started and when a turn ends,
+// since which session was written to last is what orders them.
 async function refresh(select) {
   const sessions = (await (await fetch('/api/sessions')).json()).sessions;
   list.replaceChildren();
@@ -166,8 +171,98 @@ async function open(id) {
   const body = await res.json();
   headerBox.innerHTML = body.header;
   conversation.innerHTML = body.blocks;
+  scrollToEnd();
+  input.focus();
+}
+
+// Sends what was typed and shows the answer as it arrives. The whole exchange is
+// one request: the server streams each block of it back as it is finished.
+async function send(text) {
+  if (working || selected === null || text.trim() === '') return;
+  working = true;
+  form.classList.add('working');
+  input.disabled = true;
+  input.value = '';
+
+  try {
+    const res = await fetch('/api/sessions/' + encodeURIComponent(selected) + '/message', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: text }),
+    });
+    if (res.status === 409) note('the session is busy; wait for the answer');
+    else if (!res.ok) note('the prompt was refused (' + res.status + ')');
+    else await readStream(res);
+  } catch (err) {
+    note('lost the connection: ' + err.message);
+  } finally {
+    working = false;
+    form.classList.remove('working');
+    input.disabled = false;
+    input.focus();
+    // The turn wrote to the session, so it is now the most recent one.
+    refresh(selected);
+  }
+}
+
+// Reads the event stream: frames are separated by a blank line, and each is a
+// name and a line of JSON data.
+async function readStream(res) {
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let end;
+    while ((end = buffer.indexOf('\n\n')) >= 0) {
+      handleFrame(buffer.slice(0, end));
+      buffer = buffer.slice(end + 2);
+    }
+  }
+  // Whatever is left could not be a whole frame, but show it rather than lose it.
+  if (buffer.trim() !== '') handleFrame(buffer);
+}
+
+function handleFrame(frame) {
+  let event = 'message';
+  let data = '';
+  for (const line of frame.split('\n')) {
+    if (line.startsWith('event:')) event = line.slice(6).trim();
+    else if (line.startsWith('data:')) data += line.slice(5).trim();
+  }
+  if (data === '') return;
+  if (event === 'block') {
+    // The block is the server's HTML, which is what it is for.
+    conversation.insertAdjacentHTML('beforeend', JSON.parse(data).html);
+    scrollToEnd();
+  } else if (event === 'header') {
+    headerBox.innerHTML = JSON.parse(data).html;
+  } else if (event === 'error') {
+    note(JSON.parse(data).message);
+  }
+}
+
+// A line the page writes itself, such as why a turn did not happen. The text is
+// set as text, since it is not the server's HTML.
+function note(text) {
+  const line = document.createElement('div');
+  line.className = 'notice failed';
+  line.textContent = text;
+  conversation.append(line);
+  scrollToEnd();
+}
+
+function scrollToEnd() {
   conversation.scrollTop = conversation.scrollHeight;
 }
+
+form.onsubmit = (event) => {
+  event.preventDefault();
+  send(input.value);
+  return false;
+};
 
 document.getElementById('new').onclick = async () => {
   const started = await (await fetch('/api/sessions', { method: 'POST' })).json();
@@ -179,6 +274,7 @@ document.getElementById('new').onclick = async () => {
 (async () => {
   const sessions = await refresh();
   if (sessions.length > 0) await open(sessions[0].id);
+  else input.focus();
 })();
 </script>
 </body>
