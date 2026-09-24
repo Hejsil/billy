@@ -766,14 +766,59 @@ fn element(comptime tag: []const u8, class: []const u8, text: []const u8, out: *
     try out.print("</{s}>\n", .{tag});
 }
 
-/// Writes the `<summary>` of a tool call's `<details>`: the glyph of the tool,
-/// its name, what the call acts on, and -- once the call has run -- the status it
-/// exited with. A collapsed call shows this line and nothing else, so it says
-/// which tool ran, what it ran on, and whether it worked.
+/// The pill a tool call shows between its name and what it acted on: a
+/// fixed-width chip that holds the status the call exited with, so a status is
+/// always in the same place and the description after it always lines up.
 ///
-/// `exit` is the status to show: null while the call is still running, and for
-/// every tool whose result carries no status.
-fn toolSummary(call: Tools.Call, exit: ?Tools.Exit, out: *Io.Writer) !void {
+/// Null, where one of these is taken, means the call has no status to show,
+/// which is every tool but bash.
+const Status = union(enum) {
+    /// The call is still running, so its status is not known yet.
+    running,
+    /// The call has finished: the status it exited with, or null for a result
+    /// that carries none, as one stored before billy wrote the status does.
+    finished: ?Tools.Exit,
+};
+
+/// Whether `call` is a bash call, the only kind with an exit status to show.
+fn hasStatus(call: Tools.Call) bool {
+    return switch (call) {
+        .bash => true,
+        else => false,
+    };
+}
+
+/// Writes the pill for `status`: grey with an ellipsis while the call runs, the
+/// colour of the exit and the code once it has one, and grey and empty for a
+/// finished call whose status was never recorded. The element is the same width
+/// in every case, so the description after it starts in the same place on every
+/// row.
+fn pill(status: Status, out: *Io.Writer) !void {
+    switch (status) {
+        // No animation: the ellipsis alone says the call has not finished.
+        .running => try out.writeAll("<span class=\"exit running\" title=\"running\">…</span>"),
+        .finished => |maybe_exit| {
+            const exit = maybe_exit orelse return out.writeAll(
+                "<span class=\"exit unknown\" title=\"the exit status was not recorded\"></span>",
+            );
+            try out.print("<span class=\"exit {s}\" title=\"exit code ", .{
+                if (exit.ok) "ok" else "failed",
+            });
+            try escape(exit.code, out);
+            try out.writeAll("\">");
+            try out.writeAll(if (exit.ok) Tools.exit_marks.ok else Tools.exit_marks.failed);
+            try out.writeAll(" ");
+            try escape(exit.code, out);
+            try out.writeAll("</span>");
+        },
+    }
+}
+
+/// Writes the `<summary>` of a tool call's `<details>`: the glyph of the tool,
+/// its name, the pill of its status when it has one, and what the call acted on.
+/// A collapsed call shows this line and nothing else, so it says which tool ran,
+/// what it ran on, and whether it worked.
+fn toolSummary(call: Tools.Call, status: ?Status, out: *Io.Writer) !void {
     const head = Tools.Heading.of(call);
     try out.writeAll("<summary class=\"tool-head\">");
     try out.print("<span class=\"glyph hue-{s}\">", .{@tagName(head.hue)});
@@ -781,6 +826,9 @@ fn toolSummary(call: Tools.Call, exit: ?Tools.Exit, out: *Io.Writer) !void {
     try out.writeAll("</span> <span class=\"name\">");
     try escape(head.name, out);
     try out.writeAll("</span>");
+    // The status sits right after the name, before what the call acted on, so a
+    // status is in the same place on every row.
+    if (status) |state| try pill(state, out);
     // What the call acts on. A bash call's heading carries the model's
     // description of what the command does, so a collapsed call says what it is
     // for. A call from before the tool asked for one has no description, so the
@@ -792,14 +840,6 @@ fn toolSummary(call: Tools.Call, exit: ?Tools.Exit, out: *Io.Writer) !void {
     if (target.len > 0) {
         try out.writeAll(" <span class=\"target\">");
         try escape(target, out);
-        try out.writeAll("</span>");
-    }
-    if (exit) |status| {
-        // The mark repeats what the colour says, as the terminal's does, so the
-        // line reads the same where the colour does not.
-        try out.print("<span class=\"exit {s}\">", .{if (status.ok) "ok" else "failed"});
-        try out.writeAll(if (status.ok) "✓ exit " else "✗ exit ");
-        try escape(status.code, out);
         try out.writeAll("</span>");
     }
     try out.writeAll("</summary>\n");
@@ -883,16 +923,19 @@ pub fn block(gpa: std.mem.Allocator, b: agent.Block, out: *Io.Writer) !void {
         // it with the second.
         .tool_begin => |call| {
             try out.writeAll("<details class=\"tool\">");
-            try toolSummary(call, null, out);
+            // A call still running shows a grey pill with an ellipsis, which the
+            // result replaces with the status when it arrives. Only bash has a
+            // status, so any other tool shows no pill.
+            try toolSummary(call, if (hasStatus(call)) .running else null, out);
             try out.writeAll("<div class=\"tool-body\"></div></details>\n");
         },
         .tool_end => |tool| {
-            const exit: ?Tools.Exit = switch (tool.call) {
-                .bash => if (Tools.bashOutput(tool.result)) |output| output.exit else null,
-                else => null,
-            };
+            const status: ?Status = if (hasStatus(tool.call))
+                .{ .finished = if (Tools.bashOutput(tool.result)) |output| output.exit else null }
+            else
+                null;
             try out.writeAll("<details class=\"tool\">");
-            try toolSummary(tool.call, exit, out);
+            try toolSummary(tool.call, status, out);
             try out.writeAll("<div class=\"tool-body\">");
             try toolBody(gpa, tool.call, tool.result, out);
             try out.writeAll("</div></details>\n");
@@ -975,8 +1018,9 @@ test "a bash call shows its exit status in the head and its streams in the body"
         .arguments = "{\"command\":\"make\"}",
     } });
 
-    // The status the command exited with is a badge in the summary, and the two
-    // streams are shown apart under it, without the status line repeated.
+    // The status the command exited with is a pill right after the tool's name,
+    // before what it acted on, and the two streams are shown apart under it,
+    // without the status line repeated.
     try block(gpa, .{ .tool_end = .{
         .call = bash,
         .result = "exit code: 2\nbuilt\nstderr:\nboom\n",
@@ -984,8 +1028,8 @@ test "a bash call shows its exit status in the head and its streams in the body"
     try std.testing.expectEqualStrings(
         "<details class=\"tool\"><summary class=\"tool-head\">" ++
             "<span class=\"glyph hue-cyan\">❯</span> <span class=\"name\">bash</span>" ++
-            " <span class=\"target\">make</span>" ++
-            "<span class=\"exit failed\">✗ exit 2</span></summary>\n" ++
+            "<span class=\"exit failed\" title=\"exit code 2\">✗ 2</span>" ++
+            " <span class=\"target\">make</span></summary>\n" ++
             "<div class=\"tool-body\"><pre class=\"command\">make</pre>\n" ++
             "<pre class=\"stdout\">built</pre>\n" ++
             "<pre class=\"stderr\">boom</pre>\n</div></details>\n",
@@ -996,15 +1040,63 @@ test "a bash call shows its exit status in the head and its streams in the body"
     // A command that succeeded reads ok, and one that printed nothing says so
     // rather than leaving the body empty.
     try block(gpa, .{ .tool_end = .{ .call = bash, .result = "exit code: 0\n(no output)\n" } }, &out.writer);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "<span class=\"exit ok\">✓ exit 0</span>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "<span class=\"exit ok\" title=\"exit code 0\">✓ 0</span>") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "<pre class=\"result\">(no output)</pre>") != null);
     out.clearRetainingCapacity();
 
     // A bash result billy did not write -- a session saved before the status was
-    // -- is shown as it is, with no badge.
+    // -- is shown as it is, with an empty grey pill rather than the running one:
+    // the call has finished, so nothing should claim it is still going.
     try block(gpa, .{ .tool_end = .{ .call = bash, .result = "make: nothing to be done" } }, &out.writer);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "class=\"exit") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "<span class=\"exit unknown\" title=\"the exit status was not recorded\"></span>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "running") == null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "<pre class=\"result\">make: nothing to be done</pre>") != null);
+}
+
+test "a running call shows a grey pill, and a finished one the status" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    const bash = Tools.parse(arena, .{ .id = "1", .function = .{
+        .name = "bash",
+        .arguments = "{\"command\":\"make\",\"description\":\"build it\"}",
+    } });
+
+    // The half a stream sends while the command runs: a grey pill with an
+    // ellipsis, where the status will go.
+    try block(gpa, .{ .tool_begin = bash }, &out.writer);
+    try std.testing.expectEqualStrings(
+        "<details class=\"tool\"><summary class=\"tool-head\">" ++
+            "<span class=\"glyph hue-cyan\">❯</span> <span class=\"name\">bash</span>" ++
+            "<span class=\"exit running\" title=\"running\">…</span>" ++
+            " <span class=\"target\">build it</span></summary>\n" ++
+            "<div class=\"tool-body\"></div></details>\n",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+
+    // The half sent when the result arrives: the same row with the status in the
+    // pill, so replacing the first with it turns the ellipsis into the status.
+    try block(gpa, .{ .tool_end = .{ .call = bash, .result = "exit code: 0\n" } }, &out.writer);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "<span class=\"exit ok\" title=\"exit code 0\">✓ 0</span>") != null);
+
+    // A tool with no status has no pill: not while it runs, and not when it is
+    // done.
+    out.clearRetainingCapacity();
+    const read = Tools.parse(arena, .{ .id = "1", .function = .{
+        .name = "read",
+        .arguments = "{\"path\":\"a.zig\"}",
+    } });
+    try block(gpa, .{ .tool_begin = read }, &out.writer);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "class=\"exit") == null);
+    out.clearRetainingCapacity();
+    try block(gpa, .{ .tool_end = .{ .call = read, .result = "1\tx" } }, &out.writer);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "class=\"exit") == null);
 }
 
 test "a bash call shows its command, and a write shows what it wrote" {

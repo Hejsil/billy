@@ -96,9 +96,9 @@
   details.tool { margin-bottom: 16px; }
   summary.tool-head {
     color: var(--dim); font-size: 12px; cursor: pointer; list-style: none;
-    display: flex; align-items: baseline; gap: 5px;
-    /* One line, so a call stays a single compact row; a long path is cut off
-       with an ellipsis rather than wrapping. */
+    display: flex; align-items: center; gap: 6px;
+    /* One line, so a call stays a single compact row; a long description is cut
+       off with an ellipsis rather than wrapping. */
     white-space: nowrap; overflow: hidden;
   }
   summary.tool-head::-webkit-details-marker { display: none; }
@@ -108,13 +108,22 @@
      glyph of a `read`, which is a triangle too. */
   summary.tool-head::before { content: '›'; color: #3a3f4b; flex: none; }
   details.tool[open] summary.tool-head::before { transform: rotate(90deg); }
-  .tool-head .name { color: var(--text); font-weight: 600; }
+  .tool-head .name { color: var(--text); font-weight: 600; flex: none; }
   .tool-head .target { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-  /* The exit status, shown once the call has run. It stays in the summary's one
-     line, after what the call acted on. */
-  .tool-head .exit { flex: none; }
-  .tool-head .exit.ok { color: var(--add); }
-  .tool-head .exit.failed { color: var(--del); }
+  /* The exit status: a fixed-width pill between the tool's name and what it acted
+     on, so a status is always in the same place and the description after it
+     always lines up. Grey with an ellipsis while the call runs; the colour of the
+     exit and the code once it has one; grey and empty for a finished call whose
+     status was never recorded. */
+  .tool-head .exit {
+    flex: none; display: inline-flex; align-items: center; justify-content: center;
+    width: 4.5em; height: 18px; padding: 0 6px; border-radius: 9px;
+    font-size: 11px; line-height: 1; border: 1px solid transparent;
+    font-variant-numeric: tabular-nums; overflow: hidden;
+  }
+  .tool-head .exit.ok { color: var(--add); border-color: rgba(158, 206, 106, 0.45); background: rgba(158, 206, 106, 0.10); }
+  .tool-head .exit.failed { color: var(--del); border-color: rgba(247, 118, 142, 0.5); background: rgba(247, 118, 142, 0.12); }
+  .tool-head .exit.running, .tool-head .exit.unknown { color: var(--dim); border-color: var(--line); background: rgba(255, 255, 255, 0.03); }
   .tool-head .glyph { color: var(--dim); }
   .tool-head .glyph.hue-blue { color: var(--accent); }
   .tool-head .glyph.hue-green { color: var(--add); }

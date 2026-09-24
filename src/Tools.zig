@@ -892,10 +892,11 @@ const label_mark = "▾";
 /// The mark in front of an exit status: a check when the command succeeded and a
 /// cross when it did not. It repeats what the colour says, so the line reads the
 /// same where the colour does not, such as a colour-blind terminal or a log with
-/// the escape codes stripped.
-const exit_marks = struct {
-    const ok = "✓";
-    const failed = "✗";
+/// the escape codes stripped. The web pill uses the same marks, so the two
+/// frontends agree on what a status looks like.
+pub const exit_marks = struct {
+    pub const ok = "✓";
+    pub const failed = "✗";
 };
 
 /// How a section of a block is printed. The label line is bold, so it reads as
