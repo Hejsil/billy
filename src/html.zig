@@ -117,6 +117,13 @@ pub fn markdown(text: []const u8, out: *Io.Writer) !void {
     // The marker of the fence a code block was opened with, until the fence that
     // closes it; null when no code block is open.
     var fence: ?[]const u8 = null;
+    // How many blank lines have been seen since the last line that was not
+    // blank. One blank line does not end a list: a list written with a blank
+    // line between its items is still one list, and closing it there would
+    // restart its numbering, which is what makes every item show as 1. The count
+    // is kept so that a list is ended by a second blank line, rather than
+    // reaching across a gap to the next item.
+    var blanks: usize = 0;
 
     // Split what is written, not the newline that ends it: a text ending in a
     // newline would otherwise have a last empty line, which at the end of a code
@@ -139,9 +146,18 @@ pub fn markdown(text: []const u8, out: *Io.Writer) !void {
 
         const trimmed = std.mem.trimEnd(u8, line, " \t");
         if (trimmed.len == 0) {
-            try close(&open, out);
+            // A blank line ends a paragraph, a quote or a code block at once. A
+            // list may carry on after one blank line, so it is left open for the
+            // next line to decide; two blank lines end it.
+            if (open == .ordered or open == .unordered) {
+                blanks += 1;
+                if (blanks >= 2) try close(&open, out);
+            } else {
+                try close(&open, out);
+            }
             continue;
         }
+        blanks = 0;
 
         if (fenceOf(trimmed)) |opening| {
             try close(&open, out);
@@ -174,7 +190,17 @@ pub fn markdown(text: []const u8, out: *Io.Writer) !void {
             const wanted: Block = if (item.ordered) .ordered else .unordered;
             if (open != wanted) {
                 try close(&open, out);
-                try out.writeAll(if (item.ordered) "<ol>\n" else "<ul>\n");
+                // An ordered list keeps the number it was written starting at, so
+                // a list that starts at 3 shows 3, 4, 5 rather than 1, 2, 3. The
+                // numbers after the first are not written: an `<ol>` counts its
+                // own items from wherever it starts.
+                if (!item.ordered) {
+                    try out.writeAll("<ul>\n");
+                } else if (item.number > 1) {
+                    try out.print("<ol start=\"{d}\">\n", .{item.number});
+                } else {
+                    try out.writeAll("<ol>\n");
+                }
                 open = wanted;
             }
             try out.writeAll("<li>");
@@ -292,7 +318,14 @@ fn isRule(line: []const u8) bool {
     return count >= 3;
 }
 
-const Item = struct { ordered: bool, text: []const u8 };
+const Item = struct {
+    ordered: bool,
+    text: []const u8,
+    /// The number an ordered item was written with. Only the first item of a
+    /// list matters: it is where the list starts, and the rest are numbered from
+    /// it. An unordered item is always 1.
+    number: usize = 1,
+};
 
 /// A list item: `-`, `*` or `+` and a space for an unordered one, or digits and
 /// a `.` or `)` and a space for an ordered one.
@@ -307,7 +340,14 @@ fn itemOf(line: []const u8) ?Item {
     if (digits == 0 or digits + 1 >= line.len) return null;
     if (line[digits] != '.' and line[digits] != ')') return null;
     if (line[digits + 1] != ' ' and line[digits + 1] != '\t') return null;
-    return .{ .ordered = true, .text = std.mem.trimStart(u8, line[digits + 2 ..], " \t") };
+    // The number is where the list starts. A number too long to be one is read
+    // as the start of one, so a nonsense marker is still a list.
+    const number = std.fmt.parseInt(usize, line[0..digits], 10) catch 1;
+    return .{
+        .ordered = true,
+        .text = std.mem.trimStart(u8, line[digits + 2 ..], " \t"),
+        .number = number,
+    };
 }
 
 /// Writes the inline markdown of one line of text: code, emphasis and links,
@@ -561,6 +601,41 @@ test "lists are written as lists, and do not run into a paragraph" {
     );
     // A paragraph after a list is its own block.
     try expectMarkdown("<ul>\n<li>one</li>\n</ul>\n<p>after</p>\n", "- one\nafter\n");
+
+    // A blank line between items does not end the list, and does not restart its
+    // numbering: the items are still one list, written as one.
+    try expectMarkdown(
+        "<ol>\n<li>one</li>\n<li>two</li>\n</ol>\n",
+        "1. one\n\n2. two\n",
+    );
+    try expectMarkdown(
+        "<ul>\n<li>one</li>\n<li>two</li>\n</ul>\n",
+        "- one\n\n- two\n",
+    );
+    // A blank line, then something that is not an item, ends the list.
+    try expectMarkdown(
+        "<ol>\n<li>one</li>\n</ol>\n<p>after</p>\n",
+        "1. one\n\nafter\n",
+    );
+    // Two blank lines end it too, so a list does not reach across a gap; the
+    // next item starts a new list at the number it was written with.
+    try expectMarkdown(
+        "<ol>\n<li>one</li>\n</ol>\n<ol start=\"2\">\n<li>two</li>\n</ol>\n",
+        "1. one\n\n\n2. two\n",
+    );
+
+    // A list starting at a number other than 1 keeps it, so it does not show as
+    // 1 where the model wrote 3.
+    try expectMarkdown(
+        "<ol start=\"3\">\n<li>three</li>\n<li>four</li>\n</ol>\n",
+        "3. three\n4. four\n",
+    );
+    // Every item written as 1 is still one list that counts up, which is how a
+    // model that numbers every item `1.` is meant to read.
+    try expectMarkdown(
+        "<ol>\n<li>one</li>\n<li>two</li>\n<li>three</li>\n</ol>\n",
+        "1. one\n1. two\n1. three\n",
+    );
 }
 
 test "a code block is kept as it was written, and nothing in it is markup" {
