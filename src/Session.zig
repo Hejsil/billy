@@ -1013,7 +1013,8 @@ fn usableName(text: []const u8) bool {
     return !std.mem.allEqual(u8, text, '.');
 }
 
-/// The ids of the sessions in `dir`, the one most recently written to first.
+/// The ids of the sessions in the directory at `path`, the one most recently
+/// written to first.
 ///
 /// The order is the time each session file was last written, so the session
 /// being worked in is at the top and stays there as it grows. The time is asked
@@ -1024,7 +1025,22 @@ fn usableName(text: []const u8) bool {
 /// Only files that could be a session are listed, so a file that is not one is
 /// passed over rather than reported as a session. The ids are `gpa`'s, and the
 /// caller frees each of them and then the list.
-pub fn list(dir: Io.Dir, io: Io, gpa: std.mem.Allocator) ![][]const u8 {
+///
+/// The directory is opened here, one handle per listing, rather than taken from
+/// the caller. Reading a directory keeps its place in the handle it was opened
+/// on, so two listings sharing one handle read over each other and each sees a
+/// part of the directory; a server with several connections asking at once needs
+/// each to have its own. Opening it here is what makes that impossible to get
+/// wrong.
+pub fn list(io: Io, path: []const u8, gpa: std.mem.Allocator) ![][]const u8 {
+    var dir = try Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
+    defer dir.close(io);
+    return listIn(dir, io, gpa);
+}
+
+/// The ids of the sessions in `dir`, which must be a handle this listing has to
+/// itself. See `list`, which opens one.
+fn listIn(dir: Io.Dir, io: Io, gpa: std.mem.Allocator) ![][]const u8 {
     // The ids and the times they were written are two lists kept in step: the
     // times are only there to order the ids by, so sorting has to move both.
     var ids: std.ArrayList([]const u8) = .empty;
@@ -1242,7 +1258,7 @@ test "the sessions in a directory are listed by when they were written" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad name" ++ extension, .data = "x" });
     try tmp.dir.createDirPath(std.testing.io, "a-directory" ++ extension);
 
-    const ids = try list(tmp.dir, std.testing.io, std.testing.allocator);
+    const ids = try listIn(tmp.dir, std.testing.io, std.testing.allocator);
     defer freeList(ids, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 3), ids.len);
     try std.testing.expectEqualStrings("dev", ids[0]);
@@ -1277,7 +1293,7 @@ test "the ordering keeps each id with the time it was written at" {
         });
     }
 
-    const ids = try list(tmp.dir, std.testing.io, std.testing.allocator);
+    const ids = try listIn(tmp.dir, std.testing.io, std.testing.allocator);
     defer freeList(ids, std.testing.allocator);
 
     // The write times descend as the ids ascend, so the listing is the ids in
@@ -1310,7 +1326,7 @@ test "sessions written at the same moment are ordered by their ids" {
 
     // The same write time on both, so the newer id comes first and the order does
     // not depend on how the directory happened to be read.
-    const ids = try list(tmp.dir, std.testing.io, std.testing.allocator);
+    const ids = try listIn(tmp.dir, std.testing.io, std.testing.allocator);
     defer freeList(ids, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), ids.len);
     try std.testing.expectEqualStrings(newer_buf[0..ulid.length], ids[0]);
@@ -1323,7 +1339,7 @@ test "an empty sessions directory lists nothing" {
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const ids = try list(tmp.dir, std.testing.io, std.testing.allocator);
+    const ids = try listIn(tmp.dir, std.testing.io, std.testing.allocator);
     defer freeList(ids, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), ids.len);
 }

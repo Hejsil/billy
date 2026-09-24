@@ -290,8 +290,9 @@ fn listSessions(setup: *Setup, registry: *Registry, request: *std.http.Server.Re
     const gpa = setup.gpa;
 
     // What is on disk. Each id is its own allocation, freed once the reply is
-    // built from them.
-    const stored = try Session.list(setup.sessions, setup.io, gpa);
+    // built from them. The listing opens the directory itself, so a listing here
+    // and one on another connection do not read over each other.
+    const stored = try Session.list(setup.io, setup.sessions_path, gpa);
     defer {
         for (stored) |id| gpa.free(id);
         gpa.free(stored);

@@ -122,11 +122,7 @@ pub fn open(init: std.process.Init, out: *Io.Writer) !Setup {
         std.log.err("cannot find where to store sessions: {s}", .{@errorName(err)});
         return err;
     };
-    // Opened for iteration as well, since the web frontend lists the sessions in
-    // the directory to show them.
-    var sessions = Io.Dir.cwd().createDirPathOpen(io, sessions_path, .{
-        .open_options = .{ .iterate = true },
-    }) catch |err| {
+    var sessions = Io.Dir.cwd().createDirPathOpen(io, sessions_path, .{}) catch |err| {
         std.log.err("cannot use {s} for sessions: {s}", .{ sessions_path, @errorName(err) });
         return err;
     };
