@@ -610,7 +610,7 @@ fn askSession(
     };
     defer session.deinit();
 
-    var runner = try Runner.init(setup.io, gpa, try setup.agentConfig(session.cwd, .plain), session.cwd, http);
+    var runner = try Runner.init(setup.io, gpa, setup.agentConfig(session.cwd, .plain), session.cwd, http);
     defer runner.deinit();
     try runner.prepare(&session);
 

@@ -23,8 +23,6 @@ io: Io,
 /// Temporary allocations, and what a tool format script is given to lay its
 /// output out with.
 gpa: std.mem.Allocator,
-/// The process arena: everything read in here that lives as long as the process.
-arena: std.mem.Allocator,
 environ: *const std.process.Environ.Map,
 
 /// The configuration. It owns an arena of its own for the strings read out of
@@ -47,6 +45,10 @@ cwd: []const u8,
 api_key: []const u8,
 /// The endpoint billy talks to, and the model it asks for.
 base_url: []const u8,
+/// The full URL of the chat completions endpoint, built once from `base_url`.
+/// It is kept here rather than made per run because both frontends ask for it
+/// often -- the web server once per turn -- and it never changes.
+url: []const u8,
 model: []const u8,
 /// Web search, when the configuration names a backend and its key is set. Null
 /// leaves `web_search` out of the tools the model is offered.
@@ -106,6 +108,12 @@ pub fn open(init: std.process.Init, out: *Io.Writer) !Setup {
 
     const base_url = environ.get("BILLY_BASE_URL") orelse "https://api.deepseek.com";
     const model = environ.get("BILLY_MODEL") orelse "deepseek-flash";
+    // The endpoint URL is built once, here, and lives with the process. The web
+    // server asks for the agent configuration once per turn, so building it
+    // there would leak one allocation per turn into the process arena.
+    const url = try std.fmt.allocPrint(arena, "{s}/chat/completions", .{
+        std.mem.trimEnd(u8, base_url, "/"),
+    });
     const api_key = credentials.modelKey(&store, environ, base_url) orelse {
         std.log.err("run `billy login deepseek`, or set DEEPSEEK_API_KEY to your API key", .{});
         return error.MissingApiKey;
@@ -150,7 +158,6 @@ pub fn open(init: std.process.Init, out: *Io.Writer) !Setup {
     return .{
         .io = io,
         .gpa = init.gpa,
-        .arena = arena,
         .environ = environ,
         .settings = settings.config,
         .sessions = sessions,
@@ -160,6 +167,7 @@ pub fn open(init: std.process.Init, out: *Io.Writer) !Setup {
         .cwd = cwd,
         .api_key = api_key,
         .base_url = base_url,
+        .url = url,
         .model = model,
         .search = search_config,
     };
@@ -178,13 +186,14 @@ pub fn deinit(setup: *Setup) void {
 /// The window and the prices are not reported by the API, so they are looked up
 /// by provider and model; an unknown model simply has no gauge and no cost, and
 /// so no compaction, which needs a window to measure a conversation against.
-pub fn agentConfig(setup: *const Setup, cwd: []const u8, style: styling.Style) !agent.Config {
+///
+/// Nothing is allocated here: every string is one the setup already holds, so
+/// asking for this once a turn costs nothing that would have to be freed.
+pub fn agentConfig(setup: *const Setup, cwd: []const u8, style: styling.Style) agent.Config {
     const settings = &setup.settings;
     return .{
         .api_key = setup.api_key,
-        .url = try std.fmt.allocPrint(setup.arena, "{s}/chat/completions", .{
-            std.mem.trimEnd(u8, setup.base_url, "/"),
-        }),
+        .url = setup.url,
         .model = setup.model,
         .max_turns = settings.max_turns,
         .bash_timeout_s = settings.tools.bash.timeout_s,
