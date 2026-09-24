@@ -255,47 +255,72 @@ fn handle(
     var server: std.http.Server = .init(&reader.interface, &writer.interface);
 
     var request = server.receiveHead() catch return;
-    route(setup, registry, http, &request) catch |err| {
+    // Whether a reply has gone out for this request yet. A failure after the
+    // reply has started cannot be reported with a status -- the head is already
+    // sent -- so the flag is what tells the failure path whether a 500 is still
+    // possible.
+    var answered = false;
+    route(setup, registry, http, &request, &answered) catch |err| {
         std.log.err("cannot answer a request: {s}", .{@errorName(err)});
+        // Nothing has been sent, so the browser can be told what happened
+        // rather than only watching the connection drop.
+        if (!answered) request.respond("billy: internal error\n", .{
+            .status = .internal_server_error,
+            .extra_headers = &.{ContentType.text.header()},
+            .keep_alive = false,
+        }) catch {};
     };
 }
 
 /// The routes there are. Everything else is a 404, so a request billy does not
 /// understand is answered rather than left hanging.
-fn route(setup: *Setup, registry: *Registry, http: *std.http.Client, request: *std.http.Server.Request) !void {
+///
+/// `answered` is set once a reply for the request has begun, so the caller knows
+/// whether a failure can still be turned into a status.
+fn route(
+    setup: *Setup,
+    registry: *Registry,
+    http: *std.http.Client,
+    request: *std.http.Server.Request,
+    answered: *bool,
+) !void {
     // The path is the target up to a query, which none of these routes take.
     const target = request.head.target;
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
 
     if (request.head.method == .GET) {
-        if (std.mem.eql(u8, path, "/")) return request.respond(page, .{
-            .status = .ok,
-            .extra_headers = &.{ContentType.html.header()},
-            .keep_alive = false,
-        });
-        if (std.mem.eql(u8, path, "/api/sessions")) return listSessions(setup, registry, request);
+        if (std.mem.eql(u8, path, "/")) {
+            answered.* = true;
+            return request.respond(page, .{
+                .status = .ok,
+                .extra_headers = &.{ContentType.html.header()},
+                .keep_alive = false,
+            });
+        }
+        if (std.mem.eql(u8, path, "/api/sessions")) return listSessions(setup, registry, request, answered);
         if (std.mem.startsWith(u8, path, "/api/sessions/")) {
             const rest = path["/api/sessions/".len..];
             // `{id}/message` is a prompt, which is a POST; everything under the
             // id otherwise is the session itself.
             if (std.mem.endsWith(u8, rest, "/message")) {
-                return reply(request, .text, "method not allowed\n", .method_not_allowed);
+                return reply(request, .text, "method not allowed\n", .method_not_allowed, answered);
             }
-            return openSession(setup, registry, request, rest);
+            return openSession(setup, registry, request, rest, answered);
         }
     }
     if (request.head.method == .POST) {
-        if (std.mem.eql(u8, path, "/api/sessions")) return startSession(setup, registry, request);
+        if (std.mem.eql(u8, path, "/api/sessions")) return startSession(setup, registry, request, answered);
         const prefix = "/api/sessions/";
         if (std.mem.startsWith(u8, path, prefix)) {
             const rest = path[prefix.len..];
             if (std.mem.endsWith(u8, rest, "/message")) {
                 const id = rest[0 .. rest.len - "/message".len];
-                return askSession(setup, registry, http, request, id);
+                return askSession(setup, registry, http, request, id, answered);
             }
         }
     }
 
+    answered.* = true;
     return request.respond("not found\n", .{
         .status = .not_found,
         .extra_headers = &.{ContentType.text.header()},
@@ -312,7 +337,7 @@ const Listing = struct { sessions: []const Listed };
 
 /// `GET /api/sessions`: every session, the ones started but not written yet
 /// first, then the ones on disk, newest written first.
-fn listSessions(setup: *Setup, registry: *Registry, request: *std.http.Server.Request) !void {
+fn listSessions(setup: *Setup, registry: *Registry, request: *std.http.Server.Request, answered: *bool) !void {
     const gpa = setup.gpa;
 
     // What is on disk. Each id is its own allocation, freed once the reply is
@@ -332,7 +357,7 @@ fn listSessions(setup: *Setup, registry: *Registry, request: *std.http.Server.Re
     var body: std.Io.Writer.Allocating = .init(gpa);
     defer body.deinit();
     try std.json.Stringify.value(Listing{ .sessions = sessions.items }, .{}, &body.writer);
-    return reply(request, .json, body.written(), .ok);
+    return reply(request, .json, body.written(), .ok, answered);
 }
 
 /// One session's page: the header line above a conversation, and the
@@ -344,7 +369,13 @@ const Opened = struct { header: []const u8, blocks: []const u8 };
 /// A session with no file yet is one that has been started and not asked
 /// anything, which is what a page should show: an empty conversation rather than
 /// a failure. Any other missing id is a 404.
-fn openSession(setup: *Setup, registry: *Registry, request: *std.http.Server.Request, id: []const u8) !void {
+fn openSession(
+    setup: *Setup,
+    registry: *Registry,
+    request: *std.http.Server.Request,
+    id: []const u8,
+    answered: *bool,
+) !void {
     const gpa = setup.gpa;
 
     var body: std.Io.Writer.Allocating = .init(gpa);
@@ -352,11 +383,11 @@ fn openSession(setup: *Setup, registry: *Registry, request: *std.http.Server.Req
     const opened = writeSession(setup, registry, gpa, id, &body.writer) catch |err| switch (err) {
         // An id that could not be a session name is a bad request, not a missing
         // session.
-        error.InvalidSessionId => return reply(request, .text, "bad session id\n", .bad_request),
+        error.InvalidSessionId => return reply(request, .text, "bad session id\n", .bad_request, answered),
         else => return err,
     };
-    if (!opened) return reply(request, .text, "no such session\n", .not_found);
-    return reply(request, .json, body.written(), .ok);
+    if (!opened) return reply(request, .text, "no such session\n", .not_found, answered);
+    return reply(request, .json, body.written(), .ok, answered);
 }
 
 /// Writes the JSON a session's page is built from, and says whether the session
@@ -428,7 +459,7 @@ fn writeOpened(out: *Io.Writer, header: []const u8, blocks: []const u8) !void {
 ///
 /// Nothing is written. The id is what the page opens, and the session comes into
 /// being when it is first asked something.
-fn startSession(setup: *Setup, registry: *Registry, request: *std.http.Server.Request) !void {
+fn startSession(setup: *Setup, registry: *Registry, request: *std.http.Server.Request, answered: *bool) !void {
     const gpa = setup.gpa;
 
     // Opening a session that is not resumed gives it a fresh id and writes
@@ -442,7 +473,7 @@ fn startSession(setup: *Setup, registry: *Registry, request: *std.http.Server.Re
     var body: std.Io.Writer.Allocating = .init(gpa);
     defer body.deinit();
     try std.json.Stringify.value(Listed{ .id = id }, .{}, &body.writer);
-    return reply(request, .json, body.written(), .created);
+    return reply(request, .json, body.written(), .created, answered);
 }
 
 /// What a reply is, so the browser is told how to read it.
@@ -465,13 +496,16 @@ const ContentType = enum {
     }
 };
 
-/// Answers a request with `body`, and ends the connection.
+/// Answers a request with `body`, and ends the connection. Marks the request
+/// answered, so the caller knows a failure now cannot be reported with a status.
 fn reply(
     request: *std.http.Server.Request,
     content_type: ContentType,
     body: []const u8,
     status: std.http.Status,
+    answered: *bool,
 ) !void {
+    answered.* = true;
     try request.respond(body, .{
         .status = status,
         .extra_headers = &.{content_type.header()},
@@ -600,6 +634,7 @@ fn askSession(
     http: *std.http.Client,
     request: *std.http.Server.Request,
     id: []const u8,
+    answered: *bool,
 ) !void {
     const gpa = setup.gpa;
 
@@ -608,19 +643,19 @@ fn askSession(
     var body_buffer: [4096]u8 = undefined;
     const body_reader = request.readerExpectNone(&body_buffer);
     const body = body_reader.allocRemaining(gpa, .limited(1 << 20)) catch
-        return reply(request, .text, "cannot read the prompt\n", .bad_request);
+        return reply(request, .text, "cannot read the prompt\n", .bad_request, answered);
     defer gpa.free(body);
 
     const parsed = std.json.parseFromSlice(Prompt, gpa, body, .{
         .ignore_unknown_fields = true,
-    }) catch return reply(request, .text, "the prompt is not JSON\n", .bad_request);
+    }) catch return reply(request, .text, "the prompt is not JSON\n", .bad_request, answered);
     defer parsed.deinit();
     if (parsed.value.text.len == 0)
-        return reply(request, .text, "the prompt is empty\n", .bad_request);
+        return reply(request, .text, "the prompt is empty\n", .bad_request, answered);
 
     // Taken for the whole turn, and given back however the turn ends.
     if (!try registry.claim(id))
-        return reply(request, .text, "the session is busy\n", .conflict);
+        return reply(request, .text, "the session is busy\n", .conflict, answered);
     defer registry.release(id);
 
     // The session is opened fresh for this turn and dropped at the end, so it is
@@ -629,7 +664,7 @@ fn askSession(
     // file, which is not an error: opening it here is what writes it.
     var session = Session.open(setup.io, setup.sessions, gpa, id, setup.cwd) catch |err| switch (err) {
         error.SessionNotFound => if (!registry.isReserved(id))
-            return reply(request, .text, "no such session\n", .not_found)
+            return reply(request, .text, "no such session\n", .not_found, answered)
         else
             try Session.create(setup.io, setup.sessions, gpa, id, setup.cwd),
         else => return err,
@@ -641,7 +676,8 @@ fn askSession(
     try runner.prepare(&session);
 
     // The head of the reply goes out before the run starts, so the page can read
-    // the stream while the model is working.
+    // the stream while the model is working. From here on a failure is part of
+    // the stream rather than something the connection can be told with a status.
     var stream_buffer: [4096]u8 = undefined;
     var body_writer = try request.respondStreaming(&stream_buffer, .{
         .respond_options = .{
@@ -649,6 +685,7 @@ fn askSession(
             .keep_alive = false,
         },
     });
+    answered.* = true;
     defer body_writer.end() catch {};
 
     var stream = Stream{ .body = &body_writer, .gpa = gpa };
