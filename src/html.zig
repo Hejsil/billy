@@ -14,6 +14,10 @@
 //! emphasis, links and a rule. Anything else is shown as the text it is, which is
 //! always right, if not always pretty; `markdown` says where it falls short and
 //! what it would take to do properly.
+//!
+//! A tool call is a `<details>` a page shows collapsed, so a conversation with
+//! many calls stays readable: the summary is the call's head and the body is what
+//! it ran and what it produced.
 
 const std = @import("std");
 const Io = std.Io;
@@ -762,30 +766,66 @@ fn element(comptime tag: []const u8, class: []const u8, text: []const u8, out: *
     try out.print("</{s}>\n", .{tag});
 }
 
-/// Writes the head of a tool call's block: the glyph of the tool, its name and
-/// what the call acts on, and then what the call shows under that -- an edit's
-/// diff, or the command a bash call runs.
-///
-/// A call's block is two pieces, this and `toolEnd`, rather than one element
-/// opened here and closed there. A piece that is opened and never closed would
-/// swallow whatever follows it, and a live call shows its head long before its
-/// result; two pieces written next to each other are safe either way, and the
-/// frontend styles them as one block.
-pub fn toolBegin(gpa: std.mem.Allocator, call: Tools.Call, out: *Io.Writer) !void {
+/// Writes the head of a tool call as the `<summary>` of the call's `<details>`:
+/// the glyph of the tool, its name and what the call acts on. A collapsed call
+/// shows this line and nothing else, so it says which tool ran and what it ran
+/// on without showing what it did.
+pub fn toolHead(call: Tools.Call, out: *Io.Writer) !void {
     const head = Tools.Heading.of(call);
-    try out.writeAll("<div class=\"tool-head\">");
+    try out.writeAll("<summary class=\"tool-head\">");
     try out.print("<span class=\"glyph hue-{s}\">", .{@tagName(head.hue)});
     try escape(head.glyph, out);
     try out.writeAll("</span> <span class=\"name\">");
     try escape(head.name, out);
     try out.writeAll("</span>");
-    if (head.target.len > 0) {
+    // What the call acts on. A bash call's heading names nothing, so what it acts
+    // on is the command, and its first line goes here: a collapsed call then says
+    // what it ran rather than only that it ran something. The body shows the
+    // command whole, so what is here is the beginning of it and no more.
+    const target = if (head.target.len > 0) head.target else switch (call) {
+        .bash => |args| firstLine(args.command),
+        else => "",
+    };
+    if (target.len > 0) {
         try out.writeAll(" <span class=\"target\">");
-        try escape(head.target, out);
+        try escape(target, out);
         try out.writeAll("</span>");
     }
-    try out.writeAll("</div>\n");
+    try out.writeAll("</summary>\n");
+}
 
+/// The first line of `text`, with the whitespace around it taken off: what a
+/// collapsed bash call shows of its command. A command over several lines shows
+/// its first line only, and a long one is cut off by the page, which keeps the
+/// summary to one line.
+fn firstLine(text: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    return std.mem.trim(u8, text[0..end], " \t\r");
+}
+
+/// Writes a whole, empty-bodied tool call: the collapsed call a page shows while
+/// it runs, before the result that fills its body has arrived.
+///
+/// This is the same element `block` opens for `tool_begin`, closed and with
+/// nothing in its body, because a stream sends one event's worth of HTML on its
+/// own: an element left open there would be closed by whatever reads it, and the
+/// body sent with the result has to have somewhere to land. A caller that writes
+/// a whole conversation writes the two halves with `block` instead, since there
+/// they are one string and are closed by `tool_end`.
+pub fn toolOpened(call: Tools.Call, out: *Io.Writer) !void {
+    try out.writeAll("<details class=\"tool\">");
+    try toolHead(call, out);
+    try out.writeAll("<div class=\"tool-body\"></div></details>\n");
+}
+
+/// Writes the body of a tool call: what a page shows once the call is expanded.
+/// That is what the call meant to do -- an edit's diff, or the command a bash
+/// call runs -- and then what it produced.
+///
+/// This is the whole of the body, with no element of its own around it: a
+/// caller puts it inside the call's body element. The stream sends it on its own
+/// when a result arrives, to be added to a body already on the page.
+pub fn toolBody(gpa: std.mem.Allocator, call: Tools.Call, result: []const u8, out: *Io.Writer) !void {
     switch (call) {
         // The change the call means to make, from the call alone, so a replayed
         // session shows the same diff the run did.
@@ -799,16 +839,17 @@ pub fn toolBegin(gpa: std.mem.Allocator, call: Tools.Call, out: *Io.Writer) !voi
         .bash => |args| try element("pre", "command", std.mem.trimEnd(u8, args.command, "\n"), out),
         else => {},
     }
+    try toolResult(call, result, out);
 }
 
-/// Writes the body of a tool call's block: what the call produced.
+/// Writes what a tool call produced, which is the other half of its body.
 ///
 /// A write shows the content it put in the file rather than its result, since
 /// that content is what it produced; an edit shows nothing, since its result
 /// would only repeat the diff above it; and a call that failed shows billy's
 /// message for the failure whatever it was asked to do. Anything else shows the
 /// text the call returned.
-pub fn toolEnd(call: Tools.Call, result: []const u8, out: *Io.Writer) !void {
+fn toolResult(call: Tools.Call, result: []const u8, out: *Io.Writer) !void {
     const text = std.mem.trimEnd(u8, result, "\n");
     if (std.mem.startsWith(u8, result, "error: ")) {
         return element("pre", "error", text, out);
@@ -834,8 +875,22 @@ pub fn block(gpa: std.mem.Allocator, b: agent.Block, out: *Io.Writer) !void {
     switch (b) {
         .prompt => |text| try titled(agent.marks.prompt.glyph, "prompt", text, out),
         .answer => |text| try titled(agent.marks.answer.glyph, "answer", text, out),
-        .tool_begin => |call| try toolBegin(gpa, call, out),
-        .tool_end => |tool| try toolEnd(tool.call, tool.result, out),
+        // A tool call is one `<details>`, collapsed by default, opened here and
+        // closed by `tool_end`: the head is the summary a collapsed call shows,
+        // and the body is everything the call did. Writing a whole conversation
+        // gives the two halves next to each other, so they read as one element;
+        // the stream sends them apart, and the page puts the body into the call
+        // it opened. Each block is a piece of one element, which is why a caller
+        // that writes only some of a conversation must still write them in pairs.
+        .tool_begin => |call| {
+            try out.writeAll("<details class=\"tool\">");
+            try toolHead(call, out);
+            try out.writeAll("<div class=\"tool-body\">");
+        },
+        .tool_end => |tool| {
+            try toolBody(gpa, tool.call, tool.result, out);
+            try out.writeAll("</div></details>\n");
+        },
         // A compaction stands in for the messages it replaced. What it holds is
         // the ask and the summary, which a page could show; for now it is the
         // line the terminal shows it as.
@@ -872,15 +927,31 @@ test "a tool call is rendered as a head and a body" {
     defer out.deinit();
 
     // A read: the head names the tool and its path, the body is what came back.
-    try toolBegin(arena, Tools.parse(arena, .{ .id = "1", .function = .{
+    // The two halves are written by `block` as the two halves of one `<details>`
+    // -- the summary a collapsed call shows, and the body it opens onto.
+    const call = Tools.parse(arena, .{ .id = "1", .function = .{
         .name = "read",
         .arguments = "{\"path\":\"a.zig\"}",
-    } }), &out.writer);
-    try toolEnd(.{ .read = .{ .path = "a.zig" } }, "1\tconst x = 1;", &out.writer);
+    } });
+    try block(gpa, .{ .tool_begin = call }, &out.writer);
+    try block(gpa, .{ .tool_end = .{ .call = call, .result = "1\tconst x = 1;" } }, &out.writer);
     try std.testing.expectEqualStrings(
-        "<div class=\"tool-head\"><span class=\"glyph hue-blue\">▸</span> " ++
-            "<span class=\"name\">read</span> <span class=\"target\">a.zig</span></div>\n" ++
-            "<pre class=\"result\">1\tconst x = 1;</pre>\n",
+        "<details class=\"tool\"><summary class=\"tool-head\">" ++
+            "<span class=\"glyph hue-blue\">▸</span> <span class=\"name\">read</span>" ++
+            " <span class=\"target\">a.zig</span></summary>\n" ++
+            "<div class=\"tool-body\"><pre class=\"result\">1\tconst x = 1;</pre>\n</div></details>\n",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+
+    // The shape a stream sends while the call runs: the same element, whole and
+    // collapsed, with an empty body for the result to be added to.
+    try toolOpened(.{ .bash = .{ .command = "ls" } }, &out.writer);
+    try std.testing.expectEqualStrings(
+        "<details class=\"tool\"><summary class=\"tool-head\">" ++
+            "<span class=\"glyph hue-cyan\">❯</span> <span class=\"name\">bash</span>" ++
+            " <span class=\"target\">ls</span></summary>\n" ++
+            "<div class=\"tool-body\"></div></details>\n",
         out.written(),
     );
 }
@@ -898,13 +969,31 @@ test "a bash call shows its command, and a write shows what it wrote" {
         .name = "bash",
         .arguments = "{\"command\":\"ls -la <x>\"}",
     } });
-    try toolBegin(arena, bash, &out.writer);
+    try toolHead(bash, &out.writer);
+    try toolBody(arena, bash, "some output", &out.writer);
     // The command is escaped like any other text, and its trailing newline does
-    // not add a blank line.
+    // not add a blank line; the result follows it in the same body. The head
+    // carries the first line of the command too, so a collapsed call says what it
+    // ran.
     try std.testing.expectEqualStrings(
-        "<div class=\"tool-head\"><span class=\"glyph hue-cyan\">❯</span> " ++
-            "<span class=\"name\">bash</span></div>\n" ++
-            "<pre class=\"command\">ls -la &lt;x&gt;</pre>\n",
+        "<summary class=\"tool-head\"><span class=\"glyph hue-cyan\">❯</span> " ++
+            "<span class=\"name\">bash</span> <span class=\"target\">ls -la &lt;x&gt;</span></summary>\n" ++
+            "<pre class=\"command\">ls -la &lt;x&gt;</pre>\n" ++
+            "<pre class=\"result\">some output</pre>\n",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+
+    // A command over several lines: the head shows its first line, the body the
+    // whole of it.
+    const multi = Tools.parse(arena, .{ .id = "1", .function = .{
+        .name = "bash",
+        .arguments = "{\"command\":\"cd /tmp\\nls\"}",
+    } });
+    try toolHead(multi, &out.writer);
+    try std.testing.expectEqualStrings(
+        "<summary class=\"tool-head\"><span class=\"glyph hue-cyan\">❯</span> " ++
+            "<span class=\"name\">bash</span> <span class=\"target\">cd /tmp</span></summary>\n",
         out.written(),
     );
     out.clearRetainingCapacity();
@@ -915,12 +1004,12 @@ test "a bash call shows its command, and a write shows what it wrote" {
         .name = "write",
         .arguments = "{\"path\":\"a.zig\",\"content\":\"hello\"}",
     } });
-    try toolEnd(write, "wrote 5 bytes to a.zig", &out.writer);
+    try toolBody(arena, write, "wrote 5 bytes to a.zig", &out.writer);
     try std.testing.expectEqualStrings("<pre class=\"result\">hello</pre>\n", out.written());
     out.clearRetainingCapacity();
 
     // A failure is shown as billy's message for it, whatever the call was.
-    try toolEnd(write, "error: cannot write a.zig: AccessDenied", &out.writer);
+    try toolBody(arena, write, "error: cannot write a.zig: AccessDenied", &out.writer);
     try std.testing.expectEqualStrings(
         "<pre class=\"error\">error: cannot write a.zig: AccessDenied</pre>\n",
         out.written(),
@@ -940,18 +1029,21 @@ test "an edit is shown as the diff of the strings it worked on" {
         .name = "edit",
         .arguments = "{\"path\":\"a.zig\",\"old_string\":\"old\",\"new_string\":\"new\"}",
     } });
-    try toolBegin(arena, edit, &out.writer);
-    // The diff is right under the header, and its result shows nothing.
+    try toolHead(edit, &out.writer);
+    // The diff is the body, and the result of the edit shows nothing of its own
+    // -- it would only repeat the diff.
+    try toolBody(arena, edit, "replaced 1 occurrence(s) in a.zig", &out.writer);
     try std.testing.expectEqualStrings(
-        "<div class=\"tool-head\"><span class=\"glyph hue-yellow\">✎</span> " ++
-            "<span class=\"name\">edit</span> <span class=\"target\">a.zig</span></div>\n" ++
+        "<summary class=\"tool-head\"><span class=\"glyph hue-yellow\">✎</span> " ++
+            "<span class=\"name\">edit</span> <span class=\"target\">a.zig</span></summary>\n" ++
             "<pre class=\"diff\"><span class=\"removed\">-old</span>\n" ++
             "<span class=\"added\">+new</span>\n</pre>\n",
         out.written(),
     );
     out.clearRetainingCapacity();
 
-    try toolEnd(edit, "replaced 1 occurrence(s) in a.zig", &out.writer);
+    // An edit that changes nothing shows no body at all.
+    try toolBody(arena, .{ .edit = .{ .path = "a.zig", .old_string = "same", .new_string = "same" } }, "replaced 0 occurrence(s) in a.zig", &out.writer);
     try std.testing.expectEqualStrings("", out.written());
 }
 
@@ -1048,9 +1140,15 @@ test "a whole conversation is rendered, a tool call and a compaction included" {
     // The prompt is a block of its own, and its text is laid out as markdown.
     try std.testing.expect(std.mem.indexOf(u8, page, "<div class=\"block prompt\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<p>read it</p>") != null);
-    // The read call is headed and its result is the body.
+    // The read call is headed and its result is the body, wrapped in one
+    // `<details>` that a page shows collapsed until it is opened.
+    try std.testing.expect(std.mem.indexOf(u8, page, "<details class=\"tool\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<summary class=\"tool-head\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<span class=\"name\">read</span>") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<pre class=\"result\">1\tconst x = 1;</pre>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "</div></details>\n") != null);
+    // The details is not opened, so a page shows it collapsed to begin with.
+    try std.testing.expect(std.mem.indexOf(u8, page, "<details class=\"tool\" open>") == null);
     // The edit is shown as its diff, and no result of its own.
     try std.testing.expect(std.mem.indexOf(u8, page, "<span class=\"removed\">-old</span>") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<span class=\"added\">+new</span>") != null);

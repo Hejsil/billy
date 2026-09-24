@@ -91,9 +91,25 @@
   pre code { background: none; padding: 0; }
   pre.error { color: var(--del); }
 
-  /* A tool call: its head, then what it ran and what came back. */
-  .tool-head { color: var(--dim); font-size: 12px; margin-bottom: 5px; }
+  /* A tool call: a headed summary that opens onto what the call ran and what it
+     produced, collapsed by default so a long conversation stays readable. */
+  details.tool { margin-bottom: 16px; }
+  summary.tool-head {
+    color: var(--dim); font-size: 12px; cursor: pointer; list-style: none;
+    display: flex; align-items: baseline; gap: 5px;
+    /* One line, so a call stays a single compact row; a long path is cut off
+       with an ellipsis rather than wrapping. */
+    white-space: nowrap; overflow: hidden;
+  }
+  summary.tool-head::-webkit-details-marker { display: none; }
+  summary.tool-head:hover .name { text-decoration: underline; }
+  /* The disclosure marker: a chevron that turns to point down once the call is
+     open. It is a chevron rather than a triangle so it is not mistaken for the
+     glyph of a `read`, which is a triangle too. */
+  summary.tool-head::before { content: '›'; color: #3a3f4b; flex: none; }
+  details.tool[open] summary.tool-head::before { transform: rotate(90deg); }
   .tool-head .name { color: var(--text); font-weight: 600; }
+  .tool-head .target { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
   .tool-head .glyph { color: var(--dim); }
   .tool-head .glyph.hue-blue { color: var(--accent); }
   .tool-head .glyph.hue-green { color: var(--add); }
@@ -101,6 +117,10 @@
   .tool-head .glyph.hue-cyan { color: #7dcfff; }
   .tool-head .glyph.hue-magenta { color: #bb9af7; }
   .tool-head .glyph.hue-red { color: var(--del); }
+  /* The body is indented under the summary, and its last piece does not add a
+     gap of its own. */
+  .tool-body { margin: 5px 0 0 14px; }
+  .tool-body > :last-child { margin-bottom: 0; }
   pre.diff .removed { color: var(--del); }
   pre.diff .added { color: var(--add); }
   pre.diff .context, pre.diff .elided { color: var(--dim); }
@@ -140,6 +160,10 @@ const form = document.getElementById('prompt');
 const input = document.getElementById('text');
 let selected = null;
 let working = false;
+// The tool call the turn is in the middle of: the `<details>` opened by a
+// `tool_begin` event, whose body the `tool_end` event fills in. Null when no
+// call is open.
+let openCall = null;
 
 // The sessions are listed again when a new one is started and when a turn ends,
 // since which session was written to last is what orders them. The list is
@@ -199,6 +223,8 @@ async function open(id) {
   for (const item of list.children) item.classList.toggle('selected', item.dataset.id === id);
   headerBox.innerHTML = body.header;
   conversation.innerHTML = body.blocks;
+  // Whatever the old conversation had open is gone with it.
+  openCall = null;
   scrollToEnd();
   input.focus();
 }
@@ -226,6 +252,8 @@ async function send(text) {
     note('lost the connection: ' + err.message);
   } finally {
     working = false;
+    // A turn that ended mid-call leaves nothing to fill in.
+    openCall = null;
     form.classList.remove('working');
     input.disabled = false;
     input.focus();
@@ -265,6 +293,22 @@ function handleFrame(frame) {
   if (event === 'block') {
     // The block is the server's HTML, which is what it is for.
     conversation.insertAdjacentHTML('beforeend', JSON.parse(data).html);
+    scrollToEnd();
+  } else if (event === 'tool_begin') {
+    // The call arrives whole -- head and an empty body -- and collapsed, since
+    // the element is not opened; the result below fills its body.
+    conversation.insertAdjacentHTML('beforeend', JSON.parse(data).html);
+    openCall = conversation.lastElementChild;
+    scrollToEnd();
+  } else if (event === 'tool_end') {
+    const html = JSON.parse(data).html;
+    const body = openCall && openCall.querySelector('.tool-body');
+    // The body goes into the call on screen; if none is open -- the events are
+    // always a pair, so this is only a stream that went wrong -- it is shown as
+    // a block of its own rather than lost.
+    if (body) body.insertAdjacentHTML('beforeend', html);
+    else conversation.insertAdjacentHTML('beforeend', html);
+    openCall = null;
     scrollToEnd();
   } else if (event === 'header') {
     headerBox.innerHTML = JSON.parse(data).html;

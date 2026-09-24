@@ -632,10 +632,11 @@ const Prompt = struct { text: []const u8 };
 /// run as it happens.
 ///
 /// The answer is `text/event-stream`, one event per thing the run shows: a
-/// `block` for each finished block (the prompt, a tool call with its result, the
-/// reply), a `header` with the new gauge and cost, an `error` when the run
-/// fails, and `done` at the end. Each is written and flushed as it happens, so
-/// the page fills in while the model works rather than after it has finished.
+/// `block` for each finished block (a prompt, a reply, a line billy writes), a
+/// `tool_begin` and `tool_end` for the two halves of a tool call, a `header` with
+/// the new gauge and cost, an `error` when the run fails, and `done` at the end.
+/// Each is written and flushed as it happens, so the page fills in while the
+/// model works rather than after it has finished.
 ///
 /// A session a turn is already running for answers 409: one thing at a time.
 fn askSession(
@@ -748,8 +749,26 @@ const Stream = struct {
         const self: *Stream = @ptrCast(@alignCast(context));
         var rendered: std.Io.Writer.Allocating = .init(self.gpa);
         defer rendered.deinit();
-        try html.block(self.gpa, b, &rendered.writer);
-        try self.send("block", HtmlEvent{ .html = rendered.written() });
+
+        const event: []const u8 = switch (b) {
+            // The two halves of a tool call go out as events of their own, so the
+            // page can put the result into the call it already has on screen.
+            // Everything else is one `block`.
+            .tool_begin => "tool_begin",
+            .tool_end => "tool_end",
+            else => "block",
+        };
+        switch (b) {
+            // The whole element, with an empty body: the head a collapsed call
+            // shows while it runs. The page adds the body to it when the result
+            // arrives, so the element is complete here rather than left open.
+            .tool_begin => |call| try html.toolOpened(call, &rendered.writer),
+            // Only the body, which the page adds to the call already on screen;
+            // the element around it is there and is not written again.
+            .tool_end => |tool| try html.toolBody(self.gpa, tool.call, tool.result, &rendered.writer),
+            else => try html.block(self.gpa, b, &rendered.writer),
+        }
+        try self.send(event, HtmlEvent{ .html = rendered.written() });
     }
 
     fn fail(self: *Stream, message: []const u8) !void {
