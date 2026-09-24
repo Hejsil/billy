@@ -63,6 +63,118 @@ pub const Display = struct {
     style: styling.Style = .plain,
 };
 
+/// One unit of what a run shows: the pieces a conversation is made of, each
+/// finished before the next begins. A block is what the run says happened; how it
+/// looks is the frontend's, so nothing here is text. A tool call and the result
+/// that answered it are one block, since that is one thing the model did.
+/// One unit of what a run shows: the pieces a conversation is made of, in the
+/// order they happened. A block is what the run says happened; how it looks is
+/// the frontend's, so nothing here is text.
+///
+/// A tool call is two blocks, the call as it begins and the call with its result
+/// as it ends, so a frontend can show a slow command while it runs. A frontend
+/// that shows only finished work ignores the first.
+pub const Block = union(enum) {
+    /// What the user typed.
+    prompt: []const u8,
+    /// What the model answered.
+    answer: []const u8,
+    /// A tool call as it begins, before it runs.
+    tool_begin: Tools.Call,
+    /// A tool call and the result that answered it.
+    tool_end: Tool,
+    /// A compaction: the prompt that asked for it and the summary it produced,
+    /// which a request carries in place of the conversation before it. A frontend
+    /// may show them, or stand them in with a line of its own.
+    compacted: Compacted,
+    /// A line billy writes itself, such as why a run stopped.
+    notice: []const u8,
+
+    pub const Tool = struct {
+        /// The call as it was parsed, which is what a frontend shows to say what
+        /// ran. It belongs to the tool set's scratch, so it lasts until the next
+        /// call; a frontend that keeps one has to copy what it keeps.
+        call: Tools.Call,
+        /// The text of the result, capped by `Tools.run`. The copy `run` wrote,
+        /// which is the caller's for as long as it keeps it.
+        result: []const u8,
+    };
+
+    pub const Compacted = struct {
+        /// What was asked of the model: summarize the conversation so far.
+        prompt: []const u8,
+        /// What it answered, which is what a request now carries in place of the
+        /// messages before it. Owned by the caller until the next block.
+        summary: []const u8,
+    };
+};
+
+/// Where a run's blocks go. The run says what happened and the emitter decides
+/// how it looks, which is what lets the same run be shown in a terminal or over
+/// the web without the run knowing which it is talking to.
+pub const Emitter = struct {
+    context: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Shows one block. Blocks arrive in the order they happened, and a
+        /// frontend gets each one whole; nothing is half-shown.
+        block: *const fn (context: *anyopaque, block: Block) anyerror!void,
+    };
+
+    /// Shows one block.
+    pub fn show(emitter: Emitter, block: Block) !void {
+        return emitter.vtable.block(emitter.context, block);
+    }
+};
+
+/// Shows blocks on the terminal, the way billy always has: the block headers, a
+/// reply's markdown laid out by the format script, and the tools laid out by
+/// theirs.
+const Terminal = struct {
+    out: *Io.Writer,
+    display: Display,
+    /// For what showing a block builds, such as an edit's diff. Each block frees
+    /// what it takes, so nothing is kept between them.
+    scratch: std.mem.Allocator,
+
+    fn emitter(self: *Terminal) Emitter {
+        return .{ .context = self, .vtable = &.{ .block = show } };
+    }
+
+    fn show(context: *anyopaque, block: Block) anyerror!void {
+        const self = selfOf(context);
+        switch (block) {
+            .prompt => |text| try printPrompt(self.out, text, self.display),
+            .answer => |content| try printAnswer(self.out, content, self.display),
+            // The header goes out as the call begins, so a command that runs
+            // long has it on screen while it runs.
+            .tool_begin => |call| {
+                try Tools.printHead(self.scratch, call, self.display.formats, self.display.style, self.out);
+                try self.out.flush();
+            },
+            // The header is out already, so only the result is left; the blank
+            // line ends the block as it always has.
+            .tool_end => |tool| {
+                try Tools.printResult(tool.call, tool.result, self.display.style, self.out);
+                try self.out.writeAll("\n");
+                try self.out.flush();
+            },
+            // The terminal stands the two in with one line rather than showing
+            // them, which is what a compaction has always looked like here.
+            .compacted => try printCompacted(self.out, self.display.style),
+            .notice => |text| {
+                try self.out.print("{s}\n", .{text});
+                try self.out.flush();
+            },
+        }
+    }
+
+    fn selfOf(context: *anyopaque) *Terminal {
+        return @ptrCast(@alignCast(context));
+    }
+};
+
 const system_prompt =
     \\You are a coding agent working in the user's project directory.
     \\Inspect the code before you change it, and use the tools to do the work.
@@ -299,14 +411,12 @@ pub fn run(
         .io = io,
         .dir = work_dir,
         .gpa = gpa,
-        .log = out,
         .formats = config.display.formats,
         .bash_timeout_s = config.bash_timeout_s,
         .style = config.display.style,
         .search = config.search,
         .http = &http,
     });
-    defer tool_set.deinit();
     var client: llm.Client = .{
         .gpa = gpa,
         .io = io,
@@ -333,6 +443,11 @@ pub fn run(
     try session.appendSystemPrompt(prompt_text);
     try session.ensureTools(tool_set.definitions());
 
+    // The blocks of the run are shown on the terminal, the way billy has always
+    // shown them.
+    var terminal = Terminal{ .out = out, .display = config.display, .scratch = gpa };
+    const emitter = terminal.emitter();
+
     // The header is rebuilt for every prompt, so it reflects the tokens and cost
     // of the turns run so far. One buffer holds it for the whole loop; each pass
     // clears it and writes the header into it.
@@ -345,7 +460,7 @@ pub fn run(
         // the header is built, so the header then reports the smaller
         // conversation. Doing nothing is not an error: the prompt goes on with
         // the conversation as it is.
-        maybeCompact(io, &client, out, config, session) catch |err|
+        maybeCompact(io, &client, emitter, config, session) catch |err|
             std.log.warn("compaction failed: {s}", .{@errorName(err)});
         header.clearRetainingCapacity();
         try sessionHeader(&header.writer, config, session.id(), session.context_tokens, session.cost);
@@ -356,11 +471,11 @@ pub fn run(
         // prompt is written out now as the block a replay shows: the `> ` belongs
         // to the input, not to what was said. Flushed before the request, which
         // may take a while, so the user sees what was sent.
-        try printPrompt(out, line, config.display);
+        try emitter.show(.{ .prompt = line });
         try out.flush();
         // A failed request must not end the session: report it and take the
         // next request from the user.
-        turn(io, &client, &tool_set, out, config, session) catch |err|
+        turn(io, &client, &tool_set, emitter, config, session) catch |err|
             std.log.err("request failed: {s}", .{@errorName(err)});
     }
     try out.flush();
@@ -529,15 +644,23 @@ fn printMessage(
     }
 }
 
-/// Runs the model until it replies with text instead of tool calls.
+/// Runs the model until it replies with text instead of tool calls, showing what
+/// happens as blocks as it goes.
 fn turn(
     io: Io,
     client: *llm.Client,
     tool_set: *Tools,
-    out: *Io.Writer,
+    emitter: Emitter,
     config: Config,
     session: *Session,
 ) !void {
+    // Holds the parsed call of each tool call the model asks for, which is read
+    // until that call has been run and shown. Reset per call, so a turn that
+    // makes many calls holds only the one it is on.
+    var scratch_state = std.heap.ArenaAllocator.init(tool_set.gpa);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+
     var remaining: usize = config.max_turns;
     // A compaction that failed is not tried again within the same turn, so a
     // provider that will not summarize cannot turn every request of a long turn
@@ -549,7 +672,7 @@ fn turn(
         // instead of failing on an overlong request. A failure to compact is not
         // the turn's: the request goes out with the conversation as it is.
         if (!compact_failed) {
-            maybeCompact(io, client, out, config, session) catch |err| {
+            maybeCompact(io, client, emitter, config, session) catch |err| {
                 std.log.warn("compaction failed: {s}", .{@errorName(err)});
                 compact_failed = true;
             };
@@ -571,20 +694,39 @@ fn turn(
         try session.append(completion.message);
 
         const message = completion.message;
-        const calls = message.tool_calls orelse
-            return printAnswer(out, message.content, config.display);
-        if (calls.len == 0) return printAnswer(out, message.content, config.display);
+        const calls = message.tool_calls orelse {
+            return emitter.show(.{ .answer = message.content orelse "" });
+        };
+        if (calls.len == 0) return emitter.show(.{ .answer = message.content orelse "" });
 
         for (calls) |call| {
+            // The call is parsed and shown before it runs, so a command that
+            // runs long has its header on screen while it runs, and then the
+            // result once it is in. The parsed call lives in the turn's scratch,
+            // which the next call resets, so it is used before then.
+            _ = scratch_state.reset(.retain_capacity);
+            const parsed = Tools.parse(scratch, call);
+            try emitter.show(.{ .tool_begin = parsed });
+
+            var result: std.Io.Writer.Allocating = .init(tool_set.gpa);
+            defer result.deinit();
+            try tool_set.run(parsed, &result.writer);
+
             try session.append(.{
                 .role = "tool",
                 .tool_call_id = call.id,
-                .content = try tool_set.run(call),
+                .content = result.written(),
             });
+            try emitter.show(.{ .tool_end = .{ .call = parsed, .result = result.written() } });
         }
     }
-    try out.print("stopped after {d} turns without a final answer\n", .{config.max_turns});
-    try out.flush();
+    var buffer: [96]u8 = undefined;
+    const stopped = std.fmt.bufPrint(
+        &buffer,
+        "stopped after {d} turns without a final answer",
+        .{config.max_turns},
+    ) catch "stopped without a final answer";
+    try emitter.show(.{ .notice = stopped });
 }
 
 /// The rates in effect right now. Zero for a model billy does not know, which
@@ -629,7 +771,7 @@ fn compactThreshold(config: Config) usize {
 fn maybeCompact(
     io: Io,
     client: *llm.Client,
-    out: *Io.Writer,
+    emitter: Emitter,
     config: Config,
     session: *Session,
 ) !void {
@@ -652,7 +794,7 @@ fn maybeCompact(
     // it.
     session.context_tokens = 0;
     try session.appendCompaction(compact_prompt, summary);
-    try printCompacted(out, config.display.style);
+    try emitter.show(.{ .compacted = .{ .prompt = compact_prompt, .summary = summary } });
 }
 
 /// One request that asks the model to summarize the conversation it is being
@@ -1070,6 +1212,13 @@ fn testConfig(model: []const u8, cwd: []const u8, home: ?[]const u8) Config {
     };
 }
 
+/// A terminal a test can show blocks through and read back from `out`. The
+/// returned value has to outlive the emitter taken from it, since the emitter
+/// borrows it.
+fn testTerminal(out: *Io.Writer, display: Display) Terminal {
+    return .{ .out = out, .display = display, .scratch = std.testing.allocator };
+}
+
 /// Off-peak on a Friday, so the rates are the published base rates.
 const off_peak_utc = 1789732800; // Friday 2026-09-18 12:00 UTC
 /// Peak on a Friday, when DeepSeek doubles its rates.
@@ -1428,7 +1577,8 @@ test "maybeCompact folds the conversation into a summary at its end" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try maybeCompact(io, &client, &out.writer, config, &session);
+    var terminal = testTerminal(&out.writer, .{});
+    try maybeCompact(io, &client, terminal.emitter(), config, &session);
 
     try group.await(io);
     if (provider.err) |err| return err;
@@ -1480,18 +1630,20 @@ test "maybeCompact does nothing below the threshold, off, or with nothing new" {
     // There is no client: the function must return before it reaches for one.
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
+    var terminal = testTerminal(&out.writer, .{});
+    const emitter = terminal.emitter();
 
     // Below the threshold.
     session.context_tokens = 100;
-    try maybeCompact(io, undefined, &out.writer, config, &session);
+    try maybeCompact(io, undefined, emitter, config, &session);
     // Turned off.
     session.context_tokens = 999;
     config.compact_at = 0;
-    try maybeCompact(io, undefined, &out.writer, config, &session);
+    try maybeCompact(io, undefined, emitter, config, &session);
     // A model with no known window has no threshold to measure against.
     config.compact_at = 80;
     config.model_info = null;
-    try maybeCompact(io, undefined, &out.writer, config, &session);
+    try maybeCompact(io, undefined, emitter, config, &session);
 
     // Nothing was added, and nothing was printed.
     try std.testing.expectEqual(2, session.messages.items.len);
@@ -1518,7 +1670,8 @@ test "maybeCompact does not compact a summary that stands alone" {
     session.context_tokens = 999;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try maybeCompact(io, undefined, &out.writer, config, &session);
+    var terminal = testTerminal(&out.writer, .{});
+    try maybeCompact(io, undefined, terminal.emitter(), config, &session);
 
     try std.testing.expectEqual(3, session.messages.items.len);
     try std.testing.expectEqualStrings("", out.written());
@@ -1560,5 +1713,238 @@ const SummaryProvider = struct {
                 "\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"total_tokens\":105}}",
             .{ .keep_alive = false },
         );
+    }
+};
+
+test "the terminal shows a tool call the way a replay does" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    defer http.deinit();
+    var tool_set = try Tools.init(.{
+        .io = std.testing.io,
+        .dir = Io.Dir.cwd(),
+        .gpa = gpa,
+        .bash_timeout_s = 120,
+        .http = &http,
+    });
+
+    const call: llm.ToolCall = .{ .id = "1", .function = .{
+        .name = "bash",
+        .arguments = "{\"command\":\"echo hi\"}",
+    } };
+
+    // Live: the call is parsed and its header written before it runs, and the
+    // result once it is in, exactly as the turn does it.
+    var live: std.Io.Writer.Allocating = .init(gpa);
+    defer live.deinit();
+    var terminal = testTerminal(&live.writer, .{});
+    const emitter = terminal.emitter();
+
+    const parsed = Tools.parse(arena, call);
+    try emitter.show(.{ .tool_begin = parsed });
+    var result: std.Io.Writer.Allocating = .init(gpa);
+    defer result.deinit();
+    try tool_set.run(parsed, &result.writer);
+    try emitter.show(.{ .tool_end = .{ .call = parsed, .result = result.written() } });
+
+    // A replay renders the stored call on its own.
+    var replayed: std.Io.Writer.Allocating = .init(gpa);
+    defer replayed.deinit();
+    try Tools.describe(arena, parsed, result.written(), .{}, .plain, &replayed.writer);
+
+    // The two paths show the same bytes, which is what keeps a run and a resume
+    // of it reading alike. The header before the result is what a slow command
+    // needs on screen while it runs.
+    try std.testing.expectEqualStrings("❯ bash\necho hi\n✓ exit 0\n▾ stdout\nhi\n\n", live.written());
+    try std.testing.expectEqualStrings(replayed.written(), live.written());
+}
+
+/// An emitter that records what a run shows, copying what it keeps, so a test
+/// can read a run back with no terminal in the way. Nothing here is shaped like
+/// a terminal, which is the point: it is the second frontend the emitter exists
+/// for.
+const Recorder = struct {
+    /// Owns the names and text it records, since a block borrows the tool set's
+    /// scratch and the caller's buffers, neither of which outlives the run.
+    arena: std.mem.Allocator,
+    seen: std.ArrayList(Seen) = .empty,
+
+    const Seen = union(enum) {
+        prompt: []const u8,
+        answer: []const u8,
+        tool_begin: []const u8,
+        tool_end: struct { name: []const u8, result: []const u8 },
+        compacted: Block.Compacted,
+        notice: []const u8,
+    };
+
+    fn emitter(self: *Recorder) Emitter {
+        return .{ .context = self, .vtable = &.{ .block = show } };
+    }
+
+    fn show(context: *anyopaque, block: Block) anyerror!void {
+        const self = selfOf(context);
+        const seen: Seen = switch (block) {
+            .prompt => |text| .{ .prompt = try self.keeper(text) },
+            .answer => |text| .{ .answer = try self.keeper(text) },
+            .tool_begin => |call| .{ .tool_begin = try self.keeper(callName(call)) },
+            .tool_end => |tool| .{ .tool_end = .{
+                .name = try self.keeper(callName(tool.call)),
+                .result = try self.keeper(tool.result),
+            } },
+            .compacted => |compaction| .{ .compacted = .{
+                .prompt = try self.keeper(compaction.prompt),
+                .summary = try self.keeper(compaction.summary),
+            } },
+            .notice => |text| .{ .notice = try self.keeper(text) },
+        };
+        try self.seen.append(self.arena, seen);
+    }
+
+    /// A copy of `text` in the recorder's arena, so what it records lasts as long
+    /// as the recorder rather than as long as the block.
+    fn keeper(self: *Recorder, text: []const u8) ![]const u8 {
+        return self.arena.dupe(u8, text);
+    }
+
+    /// The name of the tool a call names, so a test can say which one ran.
+    fn callName(call: Tools.Call) []const u8 {
+        return switch (call) {
+            .read => "read",
+            .write => "write",
+            .edit => "edit",
+            .bash => "bash",
+            .web_search => "web_search",
+            .unknown => |name| name,
+            .malformed => |bad| bad.name,
+        };
+    }
+
+    fn selfOf(context: *anyopaque) *Recorder {
+        return @ptrCast(@alignCast(context));
+    }
+};
+
+test "a turn shows the tool it runs and then the answer" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    try session.appendSystemPrompt("be terse");
+
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+
+    var provider: TurnProvider = .{};
+    var group: Io.Group = .init;
+    try group.concurrent(io, TurnProvider.serve, .{ io, &listener, &provider });
+
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/chat/completions", .{
+        listener.socket.address.getPort(),
+    });
+    defer gpa.free(url);
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+    var client: llm.Client = .{
+        .gpa = gpa,
+        .io = io,
+        .api_key = "k",
+        .url = url,
+        .model = "m",
+        .http = &http,
+    };
+    var tool_set = try Tools.init(.{
+        .io = io,
+        .dir = Io.Dir.cwd(),
+        .gpa = gpa,
+        .bash_timeout_s = 120,
+        .http = &http,
+    });
+
+    var recorder = Recorder{ .arena = arena_state.allocator() };
+    try turn(io, &client, &tool_set, recorder.emitter(), testConfig("m", "/work", null), &session);
+
+    try group.await(io);
+    if (provider.err) |err| return err;
+
+    // The call is shown as it begins, so its header could go up while it ran,
+    // and again with the result it produced. The answer follows.
+    try std.testing.expectEqual(3, recorder.seen.items.len);
+    try std.testing.expectEqualStrings("bash", recorder.seen.items[0].tool_begin);
+    const tool = recorder.seen.items[1].tool_end;
+    try std.testing.expectEqualStrings("bash", tool.name);
+    try std.testing.expectEqualStrings("exit code: 0\nhi\n", tool.result);
+    try std.testing.expectEqualStrings("all done", recorder.seen.items[2].answer);
+
+    // What was shown is what the session kept, so a resume replays the turn.
+    try std.testing.expectEqualStrings(
+        "exit code: 0\nhi\n",
+        session.contentOf(session.messages.items[session.messages.items.len - 2]).?,
+    );
+    try std.testing.expectEqualStrings(
+        "all done",
+        session.contentOf(session.messages.items[session.messages.items.len - 1]).?,
+    );
+}
+
+/// A stand-in for the model that asks for one bash command and then answers, so a
+/// test can watch a whole turn without the network. It answers as many requests
+/// as it is told to, since a turn makes one per round trip.
+const TurnProvider = struct {
+    /// Requests left to answer.
+    remaining: usize = 2,
+    /// The first failure the server ran into, so the test reports it rather than
+    /// hanging on the connection.
+    err: ?anyerror = null,
+
+    fn serve(io: Io, listener: *std.Io.net.Server, self: *TurnProvider) Io.Cancelable!void {
+        self.run(io, listener) catch |err| {
+            self.err = err;
+        };
+    }
+
+    fn run(self: *TurnProvider, io: Io, listener: *std.Io.net.Server) !void {
+        while (self.remaining > 0) : (self.remaining -= 1) {
+            var stream = try listener.accept(io);
+            defer stream.close(io);
+
+            var in_buffer: [4096]u8 = undefined;
+            var out_buffer: [4096]u8 = undefined;
+            var reader = stream.reader(io, &in_buffer);
+            var writer = stream.writer(io, &out_buffer);
+            var server: std.http.Server = .init(&reader.interface, &writer.interface);
+
+            var request = try server.receiveHead();
+            var body_buffer: [8192]u8 = undefined;
+            const body_reader = request.readerExpectNone(&body_buffer);
+            const body = try body_reader.allocRemaining(std.testing.allocator, .unlimited);
+            defer std.testing.allocator.free(body);
+
+            // The first request is answered with a call; once the result is in
+            // the conversation, the next answers with text.
+            const answered = std.mem.indexOf(u8, body, "\"tool\"") != null;
+            const reply = if (answered)
+                "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"all done\"}}]," ++
+                    "\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":2,\"total_tokens\":22}}"
+            else
+                "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"call_1\"," ++
+                    "\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":" ++
+                    "\"{\\\"command\\\":\\\"echo hi\\\"}\"}}]}}]," ++
+                    "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}";
+            try request.respond(reply, .{ .keep_alive = false });
+        }
     }
 };

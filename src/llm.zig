@@ -193,8 +193,7 @@ pub const Client = struct {
         // to carry its length before any of it is sent, and once onto the
         // connection. Neither holds a copy of it, so a request does not allocate
         // its own body.
-        var counted_buffer: [1024]u8 = undefined;
-        var counted: std.Io.Writer.Discarding = .init(&counted_buffer);
+        var counted: std.Io.Writer.Discarding = .init("");
         try writeBody(&counted.writer, request);
 
         var req = try client.http.request(.POST, try std.Uri.parse(client.url), .{
@@ -412,8 +411,7 @@ test "a request counts out to exactly the body it writes" {
     // The length the head carries is the count, and the bytes sent are what a
     // second pass writes. They have to be the same length *and* the same bytes,
     // or the request goes out malformed.
-    var counted_buffer: [16]u8 = undefined;
-    var counted: std.Io.Writer.Discarding = .init(&counted_buffer);
+    var counted: std.Io.Writer.Discarding = .init("");
     try writeBody(&counted.writer, request);
 
     var written: std.Io.Writer.Allocating = .init(gpa);

@@ -99,8 +99,6 @@ io: Io,
 dir: Io.Dir,
 /// For temporary buffers.
 gpa: std.mem.Allocator,
-/// Reports tool activity to the user.
-log: *Io.Writer,
 /// How a tool's block is laid out for the user. Shared with the transcript, so a
 /// replayed session shows a call the way the run did.
 formats: Formats,
@@ -114,11 +112,6 @@ style: Style,
 /// leaves `web_search` out of the tool set billy offers, so the model is never
 /// given a tool that could not run.
 search: ?Search.Client,
-/// One call's scratch: the parsed arguments and the result. It is reset at the
-/// start of every call, so nothing here outlives the call that made it; the
-/// caller interns what it keeps. That is what keeps a long conversation from
-/// holding every result, and what lets the tools take no allocator of their own.
-scratch: std.heap.ArenaAllocator,
 
 /// What a tool set is built from, gathered into one so the constructor reads
 /// as what each value is rather than as a run of positional arguments, which
@@ -129,8 +122,6 @@ pub const Options = struct {
     dir: Io.Dir,
     /// For temporary buffers.
     gpa: std.mem.Allocator,
-    /// Reports tool activity to the user.
-    log: *Io.Writer,
     /// How a tool's block is laid out for the user. Null layouts, for both a bash
     /// command and an edit diff, show the text as written.
     formats: Formats = .{},
@@ -156,7 +147,6 @@ pub fn init(options: Options) !Tools {
         .io = options.io,
         .dir = options.dir,
         .gpa = options.gpa,
-        .log = options.log,
         .formats = options.formats,
         .bash_timeout_s = options.bash_timeout_s,
         .style = options.style,
@@ -168,14 +158,7 @@ pub fn init(options: Options) !Tools {
             .max_results = config.max_results,
             .http = options.http,
         } else null,
-        .scratch = .init(options.gpa),
     };
-}
-
-/// Frees what a tool set owns. The definitions are built from comptime strings
-/// and go straight into the session, so the scratch is all there is.
-pub fn deinit(tools: *Tools) void {
-    tools.scratch.deinit();
 }
 
 /// The definitions a session should be given: every tool billy offers, with the
@@ -186,66 +169,159 @@ pub fn definitions(tools: *const Tools) []const Session.Definition {
     return if (tools.search != null) &specs_with_search else &specs;
 }
 
-/// Runs one tool call and returns its result. Tool failures are reported to
-/// the model as text so that it can react to them.
+/// What one call produced is written, not returned: `run` writes the result text
+/// to the writer it is given, so the caller decides where a result lands and the
+/// tools own no buffer of their own.
 ///
-/// What the user sees comes from `printHead` and `printResult`, which the
-/// transcript reuses, so a replayed session shows exactly what a live one
-/// did. The head goes out before the tool runs, so a slow command shows what
-/// it is doing, and the result follows it.
+/// A result longer than `max_result_len` is cut there, with a count of what was
+/// left out, so a tool that returns a wall of text cannot fill the model's
+/// context. That is billy's rule for every call rather than a tool's, so it is
+/// applied here, where a call's result passes, and no tool has to know about it.
+pub fn run(tools: *Tools, call: Call, result: *Io.Writer) !void {
+    var buffer: [result_buffer_len]u8 = undefined;
+    var limited = Limited.init(result, &buffer, max_result_len);
+    try tools.dispatch(call, &limited.writer);
+    // What is still gathered has to be passed on before the count of what was
+    // dropped is known, and before the caller reads the result.
+    try limited.writer.flush();
+    // A tool that wrote past the limit is told what it lost, which the model
+    // reads as a truncation rather than as the result simply ending.
+    if (limited.dropped > 0) {
+        try result.print("\n… {d} more bytes", .{limited.dropped});
+    }
+}
+
+/// How much of a result is gathered before it is passed on. Room for a good few
+/// lines, so a tool that writes a line at a time does not become a call to the
+/// writer behind this for every line, while staying small enough to keep on the
+/// stack.
 ///
-/// The parsed call and the result live in the tools' own scratch, which is
-/// dropped at the start of the next call. The caller interns what it keeps, so
-/// the result only has to last until then, which keeps a long conversation from
-/// holding every result. A caller that needs to keep one past the next call
-/// must copy it.
-pub fn run(tools: *Tools, call: llm.ToolCall) ![]const u8 {
-    _ = tools.scratch.reset(.retain_capacity);
-    const arena = tools.scratch.allocator();
+/// TODO: forward more of a write in one call. What is gathered is handed on a
+/// chunk at a time, and within a chunk each slice and the repeats are handed on
+/// separately, so `print("exit code: {d}\n")` crosses into the writer behind this
+/// several times for what is one line. `writeSplatHeaderLimit` merges the slices,
+/// the repeats and a header into one call, which is the shape wanted here, but it
+/// can consume less than it was given when the writer behind it fills up, so
+/// using it means rebuilding what is left and handing that over again. Worth it
+/// only if this shows up in a profile: it is a small constant either way.
+const result_buffer_len = 4096;
 
-    const parsed = parseCall(arena, call);
-    try printHead(arena, parsed, tools.formats, tools.style, tools.log);
-    try tools.log.flush();
+/// A writer that gathers what is written and passes it to another writer, up to
+/// a limit. Everything past the limit is counted and dropped rather than written,
+/// so a caller can put a ceiling on how much text reaches where it is going
+/// without the tool that writes it having to know.
+///
+/// The dropped count is what `run` reports once the call is done, which is why
+/// the last of what is gathered has to be flushed out first. Writing past the
+/// limit is not an error, so a tool that fills the buffer is not turned into a
+/// failed call by it.
+const Limited = struct {
+    /// Where the bytes that fit are passed on.
+    inner: *Io.Writer,
+    /// How many more bytes fit before the limit.
+    remaining: usize,
+    /// How many bytes were written past the limit and dropped.
+    dropped: usize,
+    writer: Io.Writer,
 
-    const result = switch (parsed) {
-        .read => |args| try tools.read(args),
-        .write => |args| try tools.write(args),
-        .edit => |args| try tools.edit(args),
-        .bash => |args| try tools.bash(args),
-        .web_search => |args| try tools.webSearch(args),
-        .unknown => |name| try fail(arena, "unknown tool '{s}'", .{name}),
+    fn init(inner: *Io.Writer, buffer: []u8, limit: usize) Limited {
+        return .{
+            .inner = inner,
+            .remaining = limit,
+            .dropped = 0,
+            .writer = .{ .vtable = &.{ .drain = drain }, .buffer = buffer },
+        };
+    }
+
+    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *Limited = @alignCast(@fieldParentPtr("writer", w));
+
+        // What is gathered was written before the slices handed over now, so it
+        // goes first. What fits is handed on in one write rather than a byte at
+        // a time, since `writeAll` loops on its own until it is all through.
+        const header = w.buffer[0..w.end];
+        w.end = 0;
+        try self.hand(header);
+
+        // Every slice but the last is written once. A slice that does not fit
+        // whole is handed on as the prefix of it that does.
+        for (data[0 .. data.len - 1]) |bytes| try self.hand(bytes);
+
+        // The last slice is written `splat` times. The copies go over together,
+        // which is what makes the padding of a format such as `{d:>6}` one write
+        // rather than six.
+        try self.repeat(data[data.len - 1], splat);
+
+        // Every byte handed over is consumed here, whether it was written or
+        // dropped: the caller has none of it left to hand over again.
+        var offered: usize = data[data.len - 1].len * splat;
+        for (data[0 .. data.len - 1]) |bytes| offered += bytes.len;
+        return offered;
+    }
+
+    /// Hands on as much of `bytes` as the limit still allows, and counts the
+    /// rest as dropped.
+    fn hand(self: *Limited, bytes: []const u8) Io.Writer.Error!void {
+        const fits = @min(bytes.len, self.remaining);
+        if (fits > 0) try self.inner.writeAll(bytes[0..fits]);
+        self.remaining -= fits;
+        self.dropped += bytes.len - fits;
+    }
+
+    /// Hands on as many of `splat` copies of `pattern` as the limit allows, the
+    /// whole copies in one write, and counts the rest as dropped.
+    fn repeat(self: *Limited, pattern: []const u8, splat: usize) Io.Writer.Error!void {
+        const offered = pattern.len * splat;
+        const fits = @min(offered, self.remaining);
+        self.remaining -= fits;
+        self.dropped += offered - fits;
+        if (fits == 0 or pattern.len == 0) return;
+
+        // `writeSplatAll` shuffles the slices as it consumes them, so it takes
+        // them mutably; what is copied here is the list, not the bytes.
+        const whole = fits / pattern.len;
+        if (whole > 0) {
+            var repeated = [_][]const u8{pattern};
+            try self.inner.writeSplatAll(&repeated, whole);
+        }
+        // A copy the limit cuts in half is written as far as it goes.
+        if (fits % pattern.len != 0) try self.inner.writeAll(pattern[0 .. fits % pattern.len]);
+    }
+};
+
+/// Runs a parsed call, writing the result of it -- or the reason it could not
+/// run -- to `out`, in the shape the model is given it.
+fn dispatch(tools: *Tools, call: Call, out: *Io.Writer) !void {
+    switch (call) {
+        .read => |args| try tools.read(args, out),
+        .write => |args| try tools.write(args, out),
+        .edit => |args| try tools.edit(args, out),
+        .bash => |args| try tools.bash(args, out),
+        .web_search => |args| try tools.webSearch(args, out),
+        .unknown => |name| try fail(out, "unknown tool '{s}'", .{name}),
         .malformed => |bad| try fail(
-            arena,
+            out,
             "invalid arguments for {s}: {s}",
             .{ bad.name, @errorName(bad.reason) },
         ),
-    };
-
-    try printResult(parsed, result, tools.style, tools.log);
-    try tools.log.writeAll("\n");
-    try tools.log.flush();
-    return result;
+    }
 }
 
-fn read(tools: *Tools, args: Call.Read) ![]const u8 {
-    const arena = tools.scratch.allocator();
+fn read(tools: *Tools, args: Call.Read, out: *Io.Writer) !void {
     const contents = tools.dir.readFileAlloc(
         tools.io,
         args.path,
         tools.gpa,
         .limited(16 << 20),
-    ) catch |err| return fail(arena, "cannot read {s}: {s}", .{ args.path, @errorName(err) });
+    ) catch |err| return fail(out, "cannot read {s}: {s}", .{ args.path, @errorName(err) });
     defer tools.gpa.free(contents);
 
     // A trailing newline would otherwise read as a final empty line.
     const text = std.mem.trimEnd(u8, contents, "\n");
-    if (text.len == 0) return arena.dupe(u8, "(empty file)");
+    if (text.len == 0) return out.writeAll("(empty file)");
 
     const first = args.offset orelse 1;
     const limit = args.limit orelse 2000;
-    var out: std.Io.Writer.Allocating = .init(tools.gpa);
-    defer out.deinit();
-
     var lines = std.mem.splitScalar(u8, text, '\n');
     var number: usize = 0;
     var shown: usize = 0;
@@ -254,38 +330,33 @@ fn read(tools: *Tools, args: Call.Read) ![]const u8 {
         if (number < first) continue;
         if (shown == limit) break;
         shown += 1;
-        try out.writer.print("{d:>6}\t{s}\n", .{ number, line });
+        try out.print("{d:>6}\t{s}\n", .{ number, line });
     }
     if (shown == 0) {
-        return std.fmt.allocPrint(arena, "offset {d} is past the end; {d} lines", .{ first, number });
+        return out.print("offset {d} is past the end; {d} lines", .{ first, number });
     }
-    if (shown == limit) {
-        try out.writer.print("… {d} more lines\n", .{number - first + 1 - shown});
-    }
-    return finish(arena, out.written());
+    if (shown == limit) try out.print("… {d} more lines\n", .{number - first + 1 - shown});
 }
 
-fn write(tools: *Tools, args: Call.Write) ![]const u8 {
-    const arena = tools.scratch.allocator();
+fn write(tools: *Tools, args: Call.Write, out: *Io.Writer) !void {
     if (std.fs.path.dirname(args.path)) |parent| {
         tools.dir.createDirPath(tools.io, parent) catch |err|
-            return fail(arena, "cannot create {s}: {s}", .{ parent, @errorName(err) });
+            return fail(out, "cannot create {s}: {s}", .{ parent, @errorName(err) });
     }
     tools.dir.writeFile(tools.io, .{ .sub_path = args.path, .data = args.content }) catch |err|
-        return fail(arena, "cannot write {s}: {s}", .{ args.path, @errorName(err) });
-    return std.fmt.allocPrint(arena, "wrote {d} bytes to {s}", .{ args.content.len, args.path });
+        return fail(out, "cannot write {s}: {s}", .{ args.path, @errorName(err) });
+    try out.print("wrote {d} bytes to {s}", .{ args.content.len, args.path });
 }
 
-fn edit(tools: *Tools, args: Call.Edit) ![]const u8 {
-    const arena = tools.scratch.allocator();
-    if (args.old_string.len == 0) return fail(arena, "old_string must not be empty", .{});
+fn edit(tools: *Tools, args: Call.Edit, out: *Io.Writer) !void {
+    if (args.old_string.len == 0) return fail(out, "old_string must not be empty", .{});
 
     const contents = tools.dir.readFileAlloc(
         tools.io,
         args.path,
         tools.gpa,
         .limited(16 << 20),
-    ) catch |err| return fail(arena, "cannot read {s}: {s}", .{ args.path, @errorName(err) });
+    ) catch |err| return fail(out, "cannot read {s}: {s}", .{ args.path, @errorName(err) });
     defer tools.gpa.free(contents);
 
     const change = try replaceInFile(
@@ -296,9 +367,9 @@ fn edit(tools: *Tools, args: Call.Edit) ![]const u8 {
         args.replace_all,
     );
     switch (change) {
-        .not_found => return fail(arena, "old_string not found in {s}", .{args.path}),
+        .not_found => return fail(out, "old_string not found in {s}", .{args.path}),
         .ambiguous => |count| return fail(
-            arena,
+            out,
             "old_string appears {d} times in {s}; add context or pass replace_all",
             .{ count, args.path },
         ),
@@ -307,17 +378,13 @@ fn edit(tools: *Tools, args: Call.Edit) ![]const u8 {
             tools.dir.writeFile(tools.io, .{
                 .sub_path = args.path,
                 .data = applied.text,
-            }) catch |err| return fail(arena, "cannot write {s}: {s}", .{ args.path, @errorName(err) });
-            return std.fmt.allocPrint(arena, "replaced {d} occurrence(s) in {s}", .{
-                applied.count,
-                args.path,
-            });
+            }) catch |err| return fail(out, "cannot write {s}: {s}", .{ args.path, @errorName(err) });
+            try out.print("replaced {d} occurrence(s) in {s}", .{ applied.count, args.path });
         },
     }
 }
 
-fn bash(tools: *Tools, args: Call.Bash) ![]const u8 {
-    const arena = tools.scratch.allocator();
+fn bash(tools: *Tools, args: Call.Bash, out: *Io.Writer) !void {
     // The count the configuration holds is turned into the signed seconds
     // the clock takes. A value past what it can express is absurd but must
     // not overflow the cast, so it is clamped to the longest duration, which
@@ -335,59 +402,50 @@ fn bash(tools: *Tools, args: Call.Bash) ![]const u8 {
         .timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(timeout_s) } },
     }) catch |err| switch (err) {
         error.StreamTooLong => return fail(
-            arena,
+            out,
             "command produced more than {d} bytes of output",
             .{max_command_output},
         ),
         error.Timeout => return fail(
-            arena,
+            out,
             "command did not finish within {d}s and was killed",
             .{tools.bash_timeout_s},
         ),
-        else => return fail(arena, "cannot run command: {s}", .{@errorName(err)}),
+        else => return fail(out, "cannot run command: {s}", .{@errorName(err)}),
     };
     defer tools.gpa.free(result.stdout);
     defer tools.gpa.free(result.stderr);
 
-    var out: std.Io.Writer.Allocating = .init(tools.gpa);
-    defer out.deinit();
-    try out.writer.print("exit code: {d}\n", .{formatting.exitCode(result.term)});
+    try out.print("exit code: {d}\n", .{formatting.exitCode(result.term)});
     if (result.stdout.len == 0 and result.stderr.len == 0) {
-        try out.writer.writeAll("(no output)\n");
+        try out.writeAll("(no output)\n");
     }
-    try out.writer.writeAll(result.stdout);
+    try out.writeAll(result.stdout);
     if (result.stderr.len > 0) {
-        if (result.stdout.len > 0) try out.writer.writeAll("\n");
-        try out.writer.print("stderr:\n{s}", .{result.stderr});
+        if (result.stdout.len > 0) try out.writeAll("\n");
+        try out.print("stderr:\n{s}", .{result.stderr});
     }
-    return finish(arena, out.written());
 }
 
-/// Runs one web search and returns its results as text. No backend is
-/// configured only when a resumed session carries the tool from a run that
-/// had one; the model is told so rather than the call failing outright.
-fn webSearch(tools: *Tools, args: Call.WebSearch) ![]const u8 {
-    const arena = tools.scratch.allocator();
-    const client = if (tools.search) |*client| client else return fail(arena, "web search is not configured", .{});
-    return client.search(arena, args.query) catch |err|
-        return fail(arena, "search failed: {s}", .{@errorName(err)});
+/// Runs one web search and writes its results as text. No backend is configured
+/// only when a resumed session carries the tool from a run that had one; the
+/// model is told so rather than the call failing outright.
+fn webSearch(tools: *Tools, args: Call.WebSearch, out: *Io.Writer) !void {
+    const client = if (tools.search) |*client| client else return fail(out, "web search is not configured", .{});
+
+    // The search builds its answer in an arena of its own, which is dropped once
+    // the text has been written on.
+    var arena_state = std.heap.ArenaAllocator.init(tools.gpa);
+    defer arena_state.deinit();
+    const text = client.search(arena_state.allocator(), args.query) catch |err|
+        return fail(out, "search failed: {s}", .{@errorName(err)});
+    try out.writeAll(text);
 }
 
-/// A failure reported to the model as text, so that it can react to it. It is
-/// written into the arena the call's result lives in, since that is where the
-/// caller looks for the result of a call that went wrong.
-fn fail(arena: std.mem.Allocator, comptime format: []const u8, args: anytype) ![]const u8 {
-    return std.fmt.allocPrint(arena, "error: " ++ format, args);
-}
-
-/// A result as the model is given it, cut to `max_result_len` with a count of
-/// what was left out.
-fn finish(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
-    if (text.len <= max_result_len) return arena.dupe(u8, text);
-    return std.fmt.allocPrint(arena, "{s}\n… {d} more bytes", .{
-        text[0..max_result_len],
-        text.len - max_result_len,
-    });
+/// Writes a failure to `out` as the model is given it, so that it can react to
+/// it. A call that could not run still has a result, and this is its shape.
+fn fail(out: *Io.Writer, comptime format: []const u8, args: anytype) !void {
+    try out.print("error: " ++ format, args);
 }
 
 /// What replacing `old_string` in a file produced: the new contents and how many
@@ -621,10 +679,27 @@ fn firstLine(text: []const u8) []const u8 {
     return text[0..newline];
 }
 
+/// Runs one call the way the agent does -- parse it, then run it -- writing the
+/// result into `result`. The parsed call is handed back, so a test can give both
+/// to `describe` exactly as the terminal emitter does.
+fn runCall(
+    arena: std.mem.Allocator,
+    tools: *Tools,
+    call: llm.ToolCall,
+    result: *Io.Writer,
+) !Call {
+    const parsed = parse(arena, call);
+    try tools.run(parsed, result);
+    return parsed;
+}
+
 /// Parses a tool call into the arguments of the call it names. It never fails:
 /// an unimplemented tool becomes `unknown` and arguments that do not fit become
 /// `malformed`, so a caller can still name the call it could not run.
-pub fn parseCall(arena: std.mem.Allocator, call: llm.ToolCall) Call {
+///
+/// The parsed call lives in `arena`, which has to outlive the `run` that is
+/// given it and whatever shows the call.
+pub fn parse(arena: std.mem.Allocator, call: llm.ToolCall) Call {
     return parseCallNamed(arena, call.function.name, call.function.arguments);
 }
 
@@ -633,23 +708,23 @@ pub fn parseCall(arena: std.mem.Allocator, call: llm.ToolCall) Call {
 /// that replaying one does not have to build the `llm.ToolCall` it came from.
 pub fn parseCallNamed(arena: std.mem.Allocator, name: []const u8, arguments: []const u8) Call {
     if (std.mem.eql(u8, name, "read")) {
-        return .{ .read = parse(Call.Read, arena, arguments) catch |reason|
+        return .{ .read = fromJson(Call.Read, arena, arguments) catch |reason|
             return .{ .malformed = .{ .name = name, .reason = reason } } };
     }
     if (std.mem.eql(u8, name, "write")) {
-        return .{ .write = parse(Call.Write, arena, arguments) catch |reason|
+        return .{ .write = fromJson(Call.Write, arena, arguments) catch |reason|
             return .{ .malformed = .{ .name = name, .reason = reason } } };
     }
     if (std.mem.eql(u8, name, "edit")) {
-        return .{ .edit = parse(Call.Edit, arena, arguments) catch |reason|
+        return .{ .edit = fromJson(Call.Edit, arena, arguments) catch |reason|
             return .{ .malformed = .{ .name = name, .reason = reason } } };
     }
     if (std.mem.eql(u8, name, "bash")) {
-        return .{ .bash = parse(Call.Bash, arena, arguments) catch |reason|
+        return .{ .bash = fromJson(Call.Bash, arena, arguments) catch |reason|
             return .{ .malformed = .{ .name = name, .reason = reason } } };
     }
     if (std.mem.eql(u8, name, "web_search")) {
-        return .{ .web_search = parse(Call.WebSearch, arena, arguments) catch |reason|
+        return .{ .web_search = fromJson(Call.WebSearch, arena, arguments) catch |reason|
             return .{ .malformed = .{ .name = name, .reason = reason } } };
     }
     return .{ .unknown = name };
@@ -657,7 +732,7 @@ pub fn parseCallNamed(arena: std.mem.Allocator, name: []const u8, arguments: []c
 
 /// Parses arguments that live as long as `arena`. Unknown fields are dropped, so
 /// a call from a newer model does not fail on the fields this version ignores.
-fn parse(comptime T: type, arena: std.mem.Allocator, json: []const u8) !T {
+fn fromJson(comptime T: type, arena: std.mem.Allocator, json: []const u8) !T {
     return std.json.parseFromSliceLeaky(T, arena, json, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
@@ -701,7 +776,7 @@ const marks = struct {
 /// bash command is laid out by the bash formatter, so it reads the way it runs;
 /// an edit is shown as the diff of the strings it works on; and a search shows
 /// the query it ran.
-fn printHead(scratch: std.mem.Allocator, call: Call, formats: Formats, style: Style, out: *Io.Writer) !void {
+pub fn printHead(scratch: std.mem.Allocator, call: Call, formats: Formats, style: Style, out: *Io.Writer) !void {
     switch (call) {
         .read => |args| try styling.header(marks.read, "read", args.path, style, out),
         .write => |args| try styling.header(marks.write, "write", args.path, style, out),
@@ -813,7 +888,7 @@ fn printScript(command: []const u8, format: Format, out: *Io.Writer) !void {
 /// it put in the file; an edit shows nothing, since its result would only repeat
 /// the change shown above it. Anything that failed shows why instead, whatever
 /// it was asked to do.
-fn printResult(call: Call, result: []const u8, style: Style, out: *Io.Writer) !void {
+pub fn printResult(call: Call, result: []const u8, style: Style, out: *Io.Writer) !void {
     // A call that failed reports why, whatever it was asked to do. The whole
     // result is billy's own message, so it is shown the way billy shows a
     // failure.
@@ -1081,7 +1156,7 @@ test "a block header names the tool, its colour, the bold name and the target" {
 
     // On a terminal that takes an escape code, the glyph carries the colour of
     // the tool, only the name is bold, and the target and the label are dimmed.
-    try describe(arena, parseCall(arena, .{ .id = "1", .function = .{
+    try describe(arena, parse(arena, .{ .id = "1", .function = .{
         .name = "read",
         .arguments = "{\"path\":\"a.zig\"}",
     } }), "", .{}, .ansi, &out.writer);
@@ -1092,7 +1167,7 @@ test "a block header names the tool, its colour, the bold name and the target" {
     out.clearRetainingCapacity();
 
     // A terminal that takes no escape code gets the same text without them.
-    try describe(arena, parseCall(arena, .{ .id = "1", .function = .{
+    try describe(arena, parse(arena, .{ .id = "1", .function = .{
         .name = "read",
         .arguments = "{\"path\":\"a.zig\"}",
     } }), "", .{}, .plain, &out.writer);
@@ -1114,7 +1189,7 @@ test "the exit status of a bash call is shown green or red" {
     } };
 
     // A command that succeeded.
-    try describe(arena, parseCall(arena, call), "exit code: 0\nbuilt\n", .{}, .ansi, &out.writer);
+    try describe(arena, parse(arena, call), "exit code: 0\nbuilt\n", .{}, .ansi, &out.writer);
     try std.testing.expectEqualStrings(
         "\x1b[36m❯\x1b[0m \x1b[1mbash\x1b[0m\nmake\n\x1b[1;32m✓ exit 0\x1b[0m\n\x1b[1m▾ stdout\x1b[0m\n\x1b[2mbuilt\x1b[0m\n\n",
         out.written(),
@@ -1122,7 +1197,7 @@ test "the exit status of a bash call is shown green or red" {
     out.clearRetainingCapacity();
 
     // One that did not, whose output the terminal still shows as it is.
-    try describe(arena, parseCall(arena, call), "exit code: 2\nboom\n", .{}, .ansi, &out.writer);
+    try describe(arena, parse(arena, call), "exit code: 2\nboom\n", .{}, .ansi, &out.writer);
     try std.testing.expectEqualStrings(
         "\x1b[36m❯\x1b[0m \x1b[1mbash\x1b[0m\nmake\n\x1b[1;31m✗ exit 2\x1b[0m\n\x1b[1m▾ stdout\x1b[0m\n\x1b[2mboom\x1b[0m\n\n",
         out.written(),
@@ -1144,11 +1219,9 @@ test "a bash block shows only the streams the command filled" {
         .io = std.testing.io,
         .dir = Io.Dir.cwd(),
         .gpa = gpa,
-        .log = &log.writer,
         .bash_timeout_s = 120,
         .http = &http,
     });
-    defer tool_set.deinit();
     const cases = [_]struct { command: []const u8, expected: []const u8 }{
         // Nothing printed: the status is all there is.
         .{ .command = "true", .expected = "❯ bash\ntrue\n✓ exit 0\n\n" },
@@ -1161,12 +1234,23 @@ test "a bash block shows only the streams the command filled" {
         // A command that failed is the same shape with the status in red.
         .{ .command = "exit 3", .expected = "❯ bash\nexit 3\n✗ exit 3\n\n" },
     };
+    var result: std.Io.Writer.Allocating = .init(gpa);
+    defer result.deinit();
     for (cases) |case| {
         log.clearRetainingCapacity();
+        result.clearRetainingCapacity();
         const arguments = try std.fmt.allocPrint(arena, "{{\"command\":{f}}}", .{
             std.json.fmt(case.command, .{}),
         });
-        _ = try tool_set.run(.{ .id = "1", .function = .{ .name = "bash", .arguments = arguments } });
+        const parsed = try runCall(
+            arena,
+            &tool_set,
+            .{ .id = "1", .function = .{ .name = "bash", .arguments = arguments } },
+            &result.writer,
+        );
+        // `run` writes the result but shows nothing, so what a call and its
+        // result look like is rendered here the way the terminal renders it.
+        try describe(arena, parsed, result.written(), .{}, .plain, &log.writer);
         try std.testing.expectEqualStrings(case.expected, log.written());
     }
 }
@@ -1187,7 +1271,7 @@ test "a bash result with no status line is shown as it is" {
 
     // A session saved before the status was written into the result has none,
     // so nothing is claimed about the call and the whole result is shown.
-    try describe(arena, parseCall(arena, call), "built\nnothing to do", .{}, .plain, &out.writer);
+    try describe(arena, parse(arena, call), "built\nnothing to do", .{}, .plain, &out.writer);
     try std.testing.expectEqualStrings(
         "❯ bash\nmake\n▾ output\nbuilt\nnothing to do\n\n",
         out.written(),
@@ -1204,7 +1288,7 @@ test "what a call failed with is shown red, and what it left out is dimmed" {
     defer out.deinit();
 
     // A failure is billy's own message, so the whole result is shown as one.
-    try describe(arena, parseCall(arena, .{ .id = "1", .function = .{
+    try describe(arena, parse(arena, .{ .id = "1", .function = .{
         .name = "read",
         .arguments = "{\"path\":\"a.zig\"}",
     } }), "error: cannot read a.zig: FileNotFound", .{}, .ansi, &out.writer);
@@ -1244,7 +1328,7 @@ test "a bash command is shown the way the formatter lays it out" {
     // The format script reads the command and writes it back upper case, the
     // way `shfmt | bat -l bash` reads it and writes it back laid out.
     const format: Format = .{ .script = "tr a-z A-Z | cat", .io = std.testing.io, .gpa = gpa };
-    try describe(arena, parseCall(arena, .{ .id = "1", .function = .{
+    try describe(arena, parse(arena, .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"ls -la\\n\"}",
     } }), "exit code: 0\n(no output)\n", .{ .bash = format }, .plain, &out.writer);
@@ -1278,7 +1362,7 @@ test "a bash command is shown as written when the formatter cannot lay it out" {
     const scripts = [_][]const u8{ "billy-no-such-formatter", "exit 1", "true" };
     for (scripts) |script| {
         const format: Format = .{ .script = script, .io = std.testing.io, .gpa = gpa };
-        try describe(arena, parseCall(arena, call), "exit code: 0\n(no output)\n", .{ .bash = format }, .plain, &out.writer);
+        try describe(arena, parse(arena, call), "exit code: 0\n(no output)\n", .{ .bash = format }, .plain, &out.writer);
         try std.testing.expectEqualStrings(expected, out.written());
         out.clearRetainingCapacity();
     }
@@ -1363,27 +1447,22 @@ test "run logs exactly what describe prints" {
         .io = std.testing.io,
         .dir = Io.Dir.cwd(),
         .gpa = gpa,
-        .log = &log.writer,
         .bash_timeout_s = 120,
         .http = &http,
     });
-    defer tool_set.deinit();
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"true\"}",
     } };
-    const result = try tool_set.run(call);
+    var result: std.Io.Writer.Allocating = .init(gpa);
+    defer result.deinit();
+    const parsed = try runCall(arena, &tool_set, call, &result.writer);
 
-    var described: std.Io.Writer.Allocating = .init(gpa);
-    defer described.deinit();
-    try describe(arena, parseCall(arena, call), result, .{}, .plain, &described.writer);
-
-    // The live log is the description, so a replayed session reads the same.
+    try describe(arena, parsed, result.written(), .{}, .plain, &log.writer);
     try std.testing.expectEqualStrings(
         "❯ bash\ntrue\n✓ exit 0\n\n",
         log.written(),
     );
-    try std.testing.expectEqualStrings(log.written(), described.written());
 }
 
 test "the format changes what is shown and nothing else" {
@@ -1404,31 +1483,26 @@ test "the format changes what is shown and nothing else" {
         .io = std.testing.io,
         .dir = Io.Dir.cwd(),
         .gpa = gpa,
-        .log = &log.writer,
         .formats = .{ .bash = format },
         .bash_timeout_s = 120,
         .http = &http,
     });
-    defer tool_set.deinit();
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"echo hi\"}",
     } };
-    const result = try tool_set.run(call);
+    var result: std.Io.Writer.Allocating = .init(gpa);
+    defer result.deinit();
+    const parsed = try runCall(arena, &tool_set, call, &result.writer);
 
     // The command that ran is the one the model wrote, so the result is its
     // output, and the user reads the command as the formatter laid it out.
-    try std.testing.expectEqualStrings("exit code: 0\nhi\n", result);
+    try std.testing.expectEqualStrings("exit code: 0\nhi\n", result.written());
+    try describe(arena, parsed, result.written(), .{ .bash = format }, .plain, &log.writer);
     try std.testing.expectEqualStrings(
         "❯ bash\nECHO HI\n✓ exit 0\n▾ stdout\nhi\n\n",
         log.written(),
     );
-
-    // A replayed session describes the stored call the same way.
-    var described: std.Io.Writer.Allocating = .init(gpa);
-    defer described.deinit();
-    try describe(arena, parseCall(arena, call), result, .{ .bash = format }, .plain, &described.writer);
-    try std.testing.expectEqualStrings(log.written(), described.written());
 }
 
 test "an edit diff is laid out by the edit format" {
@@ -1538,20 +1612,22 @@ test "a bash command that outlives the timeout is killed and reported" {
         .io = std.testing.io,
         .dir = Io.Dir.cwd(),
         .gpa = gpa,
-        .log = &log.writer,
         .bash_timeout_s = 1,
         .http = &http,
     });
-    defer tool_set.deinit();
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"sleep 30\"}",
     } };
-    const result = try tool_set.run(call);
+    var result: std.Io.Writer.Allocating = .init(gpa);
+    defer result.deinit();
+    var parse_state = std.heap.ArenaAllocator.init(gpa);
+    defer parse_state.deinit();
+    _ = try runCall(parse_state.allocator(), &tool_set, call, &result.writer);
 
     try std.testing.expectEqualStrings(
         "error: command did not finish within 1s and was killed",
-        result,
+        result.written(),
     );
 }
 
@@ -1561,20 +1637,20 @@ test "parseCall splits known, unknown and malformed calls" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const read_call = parseCall(arena, .{ .id = "1", .function = .{
+    const read_call = parse(arena, .{ .id = "1", .function = .{
         .name = "read",
         .arguments = "{\"path\":\"a.zig\",\"offset\":5}",
     } });
     try std.testing.expectEqualStrings("a.zig", read_call.read.path);
     try std.testing.expectEqual(@as(?usize, 5), read_call.read.offset);
 
-    const missing = parseCall(arena, .{ .id = "1", .function = .{
+    const missing = parse(arena, .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{}",
     } });
     try std.testing.expectEqualStrings("bash", missing.malformed.name);
 
-    const unknown = parseCall(arena, .{ .id = "1", .function = .{
+    const unknown = parse(arena, .{ .id = "1", .function = .{
         .name = "frobnicate",
         .arguments = "{}",
     } });
@@ -1588,7 +1664,7 @@ fn expectDescribe(expected: []const u8, name: []const u8, arguments: []const u8,
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try describe(arena_state.allocator(), parseCall(arena_state.allocator(), .{ .id = "1", .function = .{
+    try describe(arena_state.allocator(), parse(arena_state.allocator(), .{ .id = "1", .function = .{
         .name = name,
         .arguments = arguments,
     } }), result, .{}, .plain, &out.writer);
@@ -1712,7 +1788,6 @@ test "a replacement matched exactly is not re-indented" {
 fn definitionsToolSet(
     dir: Io.Dir,
     gpa: std.mem.Allocator,
-    log: *Io.Writer,
     http: *std.http.Client,
     with_search: bool,
 ) !Tools {
@@ -1720,7 +1795,6 @@ fn definitionsToolSet(
         .io = std.testing.io,
         .dir = dir,
         .gpa = gpa,
-        .log = log,
         .bash_timeout_s = 120,
         .search = if (with_search) .{
             .provider = .tavily,
@@ -1737,8 +1811,7 @@ test "the definitions cover every tool the loop dispatches" {
     defer log.deinit();
     var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
     defer http.deinit();
-    var tool_set = try definitionsToolSet(Io.Dir.cwd(), gpa, &log.writer, &http, false);
-    defer tool_set.deinit();
+    var tool_set = try definitionsToolSet(Io.Dir.cwd(), gpa, &http, false);
 
     // The names are exactly the tools the loop can dispatch, in the order the
     // model receives them, so it is never offered one that does not run.
@@ -1761,8 +1834,7 @@ test "web search is offered only when a backend is configured" {
 
     // Without a backend the search tool is not offered at all, and the tools
     // every session has come first so the set only grows.
-    var plain = try definitionsToolSet(Io.Dir.cwd(), gpa, &log.writer, &http, false);
-    defer plain.deinit();
+    var plain = try definitionsToolSet(Io.Dir.cwd(), gpa, &http, false);
     const without = plain.definitions();
     try std.testing.expectEqual(specs.len, without.len);
     for (without) |definition| {
@@ -1770,8 +1842,7 @@ test "web search is offered only when a backend is configured" {
     }
 
     // With one it is appended, so a session that gains it keeps the tools it had.
-    var searched = try definitionsToolSet(Io.Dir.cwd(), gpa, &log.writer, &http, true);
-    defer searched.deinit();
+    var searched = try definitionsToolSet(Io.Dir.cwd(), gpa, &http, true);
     const with = searched.definitions();
     try std.testing.expectEqual(specs.len + 1, with.len);
     try std.testing.expectEqualStrings("web_search", with[with.len - 1].name);
@@ -1799,26 +1870,187 @@ test "the tools work in the directory they are given, wherever billy runs" {
         .io = std.testing.io,
         .dir = work,
         .gpa = gpa,
-        .log = &log.writer,
         .bash_timeout_s = 120,
         .http = &http,
     });
-    defer tool_set.deinit();
 
-    // A file written by the tool lands in that directory.
-    _ = try tool_set.run(.{ .id = "1", .function = .{
+    // A file written by the tool lands in that directory. The result is not
+    // what this is about, so it is discarded.
+    var sink: std.Io.Writer.Discarding = .init("");
+    _ = try runCall(arena, &tool_set, .{ .id = "1", .function = .{
         .name = "write",
         .arguments = "{\"path\":\"note.txt\",\"content\":\"hi\"}",
-    } });
+    } }, &sink.writer);
     const written = try tmp.dir.readFileAlloc(std.testing.io, "project/note.txt", arena, .limited(64));
     try std.testing.expectEqualStrings("hi", written);
 
     // And a command runs there too, so `pwd` reports that directory and not the
     // one billy was started in.
     log.clearRetainingCapacity();
-    const result = try tool_set.run(.{ .id = "2", .function = .{
+    var result: std.Io.Writer.Allocating = .init(gpa);
+    defer result.deinit();
+    _ = try runCall(arena, &tool_set, .{ .id = "2", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"pwd\"}",
-    } });
-    try std.testing.expect(std.mem.indexOf(u8, result, "/project\n") != null);
+    } }, &result.writer);
+    try std.testing.expect(std.mem.indexOf(u8, result.written(), "/project\n") != null);
+}
+
+test "the limiting writer gathers writes, then passes on what fits" {
+    const gpa = std.testing.allocator;
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    // Small, so writes spill out of it and the limit is exercised across the
+    // gathers rather than all in one go.
+    var buffer: [4]u8 = undefined;
+
+    // What is written is gathered, not passed on, until the buffer fills or it
+    // is flushed: the point of the buffer is that writing a little at a time is
+    // not a call to the writer behind this every time.
+    var roomy = Limited.init(&out.writer, &buffer, 100);
+    try roomy.writer.writeAll("he");
+    try std.testing.expectEqualStrings("", out.written());
+    try roomy.writer.writeAll("llo");
+    try std.testing.expectEqualStrings("hello", out.written());
+    try std.testing.expectEqual(0, roomy.dropped);
+
+    // A write still in the buffer at the end reaches the writer on a flush, and
+    // is counted only then.
+    out.clearRetainingCapacity();
+    var gathered = Limited.init(&out.writer, &buffer, 100);
+    try gathered.writer.writeAll("ab");
+    try std.testing.expectEqualStrings("", out.written());
+    try gathered.writer.flush();
+    try std.testing.expectEqualStrings("ab", out.written());
+    try std.testing.expectEqual(0, gathered.dropped);
+    // Two bytes of the hundred are spent, so what is left of the limit is 98.
+    try std.testing.expectEqual(98, gathered.remaining);
+
+    // Exactly to the limit is still nothing dropped, so a result that lands on
+    // the cap is not reported as cut.
+    out.clearRetainingCapacity();
+    var exact = Limited.init(&out.writer, &buffer, 5);
+    try exact.writer.writeAll("hello");
+    try exact.writer.flush();
+    try std.testing.expectEqualStrings("hello", out.written());
+    try std.testing.expectEqual(0, exact.dropped);
+
+    // Past it, the limit is where the writing stops and the rest is counted, in
+    // as many writes as it took.
+    out.clearRetainingCapacity();
+    var tight = Limited.init(&out.writer, &buffer, 5);
+    try tight.writer.writeAll("he");
+    try tight.writer.writeAll("llo wor");
+    try tight.writer.writeAll("ld");
+    try tight.writer.flush();
+    try std.testing.expectEqualStrings("hello", out.written());
+    try std.testing.expectEqual(6, tight.dropped);
+
+    // A write that arrives repeated counts every repeat, and the ones past the
+    // limit are dropped like any other. This is the shape `{s:>5}` and its
+    // padding take, so the count has to be right for it too.
+    out.clearRetainingCapacity();
+    var splatted = Limited.init(&out.writer, &buffer, 4);
+    var repeated = [_][]const u8{"ab"};
+    try splatted.writer.writeSplatAll(&repeated, 3);
+    try splatted.writer.flush();
+    try std.testing.expectEqualStrings("abab", out.written());
+    try std.testing.expectEqual(2, splatted.dropped);
+
+    // A writer with a limit of zero writes nothing and counts all of it.
+    out.clearRetainingCapacity();
+    var none = Limited.init(&out.writer, &buffer, 0);
+    try none.writer.writeAll("gone");
+    try none.writer.flush();
+    try std.testing.expectEqualStrings("", out.written());
+    try std.testing.expectEqual(4, none.dropped);
+}
+
+/// A writer with no buffer of its own, so every write is handed straight to it
+/// and it can count how many hand-offs there were. What a test uses to tell
+/// batching from byte-at-a-time.
+const Counter = struct {
+    written: usize = 0,
+    hand_offs: usize = 0,
+    writer: Io.Writer,
+
+    fn init() Counter {
+        return .{ .writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} } };
+    }
+
+    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *Counter = @alignCast(@fieldParentPtr("writer", w));
+        self.hand_offs += 1;
+        var count: usize = data[data.len - 1].len * splat;
+        for (data[0 .. data.len - 1]) |bytes| count += bytes.len;
+        self.written += count;
+        return count;
+    }
+};
+
+test "the limiting writer hands the repeats over together" {
+    // A buffer too small to gather the repeats, so they reach the writer behind
+    // this and the count of hand-offs says whether they went one at a time.
+    var buffer: [2]u8 = undefined;
+
+    var counter = Counter.init();
+    var limited = Limited.init(&counter.writer, &buffer, 1000);
+    var repeats = [_][]const u8{"x"};
+    try limited.writer.writeSplatAll(&repeats, 6);
+    try limited.writer.flush();
+
+    // Six copies of one byte, handed over in a couple of writes rather than six:
+    // the padding of a format such as `{d:>6}` is one write, not one per space.
+    try std.testing.expectEqual(6, counter.written);
+    try std.testing.expect(counter.hand_offs <= 2);
+}
+
+test "a result longer than the cap is cut and says what it lost" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Far more than the cap, so the cut is plainly not the whole file.
+    const line = "x" ** 99 ++ "\n";
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(gpa);
+    for (0..1000) |_| try big.appendSlice(gpa, line);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big.txt", .data = big.items });
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    defer http.deinit();
+    var tool_set = try Tools.init(.{
+        .io = std.testing.io,
+        .dir = tmp.dir,
+        .gpa = gpa,
+        .bash_timeout_s = 120,
+        .http = &http,
+    });
+
+    var result: std.Io.Writer.Allocating = .init(gpa);
+    defer result.deinit();
+    _ = try runCall(arena, &tool_set, .{ .id = "1", .function = .{
+        .name = "read",
+        .arguments = "{\"path\":\"big.txt\"}",
+    } }, &result.writer);
+
+    // What is kept is the cap and the note, and what the note counts is exactly
+    // what the tool wrote past the cap.
+    const written = result.written();
+    const marker = "\n… ";
+    const cut = std.mem.indexOf(u8, written, marker) orelse return error.NoTruncation;
+    // What the reader kept is exactly the cap, and what the note counts is
+    // everything past it. The reader numbers each line, so what it wrote is not
+    // the file's length: six columns, a tab, the ninety-nine characters of the
+    // line and its newline, a thousand times.
+    try std.testing.expectEqual(max_result_len, cut);
+    const per_line = 6 + 1 + 99 + 1;
+    const written_by_tool = 1000 * per_line;
+    const lost = try std.fmt.parseInt(usize, written[cut + marker.len .. written.len - " more bytes".len], 10);
+    try std.testing.expectEqual(written_by_tool - max_result_len, lost);
 }
