@@ -801,7 +801,7 @@ fn turn(
         // conversation is written straight onto the connection out of the pool,
         // the reply is freed when the turn ends, and the session interns what it
         // keeps.
-        const completion = try client.complete(client.gpa, session.conversation(), session.toolSet());
+        const completion = try client.complete(client.gpa, session.conversation(&.{}), session.toolSet());
         defer completion.deinit();
 
         // The totals are recorded first, so the save inside `append` stores them
@@ -970,16 +970,13 @@ fn summarize(
     config: Config,
     session: *Session,
 ) !?[]const u8 {
-    var scratch_state = std.heap.ArenaAllocator.init(client.gpa);
-    defer scratch_state.deinit();
-    const scratch = scratch_state.allocator();
-
-    const sent = try session.resolveSend(scratch);
-    const request = try scratch.alloc(llm.Message, sent.len + 1);
-    @memcpy(request[0..sent.len], sent);
-    request[sent.len] = .{ .role = "user", .content = compact_prompt };
-
-    const completion = try client.complete(client.gpa, request, session.toolSet());
+    // The conversation the model has been given, with the compacting prompt as
+    // the message after it: the same request a turn would send, with one more
+    // message on the end, so the model reads exactly what happened. Nothing is
+    // added to the session: the prompt is written straight out of the local
+    // array and is gone when this returns.
+    const extra = [_]llm.Message{.{ .role = "user", .content = compact_prompt }};
+    const completion = try client.complete(client.gpa, session.conversation(&extra), session.toolSet());
     defer completion.deinit();
     session.recordCost(completion.usage, costOf(rateNow(io, config), completion.usage));
 

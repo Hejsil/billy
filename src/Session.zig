@@ -365,6 +365,13 @@ pub fn name(session: *const Session) []const u8 {
 /// so the body is the same either way.
 pub const Conversation = struct {
     session: *const Session,
+    /// Messages written after the conversation, for a request that carries one
+    /// turn more than the session holds: the prompt that asks for a summary, or
+    /// for a title. They are read straight out of the caller's own memory, so
+    /// adding one message to a request costs no more than sending the
+    /// conversation itself; a copy of the conversation is never built. They are
+    /// not part of the session and are not kept anywhere.
+    extra: []const llm.Message = &.{},
 
     pub fn jsonStringify(self: Conversation, json: anytype) !void {
         const session = self.session;
@@ -382,6 +389,12 @@ pub const Conversation = struct {
         for (session.messages.items[session.sentFrom()..]) |message| {
             try writeMessage(session, json, message);
         }
+        // The extra messages come last, as the newest of the request. Each is an
+        // `llm.Message`, written the way the client writes a resolved
+        // conversation, so the bytes are the ones the resolved path would write
+        // -- which is what keeps a request carrying an extra message
+        // cache-compatible with one that does not.
+        for (self.extra) |message| try json.write(message);
         try json.endArray();
     }
 };
@@ -428,9 +441,11 @@ fn writeMessage(session: *const Session, json: anytype, message: Message) !void 
 }
 
 /// The conversation as a request carries it, for passing to a client without
-/// resolving it first. The returned value borrows the session.
-pub fn conversation(session: *const Session) Conversation {
-    return .{ .session = session };
+/// resolving it first. `extra` is written after the conversation, for a request
+/// that asks the model one thing more than the session holds; see
+/// `Conversation.extra`. The returned value borrows the session and `extra`.
+pub fn conversation(session: *const Session, extra: []const llm.Message) Conversation {
+    return .{ .session = session, .extra = extra };
 }
 
 /// The first message a compaction leaves out of a request: the summary the last
@@ -540,27 +555,6 @@ pub fn resolvedMessages(session: *const Session, allocator: std.mem.Allocator) !
         out = 1;
     }
     for (session.messages.items) |message| {
-        messages[out] = try message.resolve(session, allocator);
-        out += 1;
-    }
-    return messages;
-}
-
-/// The messages a request carries, resolved out of the pool: the system prompt
-/// and then everything from the latest compaction on, the same set `conversation`
-/// writes. `allocator` owns the result, as `resolvedMessages` does. A compaction
-/// request is sent this way, so it summarizes exactly what the model has been
-/// given.
-pub fn resolveSend(session: *const Session, allocator: std.mem.Allocator) ![]const llm.Message {
-    const start = session.sentFrom();
-    const lead: usize = if (session.hasSystemPrompt()) 1 else 0;
-    const messages = try allocator.alloc(llm.Message, lead + session.messages.items.len - start);
-    var out: usize = 0;
-    if (session.string(session.system_prompt)) |prompt| {
-        messages[0] = .{ .role = "system", .content = prompt };
-        out = 1;
-    }
-    for (session.messages.items[start..]) |message| {
         messages[out] = try message.resolve(session, allocator);
         out += 1;
     }
@@ -1693,7 +1687,7 @@ test "a conversation writes the messages a request would have carried" {
 
     const via_conversation = try std.json.Stringify.valueAlloc(
         gpa,
-        session.conversation(),
+        session.conversation(&.{}),
         .{ .emit_null_optional_fields = false },
     );
     defer gpa.free(via_conversation);
@@ -1707,6 +1701,37 @@ test "a conversation writes the messages a request would have carried" {
             "{\"role\":\"tool\",\"content\":\"1\\tconst x = 1;\\n\",\"tool_call_id\":\"call_1\"}]",
         via_conversation,
     );
+}
+
+test "an extra message is written after the conversation, and is not part of it" {
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    try session.setSystemPrompt("be terse");
+    try session.append(.{ .role = "user", .content = "hello" });
+    try session.append(.{ .role = "assistant", .content = "hi" });
+    const before = session.messages.items.len;
+
+    // A request that carries one message more than the session holds, such as the
+    // prompt that asks for a title: the extra is written last, as the newest
+    // message, and the session is left exactly as it was.
+    const extra = [_]llm.Message{.{ .role = "user", .content = "give it a title" }};
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{ .emit_null_optional_fields = false } };
+    try json.write(session.conversation(&extra));
+    try std.testing.expectEqualStrings(
+        "[{\"role\":\"system\",\"content\":\"be terse\"}," ++
+            "{\"role\":\"user\",\"content\":\"hello\"}," ++
+            "{\"role\":\"assistant\",\"content\":\"hi\"}," ++
+            "{\"role\":\"user\",\"content\":\"give it a title\"}]",
+        out.written(),
+    );
+    try std.testing.expectEqual(before, session.messages.items.len);
 }
 
 test "a string that is not valid UTF-8 is repaired on the way into the pool" {
@@ -1728,7 +1753,7 @@ test "a string that is not valid UTF-8 is repaired on the way into the pool" {
     var out: std.Io.Writer.Allocating = .init(arena);
     defer out.deinit();
     var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{ .emit_null_optional_fields = false } };
-    try json.write(session.conversation());
+    try json.write(session.conversation(&.{}));
     try std.testing.expectEqualStrings(
         "[{\"role\":\"tool\",\"content\":\"a\u{FFFD}b\u{FFFD}c\",\"tool_call_id\":\"call_1\"}]",
         out.written(),
@@ -2021,7 +2046,7 @@ test "the messages a request carries start at the latest compaction" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{ .emit_null_optional_fields = false } };
-    try json.write(session.conversation());
+    try json.write(session.conversation(&.{}));
 
     // The system prompt, then the latest summary and the prompt after it: the
     // first compaction and everything before it is left out.
