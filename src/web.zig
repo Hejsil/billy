@@ -177,7 +177,7 @@ const Registry = struct {
         const owned = try registry.gpa.dupe(u8, id);
         errdefer registry.gpa.free(owned);
 
-        try registry.mutex.lock(registry.io);
+        registry.mutex.lockUncancelable(registry.io);
         defer registry.mutex.unlock(registry.io);
         try registry.reserved.append(registry.gpa, owned);
     }
