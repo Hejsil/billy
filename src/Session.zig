@@ -977,14 +977,99 @@ pub fn toolSet(session: *const Session) ToolSet {
 /// a slice of `buf`; the buffer is zero-filled, so the copy ends in NUL.
 fn setCheckedId(buf: []u8, given: []const u8) ![]const u8 {
     // One byte is kept for the NUL that ends the id in the buffer.
-    if (given.len == 0 or given.len + 1 > buf.len) return error.InvalidSessionId;
-    for (given) |byte| switch (byte) {
-        'a'...'z', 'A'...'Z', '0'...'9', '-', '_', '.' => {},
-        else => return error.InvalidSessionId,
-    };
-    if (std.mem.allEqual(u8, given, '.')) return error.InvalidSessionId;
+    if (given.len + 1 > buf.len) return error.InvalidSessionId;
+    if (!usableName(given)) return error.InvalidSessionId;
     @memcpy(buf[0..given.len], given);
     return buf[0..given.len];
+}
+
+/// Whether `text` could be the id of a session. An id is the characters a file
+/// name shares with one, and is neither empty nor all dots, which are the names
+/// that walk the directory rather than name a file in it.
+fn usableName(text: []const u8) bool {
+    if (text.len == 0) return false;
+    for (text) |byte| switch (byte) {
+        'a'...'z', 'A'...'Z', '0'...'9', '-', '_', '.' => {},
+        else => return false,
+    };
+    return !std.mem.allEqual(u8, text, '.');
+}
+
+/// The ids of the sessions in `dir`, the one most recently written to first.
+///
+/// The order is the time each session file was last written, so the session
+/// being worked in is at the top and stays there as it grows. The time is asked
+/// of the filesystem rather than read out of the id: an id carries the time it
+/// was *made*, and sessions made before ids became ULIDs carry it in a form that
+/// does not sort against a ULID at all.
+///
+/// Only files that could be a session are listed, so a file that is not one is
+/// passed over rather than reported as a session. The ids are `gpa`'s, and the
+/// caller frees each of them and then the list.
+pub fn list(dir: Io.Dir, io: Io, gpa: std.mem.Allocator) ![][]const u8 {
+    // The ids and the times they were written are two lists kept in step: the
+    // times are only there to order the ids by, so sorting has to move both.
+    var ids: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (ids.items) |made| gpa.free(made);
+        ids.deinit(gpa);
+    }
+    var written: std.ArrayList(i64) = .empty;
+    defer written.deinit(gpa);
+
+    var entries = dir.iterate();
+    while (try entries.next(io)) |entry| {
+        // A session is a regular file, so a directory or a symlink in the way is
+        // not one to read.
+        if (entry.kind != .file) continue;
+        const stem = idInName(entry.name) orelse continue;
+        // A file that cannot be asked about is one to leave out rather than one
+        // to fail the listing over.
+        const stat = dir.statFile(io, entry.name, .{}) catch continue;
+        try written.append(gpa, stat.mtime.toMilliseconds());
+        // The name is a window into the iterator, which the next entry moves on,
+        // so the id is copied out before it can go.
+        const owned = try gpa.dupe(u8, stem);
+        // A failed append leaves the copy unheld, so it is freed on the way out.
+        errdefer gpa.free(owned);
+        try ids.append(gpa, owned);
+    }
+
+    std.mem.sortUnstableContext(0, ids.items.len, Ordering{
+        .ids = ids.items,
+        .written = written.items,
+    });
+    return ids.toOwnedSlice(gpa);
+}
+
+/// Orders ids by when their session files were written, newest first, carrying
+/// the times along with them. The two lists are one list of pairs that the
+/// sorting cannot see, so a swap has to move both.
+const Ordering = struct {
+    ids: [][]const u8,
+    written: []i64,
+
+    pub fn lessThan(self: Ordering, a: usize, b: usize) bool {
+        // Newest first, and two written in the same millisecond by their ids,
+        // which is the order they were made in, so the order is total and a
+        // listing does not shuffle between calls.
+        if (self.written[a] != self.written[b]) return self.written[a] > self.written[b];
+        return std.mem.order(u8, self.ids[a], self.ids[b]) == .gt;
+    }
+
+    pub fn swap(self: Ordering, a: usize, b: usize) void {
+        std.mem.swap([]const u8, &self.ids[a], &self.ids[b]);
+        std.mem.swap(i64, &self.written[a], &self.written[b]);
+    }
+};
+
+/// The id in `file_name`, which is the name with the extension taken off, or null
+/// when the name is not that of a session file.
+fn idInName(file_name: []const u8) ?[]const u8 {
+    if (!std.mem.endsWith(u8, file_name, extension)) return null;
+    const stem = file_name[0 .. file_name.len - extension.len];
+    if (!usableName(stem)) return null;
+    return stem;
 }
 
 test "a new session is given a ULID, and nothing is written yet" {
@@ -1048,6 +1133,138 @@ test "ids made one after another differ" {
     try std.testing.expect(ulid.isId(&first));
     try std.testing.expect(ulid.isId(&second));
     try std.testing.expect(!std.mem.eql(u8, &first, &second));
+}
+
+/// Frees what `list` returned: the ids it copied out, and the list itself.
+fn freeList(ids: [][]const u8, gpa: std.mem.Allocator) void {
+    for (ids) |made| gpa.free(made);
+    gpa.free(ids);
+}
+
+test "the sessions in a directory are listed by when they were written" {
+    // Opened for iteration, since that is what listing a directory does.
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // An older id and a newer one, and a name that is not a ULID at all. The
+    // order below is none of these: it is the time each file was written, which
+    // is what makes the listing newest-first whatever the ids are.
+    var older_buf: [max_id_len]u8 = undefined;
+    ulid.encode(older_buf[0..ulid.length], 1_700_000_000_000, [_]u8{0} ** 10);
+    var newer_buf: [max_id_len]u8 = undefined;
+    ulid.encode(newer_buf[0..ulid.length], 1_700_000_001_000, [_]u8{0} ** 10);
+
+    const oldest = older_buf[0..ulid.length];
+    const newest_id = newer_buf[0..ulid.length];
+    const files = [_]struct { id: []const u8, written_ms: i64 }{
+        .{ .id = oldest, .written_ms = 1_000 }, // oldest by id, oldest by time
+        .{ .id = "dev", .written_ms = 3_000 }, // newest by time, named by hand
+        .{ .id = newest_id, .written_ms = 2_000 }, // newest by id, in the middle
+    };
+    for (files) |file| {
+        const file_name = try std.fmt.allocPrint(arena, "{s}{s}", .{ file.id, extension });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{}" });
+        try tmp.dir.setTimestamps(std.testing.io, file_name, .{
+            .modify_timestamp = .{ .new = Io.Timestamp.fromNanoseconds(
+                @as(i96, file.written_ms) * std.time.ns_per_ms,
+            ) },
+        });
+    }
+
+    // Files that are not sessions are passed over: another extension, a name that
+    // could not be an id, and a directory.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "notes.txt", .data = "x" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad name" ++ extension, .data = "x" });
+    try tmp.dir.createDirPath(std.testing.io, "a-directory" ++ extension);
+
+    const ids = try list(tmp.dir, std.testing.io, std.testing.allocator);
+    defer freeList(ids, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), ids.len);
+    try std.testing.expectEqualStrings("dev", ids[0]);
+    try std.testing.expectEqualStrings(newest_id, ids[1]);
+    try std.testing.expectEqualStrings(oldest, ids[2]);
+}
+
+test "the ordering keeps each id with the time it was written at" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Six sessions whose id order and write order run opposite ways, so the sort
+    // has to move the times along with the ids rather than reorder one list on
+    // its own: the id that was made first is the one written last, and so is the
+    // one that comes first in the listing.
+    const count = 6;
+    var buffers: [count][max_id_len]u8 = undefined;
+    for (0..count) |i| {
+        const made = buffers[i][0..ulid.length];
+        ulid.encode(made, 1_700_000_000_000 + @as(u48, @intCast(i)), [_]u8{0} ** 10);
+
+        const file_name = try std.fmt.allocPrint(arena, "{s}{s}", .{ made, extension });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{}" });
+        try tmp.dir.setTimestamps(std.testing.io, file_name, .{
+            .modify_timestamp = .{ .new = Io.Timestamp.fromNanoseconds(
+                @as(i96, 1_000 + (count - 1 - i) * 1_000) * std.time.ns_per_ms,
+            ) },
+        });
+    }
+
+    const ids = try list(tmp.dir, std.testing.io, std.testing.allocator);
+    defer freeList(ids, std.testing.allocator);
+
+    // The write times descend as the ids ascend, so the listing is the ids in
+    // the order they were made in, each still with the time it was written at.
+    try std.testing.expectEqual(@as(usize, count), ids.len);
+    for (ids, 0..) |listed, position| {
+        try std.testing.expectEqualStrings(buffers[position][0..ulid.length], listed);
+    }
+}
+
+test "sessions written at the same moment are ordered by their ids" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var older_buf: [max_id_len]u8 = undefined;
+    ulid.encode(older_buf[0..ulid.length], 1_700_000_000_000, [_]u8{0} ** 10);
+    var newer_buf: [max_id_len]u8 = undefined;
+    ulid.encode(newer_buf[0..ulid.length], 1_700_000_001_000, [_]u8{0} ** 10);
+
+    const when = Io.Timestamp.fromNanoseconds(1_000 * std.time.ns_per_ms);
+    for ([_][]const u8{ older_buf[0..ulid.length], newer_buf[0..ulid.length] }) |made| {
+        const file_name = try std.fmt.allocPrint(arena, "{s}{s}", .{ made, extension });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{}" });
+        try tmp.dir.setTimestamps(std.testing.io, file_name, .{ .modify_timestamp = .{ .new = when } });
+    }
+
+    // The same write time on both, so the newer id comes first and the order does
+    // not depend on how the directory happened to be read.
+    const ids = try list(tmp.dir, std.testing.io, std.testing.allocator);
+    defer freeList(ids, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), ids.len);
+    try std.testing.expectEqualStrings(newer_buf[0..ulid.length], ids[0]);
+    try std.testing.expectEqualStrings(older_buf[0..ulid.length], ids[1]);
+}
+
+test "an empty sessions directory lists nothing" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const ids = try list(tmp.dir, std.testing.io, std.testing.allocator);
+    defer freeList(ids, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ids.len);
 }
 
 test "setCheckedId rejects names that could escape the session directory" {
