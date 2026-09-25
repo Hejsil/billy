@@ -155,26 +155,26 @@ fn render(allocator: std.mem.Allocator, results: []const Response.Result) ![]con
 
 test "results are formatted as a numbered list of title, url and snippet" {
     const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
 
     const results = [_]Response.Result{
         .{ .title = "Zig", .url = "https://ziglang.org", .content = "A language." },
         // A result with no snippet is still worth its title and url.
         .{ .title = "Docs", .url = "https://ziglang.org/documentation" },
     };
+    const text = try render(gpa, &results);
+    defer gpa.free(text);
     try std.testing.expectEqualStrings(
         "1. Zig\nhttps://ziglang.org\nA language.\n\n2. Docs\nhttps://ziglang.org/documentation\n",
-        try render(arena_state.allocator(), &results),
+        text,
     );
 }
 
 test "a query that matched nothing says so" {
     const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
 
-    try std.testing.expectEqualStrings("(no results)", try render(arena_state.allocator(), &.{}));
+    const text = try render(gpa, &.{});
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("(no results)", text);
 }
 
 /// Stands in for the backend over a real socket: it records what the client put
@@ -259,10 +259,12 @@ test "a tavily search posts the query and reads the results back" {
         .max_results = 3,
         .http = &http,
     };
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-
-    const text = try client.tavily(arena_state.allocator(), "zig lang", endpoint, 3);
+    // `tavily` leaves the parsed reply and the list it built in the caller's
+    // allocator, so it gets an arena; the rest is the testing allocator, which
+    // reports anything not freed.
+    var reply_state = std.heap.ArenaAllocator.init(gpa);
+    defer reply_state.deinit();
+    const text = try client.tavily(reply_state.allocator(), "zig lang", endpoint, 3);
     try group.await(io);
     if (backend.err) |err| return err;
 
