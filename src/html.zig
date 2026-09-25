@@ -146,6 +146,16 @@ const Markdown = struct {
         return true;
     }
 
+    /// Writes a formatted run of HTML, where `put` writes text as it is. Returns
+    /// whether the write worked, so a callback can stop the parse the same way.
+    fn print(self: *Markdown, comptime format: []const u8, args: anytype) bool {
+        self.out.print(format, args) catch |err| {
+            self.err = err;
+            return false;
+        };
+        return true;
+    }
+
     /// Writes `text` escaped, so nothing in it can become markup.
     fn putEscaped(self: *Markdown, text: []const u8) bool {
         escape(text, self.out) catch |err| {
@@ -214,9 +224,7 @@ const Markdown = struct {
     /// from 3 shows 3, 4, 5 rather than 1, 2, 3.
     fn openOl(self: *Markdown, detail: *const md.c.MD_BLOCK_OL_DETAIL) bool {
         if (detail.start == 1) return self.put("<ol>\n");
-        var buffer: [32]u8 = undefined;
-        const text = std.fmt.bufPrint(&buffer, "<ol start=\"{d}\">\n", .{detail.start}) catch return true;
-        return self.put(text);
+        return self.print("<ol start=\"{d}\">\n", .{detail.start});
     }
 
     /// A task item is a disabled checkbox, so a `- [x]` reads as a checked box
@@ -1072,11 +1080,7 @@ pub fn block(gpa: std.mem.Allocator, b: agent.Block, out: *Io.Writer) !void {
         // line the terminal shows it as.
         .compacted => try element("div", "compacted", agent.marks.compacted.glyph ++ " compacted", out),
         .notice => |text| try element("div", "notice", text, out),
-        .elided => |count| {
-            var buffer: [64]u8 = undefined;
-            const line = std.fmt.bufPrint(&buffer, "… {d} earlier blocks", .{count}) catch "… earlier blocks";
-            try element("div", "elided", line, out);
-        },
+        .elided => |count| try out.print("<div class=\"elided\">… {d} earlier blocks</div>\n", .{count}),
     }
 }
 

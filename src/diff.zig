@@ -130,11 +130,7 @@ pub fn print(diff: []const Line, style: styling.Style, out: *Io.Writer) !void {
             },
             .removed => try markedLine(line.kind, line.text, .red, style, out),
             .added => try markedLine(line.kind, line.text, .green, style, out),
-            .elided => {
-                var buffer: [64]u8 = undefined;
-                const text = std.fmt.bufPrint(&buffer, " … {d} more lines", .{line.hidden}) catch " …";
-                try style.dim(text, out);
-            },
+            .elided => try out.print("{s} … {d} more lines{s}", .{ style.on("2"), line.hidden, style.off() }),
         }
         try out.writeAll("\n");
     }

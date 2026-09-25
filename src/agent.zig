@@ -773,10 +773,7 @@ fn blocksIn(session: *const Session, messages: []const Session.Message, index: u
 /// not read as the whole session. It is the count a short block gives of the
 /// lines it cut, standing where the blocks it names would have been.
 fn printElided(count: usize, style: styling.Style, out: *Io.Writer) !void {
-    var buffer: [64]u8 = undefined;
-    const line = std.fmt.bufPrint(&buffer, "… {d} earlier blocks", .{count}) catch "… earlier blocks";
-    try style.dim(line, out);
-    try out.writeAll("\n");
+    try out.print("{s}… {d} earlier blocks{s}\n", .{ style.on("2"), count, style.off() });
 }
 
 /// Runs the model until it replies with text instead of tool calls, showing what
