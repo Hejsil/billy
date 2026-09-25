@@ -15,12 +15,31 @@
   body {
     display: flex; background: var(--bg); color: var(--text);
     font: 14px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    /* `dvh` follows the visible area, so a phone's address bar does not push the
+       prompt box off the bottom; `overflow: hidden` keeps the page from scrolling
+       as a whole, the conversation scrolls instead. */
+    height: 100dvh; overflow: hidden;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  /* The button that opens the session list on a narrow screen. It is hidden
+     where the sidebar is always shown. */
+  #topbar { display: flex; align-items: center; flex: none; }
+  #menu {
+    display: none; flex: none; align-items: center; justify-content: center;
+    width: 44px; height: 40px; margin-left: 4px; padding: 0;
+    background: none; border: none; color: var(--text); font: inherit;
+    font-size: 18px; cursor: pointer;
   }
 
   /* The list of sessions down the left, and the button that starts a new one. */
   #sidebar {
     width: 250px; flex: none; display: flex; flex-direction: column;
     background: var(--panel); border-right: 1px solid var(--line);
+  }
+  /* Dims the page behind the session list when it is open over it. */
+  #backdrop {
+    display: none; position: fixed; inset: 0; z-index: 9; background: rgba(0, 0, 0, 0.5);
   }
   #sidebar header {
     display: flex; align-items: center; justify-content: space-between;
@@ -57,6 +76,7 @@
   /* The conversation in the middle, with the prompt box under it. */
   main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   #header {
+    flex: 1; min-width: 0;
     padding: 7px 16px; border-bottom: 1px solid var(--line);
     color: var(--dim); font-size: 12px; display: flex; gap: 6px; flex-wrap: wrap;
   }
@@ -195,6 +215,29 @@
   }
   .failed { color: var(--del); }
   #prompt.working #text { color: var(--dim); }
+  #prompt.working #mode { color: var(--dim); }
+
+  /* A narrow screen: the conversation takes the whole width and the session list
+     is a drawer over it, opened by the menu button. Tap targets grow and the
+     prompt box is 16px, which is the size a phone will not zoom in on when it is
+     focused. */
+  @media (max-width: 720px) {
+    #menu { display: flex; }
+    #sidebar {
+      position: fixed; top: 0; left: 0; z-index: 10; height: 100dvh;
+      width: min(80vw, 300px);
+      transform: translateX(-100%); transition: transform 0.2s ease;
+    }
+    body.drawer #sidebar { transform: translateX(0); }
+    body.drawer #backdrop { display: block; }
+    #new { width: 34px; height: 34px; font-size: 20px; }
+    #list { padding: 8px; }
+    #list li { padding: 10px 10px; }
+    #header { padding: 8px 12px; }
+    #conversation { padding: 12px; }
+    #prompt { padding: 10px; }
+    #text, #mode { font-size: 16px; }
+  }
 </style>
 </head>
 <body>
@@ -207,7 +250,10 @@
   </aside>
 
   <main>
-    <div id="header"></div>
+    <div id="topbar">
+      <button id="menu" title="sessions">&#9776;</button>
+      <div id="header"></div>
+    </div>
     <div id="conversation"></div>
     <form id="prompt">
       <textarea id="text" rows="1" placeholder="ask billy something (shift+enter for a newline)" autocomplete="off"></textarea>
@@ -217,6 +263,7 @@
       </select>
     </form>
   </main>
+  <div id="backdrop"></div>
 
 <script>
 // The page is a shell: every block of a conversation is rendered by the server
@@ -227,6 +274,8 @@ const conversation = document.getElementById('conversation');
 const form = document.getElementById('prompt');
 const input = document.getElementById('text');
 const modeSelect = document.getElementById('mode');
+const menuButton = document.getElementById('menu');
+const backdrop = document.getElementById('backdrop');
 let selected = null;
 let working = false;
 // The tool call the turn is in the middle of: the `<details>` opened by a
@@ -307,6 +356,7 @@ async function open(id) {
   }
   selected = id;
   for (const item of list.children) item.classList.toggle('selected', item.dataset.id === id);
+  closeDrawer();
   headerBox.innerHTML = body.header;
   conversation.innerHTML = body.blocks;
   // The mode is only chosen for a session that has no conversation yet, so it is
@@ -433,6 +483,15 @@ function scrollToEnd() {
   conversation.scrollTop = conversation.scrollHeight;
 }
 
+// The session list is a drawer on a narrow screen: the menu button opens it and
+// the backdrop or a chosen session closes it. On a wide screen it is always
+// shown, so opening it is a no-op there.
+function closeDrawer() {
+  document.body.classList.remove('drawer');
+}
+menuButton.onclick = () => document.body.classList.toggle('drawer');
+backdrop.onclick = closeDrawer;
+
 form.onsubmit = (event) => {
   event.preventDefault();
   send(input.value);
@@ -461,6 +520,7 @@ document.getElementById('new').onclick = async () => {
   // A new session may not be started mid-turn either: it would take the view
   // away from the turn that is still running.
   if (working) return;
+  closeDrawer();
   try {
     const res = await fetch('/api/sessions', { method: 'POST' });
     if (!res.ok) {
