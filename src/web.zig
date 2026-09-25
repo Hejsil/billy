@@ -20,6 +20,7 @@ const Io = std.Io;
 const agent = @import("agent.zig");
 const html = @import("html.zig");
 const models = @import("models.zig");
+const mode = @import("mode.zig");
 const Session = @import("Session.zig");
 const Runner = @import("agent.zig").Runner;
 const Setup = @import("Setup.zig");
@@ -705,8 +706,6 @@ fn askSession(
         .ignore_unknown_fields = true,
     }) catch return reply(request, .text, "the prompt is not JSON\n", .bad_request, answered);
     defer parsed.deinit();
-    if (parsed.value.text.len == 0)
-        return reply(request, .text, "the prompt is empty\n", .bad_request, answered);
 
     // Taken for the whole turn, and given back however the turn ends.
     if (!try registry.claim(id))
@@ -726,7 +725,20 @@ fn askSession(
     };
     defer session.deinit();
 
-    var runner = try Runner.init(setup.io, gpa, setup.agentConfig(session.cwd, .plain), session.cwd, http);
+    // The first prompt of a new session sets its mode: `/ask` opens the ask mode,
+    // and anything else the general one. A resumed session keeps the one it was
+    // saved with.
+    var text = parsed.value.text;
+    var config = setup.agentConfig(session.cwd, .plain);
+    if (session.messages.items.len == 0) {
+        const choice = mode.Mode.start(text);
+        config.mode = choice.mode;
+        text = choice.text;
+    }
+    if (text.len == 0)
+        return reply(request, .text, "the prompt is empty\n", .bad_request, answered);
+
+    var runner = try Runner.init(setup.io, gpa, config, session.cwd, http);
     defer runner.deinit();
     try runner.prepare(&session);
 
@@ -751,12 +763,12 @@ fn askSession(
     // own title, if it gives one, arrives with the list the page refreshes when
     // the turn ends.
     if (session.messages.items.len == 0) {
-        _ = try agent.nameFromPrompt(&session, parsed.value.text);
+        _ = try agent.nameFromPrompt(&session, text);
         if (session.title()) |title| try stream.send("title", TitleEvent{ .title = title });
     }
 
     runner.compactIfNeeded(emitter, &session);
-    runner.ask(emitter, &session, parsed.value.text) catch |err| {
+    runner.ask(emitter, &session, text) catch |err| {
         std.log.err("a request failed: {s}", .{@errorName(err)});
         try stream.fail(@errorName(err));
     };

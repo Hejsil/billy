@@ -516,10 +516,14 @@ pub const Runner = struct {
     /// configuration directory and the project's from the session's directory,
     /// and both are part of the prompt, so they are sent with every request.
     pub fn prepare(runner: *Runner, session: *Session) !void {
-        // The mode is recorded with the session, so a resume keeps the one it
-        // started in and the request it sends matches the earlier run.
-        session.setMode(runner.config.mode);
-        if (!session.hasSystemPrompt()) {
+        // A resumed session keeps the mode it started in; a new one takes the
+        // mode the frontend chose, which its first prompt may have named with
+        // `/ask`. Either way the runner's mode matches the session's, so the tool
+        // set it offers and the guard it runs are the session's own.
+        if (session.hasSystemPrompt()) {
+            runner.config.mode = session.mode;
+        } else {
+            session.setMode(runner.config.mode);
             const prompt_text = try leadPrompt(
                 runner.io,
                 runner.gpa,
@@ -600,9 +604,10 @@ pub fn run(
 
     var runner = try Runner.init(io, gpa, config, session.cwd, &http);
     defer runner.deinit();
-    // The conversation this session already has, or the system prompt and tools
-    // a new one starts with.
-    try runner.prepare(session);
+    // A resumed session keeps the prompt and tools it was saved with, so it is
+    // prepared here; a new one gets them when its first prompt names the mode.
+    var started = session.messages.items.len > 0;
+    if (started) try runner.prepare(session);
 
     // The editor holds the lines it returns and its history in an arena of its
     // own, over `gpa`, so the run need not keep an allocator for them.
@@ -630,6 +635,20 @@ pub fn run(
         try sessionHeader(&header.writer, config, session.id(), session.context_tokens, session.cost);
         const line = (try editor.readLine(header.written(), prompt)) orelse break;
         if (line.len == 0) continue;
+        // The first prompt of a new session sets its mode: `/ask` opens the ask
+        // mode, and anything else the general one. The lead is prepared from the
+        // mode before the first request, so nothing is sent before it is known.
+        var text = line;
+        if (!started) {
+            const choice = Mode.start(line);
+            runner.config.mode = choice.mode;
+            text = choice.text;
+            started = true;
+            try runner.prepare(session);
+            // A first prompt that was only `/ask` names the mode and asks
+            // nothing, so the turn waits for the next prompt.
+            if (text.len == 0) continue;
+        }
         // The line editor has erased the prompt it was typed behind, so the
         // prompt is written out now as the block a replay shows: the `> ` belongs
         // to the input, not to what was said. Flushed before the request, which
@@ -637,7 +656,7 @@ pub fn run(
         //
         // A failed request must not end the session: report it and take the next
         // request from the user.
-        runner.ask(emitter, session, line) catch |err|
+        runner.ask(emitter, session, text) catch |err|
             std.log.err("request failed: {s}", .{@errorName(err)});
         try out.flush();
     }
@@ -2150,6 +2169,46 @@ test "prepare gives a fresh session the user's instructions from the configurati
     // configuration directory is read for every session and not only a project.
     try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, Mode.general.prompt()) != null);
     try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, "USER RULES") != null);
+}
+
+test "prepare gives an ask session the ask prompt and only the tools it allows" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // A configuration directory with instructions, to check ask mode leaves them
+    // out: they say how to change code, which ask mode does not do.
+    var config_dir = std.testing.tmpDir(.{});
+    defer config_dir.cleanup();
+    try config_dir.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "USER RULES" });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+    var config = testConfig("m", "/work", null);
+    config.mode = .ask;
+    config.user_instructions_dir = config_dir.dir;
+    const work_dir = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(work_dir);
+    var runner = try Runner.init(io, gpa, config, work_dir, &http);
+    defer runner.deinit();
+
+    try runner.prepare(&session);
+
+    // The mode is recorded, the prompt is ask's without the instructions, and the
+    // tools stored are the two ask allows.
+    try std.testing.expectEqual(Mode.ask, session.mode);
+    try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, Mode.ask.prompt()) != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, "USER RULES") == null);
+
+    const defs = runner.tool_set.definitions(.ask);
+    try std.testing.expectEqual(@as(usize, 2), defs.len);
+    try std.testing.expectEqualStrings("read", defs[0].name);
+    try std.testing.expectEqualStrings("edit", defs[1].name);
+    try std.testing.expectEqual(defs.len, session.tools.len);
 }
 
 test "the terminal shows a tool call the way a replay does" {
