@@ -438,8 +438,8 @@ test "parseArgs reads the config subcommand on its own" {
         try parseArgs(&.{ "billy", "config", "tools.bash.format", "--nope" }),
     );
     try expectOptions(
-        .{ .config = .{ .path = "markdown.format", .value = "" } },
-        try parseArgs(&.{ "billy", "config", "markdown.format", "" }),
+        .{ .config = .{ .path = "tools.edit.format", .value = "" } },
+        try parseArgs(&.{ "billy", "config", "tools.edit.format", "" }),
     );
     // The subcommand has its own usage.
     try expectOptions(.{ .config = .{ .help = true } }, try parseArgs(&.{ "billy", "config", "-h" }));

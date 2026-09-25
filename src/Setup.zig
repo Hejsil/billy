@@ -209,10 +209,10 @@ pub fn agentConfig(setup: *const Setup, cwd: []const u8, style: styling.Style) a
         // How billy lays out and decorates what it shows. A bash command is laid
         // out by its format script, so the user reads the command the way it
         // runs; an edit is shown as a diff, laid out by its own script when one
-        // is set; a reply and a prompt are laid out by the markdown script; and
-        // the block headers are decorated for `style`. Only the display changes:
-        // the command that runs, the file that is written, the session and the
-        // model keep the text as it was written.
+        // is set; and the block headers are decorated for `style`. Only the
+        // display changes: the command that runs, the file that is written, the
+        // session and the model keep the text as it was written. A reply and a
+        // prompt are markdown, laid out by billy's own renderer (`term.zig`).
         .display = .{
             .formats = .{
                 .bash = if (settings.tools.bash.format) |script| .{
@@ -226,11 +226,6 @@ pub fn agentConfig(setup: *const Setup, cwd: []const u8, style: styling.Style) a
                     .gpa = setup.gpa,
                 } else null,
             },
-            .markdown = if (settings.markdown.format) |script| .{
-                .script = script,
-                .io = setup.io,
-                .gpa = setup.gpa,
-            } else null,
             .style = style,
         },
         // Web search is offered only when the configuration names a backend and

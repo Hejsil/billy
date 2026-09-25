@@ -85,20 +85,6 @@ pub const Edit = struct {
     format: ?[]const u8 = null,
 };
 
-/// Settings for the markdown billy shows. Markdown is not a tool: it is the
-/// form the replies and the prompts are written in, so the setting applies to
-/// both.
-pub const Markdown = struct {
-    /// A shell script that lays markdown out for the display: it reads the text
-    /// on standard input and writes the formatted text on standard output, such
-    /// as `glow -` or `bat -l md --plain`. Null shows the text exactly as it was
-    /// written.
-    ///
-    /// Only the display changes; what a session stores and what the model is
-    /// sent keep the text as it was written.
-    format: ?[]const u8 = null,
-};
-
 /// The configuration file as it is written to and read from disk. The settings
 /// are the configuration's own, since the file holds exactly those.
 const Stored = struct {
@@ -114,7 +100,6 @@ const Stored = struct {
     /// and a session is then listed by its id.
     title: bool = true,
     tools: Tools = .{},
-    markdown: Markdown = .{},
 
     const default = Stored{};
 
@@ -161,9 +146,6 @@ compact_at: usize = Stored.default.compact_at,
 title: bool = Stored.default.title,
 /// Settings for the tools the agent can call, by tool name.
 tools: Tools = Stored.default.tools,
-/// Settings for the markdown billy shows: the replies it writes and the
-/// prompts the user types.
-markdown: Markdown = Stored.default.markdown,
 
 /// An empty configuration, with the arena a file read fills in. Its settings
 /// are the defaults, which is what a missing file is written with.
@@ -538,20 +520,17 @@ test "open reads the compaction threshold from the file" {
     try std.testing.expectEqual(0, off.config.compact_at);
 }
 
-test "open reads the markdown format from the file" {
+test "a retired markdown setting in the file is ignored" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var opened = try openFrom(&tmp, "{\"markdown\":{\"format\":\"glow -\"}}");
+    // A reply and a prompt are laid out by billy's own renderer now, so the
+    // `markdown` section a file may still carry is read the way any unknown field
+    // is: left alone, without making the file unusable.
+    var opened = try openFrom(&tmp, "{\"markdown\":{\"format\":\"glow -\"},\"max_turns\":7}");
     defer opened.config.deinit();
-    try std.testing.expectEqualStrings("glow -", opened.config.markdown.format.?);
-    // The tools are untouched by a markdown format.
+    try std.testing.expectEqual(7, opened.config.max_turns);
     try std.testing.expect(opened.config.tools.bash.format == null);
-
-    // A file without one leaves the format unset, as before.
-    var bare = try openFrom(&tmp, "{}");
-    defer bare.config.deinit();
-    try std.testing.expect(bare.config.markdown.format == null);
 }
 
 test "open leaves the bash format unset when the file does not set one" {
@@ -653,9 +632,6 @@ test "the file is indented, so it can be read and edited by hand" {
         \\      "provider": null,
         \\      "max_results": 5
         \\    }
-        \\  },
-        \\  "markdown": {
-        \\    "format": null
         \\  }
         \\}
     , text);
@@ -721,9 +697,6 @@ test "set names a setting by its dotted path" {
     try std.testing.expectEqual(search.Provider.tavily, config.tools.web_search.provider.?);
     try config.set("tools.web_search.max_results", "3");
     try std.testing.expectEqual(3, config.tools.web_search.max_results);
-
-    try config.set("markdown.format", "glow -");
-    try std.testing.expectEqualStrings("glow -", config.markdown.format.?);
 }
 
 test "set writes null to clear a setting that has no value" {
@@ -772,7 +745,6 @@ test "a setting set by path is written and read back" {
     try config.set("tools.bash.format", "shfmt");
     try config.set("tools.bash.timeout_s", "45");
     try config.set("tools.web_search.provider", "tavily");
-    try config.set("markdown.format", "glow -");
     try config.save(std.testing.io, tmp.dir);
 
     var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
@@ -780,7 +752,6 @@ test "a setting set by path is written and read back" {
     try std.testing.expectEqualStrings("shfmt", opened.config.tools.bash.format.?);
     try std.testing.expectEqual(45, opened.config.tools.bash.timeout_s);
     try std.testing.expectEqual(search.Provider.tavily, opened.config.tools.web_search.provider.?);
-    try std.testing.expectEqualStrings("glow -", opened.config.markdown.format.?);
 }
 
 test "run sets a setting in the file, creating it when it is missing" {

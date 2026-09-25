@@ -10,8 +10,8 @@ const Mock = @import("mock.zig");
 const search = @import("search.zig");
 const LineEditor = @import("LineEditor.zig");
 const Session = @import("Session.zig");
-const formatting = @import("format.zig");
 const styling = @import("style.zig");
+const term = @import("term.zig");
 
 pub const Config = struct {
     api_key: []const u8,
@@ -54,9 +54,9 @@ pub const Config = struct {
 };
 
 /// How billy lays out and decorates what it shows: the formatter scripts for a
-/// tool's block, the markdown formatter and the terminal style. They travel
-/// together through the printing, so they are gathered here rather than passed
-/// apart as a run of arguments that had grown hard to read.
+/// tool's block and the terminal style. They travel together through the
+/// printing, so they are gathered here rather than passed apart as a run of
+/// arguments that had grown hard to read.
 ///
 /// The layout is presentation only: the command that runs, what a session stores
 /// and what the model is sent keep the text as it was written.
@@ -64,9 +64,6 @@ pub const Display = struct {
     /// How a tool's block is laid out before it is shown: a bash command and an
     /// edit's diff. Null shows each as it was written.
     formats: Tools.Formats = .{},
-    /// How the markdown of a reply and a prompt is laid out before it is shown.
-    /// Null shows the text as written.
-    markdown: formatting.Format = null,
     /// How billy decorates the lines it prints itself, such as a block header.
     /// Plain everywhere the terminal does not take escape codes.
     style: styling.Style = .plain,
@@ -164,14 +161,14 @@ const Terminal = struct {
         switch (block) {
             .prompt => |text| {
                 if (self.replay) try self.out.writeAll("\n");
-                try printPrompt(self.out, text, self.display);
+                try printPrompt(self.scratch, self.out, text, self.display);
                 // The prompt goes out as it is typed, before the request that
                 // answers it, so what was sent is on screen while the model
                 // works. Without this it waits in the buffer until the answer
                 // or a tool call flushes it.
                 try self.out.flush();
             },
-            .answer => |content| try printAnswer(self.out, content, self.display),
+            .answer => |content| try printAnswer(self.scratch, self.out, content, self.display),
             // The header goes out as the call begins, so a command that runs
             // long has it on screen while it runs.
             .tool_begin => |call| {
@@ -1166,22 +1163,21 @@ fn printCompacted(out: *Io.Writer, style: styling.Style) !void {
 ///
 /// The blank line keeps the prompt from reading as the label of the answer or
 /// the tool block that follows it, which begin on the very next row otherwise.
-fn printPrompt(out: *Io.Writer, text: []const u8, display: Display) !void {
+fn printPrompt(gpa: std.mem.Allocator, out: *Io.Writer, text: []const u8, display: Display) !void {
     try styling.header(marks.prompt, "prompt", "", display.style, out);
-    if (!try formatting.apply(display.markdown, text, out)) try out.writeAll(text);
+    try term.write(gpa, text, display.style, out);
     try out.writeAll("\n\n");
 }
 
-/// Prints a reply under its own header, the markdown laid out by `markdown` when
-/// one is set and as it was written when there is none or it cannot be used.
-/// Only the display changes; the session and the model keep the text itself.
-fn printAnswer(out: *Io.Writer, content: ?[]const u8, display: Display) !void {
+/// Prints a reply under its own header, laid out as markdown. Only the display
+/// changes; the session and the model keep the text itself.
+fn printAnswer(gpa: std.mem.Allocator, out: *Io.Writer, content: ?[]const u8, display: Display) !void {
     try styling.header(marks.answer, "answer", "", display.style, out);
     const text = content orelse "";
     if (text.len == 0) {
         try display.style.dim("(empty reply)", out);
-    } else if (!try formatting.apply(display.markdown, text, out)) {
-        try out.writeAll(text);
+    } else {
+        try term.write(gpa, text, display.style, out);
     }
     try out.writeAll("\n");
     try out.flush();
@@ -1194,7 +1190,6 @@ fn printAnswer(out: *Io.Writer, content: ?[]const u8, display: Display) !void {
 fn expectTranscript(
     expected: []const u8,
     messages: []const llm.Message,
-    markdown: formatting.Format,
     style: styling.Style,
 ) !void {
     const gpa = std.testing.allocator;
@@ -1211,7 +1206,7 @@ fn expectTranscript(
 
     // No bash format: what these cover is how a message is headed and laid out,
     // which the tool format does not touch. Zero shows the whole conversation.
-    try printTranscript(gpa, &out.writer, &session, .{ .markdown = markdown, .style = style }, 0);
+    try printTranscript(gpa, &out.writer, &session, .{ .style = style }, 0);
     try std.testing.expectEqualStrings(expected, out.written());
 }
 
@@ -1278,7 +1273,6 @@ test "printTranscript replays a conversation as the blocks it was made of" {
             .{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;" },
             .{ .role = "assistant", .content = "done" },
         },
-        null,
         .plain,
     );
 }
@@ -1292,66 +1286,32 @@ test "printTranscript leaves out the system prompt and an unpaired tool result" 
             .{ .role = "system", .content = "ignore me" },
             .{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;" },
         },
-        null,
         .plain,
     );
 }
 
 test "a reply is headed by its own header, and its markdown laid out" {
-    // `tr` stands in for a markdown formatter: it reads the reply and writes it
-    // back upper case, so what the display shows is plainly not the text itself.
-    const markdown: formatting.Format = .{
-        .script = "tr a-z A-Z",
-        .io = std.testing.io,
-        .gpa = std.testing.allocator,
-    };
+    // A reply is markdown, laid out by the built-in renderer: the marks are taken
+    // off and the text is set as a terminal shows it.
     try expectTranscript(
-        "◆ answer\nHELLO\n",
-        &.{.{ .role = "assistant", .content = "hello" }},
-        markdown,
+        "◆ answer\nhi\n",
+        &.{.{ .role = "assistant", .content = "**hi**" }},
         .plain,
     );
 
-    // No formatter, and one that fails, both leave the reply as it was written.
+    // An empty reply is said to be empty rather than shown blank.
     try expectTranscript(
-        "◆ answer\nhello\n",
-        &.{.{ .role = "assistant", .content = "hello" }},
-        null,
-        .plain,
-    );
-    const broken: formatting.Format = .{
-        .script = "exit 1",
-        .io = std.testing.io,
-        .gpa = std.testing.allocator,
-    };
-    try expectTranscript(
-        "◆ answer\nhello\n",
-        &.{.{ .role = "assistant", .content = "hello" }},
-        broken,
+        "◆ answer\n(empty reply)\n",
+        &.{.{ .role = "assistant", .content = "" }},
         .plain,
     );
 }
 
 test "a prompt from the session is headed and laid out like a reply" {
-    // The same stand-in formatter as a reply: a prompt is markdown too, so it is
-    // laid out by the same script.
-    const markdown: formatting.Format = .{
-        .script = "tr a-z A-Z",
-        .io = std.testing.io,
-        .gpa = std.testing.allocator,
-    };
+    // A prompt is markdown too, so it is laid out by the same renderer.
     try expectTranscript(
-        "\n» prompt\nHELLO\n\n",
-        &.{.{ .role = "user", .content = "hello" }},
-        markdown,
-        .plain,
-    );
-
-    // Without one, the prompt is shown as it was typed.
-    try expectTranscript(
-        "\n» prompt\nhello\n\n",
-        &.{.{ .role = "user", .content = "hello" }},
-        null,
+        "\n» prompt\nhi\n\n",
+        &.{.{ .role = "user", .content = "**hi**" }},
         .plain,
     );
 }
@@ -1363,30 +1323,22 @@ test "a prompt is headed by the same block live and replayed" {
 
     // The block a replay shows, but with no blank line in front: it is printed
     // where the line editor left the cursor, on the row the header stood on.
-    try printPrompt(&out.writer, "hello", .{ .style = .plain });
+    try printPrompt(gpa, &out.writer, "hello", .{ .style = .plain });
     try std.testing.expectEqualStrings("» prompt\nhello\n\n", out.written());
     out.clearRetainingCapacity();
 
-    // A prompt is markdown, so it is laid out by the same script as a reply.
-    const markdown: formatting.Format = .{
-        .script = "tr a-z A-Z",
-        .io = std.testing.io,
-        .gpa = gpa,
-    };
-    try printPrompt(&out.writer, "hello", .{ .markdown = markdown, .style = .plain });
-    try std.testing.expectEqualStrings("» prompt\nHELLO\n\n", out.written());
-    out.clearRetainingCapacity();
-
-    // The `> ` the line was typed behind is not part of the block.
-    try printPrompt(&out.writer, "hello", .{ .style = .ansi });
-    try std.testing.expectEqualStrings("\x1b[34m»\x1b[0m \x1b[1mprompt\x1b[0m\nhello\n\n", out.written());
+    // A prompt is markdown, so it is laid out by the same renderer as a reply.
+    try printPrompt(gpa, &out.writer, "**hello**", .{ .style = .ansi });
+    try std.testing.expectEqualStrings(
+        "\x1b[34m»\x1b[0m \x1b[1mprompt\x1b[0m\n\x1b[1mhello\x1b[0m\n\n",
+        out.written(),
+    );
 }
 
 test "an empty reply is shown under its header, in place of the text" {
     try expectTranscript(
         "◆ answer\n(empty reply)\n",
         &.{.{ .role = "assistant", .content = "" }},
-        null,
         .plain,
     );
 }
@@ -1401,7 +1353,6 @@ test "a prompt and a reply are headed alike, in the colours of the display" {
             .{ .role = "user", .content = "hello" },
             .{ .role = "assistant", .content = "hi" },
         },
-        null,
         .ansi,
     );
 }
@@ -1488,7 +1439,6 @@ test "printTranscript gives each call the result that names it" {
             .{ .role = "tool", .tool_call_id = "call_1", .content = "contents of a" },
             .{ .role = "tool", .tool_call_id = "call_2", .content = "contents of b" },
         },
-        null,
         .plain,
     );
 }
@@ -1508,7 +1458,6 @@ test "printTranscript rebuilds an edit's diff from the stored call" {
             }} },
             .{ .role = "tool", .tool_call_id = "call_1", .content = "replaced 1 occurrence(s) in a.zig" },
         },
-        null,
         .plain,
     );
 }
