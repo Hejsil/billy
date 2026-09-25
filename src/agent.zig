@@ -640,7 +640,7 @@ pub fn run(
         // mode before the first request, so nothing is sent before it is known.
         var text = line;
         if (!started) {
-            const choice = Mode.start(line);
+            const choice = Mode.start(line, .general);
             runner.config.mode = choice.mode;
             text = choice.text;
             started = true;
@@ -2205,9 +2205,8 @@ test "prepare gives an ask session the ask prompt and only the tools it allows" 
     try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, "USER RULES") == null);
 
     const defs = runner.tool_set.definitions(.ask);
-    try std.testing.expectEqual(@as(usize, 2), defs.len);
+    try std.testing.expectEqual(@as(usize, 1), defs.len);
     try std.testing.expectEqualStrings("read", defs[0].name);
-    try std.testing.expectEqualStrings("edit", defs[1].name);
     try std.testing.expectEqual(defs.len, session.tools.len);
 }
 

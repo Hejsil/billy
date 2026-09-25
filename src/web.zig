@@ -731,7 +731,7 @@ fn askSession(
     var text = parsed.value.text;
     var config = setup.agentConfig(session.cwd, .plain);
     if (session.messages.items.len == 0) {
-        const choice = mode.Mode.start(text);
+        const choice = mode.Mode.start(text, .ask);
         config.mode = choice.mode;
         text = choice.text;
     }

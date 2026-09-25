@@ -36,25 +36,33 @@ pub const Mode = enum {
     pub fn allows(mode: Mode, name: []const u8) bool {
         return switch (mode) {
             .general => true,
-            // Everything billy offers but `bash` and `write`. Edit is left in.
-            .ask => !std.mem.eql(u8, name, "bash") and !std.mem.eql(u8, name, "write"),
+            // Everything but the tools that change the system: `bash` runs a
+            // command, `write` replaces a file, and `edit` rewrites one.
+            .ask => !std.mem.eql(u8, name, "bash") and
+                !std.mem.eql(u8, name, "write") and
+                !std.mem.eql(u8, name, "edit"),
         };
     }
 
     /// What a session's first prompt asks for: the mode to start in, and the
-    /// prompt with any leading command taken off. `/ask` starts an ask session,
-    /// so a mode need not be chosen before the first thing is typed.
-    pub fn start(text: []const u8) Start {
-        const rest = std.mem.trimStart(u8, text, " \t");
-        if (std.mem.startsWith(u8, rest, ask_command)) {
-            const after = rest[ask_command.len..];
-            if (after.len == 0 or after[0] == ' ' or after[0] == '\t' or after[0] == '\n') {
-                return .{ .mode = .ask, .text = std.mem.trimStart(u8, after, " \t\n") };
-            }
-        }
-        return .{ .mode = .general, .text = text };
+    /// prompt with any leading command taken off. `/ask` and `/general` start in
+    /// that mode; anything else starts in `default`, which is the frontend's own.
+    pub fn start(text: []const u8, default: Mode) Start {
+        if (command(text, ask_command)) |rest| return .{ .mode = .ask, .text = rest };
+        if (command(text, general_command)) |rest| return .{ .mode = .general, .text = rest };
+        return .{ .mode = default, .text = text };
     }
 };
+
+/// `text` with the command `name` taken off its front, or null when it does not
+/// open with it. A command is a whole word: `/asking` is not `/ask`.
+fn command(text: []const u8, name: []const u8) ?[]const u8 {
+    const rest = std.mem.trimStart(u8, text, " \t");
+    if (!std.mem.startsWith(u8, rest, name)) return null;
+    const after = rest[name.len..];
+    if (after.len > 0 and after[0] != ' ' and after[0] != '\t' and after[0] != '\n') return null;
+    return std.mem.trimStart(u8, after, " \t\n");
+}
 
 /// What a first prompt asks for: the mode it names and the prompt itself.
 pub const Start = struct {
@@ -62,8 +70,9 @@ pub const Start = struct {
     text: []const u8,
 };
 
-/// The command that opens the ask mode from the first prompt.
+/// The commands a first prompt can open with to name the mode.
 const ask_command = "/ask";
+const general_command = "/general";
 
 const general_prompt =
     \\You are a coding agent working in the user's project directory.
@@ -79,12 +88,13 @@ const ask_prompt =
 test "ask allows the tools that read and search, and no others" {
     try std.testing.expect(Mode.general.allows("bash"));
     try std.testing.expect(Mode.general.allows("write"));
+    try std.testing.expect(Mode.general.allows("edit"));
 
     try std.testing.expect(Mode.ask.allows("read"));
-    try std.testing.expect(Mode.ask.allows("edit"));
     try std.testing.expect(Mode.ask.allows("web_search"));
     try std.testing.expect(!Mode.ask.allows("bash"));
     try std.testing.expect(!Mode.ask.allows("write"));
+    try std.testing.expect(!Mode.ask.allows("edit"));
 }
 
 test "ask does not read the instruction files" {
@@ -92,15 +102,22 @@ test "ask does not read the instruction files" {
     try std.testing.expect(!Mode.ask.instructions());
 }
 
-test "a first prompt opens the mode it names" {
-    // `/ask` on its own names the mode with nothing left to ask.
-    try std.testing.expectEqual(Mode.ask, Mode.start("/ask").mode);
-    try std.testing.expectEqualStrings("", Mode.start("/ask").text);
-    try std.testing.expectEqualStrings("what is x", Mode.start("/ask what is x").text);
+test "a first prompt opens the mode it names, or the default" {
+    // `/ask` and `/general` name the mode; with nothing after them nothing is
+    // asked, and with something it is the prompt.
+    try std.testing.expectEqual(Mode.ask, Mode.start("/ask", .general).mode);
+    try std.testing.expectEqualStrings("", Mode.start("/ask", .general).text);
+    try std.testing.expectEqualStrings("what is x", Mode.start("/ask what is x", .general).text);
+    try std.testing.expectEqual(Mode.general, Mode.start("/general do it", .ask).mode);
+    try std.testing.expectEqualStrings("do it", Mode.start("/general do it", .ask).text);
 
-    // Anything else is a general prompt, kept as it is.
-    try std.testing.expectEqual(Mode.general, Mode.start("hello").mode);
-    try std.testing.expectEqualStrings("hello", Mode.start("hello").text);
-    // A word that merely starts with the command is not it.
-    try std.testing.expectEqual(Mode.general, Mode.start("/asking around").mode);
+    // Anything else is the default, kept as it is. The web starts in ask; the
+    // terminal starts in general.
+    try std.testing.expectEqual(Mode.ask, Mode.start("hello", .ask).mode);
+    try std.testing.expectEqualStrings("hello", Mode.start("hello", .ask).text);
+    try std.testing.expectEqual(Mode.general, Mode.start("hello", .general).mode);
+
+    // A word that merely starts with a command is not it.
+    try std.testing.expectEqual(Mode.general, Mode.start("/asking around", .general).mode);
+    try std.testing.expectEqual(Mode.ask, Mode.start("/generally", .ask).mode);
 }
