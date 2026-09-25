@@ -1206,10 +1206,10 @@ test "describe frames a call and its output" {
     // A web search shows the query it ran, and its results under the output
     // label like any other text a tool returned.
     try expectDescribe(
-        "⌕ web_search zig lang\n▾ output\n1. Zig\nhttps://ziglang.org\n\n",
+        "⌕ web_search zig lang\n▾ output\n1. Zig\n   https://ziglang.org\n\n",
         "web_search",
         "{\"query\":\"zig lang\"}",
-        "1. Zig\nhttps://ziglang.org",
+        "1. Zig\n   https://ziglang.org",
         .{},
     );
     // A tool that is not implemented shows its name, and the reason it could not
