@@ -12,6 +12,7 @@ const LineEditor = @import("LineEditor.zig");
 const Session = @import("Session.zig");
 const styling = @import("style.zig");
 const term = @import("term.zig");
+const Mode = @import("mode.zig").Mode;
 
 pub const Config = struct {
     api_key: []const u8,
@@ -46,6 +47,9 @@ pub const Config = struct {
     /// Whether the model is asked for a short title for a session, after its
     /// first turn, so a frontend can list it by name. Mirrors the configuration.
     title: bool = true,
+    /// What the session may do and what its prompt says, decided when it starts.
+    /// See `mode.zig`.
+    mode: Mode = .general,
     /// How what billy shows is laid out and decorated, from the configuration.
     display: Display = .{},
     /// Web search, when the configuration names a backend and its key is set.
@@ -197,12 +201,6 @@ const Terminal = struct {
         return @ptrCast(@alignCast(context));
     }
 };
-
-const system_prompt =
-    \\You are a coding agent working in the user's project directory.
-    \\Inspect the code before you change it, and use the tools to do the work.
-    \\Reply with plain text when the task is done.
-;
 
 /// The files a project's own instructions are read from, in the order they are
 /// tried. `AGENTS.md` is the open convention; `CLAUDE.md` is accepted after it so
@@ -518,17 +516,21 @@ pub const Runner = struct {
     /// configuration directory and the project's from the session's directory,
     /// and both are part of the prompt, so they are sent with every request.
     pub fn prepare(runner: *Runner, session: *Session) !void {
+        // The mode is recorded with the session, so a resume keeps the one it
+        // started in and the request it sends matches the earlier run.
+        session.setMode(runner.config.mode);
         if (!session.hasSystemPrompt()) {
             const prompt_text = try leadPrompt(
                 runner.io,
                 runner.gpa,
                 runner.work_dir,
                 runner.config.user_instructions_dir,
+                runner.config.mode,
             );
             defer runner.gpa.free(prompt_text);
             try session.setSystemPrompt(prompt_text);
         }
-        try session.ensureTools(runner.tool_set.definitions());
+        try session.ensureTools(runner.tool_set.definitions(runner.config.mode));
     }
 
     /// Compacts the conversation if it has outgrown the context window, so that
@@ -552,7 +554,8 @@ pub const Runner = struct {
             runner.gpa,
             runner.work_dir,
             runner.config.user_instructions_dir,
-            runner.tool_set.definitions(),
+            runner.config.mode,
+            runner.tool_set.definitions(runner.config.mode),
             session,
         ) catch |err| std.log.warn("could not refresh the prompt and tools: {s}", .{@errorName(err)});
     }
@@ -839,7 +842,7 @@ fn turn(
                 break :blk false;
             };
             if (compacted) {
-                refreshLead(io, tool_set.gpa, tool_set.dir, config.user_instructions_dir, tool_set.definitions(), session) catch |err|
+                refreshLead(io, tool_set.gpa, tool_set.dir, config.user_instructions_dir, config.mode, tool_set.definitions(config.mode), session) catch |err|
                     std.log.warn("could not refresh the prompt and tools: {s}", .{@errorName(err)});
             }
         }
@@ -864,7 +867,7 @@ fn turn(
         // No calls means the model answered, which ends the turn.
         if (calls.len == 0) return emitter.show(.{ .answer = message.content orelse "" });
 
-        try runCalls(tool_set, emitter, &scratch_state, session, calls);
+        try runCalls(tool_set, emitter, &scratch_state, session, config.mode, calls);
     }
     var buffer: [96]u8 = undefined;
     const stopped = std.fmt.bufPrint(
@@ -887,6 +890,7 @@ fn runCalls(
     emitter: Emitter,
     scratch_state: *std.heap.ArenaAllocator,
     session: *Session,
+    mode: Mode,
     calls: []const llm.ToolCall,
 ) !void {
     for (calls) |call| {
@@ -896,7 +900,15 @@ fn runCalls(
 
         var result: std.Io.Writer.Allocating = .init(tool_set.gpa);
         defer result.deinit();
-        try tool_set.run(parsed, &result.writer);
+        // The mode's tools are what the model is offered, but a session file or
+        // a crafted request can still name one it is not allowed, so the call is
+        // refused here as well as filtered out of the offer.
+        const name = Tools.callName(parsed);
+        if (!mode.allows(name)) {
+            try result.writer.print("error: the {s} mode does not allow the {s} tool", .{ @tagName(mode), name });
+        } else {
+            try tool_set.run(parsed, &result.writer);
+        }
 
         try session.append(.{
             .role = "tool",
@@ -917,15 +929,19 @@ fn runCalls(
 /// request and survives whatever context trimming happens later. That is what
 /// keeps the rules the user and the project care about from being dropped
 /// partway through a long session. The caller owns the text and frees it.
-fn leadPrompt(io: Io, gpa: std.mem.Allocator, dir: Io.Dir, user_dir: ?Io.Dir) ![]u8 {
+fn leadPrompt(io: Io, gpa: std.mem.Allocator, dir: Io.Dir, user_dir: ?Io.Dir, mode: Mode) ![]u8 {
     var text: std.Io.Writer.Allocating = .init(gpa);
     errdefer text.deinit();
-    // Billy's own text first, then each section of instructions as it is found,
+    // The mode's text first, then each section of instructions as it is found,
     // so the whole prompt is written once into one buffer with no part of it
     // built apart and then copied in.
-    try text.writer.writeAll(system_prompt);
-    if (user_dir) |config_dir| _ = try globalInstructions(io, &text.writer, config_dir);
-    _ = try projectInstructions(io, &text.writer, dir);
+    try text.writer.writeAll(mode.prompt());
+    // Ask mode answers questions rather than changing code, so the instruction
+    // files, which say how to change it, are left out.
+    if (mode.instructions()) {
+        if (user_dir) |config_dir| _ = try globalInstructions(io, &text.writer, config_dir);
+        _ = try projectInstructions(io, &text.writer, dir);
+    }
     return text.toOwnedSlice();
 }
 
@@ -945,10 +961,11 @@ fn refreshLead(
     gpa: std.mem.Allocator,
     dir: Io.Dir,
     user_dir: ?Io.Dir,
+    mode: Mode,
     definitions: []const Session.Definition,
     session: *Session,
 ) !void {
-    const prompt_text = try leadPrompt(io, gpa, dir, user_dir);
+    const prompt_text = try leadPrompt(io, gpa, dir, user_dir, mode);
     defer gpa.free(prompt_text);
     try session.setSystemPrompt(prompt_text);
     try session.setTools(definitions);
@@ -1808,39 +1825,42 @@ test "the prompt is billy's own, the user's instructions, then the project's" {
 
     // With neither file, the prompt is billy's own text alone.
     {
-        const text = try leadPrompt(io, gpa, project.dir, config.dir);
+        const text = try leadPrompt(io, gpa, project.dir, config.dir, .general);
         defer gpa.free(text);
-        try std.testing.expectEqualStrings(system_prompt, text);
+        try std.testing.expectEqualStrings(Mode.general.prompt(), text);
     }
 
     // The user's instructions are read from the configuration directory and
     // joined after billy's own text, with no project file needed for them.
     try config.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "USER RULES" });
     {
-        const text = try leadPrompt(io, gpa, project.dir, config.dir);
+        const text = try leadPrompt(io, gpa, project.dir, config.dir, .general);
         defer gpa.free(text);
-        try std.testing.expectEqualStrings(
-            system_prompt ++ "\n\nThe user's instructions follow, read from AGENTS.md.\n\nUSER RULES",
-            text,
+        const expected = try std.fmt.allocPrint(
+            gpa,
+            "{s}\n\nThe user's instructions follow, read from AGENTS.md.\n\nUSER RULES",
+            .{Mode.general.prompt()},
         );
+        defer gpa.free(expected);
+        try std.testing.expectEqualStrings(expected, text);
     }
 
     // The project's follow the user's, so the more particular rules are read
     // last, and all three are there.
     try project.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "PROJECT RULES" });
     {
-        const text = try leadPrompt(io, gpa, project.dir, config.dir);
+        const text = try leadPrompt(io, gpa, project.dir, config.dir, .general);
         defer gpa.free(text);
         const user = std.mem.indexOf(u8, text, "USER RULES") orelse return error.TestUnexpectedResult;
         const local = std.mem.indexOf(u8, text, "PROJECT RULES") orelse return error.TestUnexpectedResult;
-        try std.testing.expect(std.mem.indexOf(u8, text, system_prompt) != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, Mode.general.prompt()) != null);
         try std.testing.expect(user < local);
     }
 
     // A project on its own still works, when the configuration holds no file.
     try config.dir.deleteFile(io, "AGENTS.md");
     {
-        const text = try leadPrompt(io, gpa, project.dir, null);
+        const text = try leadPrompt(io, gpa, project.dir, null, .general);
         defer gpa.free(text);
         try std.testing.expect(std.mem.indexOf(u8, text, "PROJECT RULES") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "USER RULES") == null);
@@ -2074,12 +2094,12 @@ test "refreshLead replaces the prompt, the project instructions and the tools" {
     try session.setSystemPrompt("OLD PROMPT");
     try session.setTools(&old_tools);
 
-    try refreshLead(io, gpa, tmp.dir, null, &new_tools, &session);
+    try refreshLead(io, gpa, tmp.dir, null, .general, &new_tools, &session);
 
     // The prompt is the current one: billy's own text with the project's
     // instructions after it, and none of the old prompt left.
     const prompt_text = session.systemPrompt().?;
-    try std.testing.expect(std.mem.indexOf(u8, prompt_text, system_prompt) != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt_text, Mode.general.prompt()) != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt_text, "PROJECT RULES") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt_text, "OLD PROMPT") == null);
 
@@ -2128,7 +2148,7 @@ test "prepare gives a fresh session the user's instructions from the configurati
 
     // The prompt the session runs with carries the user's instructions, so the
     // configuration directory is read for every session and not only a project.
-    try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, system_prompt) != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, Mode.general.prompt()) != null);
     try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, "USER RULES") != null);
 }
 

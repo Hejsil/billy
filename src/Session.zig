@@ -25,6 +25,7 @@ const Io = std.Io;
 const llm = @import("llm.zig");
 const ulid = @import("ulid.zig");
 const xdg = @import("xdg.zig");
+const Mode = @import("mode.zig").Mode;
 
 const Session = @This();
 
@@ -80,6 +81,9 @@ const Stored = struct {
     /// conversation alone, so that the prompt and the tools can be replaced at a
     /// compaction without rewriting the conversation the model has seen.
     system_prompt: ?[]const u8 = null,
+    /// The mode the session runs in, which fixes its prompt and its tools. A file
+    /// saved before modes existed has none, and reads back as general.
+    mode: Mode = .general,
     /// The conversation, oldest first.
     messages: []const llm.Message = &.{},
     /// Indices into `messages`, sorted, of the summaries a compaction produced.
@@ -253,6 +257,10 @@ system_prompt: StringIndex = .none,
 /// the pool like every other string. `.none` until the session is named, which
 /// happens on the first turn.
 title_index: StringIndex = .none,
+
+/// What the session may do and what its prompt says. Kept so a resume keeps the
+/// mode it started in rather than the default.
+mode: Mode = .general,
 
 /// Indices into `messages`, sorted and without repeats, of the summaries a
 /// compaction produced. Keeping them as a list rather than a flag on every
@@ -636,6 +644,12 @@ pub fn setSystemPrompt(session: *Session, system_prompt: []const u8) !void {
     session.system_prompt = try session.internString(system_prompt);
 }
 
+/// Records the mode the session runs in. Set once, when the session starts; the
+/// prompt and tools stored with it follow from the mode.
+pub fn setMode(session: *Session, mode: Mode) void {
+    session.mode = mode;
+}
+
 /// Records `system_prompt` unless the session already has one. A resumed session
 /// carries the prompt it was saved with, which is kept so the request it sends
 /// matches the earlier run byte for byte; a new session gets the current one.
@@ -726,6 +740,8 @@ pub fn save(session: *Session) !void {
         try json.objectField("system_prompt");
         try json.write(prompt);
     }
+    try json.objectField("mode");
+    try json.write(session.mode);
     try json.objectField("messages");
     try json.beginArray();
     for (session.messages.items) |message| try writeMessage(session, &json, message);
@@ -787,6 +803,9 @@ fn load(session: *Session) !void {
     // The title is optional and came after the version, so no migration or bump
     // was needed for it.
     if (stored.title) |stored_title| try session.setTitle(stored_title);
+
+    // The mode came after the version too; a file without one reads as general.
+    session.mode = stored.mode;
 
     // The system prompt is its own field in a version 3 file. An older file
     // instead holds it as the first message, sometimes as a leading run of them;

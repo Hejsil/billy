@@ -8,6 +8,7 @@ const formatting = @import("format.zig");
 const diffing = @import("diff.zig");
 const styling = @import("style.zig");
 const Session = @import("Session.zig");
+const Mode = @import("mode.zig").Mode;
 
 const Tools = @This();
 
@@ -166,12 +167,29 @@ pub fn init(options: Options) !Tools {
     };
 }
 
-/// The definitions a session should be given: every tool billy offers, with the
-/// search tool last when a backend is configured. The strings are the spec
-/// table's own, which are comptime, so this builds nothing; the session interns
-/// and stores them.
-pub fn definitions(tools: *const Tools) []const Session.Definition {
-    return if (tools.search != null) &specs_with_search else &specs;
+/// The definitions a session should be given: the tools the mode allows, in the
+/// spec table's order, with the search tool last when a backend is configured.
+/// The strings are the spec table's own, which are comptime, so this builds
+/// nothing; the session interns and stores them.
+pub fn definitions(tools: *const Tools, mode: Mode) []const Session.Definition {
+    return switch (mode) {
+        .general => if (tools.search != null) &specs_with_search else &specs,
+        .ask => if (tools.search != null) &ask_specs_with_search else &ask_specs,
+    };
+}
+
+/// The name of the tool `call` names, for a caller that has to check it against
+/// a mode without showing the call.
+pub fn callName(call: Call) []const u8 {
+    return switch (call) {
+        .read => "read",
+        .write => "write",
+        .edit => "edit",
+        .bash => "bash",
+        .web_search => "web_search",
+        .unknown => |name| name,
+        .malformed => |bad| bad.name,
+    };
 }
 
 /// What one call produced is written, not returned: `run` writes the result text
@@ -1150,6 +1168,32 @@ const search_spec = Session.Definition{
 /// order is what keeps the set growing by appending rather than reordering.
 const specs_with_search = specs ++ [_]Session.Definition{search_spec};
 
+/// Why the filtered specs are returned by value rather than as a slice: a slice
+/// would point into a comptime local, which a global const may not hold.
+fn allowedCount(comptime source: []const Session.Definition, comptime mode: Mode) usize {
+    var n: usize = 0;
+    for (source) |spec| if (mode.allows(spec.name)) {
+        n += 1;
+    };
+    return n;
+}
+
+/// The specs of `source` the ask mode allows, filtered at comptime so the result
+/// is the spec table's own strings and nothing is built at run time.
+fn allowedSpecs(comptime source: []const Session.Definition, comptime mode: Mode) [allowedCount(source, mode)]Session.Definition {
+    var buffer: [allowedCount(source, mode)]Session.Definition = undefined;
+    var n: usize = 0;
+    for (source) |spec| {
+        if (!mode.allows(spec.name)) continue;
+        buffer[n] = spec;
+        n += 1;
+    }
+    return buffer;
+}
+
+const ask_specs = allowedSpecs(&specs, .ask);
+const ask_specs_with_search = allowedSpecs(&specs_with_search, .ask);
+
 test "exit codes of signals follow the shell convention" {
     try std.testing.expectEqual(0, formatting.exitCode(.{ .exited = 0 }));
     try std.testing.expectEqual(1, formatting.exitCode(.{ .exited = 1 }));
@@ -1947,7 +1991,7 @@ test "the definitions cover every tool the loop dispatches" {
 
     // The names are exactly the tools the loop can dispatch, in the order the
     // model receives them, so it is never offered one that does not run.
-    const offered = tool_set.definitions();
+    const offered = tool_set.definitions(.general);
     const expected = [_][]const u8{ "read", "write", "edit", "bash" };
     try std.testing.expectEqual(expected.len, offered.len);
     for (offered, expected) |definition, name| {
@@ -1971,7 +2015,7 @@ test "web search is offered only when a backend is configured" {
     // Without a backend the search tool is not offered at all, and the tools
     // every session has come first so the set only grows.
     var plain = try definitionsToolSet(Io.Dir.cwd(), gpa, &http, false);
-    const without = plain.definitions();
+    const without = plain.definitions(.general);
     try std.testing.expectEqual(specs.len, without.len);
     for (without) |definition| {
         try std.testing.expect(!std.mem.eql(u8, definition.name, "web_search"));
@@ -1979,7 +2023,7 @@ test "web search is offered only when a backend is configured" {
 
     // With one it is appended, so a session that gains it keeps the tools it had.
     var searched = try definitionsToolSet(Io.Dir.cwd(), gpa, &http, true);
-    const with = searched.definitions();
+    const with = searched.definitions(.general);
     try std.testing.expectEqual(specs.len + 1, with.len);
     try std.testing.expectEqualStrings("web_search", with[with.len - 1].name);
 }
