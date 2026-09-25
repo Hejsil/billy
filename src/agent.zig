@@ -875,9 +875,8 @@ fn turn(
         try session.append(completion.message);
 
         const message = completion.message;
-        const calls = message.tool_calls orelse {
-            return emitter.show(.{ .answer = message.content orelse "" });
-        };
+        const calls = message.tool_calls orelse &.{};
+        // No calls means the model answered, which ends the turn.
         if (calls.len == 0) return emitter.show(.{ .answer = message.content orelse "" });
 
         for (calls) |call| {
