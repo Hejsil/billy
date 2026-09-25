@@ -6,6 +6,7 @@ const Io = std.Io;
 const llm = @import("llm.zig");
 const models = @import("models.zig");
 const Tools = @import("Tools.zig");
+const Mock = @import("mock.zig");
 const search = @import("search.zig");
 const LineEditor = @import("LineEditor.zig");
 const Session = @import("Session.zig");
@@ -1795,22 +1796,15 @@ test "maybeCompact folds the conversation into a summary at its end" {
     // A conversation that has filled the window past the threshold.
     session.context_tokens = 900;
 
-    // A server standing in for the model, answering the compaction request with
-    // a fixed summary and recording the body it was sent.
-    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    var listener = try address.listen(io, .{ .reuse_address = true });
-    defer listener.deinit(io);
-
-    var provider: SummaryProvider = .{};
-    defer if (provider.body) |body| gpa.free(body);
-
+    // A server standing in for the model, answering the compaction request with a
+    // fixed summary and recording the body it was sent.
+    var mock = try Mock.start(gpa, io, "/chat/completions", 1, Mock.fixed(
+        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"the summary\"}}]," ++
+            "\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"total_tokens\":105}}",
+    ));
+    defer mock.deinit(io);
     var group: Io.Group = .init;
-    try group.concurrent(io, SummaryProvider.serve, .{ io, &listener, &provider });
-
-    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/chat/completions", .{
-        listener.socket.address.getPort(),
-    });
-    defer gpa.free(url);
+    try group.concurrent(io, Mock.serve, .{ io, &mock });
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -1818,7 +1812,7 @@ test "maybeCompact folds the conversation into a summary at its end" {
         .gpa = gpa,
         .io = io,
         .api_key = "k",
-        .url = url,
+        .url = mock.url,
         .model = "m",
         .http = &http,
     };
@@ -1829,11 +1823,11 @@ test "maybeCompact folds the conversation into a summary at its end" {
     try std.testing.expect(try maybeCompact(io, &client, terminal.emitter(), config, &session));
 
     try group.await(io);
-    if (provider.err) |err| return err;
+    if (mock.err) |err| return err;
 
     // The request carried the whole conversation, tool call and result included,
     // with the compacting prompt after it.
-    const body = provider.body.?;
+    const body = mock.bodies.items[0];
     try std.testing.expect(std.mem.indexOf(u8, body, "OLDPROMPT") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "call_x") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "OLDTOOLOUTPUT") != null);
@@ -1976,45 +1970,6 @@ test "refreshLead replaces the prompt, the project instructions and the tools" {
     try std.testing.expectEqual(2, resumed.tools.len);
 }
 
-/// A stand-in for the model on the wire, for the compaction tests: it answers
-/// the one summarization request with a fixed summary, recording the body so the
-/// test can check what was sent. It mirrors the provider the client tests use.
-const SummaryProvider = struct {
-    /// The request body as it arrived, owned by `std.testing.allocator`.
-    body: ?[]u8 = null,
-    /// The first failure the server ran into, so the test reports it rather than
-    /// hanging on the connection.
-    err: ?anyerror = null,
-
-    fn serve(io: Io, listener: *std.Io.net.Server, self: *SummaryProvider) Io.Cancelable!void {
-        self.run(io, listener) catch |err| {
-            self.err = err;
-        };
-    }
-
-    fn run(self: *SummaryProvider, io: Io, listener: *std.Io.net.Server) !void {
-        var stream = try listener.accept(io);
-        defer stream.close(io);
-
-        var in_buffer: [4096]u8 = undefined;
-        var out_buffer: [4096]u8 = undefined;
-        var reader = stream.reader(io, &in_buffer);
-        var writer = stream.writer(io, &out_buffer);
-        var server: std.http.Server = .init(&reader.interface, &writer.interface);
-
-        var request = try server.receiveHead();
-        var body_buffer: [4096]u8 = undefined;
-        const body_reader = request.readerExpectNone(&body_buffer);
-        self.body = try body_reader.allocRemaining(std.testing.allocator, .unlimited);
-
-        try request.respond(
-            "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"the summary\"}}]," ++
-                "\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"total_tokens\":105}}",
-            .{ .keep_alive = false },
-        );
-    }
-};
-
 test "the terminal shows a tool call the way a replay does" {
     const gpa = std.testing.allocator;
     // The parsed call's text is left in an allocator the caller drops in one go
@@ -2146,18 +2101,24 @@ test "a turn shows the tool it runs and then the answer" {
     defer session.deinit();
     try session.setSystemPrompt("be terse");
 
-    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    var listener = try address.listen(io, .{ .reuse_address = true });
-    defer listener.deinit(io);
-
-    var provider: TurnProvider = .{};
+    // The first request is answered with a tool call; once the result is in the
+    // conversation, the next is answered with text.
+    const answering = struct {
+        fn answer(_: usize, body: []const u8) Mock.Answer {
+            if (std.mem.indexOf(u8, body, "\"tool\"") != null) {
+                return .{ .body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"all done\"}}]," ++
+                    "\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":2,\"total_tokens\":22}}" };
+            }
+            return .{ .body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"call_1\"," ++
+                "\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":" ++
+                "\"{\\\"command\\\":\\\"echo hi\\\"}\"}}]}}]," ++
+                "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}" };
+        }
+    }.answer;
+    var mock = try Mock.start(gpa, io, "/chat/completions", 2, answering);
+    defer mock.deinit(io);
     var group: Io.Group = .init;
-    try group.concurrent(io, TurnProvider.serve, .{ io, &listener, &provider });
-
-    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/chat/completions", .{
-        listener.socket.address.getPort(),
-    });
-    defer gpa.free(url);
+    try group.concurrent(io, Mock.serve, .{ io, &mock });
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -2165,7 +2126,7 @@ test "a turn shows the tool it runs and then the answer" {
         .gpa = gpa,
         .io = io,
         .api_key = "k",
-        .url = url,
+        .url = mock.url,
         .model = "m",
         .http = &http,
     };
@@ -2181,7 +2142,7 @@ test "a turn shows the tool it runs and then the answer" {
     try turn(io, &client, &tool_set, recorder.emitter(), testConfig("m", "/work", null), &session);
 
     try group.await(io);
-    if (provider.err) |err| return err;
+    if (mock.err) |err| return err;
 
     // The call is shown as it begins, so its header could go up while it ran,
     // and again with the result it produced. The answer follows.
@@ -2203,53 +2164,6 @@ test "a turn shows the tool it runs and then the answer" {
     );
 }
 
-/// A stand-in for the model that answers a turn with text and the titling request
-/// with a title, so a test can watch a session being named without the network.
-const TitleProvider = struct {
-    /// Requests left to answer: the one turn and the one title request.
-    remaining: usize = 2,
-    /// The first failure the server ran into, so the test reports it rather than
-    /// hanging on the connection.
-    err: ?anyerror = null,
-
-    fn serve(io: Io, listener: *std.Io.net.Server, self: *TitleProvider) Io.Cancelable!void {
-        self.run(io, listener) catch |err| {
-            self.err = err;
-        };
-    }
-
-    fn run(self: *TitleProvider, io: Io, listener: *std.Io.net.Server) !void {
-        while (self.remaining > 0) : (self.remaining -= 1) {
-            var stream = try listener.accept(io);
-            defer stream.close(io);
-
-            var in_buffer: [4096]u8 = undefined;
-            var out_buffer: [4096]u8 = undefined;
-            var reader = stream.reader(io, &in_buffer);
-            var writer = stream.writer(io, &out_buffer);
-            var server: std.http.Server = .init(&reader.interface, &writer.interface);
-
-            var request = try server.receiveHead();
-            var body_buffer: [8192]u8 = undefined;
-            const body_reader = request.readerExpectNone(&body_buffer);
-            const body = try body_reader.allocRemaining(std.testing.allocator, .unlimited);
-            defer std.testing.allocator.free(body);
-
-            const content = if (std.mem.indexOf(u8, body, "short title") != null)
-                "Fix the flaky test"
-            else
-                "all done";
-            var reply: std.Io.Writer.Allocating = .init(std.testing.allocator);
-            defer reply.deinit();
-            try std.json.Stringify.value(.{
-                .choices = &.{.{ .message = .{ .role = "assistant", .content = content } }},
-                .usage = .{ .prompt_tokens = 10, .completion_tokens = 1, .total_tokens = 11 },
-            }, .{}, &reply.writer);
-            try request.respond(reply.written(), .{ .keep_alive = false });
-        }
-    }
-};
-
 test "the first turn names the session, and the naming is not part of it" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -2261,19 +2175,23 @@ test "the first turn names the session, and the naming is not part of it" {
     defer session.deinit();
     try session.setSystemPrompt("be terse");
 
-    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    var listener = try address.listen(io, .{ .reuse_address = true });
-    defer listener.deinit(io);
-
-    var provider: TitleProvider = .{};
+    // The turn is answered with text, and the request that asks for a title --
+    // the one whose body carries the titling prompt -- with a title.
+    const answering = struct {
+        fn answer(_: usize, body: []const u8) Mock.Answer {
+            if (std.mem.indexOf(u8, body, "short title") != null) {
+                return .{ .body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Fix the flaky test\"}}]," ++
+                    "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}" };
+            }
+            return .{ .body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"all done\"}}]," ++
+                "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}" };
+        }
+    }.answer;
+    var mock = try Mock.start(gpa, io, "/chat/completions", 2, answering);
+    defer mock.deinit(io);
     var group: Io.Group = .init;
     defer group.cancel(io);
-    try group.concurrent(io, TitleProvider.serve, .{ io, &listener, &provider });
-
-    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/chat/completions", .{
-        listener.socket.address.getPort(),
-    });
-    defer gpa.free(url);
+    try group.concurrent(io, Mock.serve, .{ io, &mock });
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -2281,7 +2199,7 @@ test "the first turn names the session, and the naming is not part of it" {
     config.title = true;
     // The runner builds the model client from the config, so the config carries
     // the address of the mock.
-    config.url = url;
+    config.url = mock.url;
     // `Runner.init` opens the directory it works in, so it has to be one that
     // exists; the session's recorded directory is separate and stays "/work".
     const work_dir = try std.process.currentPathAlloc(io, gpa);
@@ -2295,7 +2213,7 @@ test "the first turn names the session, and the naming is not part of it" {
     try runner.ask(terminal.emitter(), &session, "the flaky test keeps failing, please fix it");
 
     try group.await(io);
-    if (provider.err) |err| return err;
+    if (mock.err) |err| return err;
 
     // The model's title is kept, and the session was saved with it.
     try std.testing.expectEqualStrings("Fix the flaky test", session.title().?);
@@ -2347,52 +2265,3 @@ fn expectCleanTitle(gpa: std.mem.Allocator, expected: []const u8, raw: []const u
     defer gpa.free(title);
     try std.testing.expectEqualStrings(expected, title);
 }
-
-/// A stand-in for the model that asks for one bash command and then answers, so a
-/// test can watch a whole turn without the network. It answers as many requests
-/// as it is told to, since a turn makes one per round trip.
-const TurnProvider = struct {
-    /// Requests left to answer.
-    remaining: usize = 2,
-    /// The first failure the server ran into, so the test reports it rather than
-    /// hanging on the connection.
-    err: ?anyerror = null,
-
-    fn serve(io: Io, listener: *std.Io.net.Server, self: *TurnProvider) Io.Cancelable!void {
-        self.run(io, listener) catch |err| {
-            self.err = err;
-        };
-    }
-
-    fn run(self: *TurnProvider, io: Io, listener: *std.Io.net.Server) !void {
-        while (self.remaining > 0) : (self.remaining -= 1) {
-            var stream = try listener.accept(io);
-            defer stream.close(io);
-
-            var in_buffer: [4096]u8 = undefined;
-            var out_buffer: [4096]u8 = undefined;
-            var reader = stream.reader(io, &in_buffer);
-            var writer = stream.writer(io, &out_buffer);
-            var server: std.http.Server = .init(&reader.interface, &writer.interface);
-
-            var request = try server.receiveHead();
-            var body_buffer: [8192]u8 = undefined;
-            const body_reader = request.readerExpectNone(&body_buffer);
-            const body = try body_reader.allocRemaining(std.testing.allocator, .unlimited);
-            defer std.testing.allocator.free(body);
-
-            // The first request is answered with a call; once the result is in
-            // the conversation, the next answers with text.
-            const answered = std.mem.indexOf(u8, body, "\"tool\"") != null;
-            const reply = if (answered)
-                "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"all done\"}}]," ++
-                    "\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":2,\"total_tokens\":22}}"
-            else
-                "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"call_1\"," ++
-                    "\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":" ++
-                    "\"{\\\"command\\\":\\\"echo hi\\\"}\"}}]}}]," ++
-                    "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}";
-            try request.respond(reply, .{ .keep_alive = false });
-        }
-    }
-};
