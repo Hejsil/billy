@@ -818,14 +818,34 @@ fn load(session: *Session) !void {
     for (stored.messages[lead..]) |message| {
         try session.appendMessage(message);
     }
+    try session.loadCompactions(stored.compactions, lead);
 
-    // The compaction indices are read back against the conversation just loaded,
-    // so the sorted list a request and a transcript read is sound even if the
-    // file was written by hand: one past the end is dropped rather than trusted,
-    // the list is sorted, and a repeat is collapsed to the one copy of it. A
-    // migrated file's indices name the messages as they were stored, so each is
-    // shifted by the lead lifted out of the front of them.
-    for (stored.compactions) |index| {
+    // A run killed while a tool ran can leave the last turn without the results
+    // of its calls, which the API rejects on the next request. The turn is
+    // completed before anything reads the conversation.
+    try session.repairTail();
+
+    try session.loadTools(stored.tools);
+    session.usage = stored.usage;
+    session.context_tokens = stored.context_tokens;
+    session.cost = stored.cost;
+    // A session saved before the directory was recorded has none, and the
+    // directory billy runs in now is kept.
+    if (stored.cwd.len > 0) {
+        const owned = try session.gpa.dupe(u8, stored.cwd);
+        session.gpa.free(session.cwd);
+        session.cwd = owned;
+    }
+}
+
+/// Reads the compaction indices back against the conversation just loaded, so
+/// the sorted list a request and a transcript read is sound even if the file was
+/// written by hand: one past the end is dropped rather than trusted, the list is
+/// sorted, and a repeat is collapsed to the one copy of it. A migrated file's
+/// indices name the messages as they were stored, so each is shifted by the
+/// `lead` lifted out of the front of them.
+fn loadCompactions(session: *Session, stored: []const usize, lead: usize) !void {
+    for (stored) |index| {
         if (index < lead) continue;
         const at = index - lead;
         if (at >= session.messages.items.len) continue;
@@ -840,16 +860,13 @@ fn load(session: *Session) !void {
         kept += 1;
     }
     session.compactions.shrinkRetainingCapacity(kept);
+}
 
-    // A run killed while a tool ran can leave the last turn without the results
-    // of its calls, which the API rejects on the next request. The turn is
-    // completed before anything reads the conversation.
-    try session.repairTail();
-
-    // The tools are interned like the conversation, so the set is one array and
-    // the arguments schema becomes the JSON text the request sends it as.
-    const tools = try session.gpa.alloc(Tool, stored.tools.len);
-    for (stored.tools, tools) |stored_tool, *tool| {
+/// Interns the stored tool definitions, so the set is one array and the
+/// arguments schema becomes the JSON text the request sends it as.
+fn loadTools(session: *Session, stored: []const StoredTool) !void {
+    const tools = try session.gpa.alloc(Tool, stored.len);
+    for (stored, tools) |stored_tool, *tool| {
         tool.* = .{
             .name = try session.internString(stored_tool.function.name),
             .description = try session.internString(stored_tool.function.description),
@@ -857,16 +874,6 @@ fn load(session: *Session) !void {
         };
     }
     session.tools = tools;
-    session.usage = stored.usage;
-    session.context_tokens = stored.context_tokens;
-    session.cost = stored.cost;
-    // A session saved before the directory was recorded has none, and the
-    // directory billy runs in now is kept.
-    if (stored.cwd.len > 0) {
-        const owned = try session.gpa.dupe(u8, stored.cwd);
-        session.gpa.free(session.cwd);
-        session.cwd = owned;
-    }
 }
 
 /// Completes the last turn of a conversation a kill left half written.

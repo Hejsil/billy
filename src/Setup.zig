@@ -136,24 +136,7 @@ pub fn open(init: std.process.Init, out: *Io.Writer) !Setup {
     };
     errdefer sessions.close(io);
 
-    const search_config: ?Search.Config = if (settings.config.tools.web_search.provider) |provider| blk: {
-        // A backend named without its key is an error rather than a silent "no
-        // search": the configuration asked for the tool, and leaving it out
-        // without a word would look like a bug.
-        const service = credentials.searchService(provider);
-        const key = credentials.credential(&store, environ, service) orelse {
-            std.log.err(
-                "run `billy login {s}`, or set {s} to use web search, or clear tools.web_search in the configuration",
-                .{ service.name(), service.variable() },
-            );
-            return error.MissingApiKey;
-        };
-        break :blk .{
-            .provider = provider,
-            .api_key = key,
-            .max_results = settings.config.tools.web_search.max_results,
-        };
-    } else null;
+    const search_config = try searchConfig(&store, environ, settings.config);
 
     return .{
         .io = io,
@@ -178,6 +161,31 @@ pub fn deinit(setup: *Setup) void {
     setup.sessions.close(setup.io);
     setup.config_dir.close(setup.io);
     setup.data_dir.close(setup.io);
+}
+
+/// The web search settings for a configuration that names a backend, or null
+/// when it names none. A backend named without its key is an error rather than a
+/// silent "no search": the configuration asked for the tool, and leaving it out
+/// without a word would look like a bug.
+fn searchConfig(
+    store: *const credentials.Store,
+    environ: *const std.process.Environ.Map,
+    settings: Config,
+) !?Search.Config {
+    const provider = settings.tools.web_search.provider orelse return null;
+    const service = credentials.searchService(provider);
+    const key = credentials.credential(store, environ, service) orelse {
+        std.log.err(
+            "run `billy login {s}`, or set {s} to use web search, or clear tools.web_search in the configuration",
+            .{ service.name(), service.variable() },
+        );
+        return error.MissingApiKey;
+    };
+    return .{
+        .provider = provider,
+        .api_key = key,
+        .max_results = settings.tools.web_search.max_results,
+    };
 }
 
 /// The agent configuration for a session working in `cwd`, with its blocks

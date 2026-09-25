@@ -833,7 +833,6 @@ fn turn(
     // makes many calls holds only the one it is on.
     var scratch_state = std.heap.ArenaAllocator.init(tool_set.gpa);
     defer scratch_state.deinit();
-    const scratch = scratch_state.allocator();
 
     var remaining: usize = config.max_turns;
     // A compaction that failed is not tried again within the same turn, so a
@@ -879,26 +878,7 @@ fn turn(
         // No calls means the model answered, which ends the turn.
         if (calls.len == 0) return emitter.show(.{ .answer = message.content orelse "" });
 
-        for (calls) |call| {
-            // The call is parsed and shown before it runs, so a command that
-            // runs long has its header on screen while it runs, and then the
-            // result once it is in. The parsed call lives in the turn's scratch,
-            // which the next call resets, so it is used before then.
-            _ = scratch_state.reset(.retain_capacity);
-            const parsed = Tools.parse(scratch, call);
-            try emitter.show(.{ .tool_begin = parsed });
-
-            var result: std.Io.Writer.Allocating = .init(tool_set.gpa);
-            defer result.deinit();
-            try tool_set.run(parsed, &result.writer);
-
-            try session.append(.{
-                .role = "tool",
-                .tool_call_id = call.id,
-                .content = result.written(),
-            });
-            try emitter.show(.{ .tool_end = .{ .call = parsed, .result = result.written() } });
-        }
+        try runCalls(tool_set, emitter, &scratch_state, session, calls);
     }
     var buffer: [96]u8 = undefined;
     const stopped = std.fmt.bufPrint(
@@ -907,6 +887,38 @@ fn turn(
         .{config.max_turns},
     ) catch "stopped without a final answer";
     try emitter.show(.{ .notice = stopped });
+}
+
+/// Runs the tool calls of one answer, showing each as it runs and recording its
+/// result, so the next request carries them.
+///
+/// The call is parsed and shown before it runs, so a command that runs long has
+/// its header on screen while it runs, and then the result once it is in. The
+/// parsed call lives in the turn's scratch, which the next call resets, so it is
+/// used before then.
+fn runCalls(
+    tool_set: *Tools,
+    emitter: Emitter,
+    scratch_state: *std.heap.ArenaAllocator,
+    session: *Session,
+    calls: []const llm.ToolCall,
+) !void {
+    for (calls) |call| {
+        _ = scratch_state.reset(.retain_capacity);
+        const parsed = Tools.parse(scratch_state.allocator(), call);
+        try emitter.show(.{ .tool_begin = parsed });
+
+        var result: std.Io.Writer.Allocating = .init(tool_set.gpa);
+        defer result.deinit();
+        try tool_set.run(parsed, &result.writer);
+
+        try session.append(.{
+            .role = "tool",
+            .tool_call_id = call.id,
+            .content = result.written(),
+        });
+        try emitter.show(.{ .tool_end = .{ .call = parsed, .result = result.written() } });
+    }
 }
 
 /// The system prompt a session runs with: billy's own, the user's own
