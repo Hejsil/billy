@@ -82,13 +82,428 @@ const Escaping = struct {
 
 /// Writes the markdown of a reply or a prompt as HTML.
 ///
-/// The markdown is read as CommonMark by md4c, not by an approximation of it
-/// (see `md.zig`), which is what makes a nested list a nested list, a table a
-/// table, and the long tail -- delimiter runs, lazy continuation lines, setext
-/// headings, entities -- come out right rather than nearly right. Everything a
-/// model writes is escaped on the way to the page, as everywhere else here.
+/// The markdown is read by md4c, a CommonMark parser (`md.zig`), and rendered
+/// here: each block, span and run of text md4c reports is turned into the HTML
+/// for it. Driving the parser rather than calling md4c's own renderer is what
+/// lets billy check a link's address before writing it -- md4c renders a
+/// `javascript:` link as a link, and a reply must not be able to make one that
+/// runs code.
+///
+/// Everything a model writes is escaped, and raw HTML is turned off
+/// (`md.flags`), so a tag in a reply is shown rather than obeyed.
 pub fn markdown(gpa: std.mem.Allocator, text: []const u8, out: *Io.Writer) !void {
-    return md.toHtml(gpa, text, out);
+    var render = Markdown{ .gpa = gpa, .out = out };
+    var parser = Markdown.parser();
+    try md.parse(text, &parser, &render);
+    // A callback cannot return an error, so a failed write is kept on the
+    // renderer and reported here, once md4c has stopped.
+    if (render.err) |err| return err;
+}
+
+/// Renders one document. It is the `userdata` md4c hands back to every callback,
+/// and holds the writer each piece goes to.
+///
+/// md4c's callbacks say *what* a piece of the document is, and this writes the
+/// HTML for it: the tags are the ones a CommonMark renderer writes, so the page
+/// gets the markup it expects, with a link's address checked on the way
+/// (`safeAddress`).
+const Markdown = struct {
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    /// The first failure of the writer. A callback returns a number, not an
+    /// error, so the failure is kept here and reported once the parse is over.
+    err: ?Io.Writer.Error = null,
+    /// How deep inside an image label this is. The text of a label is an
+    /// attribute, so no tags are written there and a line break becomes a space.
+    image_depth: usize = 0,
+
+    /// The callbacks md4c reads the document with. None of them take any state
+    /// of their own but the renderer `md4c` passes back as `userdata`.
+    fn parser() md.c.MD_PARSER {
+        return .{
+            .abi_version = 0,
+            .flags = md.flags,
+            .enter_block = enterBlock,
+            .leave_block = leaveBlock,
+            .enter_span = enterSpan,
+            .leave_span = leaveSpan,
+            .text = writeText,
+            .debug_log = null,
+            .syntax = null,
+        };
+    }
+
+    /// Writes `text` on, keeping the failure if there is one. Returns whether the
+    /// write worked, so a callback can stop the parse: md4c stops at the first
+    /// callback that returns non-zero.
+    fn put(self: *Markdown, text: []const u8) bool {
+        self.out.writeAll(text) catch |err| {
+            self.err = err;
+            return false;
+        };
+        return true;
+    }
+
+    /// Writes `text` escaped, so nothing in it can become markup.
+    fn putEscaped(self: *Markdown, text: []const u8) bool {
+        escape(text, self.out) catch |err| {
+            self.err = err;
+            return false;
+        };
+        return true;
+    }
+
+    // ---- blocks ----
+
+    fn openBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
+        switch (block_type) {
+            md.c.MD_BLOCK_DOC => {},
+            md.c.MD_BLOCK_QUOTE => return self.put("<blockquote>\n"),
+            md.c.MD_BLOCK_UL => return self.put("<ul>\n"),
+            md.c.MD_BLOCK_OL => return self.openOl(@ptrCast(@alignCast(detail.?))),
+            md.c.MD_BLOCK_LI => return self.openLi(@ptrCast(@alignCast(detail.?))),
+            md.c.MD_BLOCK_HR => return self.put("<hr>\n"),
+            md.c.MD_BLOCK_H => {
+                const head: *const md.c.MD_BLOCK_H_DETAIL = @ptrCast(@alignCast(detail.?));
+                return self.put(heading_open[head.level - 1]);
+            },
+            md.c.MD_BLOCK_CODE => return self.openCode(@ptrCast(@alignCast(detail.?))),
+            md.c.MD_BLOCK_P => return self.put("<p>"),
+            md.c.MD_BLOCK_TABLE => return self.put("<table>\n"),
+            md.c.MD_BLOCK_THEAD => return self.put("<thead>\n"),
+            md.c.MD_BLOCK_TBODY => return self.put("<tbody>\n"),
+            md.c.MD_BLOCK_TR => return self.put("<tr>\n"),
+            md.c.MD_BLOCK_TH => return self.openCell("th", @ptrCast(@alignCast(detail.?))),
+            md.c.MD_BLOCK_TD => return self.openCell("td", @ptrCast(@alignCast(detail.?))),
+            // Raw HTML never reaches here: `md.flags` turns it off, so it comes
+            // as text and is escaped. Anything else is a block of an extension
+            // billy does not read.
+            else => {},
+        }
+        return true;
+    }
+
+    fn closeBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
+        switch (block_type) {
+            md.c.MD_BLOCK_DOC => {},
+            md.c.MD_BLOCK_QUOTE => return self.put("</blockquote>\n"),
+            md.c.MD_BLOCK_UL => return self.put("</ul>\n"),
+            md.c.MD_BLOCK_OL => return self.put("</ol>\n"),
+            md.c.MD_BLOCK_LI => return self.put("</li>\n"),
+            md.c.MD_BLOCK_HR => {},
+            md.c.MD_BLOCK_H => {
+                const head: *const md.c.MD_BLOCK_H_DETAIL = @ptrCast(@alignCast(detail.?));
+                return self.put(heading_close[head.level - 1]);
+            },
+            md.c.MD_BLOCK_CODE => return self.put("</code></pre>\n"),
+            md.c.MD_BLOCK_P => return self.put("</p>\n"),
+            md.c.MD_BLOCK_TABLE => return self.put("</table>\n"),
+            md.c.MD_BLOCK_THEAD => return self.put("</thead>\n"),
+            md.c.MD_BLOCK_TBODY => return self.put("</tbody>\n"),
+            md.c.MD_BLOCK_TR => return self.put("</tr>\n"),
+            md.c.MD_BLOCK_TH => return self.put("</th>\n"),
+            md.c.MD_BLOCK_TD => return self.put("</td>\n"),
+            else => {},
+        }
+        return true;
+    }
+
+    /// A list that starts at a number other than one keeps it, so a list written
+    /// from 3 shows 3, 4, 5 rather than 1, 2, 3.
+    fn openOl(self: *Markdown, detail: *const md.c.MD_BLOCK_OL_DETAIL) bool {
+        if (detail.start == 1) return self.put("<ol>\n");
+        var buffer: [32]u8 = undefined;
+        const text = std.fmt.bufPrint(&buffer, "<ol start=\"{d}\">\n", .{detail.start}) catch return true;
+        return self.put(text);
+    }
+
+    /// A task item is a disabled checkbox, so a `- [x]` reads as a checked box
+    /// rather than as its own text.
+    fn openLi(self: *Markdown, detail: *const md.c.MD_BLOCK_LI_DETAIL) bool {
+        if (detail.is_task == 0) return self.put("<li>");
+        if (!self.put("<li class=\"task-list-item\">" ++
+            "<input type=\"checkbox\" class=\"task-list-item-checkbox\" disabled")) return false;
+        if ((detail.task_mark == 'x' or detail.task_mark == 'X') and !self.put(" checked")) return false;
+        return self.put(">");
+    }
+
+    /// A fenced block keeps its language, which is what a highlighter would hang
+    /// off: `class="language-zig"`. An indented block has no language.
+    fn openCode(self: *Markdown, detail: *const md.c.MD_BLOCK_CODE_DETAIL) bool {
+        if (!self.put("<pre><code")) return false;
+        if (detail.lang.text != null) {
+            if (!self.put(" class=\"language-")) return false;
+            if (self.writeAttribute(&detail.lang, .text) == false) return false;
+            if (!self.put("\"")) return false;
+        }
+        return self.put(">");
+    }
+
+    /// A table cell, with the alignment the table asked for.
+    fn openCell(self: *Markdown, tag: []const u8, detail: *const md.c.MD_BLOCK_TD_DETAIL) bool {
+        if (!self.put("<")) return false;
+        if (!self.put(tag)) return false;
+        return switch (detail.@"align") {
+            md.c.MD_ALIGN_LEFT => self.put(" align=\"left\">"),
+            md.c.MD_ALIGN_CENTER => self.put(" align=\"center\">"),
+            md.c.MD_ALIGN_RIGHT => self.put(" align=\"right\">"),
+            else => self.put(">"),
+        };
+    }
+
+    // ---- spans ----
+
+    fn openSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) bool {
+        const inside_image = self.image_depth > 0;
+        if (span_type == md.c.MD_SPAN_IMG) self.image_depth += 1;
+        // Inside an image label only the text matters: it is the alt text, and a
+        // tag written there would break out of the attribute.
+        if (inside_image) return true;
+
+        switch (span_type) {
+            md.c.MD_SPAN_EM => return self.put("<em>"),
+            md.c.MD_SPAN_STRONG => return self.put("<strong>"),
+            md.c.MD_SPAN_A => return self.openA(@ptrCast(@alignCast(detail.?))),
+            md.c.MD_SPAN_IMG => return self.openImg(@ptrCast(@alignCast(detail.?))),
+            md.c.MD_SPAN_CODE => return self.put("<code>"),
+            md.c.MD_SPAN_INS => return self.put("<ins>"),
+            md.c.MD_SPAN_DEL => return self.put("<del>"),
+            md.c.MD_SPAN_U => return self.put("<u>"),
+            md.c.MD_SPAN_MARK => return self.put("<mark>"),
+            md.c.MD_SPAN_SUPERSCRIPT => return self.put("<sup>"),
+            md.c.MD_SPAN_SUBSCRIPT => return self.put("<sub>"),
+            else => {},
+        }
+        return true;
+    }
+
+    fn closeSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) bool {
+        if (span_type == md.c.MD_SPAN_IMG) self.image_depth -= 1;
+        if (self.image_depth > 0) return true;
+
+        switch (span_type) {
+            md.c.MD_SPAN_EM => return self.put("</em>"),
+            md.c.MD_SPAN_STRONG => return self.put("</strong>"),
+            md.c.MD_SPAN_A => return self.put("</a>"),
+            md.c.MD_SPAN_IMG => return self.closeImg(@ptrCast(@alignCast(detail.?))),
+            md.c.MD_SPAN_CODE => return self.put("</code>"),
+            md.c.MD_SPAN_INS => return self.put("</ins>"),
+            md.c.MD_SPAN_DEL => return self.put("</del>"),
+            md.c.MD_SPAN_U => return self.put("</u>"),
+            md.c.MD_SPAN_MARK => return self.put("</mark>"),
+            md.c.MD_SPAN_SUPERSCRIPT => return self.put("</sup>"),
+            md.c.MD_SPAN_SUBSCRIPT => return self.put("</sub>"),
+            else => {},
+        }
+        return true;
+    }
+
+    /// A link. Its address is checked, so one that could run code is written as a
+    /// link that goes nowhere (`safeAddress`).
+    fn openA(self: *Markdown, detail: *const md.c.MD_SPAN_A_DETAIL) bool {
+        if (!self.put("<a href=\"")) return false;
+        if (!self.writeAttribute(&detail.href, .link)) return false;
+        if (detail.title.text != null) {
+            if (!self.put("\" title=\"")) return false;
+            if (!self.writeAttribute(&detail.title, .text)) return false;
+        }
+        return self.put("\">");
+    }
+
+    fn openImg(self: *Markdown, detail: *const md.c.MD_SPAN_IMG_DETAIL) bool {
+        if (!self.put("<img src=\"")) return false;
+        if (!self.writeAttribute(&detail.src, .image)) return false;
+        return self.put("\" alt=\"");
+    }
+
+    fn closeImg(self: *Markdown, detail: *const md.c.MD_SPAN_IMG_DETAIL) bool {
+        if (detail.title.text != null) {
+            if (!self.put("\" title=\"")) return false;
+            if (!self.writeAttribute(&detail.title, .text)) return false;
+        }
+        return self.put("\">");
+    }
+
+    // ---- text ----
+
+    fn writeRun(self: *Markdown, text_type: md.c.MD_TEXTTYPE, text: []const u8) bool {
+        switch (text_type) {
+            // A NULL is replaced the way CommonMark says, rather than written.
+            md.c.MD_TEXT_NULLCHAR => return self.put("\u{FFFD}"),
+            md.c.MD_TEXT_BR => return self.put(if (self.image_depth == 0) "<br>\n" else " "),
+            md.c.MD_TEXT_SOFTBR => return self.put(if (self.image_depth == 0) "\n" else " "),
+            // An entity is decoded to the character it stands for, then escaped
+            // like any other text, so `&amp;` reads back as `&`.
+            md.c.MD_TEXT_ENTITY => {
+                var value: std.ArrayList(u8) = .empty;
+                defer value.deinit(self.gpa);
+                self.decodeEntity(text, &value) catch return self.fail();
+                return self.putEscaped(value.items);
+            },
+            // Everything else is text: normal text, code inside a block or span,
+            // and -- with raw HTML turned off -- what would have been HTML.
+            else => return self.putEscaped(text),
+        }
+    }
+
+    /// Records that writing failed, having no error to carry; the write itself
+    /// put the error on the renderer.
+    fn fail(self: *Markdown) bool {
+        if (self.err == null) self.err = error.WriteFailed;
+        return false;
+    }
+
+    // ---- attribute values ----
+
+    /// What an attribute holds, which is what decides what is safe in it.
+    const Attribute = enum {
+        /// Text, such as a link's title.
+        text,
+        /// A link's address, checked against a scheme that could run code.
+        link,
+        /// An image's address, which may be a `data:` image and so is held to
+        /// less than a link.
+        image,
+    };
+
+    /// Writes an attribute's value: an address that could run code becomes `#`,
+    /// and any other value is written escaped. The value is the entity-decoded
+    /// text, which is what the browser will read.
+    fn writeAttribute(self: *Markdown, attribute: *const md.c.MD_ATTRIBUTE, kind: Attribute) bool {
+        var value: std.ArrayList(u8) = .empty;
+        defer value.deinit(self.gpa);
+        self.decodeAttribute(attribute, &value) catch return self.fail();
+
+        if (kind != .text and !safeAddress(value.items, kind == .link)) return self.put("#");
+        return self.putEscaped(value.items);
+    }
+
+    /// Reads an attribute into `value`, resolving the entities in it. md4c hands
+    /// an attribute over in runs, each of which is ordinary text, an entity or a
+    /// NULL character.
+    fn decodeAttribute(self: *Markdown, attribute: *const md.c.MD_ATTRIBUTE, value: *std.ArrayList(u8)) !void {
+        var i: usize = 0;
+        while (attribute.substr_offsets[i] < attribute.size) : (i += 1) {
+            const start = attribute.substr_offsets[i];
+            const end = attribute.substr_offsets[i + 1];
+            const chunk = attribute.text[start..end];
+            switch (attribute.substr_types[i]) {
+                md.c.MD_TEXT_ENTITY => try self.decodeEntity(chunk, value),
+                md.c.MD_TEXT_NULLCHAR => try appendCodepoint(value, self.gpa, 0xFFFD),
+                else => try value.appendSlice(self.gpa, chunk),
+            }
+        }
+    }
+
+    /// Appends the character the entity `text` stands for: a number with its
+    /// digits, or a name looked up in md4c's table. An entity that is neither,
+    /// which md4c passes through, is kept as the text it is.
+    fn decodeEntity(self: *Markdown, text: []const u8, value: *std.ArrayList(u8)) !void {
+        if (std.mem.startsWith(u8, text, "&#")) {
+            var digits = text[2..];
+            if (std.mem.endsWith(u8, digits, ";")) digits = digits[0 .. digits.len - 1];
+            const base: u8 = if (digits.len > 0 and (digits[0] == 'x' or digits[0] == 'X')) blk: {
+                digits = digits[1..];
+                break :blk 16;
+            } else 10;
+            const codepoint = std.fmt.parseInt(u21, digits, base) catch
+                return value.appendSlice(self.gpa, text);
+            return appendCodepoint(value, self.gpa, codepoint);
+        }
+        const entity = md.c.entity_lookup(text.ptr, text.len);
+        if (entity != null) {
+            try appendCodepoint(value, self.gpa, @intCast(entity[0].codepoints[0]));
+            if (entity[0].codepoints[1] != 0) {
+                try appendCodepoint(value, self.gpa, @intCast(entity[0].codepoints[1]));
+            }
+            return;
+        }
+        try value.appendSlice(self.gpa, text);
+    }
+};
+
+const heading_open = [_][]const u8{ "<h1>", "<h2>", "<h3>", "<h4>", "<h5>", "<h6>" };
+const heading_close = [_][]const u8{ "</h1>\n", "</h2>\n", "</h3>\n", "</h4>\n", "</h5>\n", "</h6>\n" };
+
+/// Appends `codepoint` to `value` as UTF-8, or the replacement character when it
+/// is not one that may appear in text.
+fn appendCodepoint(value: *std.ArrayList(u8), gpa: std.mem.Allocator, codepoint: u21) !void {
+    var buffer: [4]u8 = undefined;
+    const encoded = std.unicode.utf8Encode(codepoint, &buffer) catch
+        return value.appendSlice(gpa, "\u{FFFD}");
+    return value.appendSlice(gpa, buffer[0..encoded]);
+}
+
+/// Whether the address `url` is one that is safe to write into a page. The scheme
+/// of the address -- the run up to the first colon, with the whitespace and
+/// control characters a browser ignores taken out -- is refused when it could run
+/// code. A link is held to more than an image: `data:` in a link is another
+/// document to open, while an image loaded from `data:` is how a picture is
+/// written without a host to fetch it from.
+fn safeAddress(url: []const u8, is_link: bool) bool {
+    var buffer: [16]u8 = undefined;
+    const scheme = schemeOf(url, &buffer);
+    const refused: []const []const u8 = if (is_link)
+        &.{ "javascript:", "vbscript:", "data:" }
+    else
+        &.{ "javascript:", "vbscript:" };
+    for (refused) |bad| {
+        if (std.mem.eql(u8, scheme, bad)) return false;
+    }
+    return true;
+}
+
+/// The scheme of `url`, lower case and with the characters a browser skips taking
+/// out, written into `buffer`: letters up to and including the first colon, or an
+/// empty string for an address with no scheme, such as a relative one. This is
+/// how a browser reads the scheme, so a `java\tscript:` or a ` javascript:` is
+/// seen as the scheme it is.
+fn schemeOf(url: []const u8, buffer: []u8) []const u8 {
+    var n: usize = 0;
+    for (url) |byte| {
+        // A browser drops leading whitespace and control characters, and any
+        // inside the scheme, before it reads it.
+        if (byte <= ' ' or byte == 0x7f) continue;
+        if (byte == ':' or byte == '/' or byte == '?' or byte == '#') {
+            if (byte == ':' and n < buffer.len) {
+                buffer[n] = ':';
+                n += 1;
+            }
+            break;
+        }
+        if (n >= buffer.len) break;
+        buffer[n] = std.ascii.toLower(byte);
+        n += 1;
+    }
+    return buffer[0..n];
+}
+
+/// Writes the HTML for one block, span or run of text, driving md4c. Each
+/// callback is C, so it returns a number: zero to carry on, non-zero to stop the
+/// parse, which is how a failed write stops it.
+fn enterBlock(block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
+    const self: *Markdown = @ptrCast(@alignCast(userdata.?));
+    return @intFromBool(!self.openBlock(block_type, detail));
+}
+
+fn leaveBlock(block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
+    const self: *Markdown = @ptrCast(@alignCast(userdata.?));
+    return @intFromBool(!self.closeBlock(block_type, detail));
+}
+
+fn enterSpan(span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
+    const self: *Markdown = @ptrCast(@alignCast(userdata.?));
+    return @intFromBool(!self.openSpan(span_type, detail));
+}
+
+fn leaveSpan(span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
+    const self: *Markdown = @ptrCast(@alignCast(userdata.?));
+    return @intFromBool(!self.closeSpan(span_type, detail));
+}
+
+fn writeText(text_type: md.c.MD_TEXTTYPE, text: [*c]const md.c.MD_CHAR, size: md.c.MD_SIZE, userdata: ?*anyopaque) callconv(.c) c_int {
+    const self: *Markdown = @ptrCast(@alignCast(userdata.?));
+    return @intFromBool(!self.writeRun(text_type, text[0..size]));
 }
 
 pub fn diff(lines: []const diffing.Line, out: *Io.Writer) !void {
@@ -289,9 +704,85 @@ test "a link is written with an escaped address, and a dangerous one is not foll
     try expectMarkdown("<p><a href=\"/docs\">docs</a></p>\n", "[docs](/docs)\n");
 
     // A scheme that runs code is written as a link that goes nowhere, so the
-    // text of it reads but clicking it does nothing. See `md.writeSafeUrls`.
+    // text of it reads but clicking it does nothing. See `safeAddress`.
     try expectMarkdown("<p><a href=\"#\">x</a></p>\n", "[x](javascript:alert(1))\n");
     try expectMarkdown("<p><a href=\"#\">x</a></p>\n", "[x](data:text/html,<b>)\n");
+}
+
+test "a scheme that could run code is refused however it is spelled" {
+    // The scheme is read the way a browser reads it: leading whitespace and
+    // control characters are skipped, and it is compared without regard to case.
+    try std.testing.expect(!safeAddress("javascript:alert(1)", true));
+    try std.testing.expect(!safeAddress(" javascript:alert(1)", true));
+    try std.testing.expect(!safeAddress("java\tscript:alert(1)", true));
+    try std.testing.expect(!safeAddress("JavaScript:alert(1)", true));
+    try std.testing.expect(!safeAddress("vbscript:x", true));
+
+    // A `data:` address is another document to open, so a link may not use one;
+    // an image loaded from `data:` is how a picture is written without a host,
+    // so an image may.
+    try std.testing.expect(!safeAddress("data:text/html,x", true));
+    try std.testing.expect(!safeAddress("data:image/png;base64,x", true));
+    try std.testing.expect(safeAddress("data:image/png;base64,x", false));
+
+    // An address with nothing to run is left alone.
+    try std.testing.expect(safeAddress("https://example.com", true));
+    try std.testing.expect(safeAddress("mailto:a@b.c", true));
+    try std.testing.expect(safeAddress("/docs", true));
+    try std.testing.expect(safeAddress("#top", true));
+    try std.testing.expect(safeAddress("relative/path", true));
+}
+
+test "a scheme spelled with entities is caught" {
+    // A `javascript:` scheme can be hidden in entities. The address is decoded
+    // before it is read, so it is refused all the same.
+    try expectMarkdown("<p><a href=\"#\">x</a></p>\n", "[x](jav&#x61;script:alert(1))\n");
+    try expectMarkdown("<p><a href=\"#\">x</a></p>\n", "[x](javascript&colon;alert(1))\n");
+}
+
+test "an image may be a data: image, but a link may not" {
+    try expectMarkdown(
+        "<p><img src=\"data:image/png;base64,AAAA\" alt=\"b\"></p>\n",
+        "![b](data:image/png;base64,AAAA)\n",
+    );
+    try expectMarkdown("<p><img src=\"#\" alt=\"a\"></p>\n", "![a](javascript:x)\n");
+}
+
+test "a reply cannot forge an address attribute" {
+    // Raw HTML is off and text is escaped, so a reply that writes an attribute
+    // writes the text of one; only md4c's own attributes are checked.
+    try expectMarkdown(
+        "<p>an &lt;a href=&quot;javascript:x&quot;&gt; tag</p>\n",
+        "an <a href=\"javascript:x\"> tag\n",
+    );
+}
+
+test "a nested list is a nested list" {
+    // The shape the old renderer got wrong: a numbered item with detail indented
+    // under it.
+    try expectMarkdown(
+        "<ol>\n<li>one<ul>\n<li>nested</li>\n</ul>\n</li>\n<li>two</li>\n</ol>\n",
+        "1. one\n   - nested\n2. two\n",
+    );
+}
+
+test "the GitHub extensions a reply uses are on" {
+    // Tables, strikethrough, task lists: the extensions a reply reaches for.
+    try expectMarkdown(
+        "<table>\n<thead>\n<tr>\n<th>a</th>\n<th>b</th>\n</tr>\n</thead>\n" ++
+            "<tbody>\n<tr>\n<td>1</td>\n<td>2</td>\n</tr>\n</tbody>\n</table>\n",
+        "| a | b |\n|---|---|\n| 1 | 2 |\n",
+    );
+    try expectMarkdown("<p><del>gone</del></p>\n", "~~gone~~\n");
+    try expectMarkdown(
+        "<ul>\n<li class=\"task-list-item\"><input type=\"checkbox\" class=\"task-list-item-checkbox\" disabled>todo</li>\n" ++
+            "<li class=\"task-list-item\"><input type=\"checkbox\" class=\"task-list-item-checkbox\" disabled checked>done</li>\n</ul>\n",
+        "- [ ] todo\n- [x] done\n",
+    );
+}
+
+test "raw HTML in the text stays text" {
+    try expectMarkdown("<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>\n", "<script>alert(1)</script>\n");
 }
 
 test "a diff is written as lines that name their side" {
