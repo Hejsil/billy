@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const Mock = @import("mock.zig");
 
 /// A message in the conversation, as sent to and received from the API.
 pub const Message = struct {
@@ -425,52 +426,6 @@ test "a request counts out to exactly the body it writes" {
     try std.testing.expectEqualStrings(one_pass, written.written());
 }
 
-/// Answers one request over a real socket with a fixed reply, recording what
-/// the client actually put on the connection so the test can check it. The
-/// count-and-write pair is only correct if the bytes that arrive are the ones
-/// the head announced, which is what a live connection is needed to see.
-const TestProvider = struct {
-    /// The body the client is expected to send, compared against what arrives.
-    expected_body: []const u8,
-    /// The length the request head announced, read off the wire.
-    content_length: ?u64 = null,
-    /// The request body as it arrived, owned by `std.testing.allocator`.
-    body: ?[]u8 = null,
-    /// The first failure the server ran into, if any, so the test can report it
-    /// instead of the connection simply hanging.
-    err: ?anyerror = null,
-
-    fn serve(io: Io, listener: *std.Io.net.Server, self: *TestProvider) Io.Cancelable!void {
-        self.run(io, listener) catch |err| {
-            self.err = err;
-        };
-    }
-
-    fn run(self: *TestProvider, io: Io, listener: *std.Io.net.Server) !void {
-        var stream = try listener.accept(io);
-        defer stream.close(io);
-
-        var in_buffer: [4096]u8 = undefined;
-        var out_buffer: [4096]u8 = undefined;
-        var reader = stream.reader(io, &in_buffer);
-        var writer = stream.writer(io, &out_buffer);
-        var server: std.http.Server = .init(&reader.interface, &writer.interface);
-
-        var request = try server.receiveHead();
-        self.content_length = request.head.content_length;
-
-        var body_buffer: [4096]u8 = undefined;
-        const body_reader = request.readerExpectNone(&body_buffer);
-        self.body = try body_reader.allocRemaining(std.testing.allocator, .unlimited);
-
-        try request.respond(
-            "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hi there\"}}]," ++
-                "\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}",
-            .{ .keep_alive = false },
-        );
-    }
-};
-
 test "a request reaches the wire with the body the head promised" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -495,20 +450,13 @@ test "a request reaches the wire with the body the head promised" {
     );
     defer gpa.free(expected);
 
-    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    var listener = try address.listen(io, .{ .reuse_address = true });
-    defer listener.deinit(io);
-
-    var provider: TestProvider = .{ .expected_body = expected };
-    defer if (provider.body) |body| gpa.free(body);
-
+    var mock = try Mock.start(gpa, io, "/chat/completions", 1, Mock.fixed(
+        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hi there\"}}]," ++
+            "\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}",
+    ));
+    defer mock.deinit(io);
     var group: Io.Group = .init;
-    try group.concurrent(io, TestProvider.serve, .{ io, &listener, &provider });
-
-    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/chat/completions", .{
-        listener.socket.address.getPort(),
-    });
-    defer gpa.free(url);
+    try group.concurrent(io, Mock.serve, .{ io, &mock });
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -516,7 +464,7 @@ test "a request reaches the wire with the body the head promised" {
         .gpa = gpa,
         .io = io,
         .api_key = "secret",
-        .url = url,
+        .url = mock.url,
         .model = "some-model",
         .http = &http,
     };
@@ -525,12 +473,12 @@ test "a request reaches the wire with the body the head promised" {
     defer completion.deinit();
 
     try group.await(io);
-    if (provider.err) |err| return err;
+    if (mock.err) |err| return err;
 
     // The head carried the counted length, and the bytes behind it are exactly
     // the body the counter measured, not something assembled separately.
-    try std.testing.expectEqual(@as(u64, expected.len), provider.content_length.?);
-    try std.testing.expectEqualStrings(expected, provider.body.?);
+    try std.testing.expectEqual(@as(u64, expected.len), mock.content_length.?);
+    try std.testing.expectEqualStrings(expected, mock.bodies.items[0]);
     try std.testing.expectEqualStrings("hi there", completion.message.content.?);
     try std.testing.expectEqual(9, completion.usage.total_tokens);
 }
@@ -608,73 +556,6 @@ test "pauseFor honors Retry-After and otherwise backs off with jitter" {
     try std.testing.expectEqual(@as(i64, 0), client.pauseFor(0, null).toMilliseconds());
 }
 
-/// A server that answers the first `fail_first` of `accepts` requests with a
-/// 503 and the rest with a completion, so the retry path is exercised over a
-/// real socket with the client opening a fresh connection each time. It stops
-/// after `accepts` requests, so the test that expects the client to give up does
-/// not leave a server waiting on a connection that never comes.
-const RetryProvider = struct {
-    accepts: usize,
-    fail_first: usize,
-    served: usize = 0,
-    err: ?anyerror = null,
-
-    fn serve(io: Io, listener: *std.Io.net.Server, self: *RetryProvider) Io.Cancelable!void {
-        self.run(io, listener) catch |err| {
-            self.err = err;
-        };
-    }
-
-    fn run(self: *RetryProvider, io: Io, listener: *std.Io.net.Server) !void {
-        while (self.served < self.accepts) {
-            var stream = try listener.accept(io);
-            defer stream.close(io);
-
-            var in_buffer: [4096]u8 = undefined;
-            var out_buffer: [4096]u8 = undefined;
-            var reader = stream.reader(io, &in_buffer);
-            var writer = stream.writer(io, &out_buffer);
-            var server: std.http.Server = .init(&reader.interface, &writer.interface);
-
-            var request = try server.receiveHead();
-            var body_buffer: [4096]u8 = undefined;
-            const body = try request.readerExpectNone(&body_buffer).allocRemaining(std.testing.allocator, .unlimited);
-            std.testing.allocator.free(body);
-
-            self.served += 1;
-            if (self.served <= self.fail_first) {
-                try request.respond(
-                    "{\"error\":{\"message\":\"busy\"}}",
-                    .{ .status = .service_unavailable, .keep_alive = false },
-                );
-            } else {
-                try request.respond(
-                    "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"made it\"}}]," ++
-                        "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}",
-                    .{ .keep_alive = false },
-                );
-            }
-        }
-    }
-};
-
-/// The URL of a fresh listening socket, and the listener itself.
-const TestListener = struct {
-    listener: std.Io.net.Server,
-    url: []const u8,
-
-    fn init(gpa: std.mem.Allocator, io: Io) !TestListener {
-        var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-        const listener = try address.listen(io, .{ .reuse_address = true });
-        return .{
-            .listener = listener,
-            .url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/chat/completions", .{
-                listener.socket.address.getPort(),
-            }),
-        };
-    }
-};
-
 /// Runs one completion against `url`, with the retry backoff turned off so the
 /// test costs no real time. The caller owns the returned completion and frees it
 /// with `deinit`.
@@ -695,27 +576,39 @@ fn completeAgainst(gpa: std.mem.Allocator, io: Io, url: []const u8, max_attempts
     return client.complete(gpa, &messages, @as([]const NoTools, &.{}));
 }
 
+/// The answer of a mock that fails the first `fail_first` requests with a 503 and
+/// succeeds after, for the retry tests.
+fn retrying(comptime fail_first: usize) *const fn (usize, []const u8) Mock.Answer {
+    return struct {
+        fn answer(number: usize, _: []const u8) Mock.Answer {
+            if (number <= fail_first) return .{
+                .status = .service_unavailable,
+                .body = "{\"error\":{\"message\":\"busy\"}}",
+            };
+            return .{ .body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"made it\"}}]," ++
+                "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}" };
+        }
+    }.answer;
+}
+
 test "a request that is rate limited is tried again and succeeds" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var listen = try TestListener.init(gpa, io);
-    defer gpa.free(listen.url);
-    defer listen.listener.deinit(io);
-
     // Two failures, then the answer: three requests, and the client should make
     // exactly that many.
-    var provider: RetryProvider = .{ .accepts = 3, .fail_first = 2 };
+    var mock = try Mock.start(gpa, io, "/chat/completions", 3, retrying(2));
+    defer mock.deinit(io);
     var group: Io.Group = .init;
-    try group.concurrent(io, RetryProvider.serve, .{ io, &listen.listener, &provider });
+    try group.concurrent(io, Mock.serve, .{ io, &mock });
 
-    const completion = try completeAgainst(gpa, io, listen.url, 4);
+    const completion = try completeAgainst(gpa, io, mock.url, 4);
     defer completion.deinit();
 
     try group.await(io);
-    if (provider.err) |err| return err;
+    if (mock.err) |err| return err;
 
-    try std.testing.expectEqual(@as(usize, 3), provider.served);
+    try std.testing.expectEqual(@as(usize, 3), mock.served);
     try std.testing.expectEqualStrings("made it", completion.message.content.?);
     try std.testing.expectEqual(4, completion.usage.total_tokens);
 }
@@ -724,84 +617,39 @@ test "a request that keeps failing is given up on after max_attempts" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var listen = try TestListener.init(gpa, io);
-    defer gpa.free(listen.url);
-    defer listen.listener.deinit(io);
-
     // Every request fails, so the client tries as many times as it is allowed.
-    var provider: RetryProvider = .{ .accepts = 3, .fail_first = 3 };
+    var mock = try Mock.start(gpa, io, "/chat/completions", 3, retrying(3));
+    defer mock.deinit(io);
     var group: Io.Group = .init;
-    try group.concurrent(io, RetryProvider.serve, .{ io, &listen.listener, &provider });
+    try group.concurrent(io, Mock.serve, .{ io, &mock });
 
-    try std.testing.expectError(error.HttpStatus, completeAgainst(gpa, io, listen.url, 3));
+    try std.testing.expectError(error.HttpStatus, completeAgainst(gpa, io, mock.url, 3));
 
     try group.await(io);
-    if (provider.err) |err| return err;
-    try std.testing.expectEqual(@as(usize, 3), provider.served);
+    if (mock.err) |err| return err;
+    try std.testing.expectEqual(@as(usize, 3), mock.served);
 }
-
-/// A server that answers `requests` requests over a single kept-alive
-/// connection, counting connections and requests, so a test can tell whether
-/// the client reused the connection or opened a new one.
-const KeepAliveProvider = struct {
-    requests: usize,
-    served: usize = 0,
-    connections: usize = 0,
-    err: ?anyerror = null,
-
-    fn serve(io: Io, listener: *std.Io.net.Server, self: *KeepAliveProvider) Io.Cancelable!void {
-        self.run(io, listener) catch |err| {
-            self.err = err;
-        };
-    }
-
-    fn run(self: *KeepAliveProvider, io: Io, listener: *std.Io.net.Server) !void {
-        // Every connection is accepted and served until the client closes it or
-        // the requests run out. A client that reused its connection needs one
-        // accept; one that opened a connection a request would need more, which
-        // is what a test counts.
-        while (self.served < self.requests) {
-            var stream = try listener.accept(io);
-            self.connections += 1;
-
-            {
-                var in_buffer: [4096]u8 = undefined;
-                var out_buffer: [4096]u8 = undefined;
-                var reader = stream.reader(io, &in_buffer);
-                var writer = stream.writer(io, &out_buffer);
-                var server: std.http.Server = .init(&reader.interface, &writer.interface);
-
-                while (self.served < self.requests) {
-                    var request = server.receiveHead() catch break; // the client closed the connection
-                    var body_buffer: [4096]u8 = undefined;
-                    const body = try request.readerExpectNone(&body_buffer).allocRemaining(std.testing.allocator, .unlimited);
-                    std.testing.allocator.free(body);
-                    self.served += 1;
-                    // A kept-alive reply leaves the connection open for the next
-                    // request, which is what the client should reuse.
-                    try request.respond(
-                        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"}}]," ++
-                            "\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}",
-                        .{ .keep_alive = true },
-                    );
-                }
-            }
-            stream.close(io);
-        }
-    }
-};
 
 test "the HTTP client is kept, so requests reuse one connection" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var listen = try TestListener.init(gpa, io);
-    defer gpa.free(listen.url);
-    defer listen.listener.deinit(io);
-
-    var provider: KeepAliveProvider = .{ .requests = 2 };
+    // A mock that keeps each connection open, so a client that reuses one needs
+    // a single connection for its requests and one that opens a fresh connection
+    // a request needs more.
+    const keep_alive = struct {
+        fn answer(_: usize, _: []const u8) Mock.Answer {
+            return .{
+                .body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"}}]," ++
+                    "\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}",
+                .keep_alive = true,
+            };
+        }
+    }.answer;
+    var mock = try Mock.start(gpa, io, "/chat/completions", 2, keep_alive);
+    defer mock.deinit(io);
     var group: Io.Group = .init;
-    try group.concurrent(io, KeepAliveProvider.serve, .{ io, &listen.listener, &provider });
+    try group.concurrent(io, Mock.serve, .{ io, &mock });
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -809,7 +657,7 @@ test "the HTTP client is kept, so requests reuse one connection" {
         .gpa = gpa,
         .io = io,
         .api_key = "k",
-        .url = listen.url,
+        .url = mock.url,
         .model = "m",
         .http = &http,
     };
@@ -826,9 +674,9 @@ test "the HTTP client is kept, so requests reuse one connection" {
     }
 
     try group.await(io);
-    if (provider.err) |err| return err;
-    try std.testing.expectEqual(@as(usize, 1), provider.connections);
-    try std.testing.expectEqual(@as(usize, 2), provider.served);
+    if (mock.err) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), mock.connections);
+    try std.testing.expectEqual(@as(usize, 2), mock.served);
 }
 
 test "usage is normalized from the DeepSeek cache fields" {
