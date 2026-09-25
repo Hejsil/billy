@@ -36,6 +36,36 @@ pub fn parse(text: []const u8, parser: *const c.MD_PARSER, userdata: ?*anyopaque
     if (c.md_parse(text.ptr, @intCast(text.len), parser, userdata) < 0) return error.MarkdownFailed;
 }
 
+/// Appends the character the entity `text` stands for to `value`: a number with
+/// its digits, or a name looked up in md4c's table. An entity that is neither,
+/// which md4c passes through as text, is kept as it is.
+pub fn decodeEntity(gpa: std.mem.Allocator, text: []const u8, value: *std.ArrayList(u8)) !void {
+    if (std.mem.startsWith(u8, text, "&#")) {
+        var digits = text[2..];
+        if (std.mem.endsWith(u8, digits, ";")) digits = digits[0 .. digits.len - 1];
+        const base: u8 = if (digits.len > 0 and (digits[0] == 'x' or digits[0] == 'X')) blk: {
+            digits = digits[1..];
+            break :blk 16;
+        } else 10;
+        const codepoint = std.fmt.parseInt(u21, digits, base) catch
+            return value.appendSlice(gpa, text);
+        return appendCodepoint(value, gpa, codepoint);
+    }
+    const entity = c.entity_lookup(text.ptr, text.len);
+    if (entity == null) return value.appendSlice(gpa, text);
+    try appendCodepoint(value, gpa, @intCast(entity[0].codepoints[0]));
+    if (entity[0].codepoints[1] != 0) try appendCodepoint(value, gpa, @intCast(entity[0].codepoints[1]));
+}
+
+/// Appends `codepoint` to `value` as UTF-8, or the replacement character when it
+/// is not one that may appear in text.
+pub fn appendCodepoint(value: *std.ArrayList(u8), gpa: std.mem.Allocator, codepoint: u21) !void {
+    var buffer: [4]u8 = undefined;
+    const encoded = std.unicode.utf8Encode(codepoint, &buffer) catch
+        return value.appendSlice(gpa, "\u{FFFD}");
+    return value.appendSlice(gpa, buffer[0..encoded]);
+}
+
 /// Renders `text` with md4c's *own* HTML renderer, so a test can check billy's
 /// renderer against it (see the oracle test in `html.zig`).
 ///

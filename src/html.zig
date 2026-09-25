@@ -348,7 +348,7 @@ const Markdown = struct {
             md.c.MD_TEXT_ENTITY => {
                 var value: std.ArrayList(u8) = .empty;
                 defer value.deinit(self.gpa);
-                self.decodeEntity(text, &value) catch return self.fail();
+                md.decodeEntity(self.gpa, text, &value) catch return self.fail();
                 return self.putEscaped(value.items);
             },
             // Everything else is text: normal text, code inside a block or span,
@@ -399,51 +399,16 @@ const Markdown = struct {
             const end = attribute.substr_offsets[i + 1];
             const chunk = attribute.text[start..end];
             switch (attribute.substr_types[i]) {
-                md.c.MD_TEXT_ENTITY => try self.decodeEntity(chunk, value),
-                md.c.MD_TEXT_NULLCHAR => try appendCodepoint(value, self.gpa, 0xFFFD),
+                md.c.MD_TEXT_ENTITY => try md.decodeEntity(self.gpa, chunk, value),
+                md.c.MD_TEXT_NULLCHAR => try md.appendCodepoint(value, self.gpa, 0xFFFD),
                 else => try value.appendSlice(self.gpa, chunk),
             }
         }
-    }
-
-    /// Appends the character the entity `text` stands for: a number with its
-    /// digits, or a name looked up in md4c's table. An entity that is neither,
-    /// which md4c passes through, is kept as the text it is.
-    fn decodeEntity(self: *Markdown, text: []const u8, value: *std.ArrayList(u8)) !void {
-        if (std.mem.startsWith(u8, text, "&#")) {
-            var digits = text[2..];
-            if (std.mem.endsWith(u8, digits, ";")) digits = digits[0 .. digits.len - 1];
-            const base: u8 = if (digits.len > 0 and (digits[0] == 'x' or digits[0] == 'X')) blk: {
-                digits = digits[1..];
-                break :blk 16;
-            } else 10;
-            const codepoint = std.fmt.parseInt(u21, digits, base) catch
-                return value.appendSlice(self.gpa, text);
-            return appendCodepoint(value, self.gpa, codepoint);
-        }
-        const entity = md.c.entity_lookup(text.ptr, text.len);
-        if (entity != null) {
-            try appendCodepoint(value, self.gpa, @intCast(entity[0].codepoints[0]));
-            if (entity[0].codepoints[1] != 0) {
-                try appendCodepoint(value, self.gpa, @intCast(entity[0].codepoints[1]));
-            }
-            return;
-        }
-        try value.appendSlice(self.gpa, text);
     }
 };
 
 const heading_open = [_][]const u8{ "<h1>", "<h2>", "<h3>", "<h4>", "<h5>", "<h6>" };
 const heading_close = [_][]const u8{ "</h1>\n", "</h2>\n", "</h3>\n", "</h4>\n", "</h5>\n", "</h6>\n" };
-
-/// Appends `codepoint` to `value` as UTF-8, or the replacement character when it
-/// is not one that may appear in text.
-fn appendCodepoint(value: *std.ArrayList(u8), gpa: std.mem.Allocator, codepoint: u21) !void {
-    var buffer: [4]u8 = undefined;
-    const encoded = std.unicode.utf8Encode(codepoint, &buffer) catch
-        return value.appendSlice(gpa, "\u{FFFD}");
-    return value.appendSlice(gpa, buffer[0..encoded]);
-}
 
 /// Whether the address `url` is one that is safe to write into a page. The scheme
 /// of the address -- the run up to the first colon, with the whitespace and

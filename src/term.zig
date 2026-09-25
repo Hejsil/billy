@@ -586,7 +586,7 @@ const Markdown = struct {
     fn writeEntity(self: *Markdown, text: []const u8) bool {
         var value: std.ArrayList(u8) = .empty;
         defer value.deinit(self.gpa);
-        self.decodeEntity(text, &value) catch return self.fail();
+        md.decodeEntity(self.gpa, text, &value) catch return self.fail();
         return self.emit(value.items);
     }
 
@@ -598,29 +598,6 @@ const Markdown = struct {
             return true;
         }
         return self.put(bytes);
-    }
-
-    fn decodeEntity(self: *Markdown, text: []const u8, value: *std.ArrayList(u8)) !void {
-        if (std.mem.startsWith(u8, text, "&#")) {
-            var digits = text[2..];
-            if (std.mem.endsWith(u8, digits, ";")) digits = digits[0 .. digits.len - 1];
-            const base: u8 = if (digits.len > 0 and (digits[0] == 'x' or digits[0] == 'X')) blk: {
-                digits = digits[1..];
-                break :blk 16;
-            } else 10;
-            const codepoint = std.fmt.parseInt(u21, digits, base) catch
-                return value.appendSlice(self.gpa, text);
-            return appendCodepoint(value, self.gpa, codepoint);
-        }
-        const entity = md.c.entity_lookup(text.ptr, text.len);
-        if (entity != null) {
-            try appendCodepoint(value, self.gpa, @intCast(entity[0].codepoints[0]));
-            if (entity[0].codepoints[1] != 0) {
-                try appendCodepoint(value, self.gpa, @intCast(entity[0].codepoints[1]));
-            }
-            return;
-        }
-        try value.appendSlice(self.gpa, text);
     }
 
     /// Stops the parse by returning a failure; the error itself is already on
@@ -635,15 +612,6 @@ const Markdown = struct {
 fn attribute(value: md.c.MD_ATTRIBUTE) []const u8 {
     if (value.text == null or value.size == 0) return "";
     return value.text[0..value.size];
-}
-
-/// Appends `codepoint` to `value` as UTF-8, or the replacement character when it
-/// is not one that may appear in text.
-fn appendCodepoint(value: *std.ArrayList(u8), gpa: std.mem.Allocator, codepoint: u21) !void {
-    var buffer: [4]u8 = undefined;
-    const encoded = std.unicode.utf8Encode(codepoint, &buffer) catch
-        return value.appendSlice(gpa, "\u{FFFD}");
-    return value.appendSlice(gpa, buffer[0..encoded]);
 }
 
 fn enterBlock(block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
