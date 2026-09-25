@@ -84,7 +84,14 @@
   .block :first-child { margin-top: 0; }
   .block p { margin: 0 0 8px; }
   .block ul, .block ol { margin: 0 0 8px; padding-left: 22px; }
-  .block h1, .block h2, .block h3 { font-size: 15px; margin: 12px 0 6px; }
+  .block h1, .block h2, .block h3, .block h4, .block h5, .block h6 { font-size: 15px; margin: 12px 0 6px; }
+  /* A link, a table and an image are what a CommonMark renderer writes that the
+     blocks above do not already cover. */
+  .block a { color: var(--accent); }
+  .block img { max-width: 100%; }
+  .block table { border-collapse: collapse; margin: 0 0 8px; }
+  .block th, .block td { border: 1px solid var(--line); padding: 3px 8px; text-align: left; }
+  .block th { background: var(--panel); }
   .block blockquote {
     margin: 0 0 8px; padding-left: 10px; border-left: 2px solid var(--line);
     color: var(--dim);

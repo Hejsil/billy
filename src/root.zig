@@ -8,6 +8,7 @@ pub const format = @import("format.zig");
 pub const html = @import("html.zig");
 pub const LineEditor = @import("LineEditor.zig");
 pub const llm = @import("llm.zig");
+pub const md = @import("md.zig");
 pub const models = @import("models.zig");
 pub const search = @import("search.zig");
 pub const Setup = @import("Setup.zig");
