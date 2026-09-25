@@ -214,18 +214,22 @@ const instruction_files = [_][]const u8{ "AGENTS.md", "CLAUDE.md" };
 /// Longest instructions read back, so an outsize file cannot exhaust memory.
 const max_instructions_len = 1 << 20;
 
-/// The instructions `dir` itself holds: the first non-empty file of `names`,
-/// under a heading naming where they came from, and null when it holds none of
-/// them. Only `dir` is read; a caller that wants a walk up does it around this.
+/// Writes the instructions `dir` itself holds to `out`, as a section a blank
+/// line below whatever came before: the first non-empty file of `names`, under a
+/// heading naming where they came from. Writes nothing and returns false when it
+/// holds none of them. Only `dir` is read; a caller that wants a walk up does it
+/// around this.
 ///
-/// The text is owned by `gpa`; the caller frees it.
+/// The file is read through `gpa` and freed here, so nothing of the section is
+/// left allocated once it is written.
 fn instructionsIn(
     io: Io,
+    out: *Io.Writer,
     gpa: std.mem.Allocator,
     dir: Io.Dir,
     names: []const []const u8,
     what: []const u8,
-) !?[]const u8 {
+) !bool {
     for (names) |name| {
         const text = dir.readFileAlloc(io, name, gpa, .limited(max_instructions_len)) catch |err| switch (err) {
             error.FileNotFound => continue,
@@ -236,17 +240,17 @@ fn instructionsIn(
         // putting a blank heading in the prompt.
         const body = std.mem.trimEnd(u8, text, " \t\r\n");
         if (body.len == 0) continue;
-        return try std.fmt.allocPrint(
-            gpa,
-            "{s} instructions follow, read from {s}.\n\n{s}",
-            .{ what, name, body },
-        );
+        // The blank line before the heading stands the section apart from the
+        // prompt above it, which every section has: billy's own text, or another
+        // section.
+        try out.print("\n\n{s} instructions follow, read from {s}.\n\n{s}", .{ what, name, body });
+        return true;
     }
-    return null;
+    return false;
 }
 
-/// The project's own instructions, read from `dir` or the nearest parent that
-/// has them, and null when the project has none. The walk stops at the
+/// Writes the project's own instructions, read from `dir` or the nearest parent
+/// that has them, and returns whether it wrote any. The walk stops at the
 /// repository root, so a file above the project is not read, and at the
 /// filesystem root when there is no repository above it.
 ///
@@ -254,9 +258,7 @@ fn instructionsIn(
 /// are sent with every request and survive whatever context trimming happens
 /// later. That is what keeps the rules a project cares about from being dropped
 /// partway through a long session.
-///
-/// The result is owned by `gpa`; the caller frees it once the prompt is built.
-fn projectInstructions(io: Io, gpa: std.mem.Allocator, dir: Io.Dir) !?[]const u8 {
+fn projectInstructions(io: Io, out: *Io.Writer, gpa: std.mem.Allocator, dir: Io.Dir) !bool {
     var current = dir;
     // The directory the caller passed is theirs to close; every one opened here
     // while walking up is this function's.
@@ -264,23 +266,23 @@ fn projectInstructions(io: Io, gpa: std.mem.Allocator, dir: Io.Dir) !?[]const u8
     defer if (owned) current.close(io);
 
     while (true) {
-        if (try instructionsIn(io, gpa, current, &instruction_files, "The project's")) |text|
-            return text;
+        if (try instructionsIn(io, out, gpa, current, &instruction_files, "The project's"))
+            return true;
         // The repository root is the last directory searched.
-        if (dirHas(io, current, ".git")) return null;
+        if (dirHas(io, current, ".git")) return false;
 
         // The parent is opened rather than derived from a path, so the walk
         // keeps no path string and follows the filesystem's own notion of a
         // parent.
         const parent = current.openDir(io, "..", .{}) catch |err| switch (err) {
-            error.FileNotFound, error.NotDir => return null,
+            error.FileNotFound, error.NotDir => return false,
             else => return err,
         };
         // At the filesystem root, `..` is the directory itself, which is what
         // ends the walk when no repository root was found above.
         if (sameDir(io, current, parent)) {
             parent.close(io);
-            return null;
+            return false;
         }
         if (owned) current.close(io);
         current = parent;
@@ -288,17 +290,15 @@ fn projectInstructions(io: Io, gpa: std.mem.Allocator, dir: Io.Dir) !?[]const u8
     }
 }
 
-/// The user's own instructions, read from the configuration directory alone and
-/// null when it holds none. Unlike the project's there is no parent to walk up
-/// to: the configuration directory is a single directory, wherever it is, so
-/// this is one read.
+/// Writes the user's own instructions, read from the configuration directory
+/// alone, and returns whether it wrote any. Unlike the project's there is no
+/// parent to walk up to: the configuration directory is a single directory,
+/// wherever it is, so this is one read.
 ///
 /// They join every session's prompt, ahead of the project's own, so a rule that
 /// holds everywhere is set once rather than copied into each project.
-///
-/// The result is owned by `gpa`; the caller frees it once the prompt is built.
-fn globalInstructions(io: Io, gpa: std.mem.Allocator, dir: Io.Dir) !?[]const u8 {
-    return instructionsIn(io, gpa, dir, &instruction_files, "The user's");
+fn globalInstructions(io: Io, out: *Io.Writer, gpa: std.mem.Allocator, dir: Io.Dir) !bool {
+    return instructionsIn(io, out, gpa, dir, &instruction_files, "The user's");
 }
 
 /// Whether `dir` holds an entry named `name`.
@@ -919,16 +919,14 @@ fn turn(
 /// keeps the rules the user and the project care about from being dropped
 /// partway through a long session. The caller owns the text and frees it.
 fn leadPrompt(io: Io, gpa: std.mem.Allocator, dir: Io.Dir, user_dir: ?Io.Dir) ![]u8 {
-    const user = if (user_dir) |config_dir| try globalInstructions(io, gpa, config_dir) else null;
-    defer if (user) |text| gpa.free(text);
-    const project = try projectInstructions(io, gpa, dir);
-    defer if (project) |text| gpa.free(text);
-
     var text: std.Io.Writer.Allocating = .init(gpa);
     errdefer text.deinit();
+    // Billy's own text first, then each section of instructions as it is found,
+    // so the whole prompt is written once into one buffer with no part of it
+    // built apart and then copied in.
     try text.writer.writeAll(system_prompt);
-    if (user) |instructions| try text.writer.print("\n\n{s}", .{instructions});
-    if (project) |instructions| try text.writer.print("\n\n{s}", .{instructions});
+    if (user_dir) |config_dir| _ = try globalInstructions(io, &text.writer, gpa, config_dir);
+    _ = try projectInstructions(io, &text.writer, gpa, dir);
     return text.toOwnedSlice();
 }
 
@@ -1680,44 +1678,60 @@ test "cost follows the cache hit, miss and output prices" {
     try std.testing.expectEqual(3.1, costOf(price, usage));
 }
 
-test "the project's instructions are read from the working directory" {
-    const gpa = std.testing.allocator;
+/// Writes the section an instruction reader (`globalInstructions` or
+/// `projectInstructions`) produces for `dir` and compares it to `expected`, so a
+/// test reads as the section it lands in the prompt.
+fn expectInstructions(expected: []const u8, read: anytype, dir: Io.Dir) !void {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try std.testing.expect(try read(std.testing.io, &out.writer, std.testing.allocator, dir));
+    try std.testing.expectEqualStrings(expected, out.written());
+}
 
+/// Checks that an instruction reader writes nothing for `dir`.
+fn expectNoInstructions(read: anytype, dir: Io.Dir) !void {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try std.testing.expect(!try read(std.testing.io, &out.writer, std.testing.allocator, dir));
+}
+
+test "the project's instructions are read from the working directory" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "Write tests.\n" });
 
-    const text = (try projectInstructions(std.testing.io, gpa, tmp.dir)).?;
-    defer gpa.free(text);
-    // The prompt names where the instructions came from and carries them through.
-    try std.testing.expect(std.mem.indexOf(u8, text, "AGENTS.md") != null);
-    try std.testing.expect(std.mem.endsWith(u8, text, "Write tests."));
+    // The section names where the instructions came from and carries them
+    // through, a blank line below the prompt above it.
+    try expectInstructions(
+        "\n\nThe project's instructions follow, read from AGENTS.md.\n\nWrite tests.",
+        projectInstructions,
+        tmp.dir,
+    );
 }
 
 test "AGENTS.md is read before CLAUDE.md" {
-    const gpa = std.testing.allocator;
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "agents" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "CLAUDE.md", .data = "claude" });
 
-    const text = (try projectInstructions(std.testing.io, gpa, tmp.dir)).?;
-    defer gpa.free(text);
-    try std.testing.expect(std.mem.endsWith(u8, text, "agents"));
+    try expectInstructions(
+        "\n\nThe project's instructions follow, read from AGENTS.md.\n\nagents",
+        projectInstructions,
+        tmp.dir,
+    );
 
     // With no AGENTS.md the other name is read, so a project written for another
     // tool still works.
     try tmp.dir.deleteFile(std.testing.io, "AGENTS.md");
-    const claude = (try projectInstructions(std.testing.io, gpa, tmp.dir)).?;
-    defer gpa.free(claude);
-    try std.testing.expect(std.mem.indexOf(u8, claude, "CLAUDE.md") != null);
-    try std.testing.expect(std.mem.endsWith(u8, claude, "claude"));
+    try expectInstructions(
+        "\n\nThe project's instructions follow, read from CLAUDE.md.\n\nclaude",
+        projectInstructions,
+        tmp.dir,
+    );
 }
 
 test "the instructions are found in a parent up to the repository root" {
-    const gpa = std.testing.allocator;
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     // A repository root holding the instructions, and a subdirectory to run from.
@@ -1726,36 +1740,32 @@ test "the instructions are found in a parent up to the repository root" {
 
     var deep = try tmp.dir.openDir(std.testing.io, "a/b", .{});
     defer deep.close(std.testing.io);
-    const text = (try projectInstructions(std.testing.io, gpa, deep)).?;
-    defer gpa.free(text);
-    try std.testing.expect(std.mem.endsWith(u8, text, "root rules"));
+    try expectInstructions(
+        "\n\nThe project's instructions follow, read from AGENTS.md.\n\nroot rules",
+        projectInstructions,
+        deep,
+    );
 }
 
 test "a project with no instructions has none" {
-    const gpa = std.testing.allocator;
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     // A repository root, so the search stops here rather than walking above it.
     try tmp.dir.createDirPath(std.testing.io, ".git");
 
-    try std.testing.expect((try projectInstructions(std.testing.io, gpa, tmp.dir)) == null);
+    try expectNoInstructions(projectInstructions, tmp.dir);
 }
 
 test "an empty instructions file is not used" {
-    const gpa = std.testing.allocator;
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, ".git");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "  \n\n" });
 
-    try std.testing.expect((try projectInstructions(std.testing.io, gpa, tmp.dir)) == null);
+    try expectNoInstructions(projectInstructions, tmp.dir);
 }
 
 test "the nearest instructions win over an ancestor's" {
-    const gpa = std.testing.allocator;
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "outer" });
@@ -1765,31 +1775,28 @@ test "the nearest instructions win over an ancestor's" {
     var inner = try tmp.dir.openDir(std.testing.io, "inner", .{});
     defer inner.close(std.testing.io);
 
-    const text = (try projectInstructions(std.testing.io, gpa, inner)).?;
-    defer gpa.free(text);
-    try std.testing.expect(std.mem.endsWith(u8, text, "inner"));
+    try expectInstructions(
+        "\n\nThe project's instructions follow, read from AGENTS.md.\n\ninner",
+        projectInstructions,
+        inner,
+    );
 }
 
 test "the user's instructions are read from the configuration directory" {
-    const gpa = std.testing.allocator;
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "Be terse.\n" });
 
-    const text = (try globalInstructions(std.testing.io, gpa, tmp.dir)).?;
-    defer gpa.free(text);
     // The heading names the user rather than the project, so the two sections of
     // a prompt read apart.
-    try std.testing.expectEqualStrings(
-        "The user's instructions follow, read from AGENTS.md.\n\nBe terse.",
-        text,
+    try expectInstructions(
+        "\n\nThe user's instructions follow, read from AGENTS.md.\n\nBe terse.",
+        globalInstructions,
+        tmp.dir,
     );
 }
 
 test "the user's instructions are read from the directory alone, not above it" {
-    const gpa = std.testing.allocator;
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     // A file above the directory handed in is not found: the configuration
@@ -1799,18 +1806,16 @@ test "the user's instructions are read from the directory alone, not above it" {
     var nested = try tmp.dir.openDir(std.testing.io, "nested", .{});
     defer nested.close(std.testing.io);
 
-    try std.testing.expect((try globalInstructions(std.testing.io, gpa, nested)) == null);
+    try expectNoInstructions(globalInstructions, nested);
 }
 
 test "a user's instructions file that is missing or empty is not used" {
-    const gpa = std.testing.allocator;
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try std.testing.expect((try globalInstructions(std.testing.io, gpa, tmp.dir)) == null);
+    try expectNoInstructions(globalInstructions, tmp.dir);
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "  \n\n" });
-    try std.testing.expect((try globalInstructions(std.testing.io, gpa, tmp.dir)) == null);
+    try expectNoInstructions(globalInstructions, tmp.dir);
 }
 
 test "the prompt is billy's own, the user's instructions, then the project's" {
