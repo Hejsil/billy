@@ -174,7 +174,7 @@ pub fn init(options: Options) !Tools {
 pub fn definitions(tools: *const Tools, mode: Mode) []const Session.Definition {
     return switch (mode) {
         .general => if (tools.search != null) &specs_with_search else &specs,
-        .ask => if (tools.search != null) &ask_specs_with_search else &ask_specs,
+        .chat => if (tools.search != null) &chat_specs_with_search else &chat_specs,
     };
 }
 
@@ -1178,7 +1178,7 @@ fn allowedCount(comptime source: []const Session.Definition, comptime mode: Mode
     return n;
 }
 
-/// The specs of `source` the ask mode allows, filtered at comptime so the result
+/// The specs of `source` the chat mode allows, filtered at comptime so the result
 /// is the spec table's own strings and nothing is built at run time.
 fn allowedSpecs(comptime source: []const Session.Definition, comptime mode: Mode) [allowedCount(source, mode)]Session.Definition {
     var buffer: [allowedCount(source, mode)]Session.Definition = undefined;
@@ -1191,8 +1191,8 @@ fn allowedSpecs(comptime source: []const Session.Definition, comptime mode: Mode
     return buffer;
 }
 
-const ask_specs = allowedSpecs(&specs, .ask);
-const ask_specs_with_search = allowedSpecs(&specs_with_search, .ask);
+const chat_specs = allowedSpecs(&specs, .chat);
+const chat_specs_with_search = allowedSpecs(&specs_with_search, .chat);
 
 test "exit codes of signals follow the shell convention" {
     try std.testing.expectEqual(0, formatting.exitCode(.{ .exited = 0 }));

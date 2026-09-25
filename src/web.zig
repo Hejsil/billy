@@ -401,7 +401,7 @@ fn writeOpened(out: *Io.Writer, header: []const u8, blocks: []const u8, session_
 
 /// The mode a web session starts in, so a new one opens in ask unless the first
 /// prompt says otherwise. The terminal keeps general as its own default.
-const default_mode: mode.Mode = .ask;
+const default_mode: mode.Mode = .chat;
 
 /// What a reply is, so the browser is told how to read it.
 const ContentType = enum {
@@ -477,9 +477,9 @@ test "a session's page is written as the JSON the page reads" {
 
     // The two halves are HTML, so the quotes and newlines in them are escaped
     // into the JSON rather than ending the string early.
-    try writeOpened(&out.writer, "<div class=\"header\">hi</div>\n", "<p>one</p>\n", "ask");
+    try writeOpened(&out.writer, "<div class=\"header\">hi</div>\n", "<p>one</p>\n", "chat");
     try std.testing.expectEqualStrings(
-        "{\"header\":\"<div class=\\\"header\\\">hi</div>\\n\",\"blocks\":\"<p>one</p>\\n\",\"mode\":\"ask\"}",
+        "{\"header\":\"<div class=\\\"header\\\">hi</div>\\n\",\"blocks\":\"<p>one</p>\\n\",\"mode\":\"chat\"}",
         out.written(),
     );
     // The page reads this back as the two strings it wrote, and the mode.
@@ -487,7 +487,7 @@ test "a session's page is written as the JSON the page reads" {
     defer parsed.deinit();
     try std.testing.expectEqualStrings("<div class=\"header\">hi</div>\n", parsed.value.header);
     try std.testing.expectEqualStrings("<p>one</p>\n", parsed.value.blocks);
-    try std.testing.expectEqualStrings("ask", parsed.value.mode);
+    try std.testing.expectEqualStrings("chat", parsed.value.mode);
 }
 
 test "a parsed prompt is copied, so the body it came from can be freed" {
@@ -497,7 +497,7 @@ test "a parsed prompt is copied, so the body it came from can be freed" {
     // in for the request body being freed. A borrowed string would follow the
     // overwrite and read as the overwrites; a copied one is unaffected.
     var buffer: [64]u8 = @splat(' ');
-    const json = "{\"text\":\"hello\",\"mode\":\"ask\"}";
+    const json = "{\"text\":\"hello\",\"mode\":\"chat\"}";
     @memcpy(buffer[0..json.len], json);
 
     const parsed = try parsePrompt(gpa, buffer[0..json.len]);
@@ -505,7 +505,7 @@ test "a parsed prompt is copied, so the body it came from can be freed" {
     @memset(buffer[0..json.len], 'x');
 
     try std.testing.expectEqualStrings("hello", parsed.value.text);
-    try std.testing.expectEqual(Mode.ask, parsed.value.mode.?);
+    try std.testing.expectEqual(Mode.chat, parsed.value.mode.?);
 }
 
 test "the page the browser is given is the one that was written" {
@@ -633,7 +633,7 @@ fn createSession(
         return reply(request, .text, "the session is busy\n", .conflict, answered);
     defer registry.release(session.id());
 
-    // The mode the page chose, or a `/ask`/`/general` command in the prompt,
+    // The mode the page chose, or a `/chat`/`/general` command in the prompt,
     // which wins over the choice.
     const choice = mode.Mode.start(parsed.value.text, parsed.value.mode orelse default_mode);
     if (choice.text.len == 0)

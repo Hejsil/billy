@@ -516,11 +516,12 @@ pub const Runner = struct {
     /// configuration directory and the project's from the session's directory,
     /// and both are part of the prompt, so they are sent with every request.
     pub fn prepare(runner: *Runner, session: *Session) !void {
-        // A resumed session keeps the mode it started in; a new one takes the
-        // mode the frontend chose, which its first prompt may have named with
-        // `/ask`. Either way the runner's mode matches the session's, so the tool
-        // set it offers and the guard it runs are the session's own.
-        if (session.hasSystemPrompt()) {
+        // A session with a conversation keeps the mode and prompt it was saved
+        // with, so its request matches the earlier run; a new one takes the mode
+        // the frontend chose, which its first prompt may have named with
+        // `/chat`. Either way the runner's mode matches the session's, so the
+        // tool set it offers and the guard it runs are the session's own.
+        if (session.messages.items.len > 0) {
             runner.config.mode = session.mode;
         } else {
             session.setMode(runner.config.mode);
@@ -532,7 +533,9 @@ pub const Runner = struct {
                 runner.config.mode,
             );
             defer runner.gpa.free(prompt_text);
-            try session.setSystemPrompt(prompt_text);
+            // A mode with no prompt of its own sends no system message, so the
+            // request is the conversation alone.
+            if (prompt_text.len > 0) try session.setSystemPrompt(prompt_text);
         }
         try session.ensureTools(runner.tool_set.definitions(runner.config.mode));
     }
@@ -637,9 +640,10 @@ pub fn run(
         try sessionHeader(&header.writer, runner.config, session.id(), session.context_tokens, session.cost);
         const line = (try editor.readLine(header.written(), prompt)) orelse break;
         if (line.len == 0) continue;
-        // The first prompt of a new session sets its mode: `/ask` opens the ask
-        // mode, and anything else the general one. The lead is prepared from the
-        // mode before the first request, so nothing is sent before it is known.
+        // The first prompt of a new session sets its mode: `/chat` opens the
+        // chat mode, and anything else the general one. The lead is prepared from
+        // the mode before the first request, so nothing is sent before it is
+        // known.
         var text = line;
         if (!started) {
             const choice = Mode.start(line, .general);
@@ -647,7 +651,7 @@ pub fn run(
             text = choice.text;
             started = true;
             try runner.prepare(session);
-            // A first prompt that was only `/ask` names the mode and asks
+            // A first prompt that was only `/chat` names the mode and asks
             // nothing, so the turn waits for the next prompt.
             if (text.len == 0) continue;
         }
@@ -988,7 +992,7 @@ fn refreshLead(
 ) !void {
     const prompt_text = try leadPrompt(io, gpa, dir, user_dir, mode);
     defer gpa.free(prompt_text);
-    try session.setSystemPrompt(prompt_text);
+    if (prompt_text.len > 0) try session.setSystemPrompt(prompt_text);
     try session.setTools(definitions);
     try session.save();
 }
@@ -1564,8 +1568,8 @@ test "header names the session, the model and the working directory" {
 
 test "header names the mode the session runs in" {
     var config = testConfig("m", "/work", null);
-    config.mode = .ask;
-    try expectHeader("billy · ask · 01HF7YAT000000000000000000 · m · /work", config, 0, 0);
+    config.mode = .chat;
+    try expectHeader("billy · chat · 01HF7YAT000000000000000000 · m · /work", config, 0, 0);
 }
 
 test "header shortens a path inside the home directory" {
@@ -2179,12 +2183,12 @@ test "prepare gives a fresh session the user's instructions from the configurati
     try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, "USER RULES") != null);
 }
 
-test "prepare gives an ask session the ask prompt and only the tools it allows" {
+test "prepare gives a chat session no prompt and only the tools it allows" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    // A configuration directory with instructions, to check ask mode leaves them
-    // out: they say how to change code, which ask mode does not do.
+    // A configuration directory with instructions, to check chat mode reads none:
+    // they say how to change code, which chat mode does not do.
     var config_dir = std.testing.tmpDir(.{});
     defer config_dir.cleanup();
     try config_dir.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "USER RULES" });
@@ -2197,7 +2201,7 @@ test "prepare gives an ask session the ask prompt and only the tools it allows" 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
     var config = testConfig("m", "/work", null);
-    config.mode = .ask;
+    config.mode = .chat;
     config.user_instructions_dir = config_dir.dir;
     const work_dir = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(work_dir);
@@ -2206,13 +2210,13 @@ test "prepare gives an ask session the ask prompt and only the tools it allows" 
 
     try runner.prepare(&session);
 
-    // The mode is recorded, the prompt is ask's without the instructions, and the
-    // tools stored are the two ask allows.
-    try std.testing.expectEqual(Mode.ask, session.mode);
-    try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, Mode.ask.prompt()) != null);
-    try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, "USER RULES") == null);
+    // The mode is recorded, no system prompt is set at all (a chat request is the
+    // conversation alone, so the instructions never reach it), and the tools
+    // stored are the ones chat allows.
+    try std.testing.expectEqual(Mode.chat, session.mode);
+    try std.testing.expect(!session.hasSystemPrompt());
 
-    const defs = runner.tool_set.definitions(.ask);
+    const defs = runner.tool_set.definitions(.chat);
     try std.testing.expectEqual(@as(usize, 1), defs.len);
     try std.testing.expectEqualStrings("read", defs[0].name);
     try std.testing.expectEqual(defs.len, session.tools.len);

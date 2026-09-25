@@ -260,7 +260,7 @@
     <form id="prompt">
       <textarea id="text" rows="1" placeholder="ask billy something (shift+enter for a newline)" autocomplete="off"></textarea>
       <select id="mode" title="what a new session may do">
-        <option value="ask">ask</option>
+        <option value="chat">chat</option>
         <option value="general">general</option>
       </select>
     </form>
@@ -551,7 +551,7 @@ function newDraft() {
   openCall = null;
   headerBox.innerHTML = '';
   conversation.innerHTML = '';
-  modeSelect.value = 'ask';
+  modeSelect.value = 'chat';
   modeSelect.disabled = false;
   input.value = '';
   grow();
