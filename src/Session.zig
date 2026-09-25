@@ -1368,25 +1368,41 @@ fn expectConvo(expected: []const llm.Message, actual: []const llm.Message) !void
     }
 }
 
+/// Frees the messages `resolvedMessages` returns: it allocates the slice and each
+/// message's tool calls, so both are given back, one message at a time.
+fn freeResolved(gpa: std.mem.Allocator, messages: []const llm.Message) void {
+    for (messages) |message| {
+        if (message.tool_calls) |calls| gpa.free(calls);
+    }
+    gpa.free(messages);
+}
+
+/// Checks the conversation `session` resolves to against `expected`, freeing what
+/// resolving it allocates. This is what a test uses instead of comparing two
+/// sessions' own indices, which number their strings differently.
+fn expectSessionConvo(gpa: std.mem.Allocator, session: *const Session, expected: []const llm.Message) !void {
+    const resolved = try session.resolvedMessages(gpa);
+    defer freeResolved(gpa, resolved);
+    try expectConvo(expected, resolved);
+}
+
 /// Writes `messages` as a session's conversation, resumes the session, and
 /// checks the conversation comes back exactly as it went in: the save/load
-/// round trip, for a conversation of any shape.
+/// round trip, for a conversation of any shape. The session is opened with the
+/// testing allocator, not an arena, so a resume that does not free what it read
+/// is reported rather than hidden.
 fn expectResume(messages: []const llm.Message) !void {
+    const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // The session's own arena, freed whole at the end, so the resolved
-    // conversations it builds need no freeing message by message.
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
 
-    var session = try newSession(&tmp, arena);
+    var session = try newSession(&tmp, gpa);
     defer session.deinit();
     for (messages) |message| try session.append(message);
 
-    var resumed = try reopen(&tmp, arena, session.id());
+    var resumed = try reopen(&tmp, gpa, session.id());
     defer resumed.deinit();
-    try expectConvo(messages, try resumed.resolvedMessages(arena));
+    try expectSessionConvo(gpa, &resumed, messages);
 }
 
 /// Checks the JSON a request carries for `session` against `expected`: the
@@ -1413,21 +1429,21 @@ test "a new session is given a ULID, and nothing is written yet" {
 }
 
 test "a session can be started for an id that has no file yet" {
-    const arena = std.testing.allocator;
+    const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     // An id handed out before the session exists: the id is what names it, and
     // nothing is read, since there is nothing to read.
-    var session = try Session.create(std.testing.io, tmp.dir, arena, "made-by-hand", "/work");
+    var session = try Session.create(std.testing.io, tmp.dir, gpa, "made-by-hand", "/work");
     defer session.deinit();
     try std.testing.expectEqualStrings("made-by-hand", session.id());
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, session.name(), .{}));
 
     // The first message is what writes it, exactly as for a generated id.
     try session.append(.{ .role = "user", .content = "hello" });
-    var resumed = try reopen(&tmp, arena, "made-by-hand");
+    var resumed = try reopen(&tmp, gpa, "made-by-hand");
     defer resumed.deinit();
     try std.testing.expectEqual(@as(usize, 1), resumed.messages.items.len);
     try std.testing.expectEqualStrings("hello", resumed.contentOf(resumed.messages.items[0]).?);
@@ -1435,12 +1451,12 @@ test "a session can be started for an id that has no file yet" {
     // An id that could not name a session is refused rather than written.
     try std.testing.expectError(
         error.InvalidSessionId,
-        Session.create(std.testing.io, tmp.dir, arena, "../escape", "/work"),
+        Session.create(std.testing.io, tmp.dir, gpa, "../escape", "/work"),
     );
 }
 
 test "a new session is written out by its first message" {
-    const arena = std.testing.allocator;
+    const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1451,7 +1467,7 @@ test "a new session is written out by its first message" {
         .parameters = "{}",
     }};
 
-    var session = try newSession(&tmp, arena);
+    var session = try newSession(&tmp, gpa);
     defer session.deinit();
 
     // Setting a session up -- its prompt and its tools -- is held in memory, so
@@ -1465,7 +1481,7 @@ test "a new session is written out by its first message" {
     // set up before it lands in the file with it.
     try session.append(.{ .role = "user", .content = "hello" });
 
-    var resumed = try reopen(&tmp, arena, session.id());
+    var resumed = try reopen(&tmp, gpa, session.id());
     defer resumed.deinit();
     try std.testing.expectEqual(1, resumed.tools.len);
     // The prompt is its own field, apart from the conversation, which is the
@@ -1519,9 +1535,7 @@ test "the sessions in a directory are listed by when they were written" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const gpa = std.testing.allocator;
 
     // An older id and a newer one, and a name that is not a ULID at all. The
     // order below is none of these: it is the time each file was written, which
@@ -1538,7 +1552,7 @@ test "the sessions in a directory are listed by when they were written" {
         .{ .id = "dev", .written_ms = 3_000 }, // newest by time, named by hand
         .{ .id = newest_id, .written_ms = 2_000 }, // newest by id, in the middle
     };
-    for (files) |file| try writeSessionAt(&tmp, arena, file.id, file.written_ms);
+    for (files) |file| try writeSessionAt(&tmp, gpa, file.id, file.written_ms);
 
     // Files that are not sessions are passed over: another extension, a name that
     // could not be an id, and a directory.
@@ -1558,9 +1572,7 @@ test "the ordering keeps each id with the time it was written at" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const gpa = std.testing.allocator;
 
     // Six sessions whose id order and write order run opposite ways, so the sort
     // has to move the times along with the ids rather than reorder one list on
@@ -1571,7 +1583,7 @@ test "the ordering keeps each id with the time it was written at" {
     for (0..count) |i| {
         const made = buffers[i][0..ulid.length];
         ulid.encode(made, 1_700_000_000_000 + @as(u48, @intCast(i)), [_]u8{0} ** 10);
-        try writeSessionAt(&tmp, arena, made, @intCast(1_000 + (count - 1 - i) * 1_000));
+        try writeSessionAt(&tmp, gpa, made, @intCast(1_000 + (count - 1 - i) * 1_000));
     }
 
     const ids = try listIn(tmp.dir, std.testing.io, std.testing.allocator);
@@ -1589,9 +1601,7 @@ test "sessions written at the same moment are ordered by their ids" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const gpa = std.testing.allocator;
 
     var older_buf: [max_id_len]u8 = undefined;
     ulid.encode(older_buf[0..ulid.length], 1_700_000_000_000, [_]u8{0} ** 10);
@@ -1601,7 +1611,7 @@ test "sessions written at the same moment are ordered by their ids" {
     // The same write time on both, so the newer id comes first and the order does
     // not depend on how the directory happened to be read.
     for ([_][]const u8{ older_buf[0..ulid.length], newer_buf[0..ulid.length] }) |made| {
-        try writeSessionAt(&tmp, arena, made, 1_000);
+        try writeSessionAt(&tmp, gpa, made, 1_000);
     }
 
     const ids = try listIn(tmp.dir, std.testing.io, std.testing.allocator);
@@ -1615,8 +1625,6 @@ test "an empty sessions directory lists nothing" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
     const ids = try listIn(tmp.dir, std.testing.io, std.testing.allocator);
     defer freeList(ids, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), ids.len);
@@ -1734,29 +1742,33 @@ test "setCheckedId rejects names that could escape the session directory" {
 }
 
 test "defaultDir follows the XDG base directory specification" {
-    const arena = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(arena);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
+    const gpa = std.testing.allocator;
 
-    var environ: std.process.Environ.Map = .init(arena);
+    var environ: std.process.Environ.Map = .init(gpa);
     defer environ.deinit();
 
-    try std.testing.expectError(error.HomeNotSet, defaultDir(allocator, &environ));
+    try std.testing.expectError(error.HomeNotSet, defaultDir(gpa, &environ));
 
     try environ.put("HOME", "/home/user");
-    try std.testing.expectEqualStrings("/home/user/.local/share/billy/sessions", try defaultDir(allocator, &environ));
-    try std.testing.expectEqualStrings("/home/user/.local/share/billy", try dataDir(allocator, &environ));
+    try expectDir("/home/user/.local/share/billy/sessions", try defaultDir(gpa, &environ), gpa);
+    try expectDir("/home/user/.local/share/billy", try dataDir(gpa, &environ), gpa);
 
     try environ.put("XDG_DATA_HOME", "/data");
-    try std.testing.expectEqualStrings("/data/billy/sessions", try defaultDir(allocator, &environ));
-    try std.testing.expectEqualStrings("/data/billy", try dataDir(allocator, &environ));
+    try expectDir("/data/billy/sessions", try defaultDir(gpa, &environ), gpa);
+    try expectDir("/data/billy", try dataDir(gpa, &environ), gpa);
 
     // An empty or relative XDG_DATA_HOME is ignored.
     try environ.put("XDG_DATA_HOME", "");
-    try std.testing.expectEqualStrings("/home/user/.local/share/billy/sessions", try defaultDir(allocator, &environ));
+    try expectDir("/home/user/.local/share/billy/sessions", try defaultDir(gpa, &environ), gpa);
     try environ.put("XDG_DATA_HOME", "relative");
-    try std.testing.expectEqualStrings("/home/user/.local/share/billy/sessions", try defaultDir(allocator, &environ));
+    try expectDir("/home/user/.local/share/billy/sessions", try defaultDir(gpa, &environ), gpa);
+}
+
+/// Checks a path `defaultDir` or `dataDir` built, freeing it: the caller owns
+/// what the function returns.
+fn expectDir(expected: []const u8, actual: []const u8, gpa: std.mem.Allocator) !void {
+    defer gpa.free(actual);
+    try std.testing.expectEqualStrings(expected, actual);
 }
 
 test "a session survives a save and resume" {
@@ -1775,11 +1787,9 @@ test "a session survives a save and resume" {
 test "a resume answers a tool call a killed run left open" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const gpa = std.testing.allocator;
 
-    var session = try newSession(&tmp, arena);
+    var session = try newSession(&tmp, gpa);
     defer session.deinit();
 
     // The assistant asked for a tool, and the run was killed before its result
@@ -1793,26 +1803,24 @@ test "a resume answers a tool call a killed run left open" {
     // The call now has an answer, so the request the session builds is one the
     // API takes: the assistant message is followed by the result of its call,
     // and the call did not finish.
-    var resumed = try reopen(&tmp, arena, session.id());
+    var resumed = try reopen(&tmp, gpa, session.id());
     defer resumed.deinit();
-    try expectConvo(&.{
+    try expectSessionConvo(gpa, &resumed, &.{
         .{ .role = "user", .content = "hello" },
         .{ .role = "assistant", .tool_calls = &.{.{
             .id = "call_1",
             .function = .{ .name = "bash", .arguments = "{}" },
         }} },
         .{ .role = "tool", .tool_call_id = "call_1", .content = interrupted_result },
-    }, try resumed.resolvedMessages(arena));
+    });
 }
 
 test "a resume answers every call a kill left open, in the order made" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const gpa = std.testing.allocator;
 
-    var session = try newSession(&tmp, arena);
+    var session = try newSession(&tmp, gpa);
     defer session.deinit();
 
     try session.append(.{ .role = "user", .content = "go" });
@@ -1827,9 +1835,9 @@ test "a resume answers every call a kill left open, in the order made" {
 
     // The result the file held stays with its call, and the call it lost is
     // answered in the place it was made rather than after the user message.
-    var resumed = try reopen(&tmp, arena, session.id());
+    var resumed = try reopen(&tmp, gpa, session.id());
     defer resumed.deinit();
-    try expectConvo(&.{
+    try expectSessionConvo(gpa, &resumed, &.{
         .{ .role = "user", .content = "go" },
         .{ .role = "assistant", .tool_calls = &.{
             .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{}" } },
@@ -1838,19 +1846,16 @@ test "a resume answers every call a kill left open, in the order made" {
         .{ .role = "tool", .tool_call_id = "call_1", .content = "the first result" },
         .{ .role = "tool", .tool_call_id = "call_2", .content = interrupted_result },
         .{ .role = "user", .content = "still there?" },
-    }, try resumed.resolvedMessages(arena));
+    });
 }
 
 test "a resume leaves a finished conversation alone" {
     const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, allocator);
+    var session = try newSession(&tmp, gpa);
     defer session.deinit();
 
     // A run that finished leaves every call answered and its compaction in
@@ -1866,7 +1871,7 @@ test "a resume leaves a finished conversation alone" {
     try session.appendCompaction("summarize this", "the summary");
     try session.append(.{ .role = "assistant", .content = "done" });
 
-    var resumed = try reopen(&tmp, allocator, session.id());
+    var resumed = try reopen(&tmp, gpa, session.id());
     defer resumed.deinit();
 
     try std.testing.expectEqual(session.messages.items.len, resumed.messages.items.len);
@@ -1876,14 +1881,11 @@ test "a resume leaves a finished conversation alone" {
 
 test "a repair moves a compaction that sits behind the turn it completes" {
     const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, allocator);
+    var session = try newSession(&tmp, gpa);
     defer session.deinit();
 
     // A file that holds a compaction right behind a call with no result, as one
@@ -1896,7 +1898,7 @@ test "a repair moves a compaction that sits behind the turn it completes" {
     }} });
     try session.appendCompaction("summarize this", "the summary");
 
-    var resumed = try reopen(&tmp, allocator, session.id());
+    var resumed = try reopen(&tmp, gpa, session.id());
     defer resumed.deinit();
 
     // user, the assistant message, its answer, then the prompt and the summary:
@@ -1911,11 +1913,9 @@ test "a repair moves a compaction that sits behind the turn it completes" {
 test "a conversation writes the messages a request would have carried" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const gpa = std.testing.allocator;
 
-    var session = try newSession(&tmp, arena);
+    var session = try newSession(&tmp, gpa);
     defer session.deinit();
 
     // A message of every shape: an optional left out, one filled in, and a call
@@ -1939,8 +1939,8 @@ test "a conversation writes the messages a request would have carried" {
     // Writing the stored conversation has to give the bytes the resolved one
     // does, field for field and in the same order, or a resumed session would
     // send a request that misses its prompt cache.
-    const gpa = std.testing.allocator;
-    const resolved = try session.resolvedMessages(arena);
+    const resolved = try session.resolvedMessages(gpa);
+    defer freeResolved(gpa, resolved);
     const via_messages = try std.json.Stringify.valueAlloc(gpa, resolved, .{ .emit_null_optional_fields = false });
     defer gpa.free(via_messages);
     try std.testing.expectEqualStrings(expected, via_messages);
@@ -1949,11 +1949,9 @@ test "a conversation writes the messages a request would have carried" {
 test "an extra message is written after the conversation, and is not part of it" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const gpa = std.testing.allocator;
 
-    var session = try newSession(&tmp, arena);
+    var session = try newSession(&tmp, gpa);
     defer session.deinit();
     try session.setSystemPrompt("be terse");
     try session.append(.{ .role = "user", .content = "hello" });
@@ -1972,12 +1970,12 @@ test "an extra message is written after the conversation, and is not part of it"
 }
 
 test "a string that is not valid UTF-8 is repaired on the way into the pool" {
-    const arena = std.testing.allocator;
+    const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, arena);
+    var session = try newSession(&tmp, gpa);
     defer session.deinit();
 
     // A command's output and a file read back are arbitrary bytes, so a result
@@ -1995,7 +1993,7 @@ test "a string that is not valid UTF-8 is repaired on the way into the pool" {
 }
 
 test "a message a session read back with bytes that are not UTF-8 is repaired" {
-    const arena = std.testing.allocator;
+    const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2009,7 +2007,7 @@ test "a message a session read back with bytes that are not UTF-8 is repaired" {
             "\"content\":[97,255,98],\"tool_call_id\":\"call_1\"}]}",
     });
 
-    var session = try reopen(&tmp, arena, "bytes");
+    var session = try reopen(&tmp, gpa, "bytes");
     defer session.deinit();
 
     try std.testing.expectEqualStrings("a\u{FFFD}b", session.contentOf(session.messages.items[0]).?);
@@ -2017,22 +2015,19 @@ test "a message a session read back with bytes that are not UTF-8 is repaired" {
     // Saving it back writes the content as a string, so the bytes are gone for
     // good and the file is one a later resume reads as text.
     try session.save();
-    const text = try tmp.dir.readFileAlloc(std.testing.io, "bytes.json", arena, .limited(1 << 16));
-    defer arena.free(text);
+    const text = try tmp.dir.readFileAlloc(std.testing.io, "bytes.json", gpa, .limited(1 << 16));
+    defer gpa.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "[97,255,98]") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\"content\":\"a\u{FFFD}b\"") != null);
 }
 
 test "a stored message reads back as its parts" {
     const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, allocator);
+    var session = try newSession(&tmp, gpa);
     defer session.deinit();
 
     try session.append(.{ .role = "user", .content = "hello" });
@@ -2066,14 +2061,11 @@ test "a stored message reads back as its parts" {
 
 test "a tool result is found only from where the search starts" {
     const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, allocator);
+    var session = try newSession(&tmp, gpa);
     defer session.deinit();
 
     try session.append(.{ .role = "assistant", .tool_calls = &.{.{
@@ -2096,12 +2088,12 @@ test "a tool result is found only from where the search starts" {
 }
 
 test "an equal string is interned once and shared" {
-    const arena = std.testing.allocator;
+    const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, arena);
+    var session = try newSession(&tmp, gpa);
     defer session.deinit();
 
     try session.append(.{ .role = "user", .content = "hello" });
@@ -2131,7 +2123,7 @@ test "an equal string is interned once and shared" {
 }
 
 test "a version 2 file's system prompt is lifted into its own field" {
-    const arena = std.testing.allocator;
+    const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2145,7 +2137,7 @@ test "a version 2 file's system prompt is lifted into its own field" {
             "{\"role\":\"user\",\"content\":\"hi\"}]}",
     });
 
-    var resumed = try reopen(&tmp, arena, "one");
+    var resumed = try reopen(&tmp, gpa, "one");
     defer resumed.deinit();
 
     // The prompt comes back as its own field and is no longer a message, so the
@@ -2161,12 +2153,12 @@ test "a version 2 file's system prompt is lifted into its own field" {
 }
 
 test "a compaction is appended and a request starts at its summary" {
-    const arena = std.testing.allocator;
+    const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, arena);
+    var session = try newSession(&tmp, gpa);
     defer session.deinit();
 
     try session.setSystemPrompt("be terse");
@@ -2201,19 +2193,19 @@ test "a compaction is appended and a request starts at its summary" {
 }
 
 test "a compaction survives a save and resume" {
-    const arena = std.testing.allocator;
+    const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, arena);
+    var session = try newSession(&tmp, gpa);
     defer session.deinit();
     try session.setSystemPrompt("be terse");
     try session.append(.{ .role = "user", .content = "one" });
     try session.appendCompaction("summarize this", "the summary");
     try session.append(.{ .role = "user", .content = "next" });
 
-    var resumed = try reopen(&tmp, arena, session.id());
+    var resumed = try reopen(&tmp, gpa, session.id());
     defer resumed.deinit();
 
     // Everything comes back, and the request still starts at the summary.
@@ -2225,7 +2217,7 @@ test "a compaction survives a save and resume" {
 }
 
 test "the compaction list is sorted and cleaned when a session is read" {
-    const arena = std.testing.allocator;
+    const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2243,7 +2235,7 @@ test "the compaction list is sorted and cleaned when a session is read" {
             "\"compactions\":[2,0,2,99]}",
     });
 
-    var session = try reopen(&tmp, arena, "odd");
+    var session = try reopen(&tmp, gpa, "odd");
     defer session.deinit();
 
     // The prompt is lifted out of the conversation, so the indices shift down by
@@ -2281,12 +2273,12 @@ test "the messages a request carries start at the latest compaction" {
 }
 
 test "the system prompt is kept apart from the conversation and is not replaced" {
-    const arena = std.testing.allocator;
+    const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, arena);
+    var session = try newSession(&tmp, gpa);
     defer session.deinit();
 
     // Setting the prompt does not put a message in the conversation: it is its own
@@ -2339,7 +2331,7 @@ test "the tools are written out with the schema as the JSON it is" {
 }
 
 test "ensureTools stores the tools and only sets them once" {
-    const arena = std.testing.allocator;
+    const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2350,7 +2342,7 @@ test "ensureTools stores the tools and only sets them once" {
         .parameters = "{}",
     }};
 
-    var session = try newSession(&tmp, arena);
+    var session = try newSession(&tmp, gpa);
     defer session.deinit();
     try session.ensureTools(&tools);
     try std.testing.expectEqual(1, session.tools.len);
@@ -2365,7 +2357,7 @@ test "ensureTools stores the tools and only sets them once" {
     try session.append(.{ .role = "user", .content = "hi" });
 
     // The stored tools survive a save and resume.
-    var resumed = try reopen(&tmp, arena, session.id());
+    var resumed = try reopen(&tmp, gpa, session.id());
     defer resumed.deinit();
     try std.testing.expectEqual(1, resumed.tools.len);
     try std.testing.expectEqualStrings("read", resumed.string(resumed.tools[0].name).?);
@@ -2377,7 +2369,7 @@ test "ensureTools stores the tools and only sets them once" {
         .description = "Run a command.",
         .parameters = "{}",
     }};
-    var reopened = try reopen(&tmp, arena, session.id());
+    var reopened = try reopen(&tmp, gpa, session.id());
     defer reopened.deinit();
     try reopened.ensureTools(&replaced);
     try std.testing.expectEqual(1, reopened.tools.len);
@@ -2385,7 +2377,7 @@ test "ensureTools stores the tools and only sets them once" {
 }
 
 test "a session saved without tools loads with none" {
-    const arena = std.testing.allocator;
+    const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2396,18 +2388,18 @@ test "a session saved without tools loads with none" {
         .data = "{\"version\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
     });
 
-    var session = try reopen(&tmp, arena, "legacy");
+    var session = try reopen(&tmp, gpa, "legacy");
     defer session.deinit();
     try std.testing.expectEqual(0, session.tools.len);
 }
 
 test "the token totals survive a save and resume" {
-    const arena = std.testing.allocator;
+    const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, arena);
+    var session = try newSession(&tmp, gpa);
     defer session.deinit();
 
     session.recordUsage(.{
@@ -2428,7 +2420,7 @@ test "the token totals survive a save and resume" {
     }, 0.0002);
     try session.append(.{ .role = "assistant", .content = "hello" });
 
-    var resumed = try reopen(&tmp, arena, session.id());
+    var resumed = try reopen(&tmp, gpa, session.id());
     defer resumed.deinit();
 
     try std.testing.expectEqual(300, resumed.usage.prompt_tokens);
@@ -2442,71 +2434,71 @@ test "the token totals survive a save and resume" {
 }
 
 test "opening an unknown or damaged session is reported" {
-    const arena = std.testing.allocator;
+    const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try std.testing.expectError(
         error.SessionNotFound,
-        reopen(&tmp, arena, "nope"),
+        reopen(&tmp, gpa, "nope"),
     );
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad.json", .data = "{" });
     try std.testing.expectError(
         error.CorruptSession,
-        reopen(&tmp, arena, "bad"),
+        reopen(&tmp, gpa, "bad"),
     );
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "future.json", .data = "{\"version\":99}" });
     try std.testing.expectError(
         error.UnsupportedSessionVersion,
-        reopen(&tmp, arena, "future"),
+        reopen(&tmp, gpa, "future"),
     );
 }
 
 test "a new session does not reuse an id whose file exists" {
-    const arena = std.testing.allocator;
+    const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var first = try newSession(&tmp, arena);
+    var first = try newSession(&tmp, gpa);
     defer first.deinit();
     try first.append(.{ .role = "user", .content = "keep me" });
 
-    var second = try newSession(&tmp, arena);
+    var second = try newSession(&tmp, gpa);
     defer second.deinit();
     try second.append(.{ .role = "user", .content = "and me" });
 
     try std.testing.expect(!std.mem.eql(u8, first.id(), second.id()));
 
-    var resumed = try reopen(&tmp, arena, first.id());
+    var resumed = try reopen(&tmp, gpa, first.id());
     defer resumed.deinit();
 
     try std.testing.expectEqualStrings("keep me", resumed.string(resumed.messages.items[0].content).?);
 }
 
 test "the working directory is stored and restored on resume" {
-    const arena = std.testing.allocator;
+    const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     // A session started in one directory.
-    var session = try Session.open(std.testing.io, tmp.dir, arena, null, "/home/user/project");
+    var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/home/user/project");
     defer session.deinit();
     try std.testing.expectEqualStrings("/home/user/project", session.cwd);
     try session.append(.{ .role = "user", .content = "hello" });
 
     // Resumed from somewhere else, it keeps the directory it was started in.
-    var resumed = try Session.open(std.testing.io, tmp.dir, arena, session.id(), "/somewhere/else");
+    var resumed = try Session.open(std.testing.io, tmp.dir, gpa, session.id(), "/somewhere/else");
     defer resumed.deinit();
     try std.testing.expectEqualStrings("/home/user/project", resumed.cwd);
 }
 
 test "a session saved before the directory was recorded uses the run's own" {
-    const arena = std.testing.allocator;
+    const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2517,7 +2509,7 @@ test "a session saved before the directory was recorded uses the run's own" {
         .data = "{\"version\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
     });
 
-    var resumed = try Session.open(std.testing.io, tmp.dir, arena, "old", "/now/here");
+    var resumed = try Session.open(std.testing.io, tmp.dir, gpa, "old", "/now/here");
     defer resumed.deinit();
     try std.testing.expectEqualStrings("/now/here", resumed.cwd);
 }
@@ -2529,7 +2521,7 @@ test "a resumed session frees everything it read back" {
     defer tmp.cleanup();
 
     // A file big enough that holding its bytes for the run would show: writing
-    // and resuming it here runs under the testing allocator, which reports any
+    // and resuming it here runs under the testing gpa, which reports any
     // allocation left behind, so this passing means the file it read and the
     // parse of it were both freed by `deinit`.
     var big: std.ArrayList(u8) = .empty;
