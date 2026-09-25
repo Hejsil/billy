@@ -220,8 +220,9 @@ const max_instructions_len = 1 << 20;
 /// holds none of them. Only `dir` is read; a caller that wants a walk up does it
 /// around this.
 ///
-/// The file is measured and then streamed to `out`, so neither the file nor the
-/// section is ever held in memory whole.
+/// The file is streamed to `out` as it is, so nothing of it is held in memory
+/// whole and nothing of it is changed. Only a file with no bytes at all is
+/// skipped, so a file of whitespace alone still heads a section.
 fn instructionsIn(
     io: Io,
     out: *Io.Writer,
@@ -236,12 +237,10 @@ fn instructionsIn(
         };
         defer file.close(io);
 
-        // The file is measured once to find where its content ends, so the
-        // trailing whitespace is trimmed and an empty or all-whitespace file is
-        // skipped rather than heading a blank section. The reader reads
-        // positionally, so the stream below starts at the beginning again.
-        const end = try contentEnd(io, file);
-        if (end == 0) continue;
+        // A file with no bytes is nothing to say, so the search carries on
+        // rather than putting a blank heading in the prompt.
+        const size = try file.length(io);
+        if (size == 0) continue;
 
         // The blank line before the heading stands the section apart from the
         // prompt above it, which every section has: billy's own text, or another
@@ -249,48 +248,10 @@ fn instructionsIn(
         try out.print("\n\n{s} instructions follow, read from {s}.\n\n", .{ what, name });
         var buffer: [4096]u8 = undefined;
         var file_reader = file.reader(io, &buffer);
-        try file_reader.interface.streamExact(out, end);
+        try file_reader.interface.streamExact(out, @intCast(@min(size, max_instructions_len)));
         return true;
     }
     return false;
-}
-
-/// The number of bytes of `file` up to its last non-whitespace byte, capped at
-/// `max_instructions_len`; zero when the file is empty or all whitespace, which
-/// is nothing to say. The file is read through `io` alone, and nothing of it is
-/// kept.
-fn contentEnd(io: Io, file: Io.File) !usize {
-    var scratch: [4096]u8 = undefined;
-    var file_reader = file.reader(io, &.{});
-    const reader = &file_reader.interface;
-
-    var end: usize = 0;
-    var offset: usize = 0;
-    while (offset < max_instructions_len) {
-        const n = reader.readSliceShort(scratch[0..@min(scratch.len, max_instructions_len - offset)]) catch |err| switch (err) {
-            error.ReadFailed => return file_reader.err.?,
-        };
-        if (n == 0) break;
-        // The last byte that is not whitespace ends the content, so a chunk of
-        // trailing whitespace leaves the end where it was.
-        if (lastNonWhitespace(scratch[0..n])) |i| end = offset + i + 1;
-        offset += n;
-    }
-    return end;
-}
-
-/// The index of the last byte of `chunk` that is not whitespace, or null when it
-/// is all whitespace. The whitespace is the set the trim used to strip.
-fn lastNonWhitespace(chunk: []const u8) ?usize {
-    var i = chunk.len;
-    while (i > 0) {
-        i -= 1;
-        switch (chunk[i]) {
-            ' ', '\t', '\r', '\n' => {},
-            else => return i,
-        }
-    }
-    return null;
 }
 
 /// Writes the project's own instructions, read from `dir` or the nearest parent
@@ -1745,9 +1706,9 @@ test "the project's instructions are read from the working directory" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "Write tests.\n" });
 
     // The section names where the instructions came from and carries them
-    // through, a blank line below the prompt above it.
+    // through, a blank line below the prompt above it, exactly as written.
     try expectInstructions(
-        "\n\nThe project's instructions follow, read from AGENTS.md.\n\nWrite tests.",
+        "\n\nThe project's instructions follow, read from AGENTS.md.\n\nWrite tests.\n",
         projectInstructions,
         tmp.dir,
     );
@@ -1804,7 +1765,7 @@ test "an empty instructions file is not used" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, ".git");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "  \n\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "" });
 
     try expectNoInstructions(projectInstructions, tmp.dir);
 }
@@ -1832,9 +1793,9 @@ test "the user's instructions are read from the configuration directory" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "Be terse.\n" });
 
     // The heading names the user rather than the project, so the two sections of
-    // a prompt read apart.
+    // a prompt read apart, and the file is carried through as it was written.
     try expectInstructions(
-        "\n\nThe user's instructions follow, read from AGENTS.md.\n\nBe terse.",
+        "\n\nThe user's instructions follow, read from AGENTS.md.\n\nBe terse.\n",
         globalInstructions,
         tmp.dir,
     );
@@ -1858,28 +1819,28 @@ test "a user's instructions file that is missing or empty is not used" {
     defer tmp.cleanup();
     try expectNoInstructions(globalInstructions, tmp.dir);
 
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "  \n\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "" });
     try expectNoInstructions(globalInstructions, tmp.dir);
 }
 
-test "a large instructions file is streamed, its trailing whitespace trimmed" {
+test "a large instructions file is streamed whole" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Longer than the 4 KiB the file is read at a time, so it crosses chunks,
-    // with the trailing whitespace in the last chunk: the trim has to hold the
-    // end it found in one chunk while the next is read.
+    // Longer than the 4 KiB the file is streamed at a time, so it crosses
+    // chunks, and the newline at the end is kept as written.
     var file_text: std.Io.Writer.Allocating = .init(gpa);
     defer file_text.deinit();
     try file_text.writer.writeAll("x" ** 5000);
-    try file_text.writer.writeAll("\n \t\r\n");
+    try file_text.writer.writeAll("\n");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = file_text.written() });
 
     var expected: std.Io.Writer.Allocating = .init(gpa);
     defer expected.deinit();
     try expected.writer.writeAll("\n\nThe project's instructions follow, read from AGENTS.md.\n\n");
     try expected.writer.writeAll("x" ** 5000);
+    try expected.writer.writeAll("\n");
 
     try expectInstructions(expected.written(), projectInstructions, tmp.dir);
 }
