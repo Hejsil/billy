@@ -1143,8 +1143,6 @@ fn expectTranscript(
     style: styling.Style,
 ) !void {
     const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1632,15 +1630,13 @@ test "cost follows the cache hit, miss and output prices" {
 
 test "the project's instructions are read from the working directory" {
     const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "Write tests.\n" });
 
-    const text = (try projectInstructions(std.testing.io, arena, tmp.dir)).?;
+    const text = (try projectInstructions(std.testing.io, gpa, tmp.dir)).?;
+    defer gpa.free(text);
     // The prompt names where the instructions came from and carries them through.
     try std.testing.expect(std.mem.indexOf(u8, text, "AGENTS.md") != null);
     try std.testing.expect(std.mem.endsWith(u8, text, "Write tests."));
@@ -1648,31 +1644,27 @@ test "the project's instructions are read from the working directory" {
 
 test "AGENTS.md is read before CLAUDE.md" {
     const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "agents" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "CLAUDE.md", .data = "claude" });
 
-    const text = (try projectInstructions(std.testing.io, arena, tmp.dir)).?;
+    const text = (try projectInstructions(std.testing.io, gpa, tmp.dir)).?;
+    defer gpa.free(text);
     try std.testing.expect(std.mem.endsWith(u8, text, "agents"));
 
     // With no AGENTS.md the other name is read, so a project written for another
     // tool still works.
     try tmp.dir.deleteFile(std.testing.io, "AGENTS.md");
-    const claude = (try projectInstructions(std.testing.io, arena, tmp.dir)).?;
+    const claude = (try projectInstructions(std.testing.io, gpa, tmp.dir)).?;
+    defer gpa.free(claude);
     try std.testing.expect(std.mem.indexOf(u8, claude, "CLAUDE.md") != null);
     try std.testing.expect(std.mem.endsWith(u8, claude, "claude"));
 }
 
 test "the instructions are found in a parent up to the repository root" {
     const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1682,43 +1674,35 @@ test "the instructions are found in a parent up to the repository root" {
 
     var deep = try tmp.dir.openDir(std.testing.io, "a/b", .{});
     defer deep.close(std.testing.io);
-    const text = (try projectInstructions(std.testing.io, arena, deep)).?;
+    const text = (try projectInstructions(std.testing.io, gpa, deep)).?;
+    defer gpa.free(text);
     try std.testing.expect(std.mem.endsWith(u8, text, "root rules"));
 }
 
 test "a project with no instructions has none" {
     const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     // A repository root, so the search stops here rather than walking above it.
     try tmp.dir.createDirPath(std.testing.io, ".git");
 
-    try std.testing.expect((try projectInstructions(std.testing.io, arena, tmp.dir)) == null);
+    try std.testing.expect((try projectInstructions(std.testing.io, gpa, tmp.dir)) == null);
 }
 
 test "an empty instructions file is not used" {
     const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, ".git");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "  \n\n" });
 
-    try std.testing.expect((try projectInstructions(std.testing.io, arena, tmp.dir)) == null);
+    try std.testing.expect((try projectInstructions(std.testing.io, gpa, tmp.dir)) == null);
 }
 
 test "the nearest instructions win over an ancestor's" {
     const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1729,7 +1713,8 @@ test "the nearest instructions win over an ancestor's" {
     var inner = try tmp.dir.openDir(std.testing.io, "inner", .{});
     defer inner.close(std.testing.io);
 
-    const text = (try projectInstructions(std.testing.io, arena, inner)).?;
+    const text = (try projectInstructions(std.testing.io, gpa, inner)).?;
+    defer gpa.free(text);
     try std.testing.expect(std.mem.endsWith(u8, text, "inner"));
 }
 
@@ -2032,9 +2017,11 @@ const SummaryProvider = struct {
 
 test "the terminal shows a tool call the way a replay does" {
     const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    // The parsed call's text is left in an allocator the caller drops in one go
+    // (`Tools.parse`), so it gets an arena of its own; everything else is built
+    // with the testing allocator, which reports anything not freed.
+    var call_state = std.heap.ArenaAllocator.init(gpa);
+    defer call_state.deinit();
 
     var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
     defer http.deinit();
@@ -2058,7 +2045,7 @@ test "the terminal shows a tool call the way a replay does" {
     var terminal = testTerminal(&live.writer, .{});
     const emitter = terminal.emitter();
 
-    const parsed = Tools.parse(arena, call);
+    const parsed = Tools.parse(call_state.allocator(), call);
     try emitter.show(.{ .tool_begin = parsed });
     var result: std.Io.Writer.Allocating = .init(gpa);
     defer result.deinit();
@@ -2068,7 +2055,7 @@ test "the terminal shows a tool call the way a replay does" {
     // A replay renders the stored call on its own.
     var replayed: std.Io.Writer.Allocating = .init(gpa);
     defer replayed.deinit();
-    try Tools.describe(arena, parsed, result.written(), .{}, .plain, &replayed.writer);
+    try Tools.describe(gpa, parsed, result.written(), .{}, .plain, &replayed.writer);
 
     // The two paths show the same bytes, which is what keeps a run and a resume
     // of it reading alike. The header before the result is what a slow command
@@ -2084,7 +2071,7 @@ test "the terminal shows a tool call the way a replay does" {
 const Recorder = struct {
     /// Owns the names and text it records, since a block borrows the tool set's
     /// scratch and the caller's buffers, neither of which outlives the run.
-    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     seen: std.ArrayList(Seen) = .empty,
 
     const Seen = union(enum) {
@@ -2118,13 +2105,13 @@ const Recorder = struct {
             .notice => |text| .{ .notice = try self.keeper(text) },
             .elided => |count| .{ .elided = count },
         };
-        try self.seen.append(self.arena, seen);
+        try self.seen.append(self.gpa, seen);
     }
 
-    /// A copy of `text` in the recorder's arena, so what it records lasts as long
+    /// A copy of `text` in the recorder's gpa, so what it records lasts as long
     /// as the recorder rather than as long as the block.
     fn keeper(self: *Recorder, text: []const u8) ![]const u8 {
-        return self.arena.dupe(u8, text);
+        return self.gpa.dupe(u8, text);
     }
 
     /// The name of the tool a call names, so a test can say which one ran.
@@ -2190,7 +2177,7 @@ test "a turn shows the tool it runs and then the answer" {
         .http = &http,
     });
 
-    var recorder = Recorder{ .arena = arena_state.allocator() };
+    var recorder = Recorder{ .gpa = arena_state.allocator() };
     try turn(io, &client, &tool_set, recorder.emitter(), testConfig("m", "/work", null), &session);
 
     try group.await(io);
