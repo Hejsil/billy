@@ -24,11 +24,9 @@ const std = @import("std");
 const Io = std.Io;
 const llm = @import("llm.zig");
 const ulid = @import("ulid.zig");
+const xdg = @import("xdg.zig");
 
 const Session = @This();
-
-/// Directory under the XDG data directory that holds billy's files.
-const app_dir = "billy";
 
 /// Subdirectory of the data directory that holds the sessions, so the session
 /// files sit apart from the credentials billy keeps in the directory itself.
@@ -982,15 +980,7 @@ fn stringPtr(session: *const Session, index: StringIndex) ?[*:0]const u8 {
 /// the sessions in a subdirectory of it, so a listing of billy's data directory
 /// shows what billy keeps rather than a wall of session files.
 pub fn dataDir(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
-    if (environ.get("XDG_DATA_HOME")) |xdg| {
-        // The specification says a relative path must be ignored.
-        if (xdg.len > 0 and std.fs.path.isAbsolute(xdg)) {
-            return std.fs.path.join(gpa, &.{ xdg, app_dir });
-        }
-    }
-
-    const home = environ.get("HOME") orelse return error.HomeNotSet;
-    return std.fs.path.join(gpa, &.{ home, ".local", "share", app_dir });
+    return xdg.dir(gpa, environ, "XDG_DATA_HOME", &.{ ".local", "share" });
 }
 
 /// The directory holding the sessions: the `sessions` subdirectory of `dataDir`,
@@ -1708,34 +1698,21 @@ test "setCheckedId rejects names that could escape the session directory" {
     _ = try setCheckedId(&buf, "x" ** (max_id_len - 1));
 }
 
-test "defaultDir follows the XDG base directory specification" {
+test "defaultDir is the sessions directory under the data directory" {
     const gpa = std.testing.allocator;
-
     var environ: std.process.Environ.Map = .init(gpa);
     defer environ.deinit();
-
-    try std.testing.expectError(error.HomeNotSet, defaultDir(gpa, &environ));
-
     try environ.put("HOME", "/home/user");
-    try expectDir("/home/user/.local/share/billy/sessions", try defaultDir(gpa, &environ), gpa);
-    try expectDir("/home/user/.local/share/billy", try dataDir(gpa, &environ), gpa);
 
-    try environ.put("XDG_DATA_HOME", "/data");
-    try expectDir("/data/billy/sessions", try defaultDir(gpa, &environ), gpa);
-    try expectDir("/data/billy", try dataDir(gpa, &environ), gpa);
+    // The rules themselves are `xdg.dir`'s; this only pins the base and the
+    // subdirectory the sessions sit in.
+    const data = try dataDir(gpa, &environ);
+    defer gpa.free(data);
+    try std.testing.expectEqualStrings("/home/user/.local/share/billy", data);
 
-    // An empty or relative XDG_DATA_HOME is ignored.
-    try environ.put("XDG_DATA_HOME", "");
-    try expectDir("/home/user/.local/share/billy/sessions", try defaultDir(gpa, &environ), gpa);
-    try environ.put("XDG_DATA_HOME", "relative");
-    try expectDir("/home/user/.local/share/billy/sessions", try defaultDir(gpa, &environ), gpa);
-}
-
-/// Checks a path `defaultDir` or `dataDir` built, freeing it: the caller owns
-/// what the function returns.
-fn expectDir(expected: []const u8, actual: []const u8, gpa: std.mem.Allocator) !void {
-    defer gpa.free(actual);
-    try std.testing.expectEqualStrings(expected, actual);
+    const sessions = try defaultDir(gpa, &environ);
+    defer gpa.free(sessions);
+    try std.testing.expectEqualStrings("/home/user/.local/share/billy/sessions", sessions);
 }
 
 test "a session survives a save and resume" {

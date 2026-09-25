@@ -10,6 +10,7 @@
 const std = @import("std");
 const Io = std.Io;
 const search = @import("search.zig");
+const xdg = @import("xdg.zig");
 
 const Config = @This();
 
@@ -411,41 +412,19 @@ pub fn run(
 /// `$HOME/.config/billy` when that is unset, as the XDG base directory
 /// specification prescribes.
 pub fn defaultDir(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
-    if (environ.get("XDG_CONFIG_HOME")) |xdg| {
-        // The specification says a relative path must be ignored.
-        if (xdg.len > 0 and std.fs.path.isAbsolute(xdg)) {
-            return std.fs.path.join(gpa, &.{ xdg, app_dir });
-        }
-    }
-    const home = environ.get("HOME") orelse return error.HomeNotSet;
-    return std.fs.path.join(gpa, &.{ home, ".config", app_dir });
+    return xdg.dir(gpa, environ, "XDG_CONFIG_HOME", &.{".config"});
 }
 
-test "defaultDir follows the XDG base directory specification" {
+test "defaultDir is billy's directory under the configuration base" {
     const gpa = std.testing.allocator;
-
     var environ: std.process.Environ.Map = .init(gpa);
     defer environ.deinit();
-
-    try std.testing.expectError(error.HomeNotSet, defaultDir(gpa, &environ));
-
     try environ.put("HOME", "/home/user");
-    try expectDir("/home/user/.config/billy", try defaultDir(gpa, &environ), gpa);
 
-    try environ.put("XDG_CONFIG_HOME", "/config");
-    try expectDir("/config/billy", try defaultDir(gpa, &environ), gpa);
-
-    // An empty or relative XDG_CONFIG_HOME is ignored.
-    try environ.put("XDG_CONFIG_HOME", "");
-    try expectDir("/home/user/.config/billy", try defaultDir(gpa, &environ), gpa);
-    try environ.put("XDG_CONFIG_HOME", "relative");
-    try expectDir("/home/user/.config/billy", try defaultDir(gpa, &environ), gpa);
-}
-
-/// Checks a path `defaultDir` built, freeing it: the caller owns what it returns.
-fn expectDir(expected: []const u8, actual: []const u8, gpa: std.mem.Allocator) !void {
-    defer gpa.free(actual);
-    try std.testing.expectEqualStrings(expected, actual);
+    // The rules themselves are `xdg.dir`'s; this only pins which base it uses.
+    const path = try defaultDir(gpa, &environ);
+    defer gpa.free(path);
+    try std.testing.expectEqualStrings("/home/user/.config/billy", path);
 }
 
 /// Writes `json` as the configuration file and opens it, so a test reads as the
@@ -766,16 +745,16 @@ test "run sets a setting in the file, creating it when it is missing" {
     // The configuration is found under XDG_CONFIG_HOME, which is pointed at the
     // temporary directory so the run writes there rather than at the user's own.
     const cwd = try std.process.currentPathAlloc(std.testing.io, arena);
-    const xdg = try std.fs.path.join(arena, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const base = try std.fs.path.join(arena, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
     var environ: std.process.Environ.Map = .init(arena);
     defer environ.deinit();
-    try environ.put("XDG_CONFIG_HOME", xdg);
+    try environ.put("XDG_CONFIG_HOME", base);
 
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
     try run(std.testing.io, &sink.writer, arena, gpa, &environ, "tools.bash.format", "shfmt");
 
-    const dir_path = try std.fs.path.join(arena, &.{ xdg, app_dir });
+    const dir_path = try std.fs.path.join(arena, &.{ base, app_dir });
     var dir = try Io.Dir.cwd().createDirPathOpen(std.testing.io, dir_path, .{});
     defer dir.close(std.testing.io);
     var opened = try Config.open(std.testing.io, dir, gpa);

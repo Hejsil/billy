@@ -18,6 +18,7 @@ pub const term = @import("term.zig");
 pub const Tools = @import("Tools.zig");
 pub const web = @import("web.zig");
 pub const ulid = @import("ulid.zig");
+pub const xdg = @import("xdg.zig");
 
 test {
     // `zig build test` only collects the tests declared in the test target's
