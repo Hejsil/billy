@@ -1169,6 +1169,7 @@ test "describe frames a call and its output" {
         "read",
         "{\"path\":\"a.zig\"}",
         "file content",
+        .{},
     );
     // A write shows the content it put in the file, not its result.
     try expectDescribe(
@@ -1176,6 +1177,7 @@ test "describe frames a call and its output" {
         "write",
         "{\"path\":\"a.zig\",\"content\":\"hello\"}",
         "wrote 5 bytes to a.zig",
+        .{},
     );
     // A write that failed shows why instead of the content it never wrote.
     try expectDescribe(
@@ -1183,6 +1185,7 @@ test "describe frames a call and its output" {
         "write",
         "{\"path\":\"a.zig\",\"content\":\"hello\"}",
         "error: cannot write a.zig: AccessDenied",
+        .{},
     );
     // An edit shows the diff of the strings it worked on, not its result.
     try expectDescribe(
@@ -1190,6 +1193,7 @@ test "describe frames a call and its output" {
         "edit",
         "{\"path\":\"a.zig\",\"old_string\":\"old text\",\"new_string\":\"new text\"}",
         "replaced 1 occurrence(s) in a.zig",
+        .{},
     );
     // The command of a bash call is printed whole.
     try expectDescribe(
@@ -1197,6 +1201,7 @@ test "describe frames a call and its output" {
         "bash",
         "{\"command\":\"ls -la\"}",
         "exit code: 0\n(no output)\n",
+        .{},
     );
     // A web search shows the query it ran, and its results under the output
     // label like any other text a tool returned.
@@ -1205,6 +1210,7 @@ test "describe frames a call and its output" {
         "web_search",
         "{\"query\":\"zig lang\"}",
         "1. Zig\nhttps://ziglang.org",
+        .{},
     );
     // A tool that is not implemented shows its name, and the reason it could not
     // run reaches the user as the output.
@@ -1213,6 +1219,7 @@ test "describe frames a call and its output" {
         "frobnicate",
         "{}",
         "error: unknown tool 'frobnicate'",
+        .{},
     );
     // A known tool with broken arguments shows its name too.
     try expectDescribe(
@@ -1220,6 +1227,7 @@ test "describe frames a call and its output" {
         "read",
         "{",
         "error: invalid arguments for read: SyntaxError",
+        .{},
     );
     // A failed edit still shows the change it meant to make, then why it did not.
     try expectDescribe(
@@ -1228,104 +1236,69 @@ test "describe frames a call and its output" {
         "edit",
         "{\"path\":\"a.zig\",\"old_string\":\"x\",\"new_string\":\"y\"}",
         "error: old_string not found in a.zig",
+        .{},
     );
 }
 
 test "a block header names the tool, its colour, the bold name and the target" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
     // On a terminal that takes an escape code, the glyph carries the colour of
     // the tool, only the name is bold, and the target and the label are dimmed.
-    try describe(gpa, parse(arena, .{ .id = "1", .function = .{
-        .name = "read",
-        .arguments = "{\"path\":\"a.zig\"}",
-    } }), "", .{}, .ansi, &out.writer);
-    try std.testing.expectEqualStrings(
+    try expectDescribe(
         "\x1b[34m▸\x1b[0m \x1b[1mread\x1b[0m \x1b[2ma.zig\x1b[0m\n\x1b[1m▾ output\x1b[0m\n\n",
-        out.written(),
+        "read",
+        "{\"path\":\"a.zig\"}",
+        "",
+        .{ .style = .ansi },
     );
-    out.clearRetainingCapacity();
-
     // A terminal that takes no escape code gets the same text without them.
-    try describe(gpa, parse(arena, .{ .id = "1", .function = .{
-        .name = "read",
-        .arguments = "{\"path\":\"a.zig\"}",
-    } }), "", .{}, .plain, &out.writer);
-    try std.testing.expectEqualStrings("▸ read a.zig\n▾ output\n\n", out.written());
+    try expectDescribe("▸ read a.zig\n▾ output\n\n", "read", "{\"path\":\"a.zig\"}", "", .{});
 }
 
 test "a bash call's description is shown in its header" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
     // The description the model gave is the header's target, and the command it
     // describes is still shown whole under it.
-    try describe(gpa, parse(arena, .{ .id = "1", .function = .{
-        .name = "bash",
-        .arguments = "{\"command\":\"cargo test\",\"description\":\"run the test suite\"}",
-    } }), "exit code: 0\n", .{}, .plain, &out.writer);
-    try std.testing.expectEqualStrings(
+    try expectDescribe(
         "❯ bash run the test suite\ncargo test\n✓ exit 0\n\n",
-        out.written(),
+        "bash",
+        "{\"command\":\"cargo test\",\"description\":\"run the test suite\"}",
+        "exit code: 0\n",
+        .{},
     );
-    out.clearRetainingCapacity();
-
     // A call from before the tool asked for a description has none, so the header
     // names only the tool; the command is still shown under it.
-    try describe(gpa, parse(arena, .{ .id = "1", .function = .{
-        .name = "bash",
-        .arguments = "{\"command\":\"cargo test\"}",
-    } }), "exit code: 0\n", .{}, .plain, &out.writer);
-    try std.testing.expectEqualStrings("❯ bash\ncargo test\n✓ exit 0\n\n", out.written());
-    out.clearRetainingCapacity();
-
+    try expectDescribe(
+        "❯ bash\ncargo test\n✓ exit 0\n\n",
+        "bash",
+        "{\"command\":\"cargo test\"}",
+        "exit code: 0\n",
+        .{},
+    );
     // A description that runs over several lines is shown by its first line only,
     // since a header is one line.
-    try printHead(gpa, parse(arena, .{ .id = "1", .function = .{
-        .name = "bash",
-        .arguments = "{\"command\":\"make\",\"description\":\"build the project\\nand its docs\"}",
-    } }), .{}, .plain, &out.writer);
-    try std.testing.expectEqualStrings("❯ bash build the project\nmake\n", out.written());
+    try expectHead(
+        "❯ bash build the project\nmake\n",
+        "bash",
+        "{\"command\":\"make\",\"description\":\"build the project\\nand its docs\"}",
+        .{},
+    );
 }
 
 test "the exit status of a bash call is shown green or red" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    const call: llm.ToolCall = .{ .id = "1", .function = .{
-        .name = "bash",
-        .arguments = "{\"command\":\"make\"}",
-    } };
-
     // A command that succeeded.
-    try describe(gpa, parse(arena, call), "exit code: 0\nbuilt\n", .{}, .ansi, &out.writer);
-    try std.testing.expectEqualStrings(
+    try expectDescribe(
         "\x1b[36m❯\x1b[0m \x1b[1mbash\x1b[0m\nmake\n\x1b[1;32m✓ exit 0\x1b[0m\n\x1b[1m▾ stdout\x1b[0m\n\x1b[2mbuilt\x1b[0m\n\n",
-        out.written(),
+        "bash",
+        "{\"command\":\"make\"}",
+        "exit code: 0\nbuilt\n",
+        .{ .style = .ansi },
     );
-    out.clearRetainingCapacity();
-
     // One that did not, whose output the terminal still shows as it is.
-    try describe(gpa, parse(arena, call), "exit code: 2\nboom\n", .{}, .ansi, &out.writer);
-    try std.testing.expectEqualStrings(
+    try expectDescribe(
         "\x1b[36m❯\x1b[0m \x1b[1mbash\x1b[0m\nmake\n\x1b[1;31m✗ exit 2\x1b[0m\n\x1b[1m▾ stdout\x1b[0m\n\x1b[2mboom\x1b[0m\n\n",
-        out.written(),
+        "bash",
+        "{\"command\":\"make\"}",
+        "exit code: 2\nboom\n",
+        .{ .style = .ansi },
     );
 }
 
@@ -1467,54 +1440,33 @@ test "what a call failed with is shown red, and what it left out is dimmed" {
 }
 
 test "a bash command is shown the way the formatter lays it out" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
     // The format script reads the command and writes it back upper case, the
-    // way `shfmt | bat -l bash` reads it and writes it back laid out.
-    const format: Format = .{ .script = "tr a-z A-Z | cat", .io = std.testing.io, .gpa = gpa };
-    try describe(gpa, parse(arena, .{ .id = "1", .function = .{
-        .name = "bash",
-        .arguments = "{\"command\":\"ls -la\\n\"}",
-    } }), "exit code: 0\n(no output)\n", .{ .bash = format }, .plain, &out.writer);
-
-    // The command is shown as the formatter wrote it; its trailing newline does
-    // not leave a blank line in the block.
-    try std.testing.expectEqualStrings(
+    // way `shfmt | bat -l bash` reads it and writes it back laid out. The
+    // command is shown as the formatter wrote it; its trailing newline does not
+    // leave a blank line in the block.
+    const format: Format = .{ .script = "tr a-z A-Z | cat", .io = std.testing.io, .gpa = std.testing.allocator };
+    try expectDescribe(
         "❯ bash\nLS -LA\n✓ exit 0\n\n",
-        out.written(),
+        "bash",
+        "{\"command\":\"ls -la\\n\"}",
+        "exit code: 0\n(no output)\n",
+        .{ .formats = .{ .bash = format } },
     );
 }
 
 test "a bash command is shown as written when the formatter cannot lay it out" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    const call: llm.ToolCall = .{ .id = "1", .function = .{
-        .name = "bash",
-        .arguments = "{\"command\":\"ls -la\"}",
-    } };
-    const expected =
-        "❯ bash\nls -la\n✓ exit 0\n\n";
-
-    // A formatter that cannot be run, one that fails and one that writes
-    // nothing all leave the command the model wrote for the user to read.
+    // A formatter that cannot be run, one that fails and one that writes nothing
+    // all leave the command the model wrote for the user to read.
     const scripts = [_][]const u8{ "billy-no-such-formatter", "exit 1", "true" };
     for (scripts) |script| {
-        const format: Format = .{ .script = script, .io = std.testing.io, .gpa = gpa };
-        try describe(gpa, parse(arena, call), "exit code: 0\n(no output)\n", .{ .bash = format }, .plain, &out.writer);
-        try std.testing.expectEqualStrings(expected, out.written());
-        out.clearRetainingCapacity();
+        const format: Format = .{ .script = script, .io = std.testing.io, .gpa = std.testing.allocator };
+        try expectDescribe(
+            "❯ bash\nls -la\n✓ exit 0\n\n",
+            "bash",
+            "{\"command\":\"ls -la\"}",
+            "exit code: 0\n(no output)\n",
+            .{ .formats = .{ .bash = format } },
+        );
     }
 }
 
@@ -1811,7 +1763,23 @@ test "parseCall splits known, unknown and malformed calls" {
     try std.testing.expectEqualStrings("frobnicate", unknown.unknown);
 }
 
-fn expectDescribe(expected: []const u8, name: []const u8, arguments: []const u8, result: []const u8) !void {
+/// How a call is shown, for a test: the formatter scripts for a tool's block
+/// and the terminal style. `.{}` is what the tests mostly want -- no script, no
+/// escape codes -- so a test that wants a colour or a formatter says only that.
+const Shown = struct {
+    formats: Formats = .{},
+    style: styling.Style = .plain,
+};
+
+/// Renders a call named `name` with `arguments` and the `result` it produced,
+/// and checks it against `expected`. One call is one line of the test.
+fn expectDescribe(
+    expected: []const u8,
+    name: []const u8,
+    arguments: []const u8,
+    result: []const u8,
+    shown: Shown,
+) !void {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1821,7 +1789,23 @@ fn expectDescribe(expected: []const u8, name: []const u8, arguments: []const u8,
     try describe(arena_state.allocator(), parse(arena_state.allocator(), .{ .id = "1", .function = .{
         .name = name,
         .arguments = arguments,
-    } }), result, .{}, .plain, &out.writer);
+    } }), result, shown.formats, shown.style, &out.writer);
+    try std.testing.expectEqualStrings(expected, out.written());
+}
+
+/// Writes the header of a call named `name` with `arguments`, and checks it
+/// against `expected`. A header alone, without a result under it.
+fn expectHead(expected: []const u8, name: []const u8, arguments: []const u8, shown: Shown) !void {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try printHead(arena_state.allocator(), parse(arena_state.allocator(), .{ .id = "1", .function = .{
+        .name = name,
+        .arguments = arguments,
+    } }), shown.formats, shown.style, &out.writer);
     try std.testing.expectEqualStrings(expected, out.written());
 }
 
