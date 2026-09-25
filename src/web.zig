@@ -21,6 +21,7 @@ const agent = @import("agent.zig");
 const html = @import("html.zig");
 const models = @import("models.zig");
 const mode = @import("mode.zig");
+const Mode = mode.Mode;
 const Session = @import("Session.zig");
 const Runner = @import("agent.zig").Runner;
 const Setup = @import("Setup.zig");
@@ -382,7 +383,13 @@ fn listSessions(setup: *Setup, registry: *Registry, request: *std.http.Server.Re
 
 /// One session's page: the header line above a conversation, and the
 /// conversation itself, both as HTML for the page to put in whole.
-const Opened = struct { header: []const u8, blocks: []const u8 };
+const Opened = struct {
+    header: []const u8,
+    blocks: []const u8,
+    /// The mode the session runs in, so the page can show it. It is fixed once
+    /// the session has a conversation, which the page reads off `blocks`.
+    mode: []const u8,
+};
 
 /// `GET /api/sessions/{id}`: a session as the page shows it.
 ///
@@ -448,7 +455,7 @@ fn writeSession(
     defer blocks.deinit();
     try html.conversation(gpa, &session, &blocks.writer);
 
-    try writeOpened(out, header.written(), blocks.written());
+    try writeOpened(out, header.written(), blocks.written(), @tagName(session.mode));
     return true;
 }
 
@@ -467,13 +474,22 @@ fn writeEmpty(gpa: std.mem.Allocator, setup: *Setup, id: []const u8, out: *Io.Wr
         .cost = 0,
     }, &header.writer);
 
-    try writeOpened(out, header.written(), "");
+    // A session started but not asked yet runs in the web's default mode.
+    try writeOpened(out, header.written(), "", @tagName(default_mode));
 }
 
 /// Writes the two halves of a session's page as the JSON object the page reads.
-fn writeOpened(out: *Io.Writer, header: []const u8, blocks: []const u8) !void {
-    try std.json.Stringify.value(Opened{ .header = header, .blocks = blocks }, .{}, out);
+fn writeOpened(out: *Io.Writer, header: []const u8, blocks: []const u8, session_mode: []const u8) !void {
+    try std.json.Stringify.value(Opened{
+        .header = header,
+        .blocks = blocks,
+        .mode = session_mode,
+    }, .{}, out);
 }
+
+/// The mode a web session starts in, so a new one opens in ask unless the first
+/// prompt says otherwise. The terminal keeps general as its own default.
+const default_mode: mode.Mode = .ask;
 
 /// `POST /api/sessions`: hands out the id of a session that does not exist yet.
 ///
@@ -598,16 +614,17 @@ test "a session's page is written as the JSON the page reads" {
 
     // The two halves are HTML, so the quotes and newlines in them are escaped
     // into the JSON rather than ending the string early.
-    try writeOpened(&out.writer, "<div class=\"header\">hi</div>\n", "<p>one</p>\n");
+    try writeOpened(&out.writer, "<div class=\"header\">hi</div>\n", "<p>one</p>\n", "ask");
     try std.testing.expectEqualStrings(
-        "{\"header\":\"<div class=\\\"header\\\">hi</div>\\n\",\"blocks\":\"<p>one</p>\\n\"}",
+        "{\"header\":\"<div class=\\\"header\\\">hi</div>\\n\",\"blocks\":\"<p>one</p>\\n\",\"mode\":\"ask\"}",
         out.written(),
     );
-    // The page reads this back as the two strings it wrote.
+    // The page reads this back as the two strings it wrote, and the mode.
     const parsed = try std.json.parseFromSlice(Opened, gpa, out.written(), .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("<div class=\"header\">hi</div>\n", parsed.value.header);
     try std.testing.expectEqualStrings("<p>one</p>\n", parsed.value.blocks);
+    try std.testing.expectEqualStrings("ask", parsed.value.mode);
 }
 
 test "the page the browser is given is the one that was written" {
@@ -671,7 +688,13 @@ test "the address to listen on is read from what was asked for" {
 }
 
 /// The prompt a page sends: what the user typed.
-const Prompt = struct { text: []const u8 };
+/// The prompt a page sends: what the user typed, and the mode the page chose for
+/// a new session. `mode` is null for a session that already has a conversation,
+/// whose mode is fixed on the session.
+const Prompt = struct {
+    text: []const u8,
+    mode: ?mode.Mode = null,
+};
 
 /// `POST /api/sessions/{id}/message`: asks the session `text`, answering with the
 /// run as it happens.
@@ -725,13 +748,13 @@ fn askSession(
     };
     defer session.deinit();
 
-    // The first prompt of a new session sets its mode: `/ask` opens the ask mode,
-    // and anything else the general one. A resumed session keeps the one it was
-    // saved with.
+    // The first prompt of a new session sets its mode: the mode the page chose,
+    // or a `/ask`/`/general` command in the prompt, which wins over the choice. A
+    // resumed session keeps the mode it was saved with.
     var text = parsed.value.text;
     var config = setup.agentConfig(session.cwd, .plain);
     if (session.messages.items.len == 0) {
-        const choice = mode.Mode.start(text, .ask);
+        const choice = mode.Mode.start(text, parsed.value.mode orelse default_mode);
         config.mode = choice.mode;
         text = choice.text;
     }

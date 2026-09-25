@@ -352,7 +352,7 @@ pub fn sessionHeader(
     context_tokens: usize,
     cost: f64,
 ) !void {
-    try out.print("billy · {s} · {s} · ", .{ session_id, config.model });
+    try out.print("billy · {s} · {s} · {s} · ", .{ @tagName(config.mode), session_id, config.model });
     try displayPath(out, config.cwd, config.home);
     if (config.model_info) |info| {
         try out.writeAll(" · ");
@@ -632,7 +632,9 @@ pub fn run(
         // conversation.
         runner.compactIfNeeded(emitter, session);
         header.clearRetainingCapacity();
-        try sessionHeader(&header.writer, config, session.id(), session.context_tokens, session.cost);
+        // The header is built from the runner's config, so the mode it shows is
+        // the one the session is running in, which the first prompt may have set.
+        try sessionHeader(&header.writer, runner.config, session.id(), session.context_tokens, session.cost);
         const line = (try editor.readLine(header.written(), prompt)) orelse break;
         if (line.len == 0) continue;
         // The first prompt of a new session sets its mode: `/ask` opens the ask
@@ -1553,30 +1555,36 @@ fn expectMoney(expected: []const u8, amount: f64) !void {
 
 test "header names the session, the model and the working directory" {
     try expectHeader(
-        "billy · 01HF7YAT000000000000000000 · deepseek-flash · /work",
+        "billy · general · 01HF7YAT000000000000000000 · deepseek-flash · /work",
         testConfig("deepseek-flash", "/work", null),
         0,
         0,
     );
 }
 
+test "header names the mode the session runs in" {
+    var config = testConfig("m", "/work", null);
+    config.mode = .ask;
+    try expectHeader("billy · ask · 01HF7YAT000000000000000000 · m · /work", config, 0, 0);
+}
+
 test "header shortens a path inside the home directory" {
     try expectHeader(
-        "billy · 01HF7YAT000000000000000000 · m · ~/repo/billy",
+        "billy · general · 01HF7YAT000000000000000000 · m · ~/repo/billy",
         testConfig("m", "/home/user/repo/billy", "/home/user"),
         0,
         0,
     );
     // The home directory itself becomes just `~`.
     try expectHeader(
-        "billy · 01HF7YAT000000000000000000 · m · ~",
+        "billy · general · 01HF7YAT000000000000000000 · m · ~",
         testConfig("m", "/home/user", "/home/user"),
         0,
         0,
     );
     // A sibling that merely shares the prefix is left alone.
     try expectHeader(
-        "billy · 01HF7YAT000000000000000000 · m · /home/user2",
+        "billy · general · 01HF7YAT000000000000000000 · m · /home/user2",
         testConfig("m", "/home/user2", "/home/user"),
         0,
         0,
@@ -1594,13 +1602,13 @@ test "header shows how full the context window is" {
     };
 
     // A fresh session has used nothing.
-    try expectHeader("billy · 01HF7YAT000000000000000000 · m · /work · 0/128k (0%) · $0", config, 0, 0);
+    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 0/128k (0%) · $0", config, 0, 0);
     // A rounded-to-zero percentage still shows the conversation is not empty.
-    try expectHeader("billy · 01HF7YAT000000000000000000 · m · /work · 500/128k (<1%) · $0", config, 500, 0);
-    try expectHeader("billy · 01HF7YAT000000000000000000 · m · /work · 16k/128k (12%) · $0", config, 16_000, 0);
+    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 500/128k (<1%) · $0", config, 500, 0);
+    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 16k/128k (12%) · $0", config, 16_000, 0);
     // A full window, and a count that rounds to a whole thousand.
-    try expectHeader("billy · 01HF7YAT000000000000000000 · m · /work · 128k/128k (100%) · $0", config, 128_000, 0);
-    try expectHeader("billy · 01HF7YAT000000000000000000 · m · /work · 13k/128k (9%) · $0", config, 12_500, 0);
+    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 128k/128k (100%) · $0", config, 128_000, 0);
+    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 13k/128k (9%) · $0", config, 12_500, 0);
 }
 
 test "header shows the accumulated session cost" {
@@ -1624,11 +1632,11 @@ test "header shows the accumulated session cost" {
         .cache_miss_tokens = 1_000_000,
     };
     const off_peak_cost = costOf(info.priceAt(off_peak_utc), usage);
-    try expectHeader("billy · 01HF7YAT000000000000000000 · deepseek-flash · /work · 3M/4M (75%) · $0.75", config, 3_000_000, off_peak_cost);
+    try expectHeader("billy · general · 01HF7YAT000000000000000000 · deepseek-flash · /work · 3M/4M (75%) · $0.75", config, 3_000_000, off_peak_cost);
     // A request made in peak hours cost double, which stays on the total even if
     // the header is shown later, off-peak.
     const peak_cost = costOf(info.priceAt(peak_utc), usage);
-    try expectHeader("billy · 01HF7YAT000000000000000000 · deepseek-flash · /work · 3M/4M (75%) · $1.51", config, 3_000_000, peak_cost);
+    try expectHeader("billy · general · 01HF7YAT000000000000000000 · deepseek-flash · /work · 3M/4M (75%) · $1.51", config, 3_000_000, peak_cost);
 }
 
 test "token counts are whole and prices keep at most two decimals" {
@@ -1652,7 +1660,7 @@ test "token counts are whole and prices keep at most two decimals" {
 test "header leaves out the gauge and cost for an unknown model" {
     const config = testConfig("who-knows", "/work", null);
     try std.testing.expect(config.model_info == null);
-    try expectHeader("billy · 01HF7YAT000000000000000000 · who-knows · /work", config, 5000, 12.34);
+    try expectHeader("billy · general · 01HF7YAT000000000000000000 · who-knows · /work", config, 5000, 12.34);
 }
 
 test "cost follows the cache hit, miss and output prices" {

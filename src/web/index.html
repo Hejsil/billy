@@ -74,6 +74,14 @@
     resize: none; overflow-y: auto; min-height: 0; max-height: 40vh;
   }
   #text:disabled { color: var(--dim); }
+  /* The mode picker beside the prompt box. It is only for a session that has not
+     been asked anything yet, so it is disabled once one has a conversation. */
+  #mode {
+    flex: none; align-self: flex-end; margin-left: 8px; cursor: pointer;
+    background: var(--panel); border: 1px solid var(--line); color: var(--text);
+    border-radius: 6px; padding: 8px 10px; font: inherit;
+  }
+  #mode:disabled { color: var(--dim); cursor: default; }
 
   /* A prompt or a reply: a headed block of markdown. */
   .block { margin-bottom: 16px; }
@@ -203,6 +211,10 @@
     <div id="conversation"></div>
     <form id="prompt">
       <textarea id="text" rows="1" placeholder="ask billy something (shift+enter for a newline)" autocomplete="off"></textarea>
+      <select id="mode" title="what a new session may do">
+        <option value="ask">ask</option>
+        <option value="general">general</option>
+      </select>
     </form>
   </main>
 
@@ -214,6 +226,7 @@ const headerBox = document.getElementById('header');
 const conversation = document.getElementById('conversation');
 const form = document.getElementById('prompt');
 const input = document.getElementById('text');
+const modeSelect = document.getElementById('mode');
 let selected = null;
 let working = false;
 // The tool call the turn is in the middle of: the `<details>` opened by a
@@ -296,6 +309,10 @@ async function open(id) {
   for (const item of list.children) item.classList.toggle('selected', item.dataset.id === id);
   headerBox.innerHTML = body.header;
   conversation.innerHTML = body.blocks;
+  // The mode is only chosen for a session that has no conversation yet, so it is
+  // shown read-only once there is one.
+  modeSelect.value = body.mode;
+  modeSelect.disabled = body.blocks.trim() !== '';
   // Whatever the old conversation had open is gone with it.
   openCall = null;
   scrollToEnd();
@@ -309,6 +326,9 @@ async function send(text) {
   working = true;
   form.classList.add('working');
   input.disabled = true;
+  // A turn makes the session one that has been asked something, so the mode is
+  // fixed from here on.
+  modeSelect.disabled = true;
   input.value = '';
   grow();
 
@@ -316,7 +336,7 @@ async function send(text) {
     const res = await fetch('/api/sessions/' + encodeURIComponent(selected) + '/message', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text: text }),
+      body: JSON.stringify({ text: text, mode: modeSelect.value }),
     });
     if (res.status === 409) note('the session is busy; wait for the answer');
     else if (!res.ok) note('the prompt was refused (' + res.status + ')');
