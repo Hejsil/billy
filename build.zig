@@ -18,6 +18,9 @@ pub fn build(b: *std.Build) void {
     mod.addIncludePath(md4c.path("src"));
     mod.addCSourceFiles(.{
         .root = md4c.path("src"),
+        // md4c-html.c is built for its renderer, which only the oracle test uses
+        // (to check billy's own renderer against md4c's); the executable does not
+        // call it, so the linker drops it.
         .files = &.{ "md4c.c", "md4c-html.c", "entity.c" },
         // C99, because the library is written in it. UTF-8, because a reply is
         // UTF-8 and md4c is told which encoding to expect rather than guessing.

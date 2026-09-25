@@ -785,6 +785,87 @@ test "raw HTML in the text stays text" {
     try expectMarkdown("<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>\n", "<script>alert(1)</script>\n");
 }
 
+/// Documents the oracle test renders, covering everything billy's renderer is
+/// meant to handle. Every address is safe: billy neutralizes a dangerous one and
+/// md4c's own renderer does not, so those are checked by the tests above rather
+/// than by the oracle.
+const oracle_corpus = [_][]const u8{
+    "# Heading one\n\n## Heading two\n\n### h3\n\n#### h4\n\n##### h5\n\n###### h6\n",
+    "A paragraph with *emphasis*, **strong**, `code`, and ~~struck~~ text.\n",
+    "A second paragraph.\n\nAnd a third, spread\nover two lines.\n",
+    "- one\n- two\n- three\n",
+    "1. one\n2. two\n3. three\n",
+    "3. three\n4. four\n",
+    "- a\n  - nested a\n  - nested b\n- b\n",
+    "1. one\n   - nested\n2. two\n",
+    "1. one\n\n2. two\n",
+    "- [ ] todo\n- [x] done\n",
+    "> a quote\n> over two lines\n",
+    "> first\n>\n> second\n",
+    "---\n\nafter a rule\n",
+    "```zig\nconst x = 1 < 2;\nif (x) return;\n```\n",
+    "```\nplain code, a < b & c\n```\n",
+    "    an indented block\n    second line\n",
+    "| a | b |\n|---|---|\n| 1 | 2 |\n",
+    "| left | center | right |\n|:-----|:------:|------:|\n| 1 | 2 | 3 |\n",
+    "[link](https://example.com/a?b=1&c=2 \"Title\")\n",
+    "[relative](/docs)\n",
+    "[mail](mailto:a@example.com)\n",
+    "![image](https://example.com/x.png \"the title\")\n",
+    "A bare https://example.com autolink and an address <a@example.com>.\n",
+    "It's an apostrophe, an & ampersand, and a <tag>\n",
+    "Entities: &amp; &lt; &copy; &#65; &#x42; &unknown;\n",
+    "[title with entities](https://example.com \"a &quot; b &amp; c\")\n",
+    "A hard break here  \nand the next line.\n",
+    "A soft\nbreak.\n",
+    "Backslash escapes: \\*not emphasis\\* and \\`not code\\`.\n",
+    "* * *\n",
+    "Text with a `code <span>` span and a <raw> tag.\n",
+    "Term\n: not a definition list\n",
+    "A footnote[^1] reference.\n\n[^1]: the definition\n",
+};
+
+test "the renderer writes what md4c's own renderer writes" {
+    const gpa = std.testing.allocator;
+    for (oracle_corpus) |doc| {
+        var ours: std.Io.Writer.Allocating = .init(gpa);
+        defer ours.deinit();
+        try markdown(gpa, doc, &ours.writer);
+
+        var theirs: std.Io.Writer.Allocating = .init(gpa);
+        defer theirs.deinit();
+        try md.oracleHtml(doc, &theirs.writer);
+
+        // md4c writes an apostrophe as `&#x27;` and billy writes `&#39;`. They are
+        // the same character, so md4c's is normalized before the two are compared.
+        const theirs_normalized = try replaceAll(gpa, theirs.written(), "&#x27;", "&#39;");
+        defer gpa.free(theirs_normalized);
+
+        if (!std.mem.eql(u8, ours.written(), theirs_normalized)) {
+            std.debug.print(
+                "\n=== document ===\n{s}\n=== billy ===\n{s}\n=== md4c ===\n{s}\n",
+                .{ doc, ours.written(), theirs_normalized },
+            );
+        }
+        try std.testing.expectEqualStrings(theirs_normalized, ours.written());
+    }
+}
+
+/// `text` with every `from` replaced by `to`, owned by `gpa`. For the oracle
+/// test's one known, harmless difference from md4c.
+fn replaceAll(gpa: std.mem.Allocator, text: []const u8, from: []const u8, to: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var rest = text;
+    while (std.mem.indexOf(u8, rest, from)) |at| {
+        try out.appendSlice(gpa, rest[0..at]);
+        try out.appendSlice(gpa, to);
+        rest = rest[at + from.len ..];
+    }
+    try out.appendSlice(gpa, rest);
+    return out.toOwnedSlice(gpa);
+}
+
 test "a diff is written as lines that name their side" {
     const gpa = std.testing.allocator;
     const lines = try diffing.lines(gpa, "a\nb\nc", "a\nx\nc");

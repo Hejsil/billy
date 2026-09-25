@@ -5,12 +5,17 @@
 //! reads, and how a document is handed to it, so that what is C-shaped stays
 //! here and what is HTML-shaped stays in `html.zig`.
 
-/// md4c, and its entity table. The table is needed because a link address is
-/// decoded before it is trusted: a `javascript:` scheme can be spelled with
-/// entities, and an entity-decoded address is the one the browser will follow.
+const std = @import("std");
+const Io = std.Io;
+
+/// md4c, its entity table, and its own HTML renderer. The table is needed
+/// because a link address is decoded before it is trusted: a `javascript:`
+/// scheme can be spelled with entities, and the decoded address is the one the
+/// browser will follow. The HTML renderer is only for the oracle test below.
 pub const c = @cImport({
     @cInclude("md4c.h");
     @cInclude("entity.h");
+    @cInclude("md4c-html.h");
 });
 
 /// The dialect billy reads, on top of plain CommonMark: the GitHub extensions a
@@ -29,4 +34,32 @@ pub const flags: c_uint = c.MD_FLAG_TABLES |
 /// the caller's to notice, which `html.zig` uses to stop on a failed write.
 pub fn parse(text: []const u8, parser: *const c.MD_PARSER, userdata: ?*anyopaque) !void {
     if (c.md_parse(text.ptr, @intCast(text.len), parser, userdata) < 0) return error.MarkdownFailed;
+}
+
+/// Renders `text` with md4c's *own* HTML renderer, so a test can check billy's
+/// renderer against it (see the oracle test in `html.zig`).
+///
+/// billy does not use this to render: md4c's renderer writes a link's address
+/// unchecked, which is the whole reason billy drives the parser itself. It is
+/// here as an independent implementation to compare against.
+pub fn oracleHtml(text: []const u8, out: *Io.Writer) !void {
+    var sink = Sink{ .out = out };
+    _ = c.md_html(text.ptr, @intCast(text.len), emit, &sink, flags, 0);
+    if (sink.err) |err| return err;
+}
+
+/// Where the oracle renderer's output goes, and the first failure of writing it.
+const Sink = struct {
+    out: *Io.Writer,
+    err: ?Io.Writer.Error = null,
+};
+
+/// Writes one chunk of the oracle renderer's output; the failure, if any, is kept
+/// on the sink, since a C callback cannot return one.
+fn emit(text: [*c]const c.MD_CHAR, size: c.MD_SIZE, userdata: ?*anyopaque) callconv(.c) void {
+    const sink: *Sink = @ptrCast(@alignCast(userdata.?));
+    if (sink.err != null) return;
+    sink.out.writeAll(text[0..size]) catch |err| {
+        sink.err = err;
+    };
 }
