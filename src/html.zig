@@ -33,7 +33,9 @@ pub fn escape(text: []const u8, out: *Io.Writer) !void {
             '<' => "&lt;",
             '>' => "&gt;",
             '"' => "&quot;",
-            '\'' => "&#39;",
+            // The hex form, which is what md4c writes, so billy's own escaping
+            // and the markdown renderer's agree character for character.
+            '\'' => "&#x27;",
             else => continue,
         };
         try out.writeAll(text[plain..i]);
@@ -539,7 +541,7 @@ test "the characters that mean something in HTML are written as themselves" {
 
     // Every one of them, and a string with none of them left as it was.
     try escape("<a href=\"x\">&'</a>", &out.writer);
-    try std.testing.expectEqualStrings("&lt;a href=&quot;x&quot;&gt;&amp;&#39;&lt;/a&gt;", out.written());
+    try std.testing.expectEqualStrings("&lt;a href=&quot;x&quot;&gt;&amp;&#x27;&lt;/a&gt;", out.written());
 
     out.clearRetainingCapacity();
     try escape("plain text 123", &out.writer);
@@ -836,34 +838,17 @@ test "the renderer writes what md4c's own renderer writes" {
         defer theirs.deinit();
         try md.oracleHtml(doc, &theirs.writer);
 
-        // md4c writes an apostrophe as `&#x27;` and billy writes `&#39;`. They are
-        // the same character, so md4c's is normalized before the two are compared.
-        const theirs_normalized = try replaceAll(gpa, theirs.written(), "&#x27;", "&#39;");
-        defer gpa.free(theirs_normalized);
-
-        if (!std.mem.eql(u8, ours.written(), theirs_normalized)) {
+        // The two agree character for character: billy's own escaping writes a
+        // character the same way md4c's does (see `escape`), so this compares
+        // the bytes as they are.
+        if (!std.mem.eql(u8, ours.written(), theirs.written())) {
             std.debug.print(
                 "\n=== document ===\n{s}\n=== billy ===\n{s}\n=== md4c ===\n{s}\n",
-                .{ doc, ours.written(), theirs_normalized },
+                .{ doc, ours.written(), theirs.written() },
             );
         }
-        try std.testing.expectEqualStrings(theirs_normalized, ours.written());
+        try std.testing.expectEqualStrings(theirs.written(), ours.written());
     }
-}
-
-/// `text` with every `from` replaced by `to`, owned by `gpa`. For the oracle
-/// test's one known, harmless difference from md4c.
-fn replaceAll(gpa: std.mem.Allocator, text: []const u8, from: []const u8, to: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    var rest = text;
-    while (std.mem.indexOf(u8, rest, from)) |at| {
-        try out.appendSlice(gpa, rest[0..at]);
-        try out.appendSlice(gpa, to);
-        rest = rest[at + from.len ..];
-    }
-    try out.appendSlice(gpa, rest);
-    return out.toOwnedSlice(gpa);
 }
 
 test "a diff is written as lines that name their side" {
