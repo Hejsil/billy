@@ -220,33 +220,77 @@ const max_instructions_len = 1 << 20;
 /// holds none of them. Only `dir` is read; a caller that wants a walk up does it
 /// around this.
 ///
-/// The file is read through `gpa` and freed here, so nothing of the section is
-/// left allocated once it is written.
+/// The file is measured and then streamed to `out`, so neither the file nor the
+/// section is ever held in memory whole.
 fn instructionsIn(
     io: Io,
     out: *Io.Writer,
-    gpa: std.mem.Allocator,
     dir: Io.Dir,
     names: []const []const u8,
     what: []const u8,
 ) !bool {
     for (names) |name| {
-        const text = dir.readFileAlloc(io, name, gpa, .limited(max_instructions_len)) catch |err| switch (err) {
+        var file = dir.openFile(io, name, .{}) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return err,
         };
-        defer gpa.free(text);
-        // An empty file is nothing to say, so the search carries on rather than
-        // putting a blank heading in the prompt.
-        const body = std.mem.trimEnd(u8, text, " \t\r\n");
-        if (body.len == 0) continue;
+        defer file.close(io);
+
+        // The file is measured once to find where its content ends, so the
+        // trailing whitespace is trimmed and an empty or all-whitespace file is
+        // skipped rather than heading a blank section. The reader reads
+        // positionally, so the stream below starts at the beginning again.
+        const end = try contentEnd(io, file);
+        if (end == 0) continue;
+
         // The blank line before the heading stands the section apart from the
         // prompt above it, which every section has: billy's own text, or another
         // section.
-        try out.print("\n\n{s} instructions follow, read from {s}.\n\n{s}", .{ what, name, body });
+        try out.print("\n\n{s} instructions follow, read from {s}.\n\n", .{ what, name });
+        var buffer: [4096]u8 = undefined;
+        var file_reader = file.reader(io, &buffer);
+        try file_reader.interface.streamExact(out, end);
         return true;
     }
     return false;
+}
+
+/// The number of bytes of `file` up to its last non-whitespace byte, capped at
+/// `max_instructions_len`; zero when the file is empty or all whitespace, which
+/// is nothing to say. The file is read through `io` alone, and nothing of it is
+/// kept.
+fn contentEnd(io: Io, file: Io.File) !usize {
+    var scratch: [4096]u8 = undefined;
+    var file_reader = file.reader(io, &.{});
+    const reader = &file_reader.interface;
+
+    var end: usize = 0;
+    var offset: usize = 0;
+    while (offset < max_instructions_len) {
+        const n = reader.readSliceShort(scratch[0..@min(scratch.len, max_instructions_len - offset)]) catch |err| switch (err) {
+            error.ReadFailed => return file_reader.err.?,
+        };
+        if (n == 0) break;
+        // The last byte that is not whitespace ends the content, so a chunk of
+        // trailing whitespace leaves the end where it was.
+        if (lastNonWhitespace(scratch[0..n])) |i| end = offset + i + 1;
+        offset += n;
+    }
+    return end;
+}
+
+/// The index of the last byte of `chunk` that is not whitespace, or null when it
+/// is all whitespace. The whitespace is the set the trim used to strip.
+fn lastNonWhitespace(chunk: []const u8) ?usize {
+    var i = chunk.len;
+    while (i > 0) {
+        i -= 1;
+        switch (chunk[i]) {
+            ' ', '\t', '\r', '\n' => {},
+            else => return i,
+        }
+    }
+    return null;
 }
 
 /// Writes the project's own instructions, read from `dir` or the nearest parent
@@ -258,7 +302,7 @@ fn instructionsIn(
 /// are sent with every request and survive whatever context trimming happens
 /// later. That is what keeps the rules a project cares about from being dropped
 /// partway through a long session.
-fn projectInstructions(io: Io, out: *Io.Writer, gpa: std.mem.Allocator, dir: Io.Dir) !bool {
+fn projectInstructions(io: Io, out: *Io.Writer, dir: Io.Dir) !bool {
     var current = dir;
     // The directory the caller passed is theirs to close; every one opened here
     // while walking up is this function's.
@@ -266,7 +310,7 @@ fn projectInstructions(io: Io, out: *Io.Writer, gpa: std.mem.Allocator, dir: Io.
     defer if (owned) current.close(io);
 
     while (true) {
-        if (try instructionsIn(io, out, gpa, current, &instruction_files, "The project's"))
+        if (try instructionsIn(io, out, current, &instruction_files, "The project's"))
             return true;
         // The repository root is the last directory searched.
         if (dirHas(io, current, ".git")) return false;
@@ -297,8 +341,8 @@ fn projectInstructions(io: Io, out: *Io.Writer, gpa: std.mem.Allocator, dir: Io.
 ///
 /// They join every session's prompt, ahead of the project's own, so a rule that
 /// holds everywhere is set once rather than copied into each project.
-fn globalInstructions(io: Io, out: *Io.Writer, gpa: std.mem.Allocator, dir: Io.Dir) !bool {
-    return instructionsIn(io, out, gpa, dir, &instruction_files, "The user's");
+fn globalInstructions(io: Io, out: *Io.Writer, dir: Io.Dir) !bool {
+    return instructionsIn(io, out, dir, &instruction_files, "The user's");
 }
 
 /// Whether `dir` holds an entry named `name`.
@@ -925,8 +969,8 @@ fn leadPrompt(io: Io, gpa: std.mem.Allocator, dir: Io.Dir, user_dir: ?Io.Dir) ![
     // so the whole prompt is written once into one buffer with no part of it
     // built apart and then copied in.
     try text.writer.writeAll(system_prompt);
-    if (user_dir) |config_dir| _ = try globalInstructions(io, &text.writer, gpa, config_dir);
-    _ = try projectInstructions(io, &text.writer, gpa, dir);
+    if (user_dir) |config_dir| _ = try globalInstructions(io, &text.writer, config_dir);
+    _ = try projectInstructions(io, &text.writer, dir);
     return text.toOwnedSlice();
 }
 
@@ -1684,7 +1728,7 @@ test "cost follows the cache hit, miss and output prices" {
 fn expectInstructions(expected: []const u8, read: anytype, dir: Io.Dir) !void {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try std.testing.expect(try read(std.testing.io, &out.writer, std.testing.allocator, dir));
+    try std.testing.expect(try read(std.testing.io, &out.writer, dir));
     try std.testing.expectEqualStrings(expected, out.written());
 }
 
@@ -1692,7 +1736,7 @@ fn expectInstructions(expected: []const u8, read: anytype, dir: Io.Dir) !void {
 fn expectNoInstructions(read: anytype, dir: Io.Dir) !void {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try std.testing.expect(!try read(std.testing.io, &out.writer, std.testing.allocator, dir));
+    try std.testing.expect(!try read(std.testing.io, &out.writer, dir));
 }
 
 test "the project's instructions are read from the working directory" {
@@ -1816,6 +1860,28 @@ test "a user's instructions file that is missing or empty is not used" {
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "  \n\n" });
     try expectNoInstructions(globalInstructions, tmp.dir);
+}
+
+test "a large instructions file is streamed, its trailing whitespace trimmed" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Longer than the 4 KiB the file is read at a time, so it crosses chunks,
+    // with the trailing whitespace in the last chunk: the trim has to hold the
+    // end it found in one chunk while the next is read.
+    var file_text: std.Io.Writer.Allocating = .init(gpa);
+    defer file_text.deinit();
+    try file_text.writer.writeAll("x" ** 5000);
+    try file_text.writer.writeAll("\n \t\r\n");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = file_text.written() });
+
+    var expected: std.Io.Writer.Allocating = .init(gpa);
+    defer expected.deinit();
+    try expected.writer.writeAll("\n\nThe project's instructions follow, read from AGENTS.md.\n\n");
+    try expected.writer.writeAll("x" ** 5000);
+
+    try expectInstructions(expected.written(), projectInstructions, tmp.dir);
 }
 
 test "the prompt is billy's own, the user's instructions, then the project's" {
