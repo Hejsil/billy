@@ -206,9 +206,39 @@ const system_prompt =
 /// tried. `AGENTS.md` is the open convention; `CLAUDE.md` is accepted after it so
 /// that a project which wrote one for another tool need not rename it.
 const instruction_files = [_][]const u8{ "AGENTS.md", "CLAUDE.md" };
-/// Longest project instructions read back, so an outsize file cannot exhaust
-/// memory.
+/// Longest instructions read back, so an outsize file cannot exhaust memory.
 const max_instructions_len = 1 << 20;
+
+/// The instructions `dir` itself holds: the first non-empty file of `names`,
+/// under a heading naming where they came from, and null when it holds none of
+/// them. Only `dir` is read; a caller that wants a walk up does it around this.
+///
+/// The text is owned by `gpa`; the caller frees it.
+fn instructionsIn(
+    io: Io,
+    gpa: std.mem.Allocator,
+    dir: Io.Dir,
+    names: []const []const u8,
+    what: []const u8,
+) !?[]const u8 {
+    for (names) |name| {
+        const text = dir.readFileAlloc(io, name, gpa, .limited(max_instructions_len)) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer gpa.free(text);
+        // An empty file is nothing to say, so the search carries on rather than
+        // putting a blank heading in the prompt.
+        const body = std.mem.trimEnd(u8, text, " \t\r\n");
+        if (body.len == 0) continue;
+        return try std.fmt.allocPrint(
+            gpa,
+            "{s} instructions follow, read from {s}.\n\n{s}",
+            .{ what, name, body },
+        );
+    }
+    return null;
+}
 
 /// The project's own instructions, read from `dir` or the nearest parent that
 /// has them, and null when the project has none. The walk stops at the
@@ -229,22 +259,8 @@ fn projectInstructions(io: Io, gpa: std.mem.Allocator, dir: Io.Dir) !?[]const u8
     defer if (owned) current.close(io);
 
     while (true) {
-        for (instruction_files) |name| {
-            const text = current.readFileAlloc(io, name, gpa, .limited(max_instructions_len)) catch |err| switch (err) {
-                error.FileNotFound => continue,
-                else => return err,
-            };
-            defer gpa.free(text);
-            // An empty file is nothing to say, so the search carries on rather
-            // than putting a blank heading in the prompt.
-            const body = std.mem.trimEnd(u8, text, " \t\r\n");
-            if (body.len == 0) continue;
-            return try std.fmt.allocPrint(
-                gpa,
-                "The project's instructions follow, read from {s}.\n\n{s}",
-                .{ name, body },
-            );
-        }
+        if (try instructionsIn(io, gpa, current, &instruction_files, "The project's")) |text|
+            return text;
         // The repository root is the last directory searched.
         if (dirHas(io, current, ".git")) return null;
 
