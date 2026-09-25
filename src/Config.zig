@@ -466,6 +466,14 @@ fn expectDir(expected: []const u8, actual: []const u8, gpa: std.mem.Allocator) !
     try std.testing.expectEqualStrings(expected, actual);
 }
 
+/// Writes `json` as the configuration file and opens it, so a test reads as the
+/// file it wrote and the setting it read back. The caller frees what comes back
+/// with `opened.config.deinit()`.
+fn openFrom(tmp: *std.testing.TmpDir, json: []const u8) !Opened {
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = json });
+    return Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+}
+
 test "open writes the defaults when the file is missing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -487,13 +495,8 @@ test "open reads the max_turns and the bash format from the file" {
     defer tmp.cleanup();
 
     // An unknown field and a missing version must not stop the read.
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = file_name,
-        .data = "{\"max_turns\":7,\"future\":true," ++
-            "\"tools\":{\"bash\":{\"format\":\"shfmt | bat -l bash\",\"unknown\":1}}}",
-    });
-
-    var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    var opened = try openFrom(&tmp, "{\"max_turns\":7,\"future\":true," ++
+        "\"tools\":{\"bash\":{\"format\":\"shfmt | bat -l bash\",\"unknown\":1}}}");
     defer opened.config.deinit();
     try std.testing.expect(!opened.created);
     try std.testing.expectEqual(7, opened.config.max_turns);
@@ -506,20 +509,12 @@ test "open reads the block count a resume replays from the file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = file_name,
-        .data = "{\"resume_blocks\":3}",
-    });
-    var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    var opened = try openFrom(&tmp, "{\"resume_blocks\":3}");
     defer opened.config.deinit();
     try std.testing.expectEqual(3, opened.config.resume_blocks);
 
     // Zero is allowed: it shows the whole session.
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = file_name,
-        .data = "{\"resume_blocks\":0}",
-    });
-    var whole = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    var whole = try openFrom(&tmp, "{\"resume_blocks\":0}");
     defer whole.config.deinit();
     try std.testing.expectEqual(0, whole.config.resume_blocks);
 }
@@ -528,23 +523,17 @@ test "open reads the compaction threshold from the file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = file_name,
-        .data = "{\"compact_at\":50}",
-    });
-    var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    var opened = try openFrom(&tmp, "{\"compact_at\":50}");
     defer opened.config.deinit();
     try std.testing.expectEqual(50, opened.config.compact_at);
 
     // A file without it falls back to the default.
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{}" });
-    var bare = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    var bare = try openFrom(&tmp, "{}");
     defer bare.config.deinit();
     try std.testing.expectEqual(Stored.default.compact_at, bare.config.compact_at);
 
     // Zero turns compaction off; it is a setting, not a mistake.
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{\"compact_at\":0}" });
-    var off = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    var off = try openFrom(&tmp, "{\"compact_at\":0}");
     defer off.config.deinit();
     try std.testing.expectEqual(0, off.config.compact_at);
 }
@@ -553,20 +542,14 @@ test "open reads the markdown format from the file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = file_name,
-        .data = "{\"markdown\":{\"format\":\"glow -\"}}",
-    });
-
-    var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    var opened = try openFrom(&tmp, "{\"markdown\":{\"format\":\"glow -\"}}");
     defer opened.config.deinit();
     try std.testing.expectEqualStrings("glow -", opened.config.markdown.format.?);
     // The tools are untouched by a markdown format.
     try std.testing.expect(opened.config.tools.bash.format == null);
 
     // A file without one leaves the format unset, as before.
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{}" });
-    var bare = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    var bare = try openFrom(&tmp, "{}");
     defer bare.config.deinit();
     try std.testing.expect(bare.config.markdown.format == null);
 }
@@ -576,22 +559,14 @@ test "open leaves the bash format unset when the file does not set one" {
     defer tmp.cleanup();
 
     // A session saved before the setting existed has no tools at all.
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = file_name,
-        .data = "{\"max_turns\":7}",
-    });
-    var older = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    var older = try openFrom(&tmp, "{\"max_turns\":7}");
     defer older.config.deinit();
     try std.testing.expect(older.config.tools.bash.format == null);
     // The timeout the setting was added with is the default for a file without one.
     try std.testing.expectEqual(Stored.default.tools.bash.timeout_s, older.config.tools.bash.timeout_s);
 
     // A format of null is the same as not setting one.
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = file_name,
-        .data = "{\"tools\":{\"bash\":{\"format\":null}}}",
-    });
-    var explicit = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    var explicit = try openFrom(&tmp, "{\"tools\":{\"bash\":{\"format\":null}}}");
     defer explicit.config.deinit();
     try std.testing.expect(explicit.config.tools.bash.format == null);
 }
@@ -601,21 +576,13 @@ test "open reads the bash timeout from the file" {
     defer tmp.cleanup();
 
     // The timeout is set alongside the format, and each is read on its own.
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = file_name,
-        .data = "{\"tools\":{\"bash\":{\"format\":\"shfmt\",\"timeout_s\":30}}}",
-    });
-    var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    var opened = try openFrom(&tmp, "{\"tools\":{\"bash\":{\"format\":\"shfmt\",\"timeout_s\":30}}}");
     defer opened.config.deinit();
     try std.testing.expectEqual(30, opened.config.tools.bash.timeout_s);
     try std.testing.expectEqualStrings("shfmt", opened.config.tools.bash.format.?);
 
     // A file without one falls back to the default.
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = file_name,
-        .data = "{\"tools\":{\"bash\":{\"format\":\"shfmt\"}}}",
-    });
-    var bare = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    var bare = try openFrom(&tmp, "{\"tools\":{\"bash\":{\"format\":\"shfmt\"}}}");
     defer bare.config.deinit();
     try std.testing.expectEqual(Stored.default.tools.bash.timeout_s, bare.config.tools.bash.timeout_s);
 }
@@ -624,30 +591,20 @@ test "open reads the web search provider and result count from the file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = file_name,
-        .data = "{\"tools\":{\"web_search\":{\"provider\":\"tavily\",\"max_results\":3}}}",
-    });
-
-    var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    var opened = try openFrom(&tmp, "{\"tools\":{\"web_search\":{\"provider\":\"tavily\",\"max_results\":3}}}");
     defer opened.config.deinit();
     try std.testing.expectEqual(search.Provider.tavily, opened.config.tools.web_search.provider.?);
     try std.testing.expectEqual(3, opened.config.tools.web_search.max_results);
 
     // The defaults leave it off, and the count ready for a provider to be named.
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{}" });
-    var bare = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    var bare = try openFrom(&tmp, "{}");
     defer bare.config.deinit();
     try std.testing.expect(bare.config.tools.web_search.provider == null);
     try std.testing.expectEqual(Stored.default.tools.web_search.max_results, bare.config.tools.web_search.max_results);
 
     // A name that is not a backend makes the file unusable rather than reading
     // as "no search", so a typo is not silently dropped.
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = file_name,
-        .data = "{\"tools\":{\"web_search\":{\"provider\":\"google\"}}}",
-    });
-    try std.testing.expectError(error.CorruptConfig, Config.open(std.testing.io, tmp.dir, std.testing.allocator));
+    try std.testing.expectError(error.CorruptConfig, openFrom(&tmp, "{\"tools\":{\"web_search\":{\"provider\":\"google\"}}}"));
 }
 
 test "save round-trips a custom max_turns" {
@@ -727,20 +684,13 @@ test "open rejects damaged, future and unusable configurations" {
 
     // A rejected configuration frees the arena it made on the way out, so a
     // failure leaks nothing.
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{" });
-    try std.testing.expectError(error.CorruptConfig, Config.open(std.testing.io, tmp.dir, std.testing.allocator));
+    try std.testing.expectError(error.CorruptConfig, openFrom(&tmp, "{"));
 
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{\"version\":99}" });
-    try std.testing.expectError(error.UnsupportedConfigVersion, Config.open(std.testing.io, tmp.dir, std.testing.allocator));
+    try std.testing.expectError(error.UnsupportedConfigVersion, openFrom(&tmp, "{\"version\":99}"));
 
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{\"max_turns\":0}" });
-    try std.testing.expectError(error.InvalidConfig, Config.open(std.testing.io, tmp.dir, std.testing.allocator));
+    try std.testing.expectError(error.InvalidConfig, openFrom(&tmp, "{\"max_turns\":0}"));
 
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = file_name,
-        .data = "{\"tools\":{\"bash\":{\"timeout_s\":0}}}",
-    });
-    try std.testing.expectError(error.InvalidConfig, Config.open(std.testing.io, tmp.dir, std.testing.allocator));
+    try std.testing.expectError(error.InvalidConfig, openFrom(&tmp, "{\"tools\":{\"bash\":{\"timeout_s\":0}}}"));
 }
 
 test "set names a setting by its dotted path" {
