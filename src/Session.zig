@@ -365,18 +365,11 @@ pub fn name(session: *const Session) []const u8 {
 /// The conversation as a completion request carries it: the `messages` array of
 /// a request body, written straight out of the pool.
 ///
-/// A request takes one of these instead of a resolved copy of the conversation,
-/// so that sending what a session holds allocates nothing at all: the messages
-/// are written straight onto the connection, and the strings are read where they
-/// were stored rather than pointed at from a second array of slices.
-///
-/// A request carries the system prompt and then only what follows the summary of
-/// the latest compaction. A compacted session keeps its whole history, for the
-/// transcript and a resume, but the messages a compaction stands in for are not
-/// sent to the model.
-///
-/// The field order and the fields left out are the ones `llm.Message` produces,
-/// so the body is the same either way.
+/// A request takes one of these rather than a resolved copy, so sending what a
+/// session holds allocates nothing: the strings are read where they were stored.
+/// It carries the system prompt and then only what follows the latest summary,
+/// so the messages a compaction stands in for are not sent. The field order and
+/// the fields left out are `llm.Message`'s, so the body is the same either way.
 pub const Conversation = struct {
     session: *const Session,
     /// Messages written after the conversation, for a request that carries one
@@ -590,16 +583,12 @@ pub fn append(session: *Session, message: llm.Message) !void {
 }
 
 /// Adds a compaction to the conversation: the prompt that asked for it and the
-/// summary it produced. The index of the summary is recorded in `compactions`,
-/// so a request from then on starts at it and carries neither the prompt nor
-/// anything the summary stands in for, while the session keeps every message it
-/// always had.
-///
-/// The prompt is stored so the pair reads as a question and its answer, and so
-/// the transcript can show the two as one line; it is never sent to the model.
-/// The summary is a user message, so the model reads it as context handed to it
-/// rather than as something it said. The messages and the index are written out
-/// together, so the session file is never left holding half of a compaction.
+/// summary it produced. The summary's index is recorded in `compactions`, so a
+/// request from then on starts at it while the session keeps every message it
+/// always had. The prompt is kept so the transcript can show the pair as one
+/// line; the summary is a user message, so the model reads it as context handed
+/// to it rather than as something it said. Both are written out together, so the
+/// file is never left holding half of a compaction.
 pub fn appendCompaction(session: *Session, prompt: []const u8, summary: []const u8) !void {
     try session.appendMessage(.{ .role = "user", .content = prompt });
     const summary_index: u32 = @intCast(session.messages.items.len);
@@ -767,7 +756,7 @@ pub fn save(session: *Session) !void {
     try atomic.replace(session.io);
 }
 
-/// Reads the conversation of an existing session into `messages`.
+/// Reads an existing session's file into `session`.
 fn load(session: *Session) !void {
     const text = session.dir.readFileAlloc(
         session.io,
@@ -1073,24 +1062,18 @@ fn usableName(text: []const u8) bool {
 }
 
 /// The ids of the sessions in the directory at `path`, the one most recently
-/// written to first, each with its title.
+/// written to first, each with its title. Only files that could be a session are
+/// listed. The ids and titles are `gpa`'s, and the caller frees each and then the
+/// list.
 ///
-/// The order is the time each session file was last written, so the session
-/// being worked in is at the top and stays there as it grows. The time is asked
-/// of the filesystem rather than read out of the id: an id carries the time it
-/// was *made*, and sessions made before ids became ULIDs carry it in a form that
-/// does not sort against a ULID at all.
+/// The order is the time each file was last written, asked of the filesystem
+/// rather than read out of the id: an id carries the time it was *made*, and one
+/// made before ids became ULIDs does not sort against them.
 ///
-/// Only files that could be a session are listed, so a file that is not one is
-/// passed over rather than reported as a session. The ids and titles are `gpa`'s,
-/// and the caller frees each of them and then the list.
-///
-/// The directory is opened here, one handle per listing, rather than taken from
-/// the caller. Reading a directory keeps its place in the handle it was opened
-/// on, so two listings sharing one handle read over each other and each sees a
-/// part of the directory; a server with several connections asking at once needs
-/// each to have its own. Opening it here is what makes that impossible to get
-/// wrong.
+/// The directory is opened here, one handle per listing. A read holds its place
+/// in the handle it was opened on, so two listings sharing one would read over
+/// each other; the server asks from several connections at once, and this is what
+/// makes each of those impossible to get wrong.
 pub fn list(io: Io, path: []const u8, gpa: std.mem.Allocator) ![]Named {
     var dir = try Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
     defer dir.close(io);

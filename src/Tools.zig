@@ -196,19 +196,14 @@ pub fn run(tools: *Tools, call: Call, result: *Io.Writer) !void {
     }
 }
 
-/// How much of a result is gathered before it is passed on. Room for a good few
+/// How much of a result is gathered before it is passed on: room for a good few
 /// lines, so a tool that writes a line at a time does not become a call to the
 /// writer behind this for every line, while staying small enough to keep on the
 /// stack.
 ///
-/// TODO: forward more of a write in one call. What is gathered is handed on a
-/// chunk at a time, and within a chunk each slice and the repeats are handed on
-/// separately, so `print("exit code: {d}\n")` crosses into the writer behind this
-/// several times for what is one line. `writeSplatHeaderLimit` merges the slices,
-/// the repeats and a header into one call, which is the shape wanted here, but it
-/// can consume less than it was given when the writer behind it fills up, so
-/// using it means rebuilding what is left and handing that over again. Worth it
-/// only if this shows up in a profile: it is a small constant either way.
+/// TODO: `writeSplatHeaderLimit` would merge a format's slices, repeats and
+/// header into one write, but it can consume less than it was given, so using it
+/// means rebuilding what is left. Worth it only if this shows up in a profile.
 const result_buffer_len = 4096;
 
 /// A writer that gathers what is written and passes it to another writer, up to
@@ -252,9 +247,8 @@ const Limited = struct {
         // whole is handed on as the prefix of it that does.
         for (data[0 .. data.len - 1]) |bytes| try self.hand(bytes);
 
-        // The last slice is written `splat` times. The copies go over together,
-        // which is what makes the padding of a format such as `{d:>6}` one write
-        // rather than six.
+        // The copies go over together, which is what makes the padding of a
+        // format such as `{d:>6}` one write rather than six.
         try self.repeat(data[data.len - 1], splat);
 
         // Every byte handed over is consumed here, whether it was written or

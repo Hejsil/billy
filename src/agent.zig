@@ -641,24 +641,10 @@ pub fn run(
     try out.flush();
 }
 
-/// Replays a stored conversation as the blocks it was made of, so that
-/// remembering the context of an earlier run is not left to the user. The tool
-/// calls go through `Tools.parseCall` and `Tools.describe`, and the replies
-/// through `printAnswer`, the same as the ones the loop printed.
-///
-/// A prompt is headed and laid out by `printPrompt` here and in the loop alike,
-/// so a replayed one reads exactly as the one that was typed, without the `> `
-/// the input is typed behind.
-///
-/// Only the last `blocks` blocks are shown, so resuming a long session is quick
-/// rather than replaying every block it ever printed; what came before is counted
-/// on a line of its own. Zero shows the whole session. A block is one printed
-/// unit: a prompt, a reply, or a tool call with its result.
-///
-/// The conversation is read where it is stored, a message at a time, so replaying
-/// a long session costs no more than the largest message in it. `gpa` is for the
-/// scratch the parsed arguments of a call need, which is dropped between
-/// messages.
+/// Replays a stored conversation on the terminal as the blocks it was made of,
+/// so remembering the context of an earlier run is not left to the user. The
+/// blocks come from `walk`, and each is shown as the run showed it, so a
+/// replayed prompt reads as the one that was typed.
 pub fn printTranscript(
     gpa: std.mem.Allocator,
     out: *Io.Writer,

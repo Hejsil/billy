@@ -85,15 +85,9 @@ const Escaping = struct {
 
 /// Writes the markdown of a reply or a prompt as HTML.
 ///
-/// The markdown is read by md4c, a CommonMark parser (`md.zig`), and rendered
-/// here: each block, span and run of text md4c reports is turned into the HTML
-/// for it. Driving the parser rather than calling md4c's own renderer is what
-/// lets billy check a link's address before writing it -- md4c renders a
-/// `javascript:` link as a link, and a reply must not be able to make one that
-/// runs code.
-///
-/// Everything a model writes is escaped, and raw HTML is turned off
-/// (`md.flags`), so a tag in a reply is shown rather than obeyed.
+/// Driving md4c's parser rather than its own renderer is what lets billy check a
+/// link's address before writing it: md4c renders a `javascript:` link as a link,
+/// and a reply must not be able to make one that runs code.
 pub fn markdown(gpa: std.mem.Allocator, text: []const u8, out: *Io.Writer) !void {
     var render = Markdown{ .gpa = gpa, .out = out };
     var parser = Markdown.parser();

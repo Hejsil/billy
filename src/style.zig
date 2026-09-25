@@ -86,8 +86,7 @@ pub const Mark = struct {
     hue: Color,
 };
 
-/// Prints a block header: the glyph in its colour, the name in bold and, when
-/// there is one, what the block acts on, dimmed: `▸ read a.zig`.
+/// Prints a block header: `▸ read a.zig`.
 pub fn header(mark: Mark, name: []const u8, target: []const u8, style: Style, out: *Io.Writer) !void {
     try style.color(mark.hue, mark.glyph, out);
     try out.writeAll(" ");

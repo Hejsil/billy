@@ -101,8 +101,6 @@ fn historyLine(ed: *const LineEditor, index: usize) []const u8 {
     return std.mem.sliceTo(ed.strings.items[ed.history.items[index]..], 0);
 }
 
-/// Reads one line, echoing and editing it in the terminal.
-///
 /// `header` is shown on its own line above the prompt while the line is being
 /// edited. Both it and the `prompt` in front of the line belong to the editing
 /// alone: on submit the whole region is erased, leaving the cursor where it

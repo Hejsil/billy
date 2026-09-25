@@ -1,9 +1,9 @@
 //! The md4c binding: billy's whole contact with the C markdown library.
 //!
-//! md4c reads the markdown; `html.zig` drives it through the parser callbacks
-//! and writes the HTML. This module only names the library, the dialect billy
-//! reads, and how a document is handed to it, so that what is C-shaped stays
-//! here and what is HTML-shaped stays in `html.zig`.
+//! md4c reads the markdown; `html.zig` and `term.zig` drive it through the parser
+//! callbacks and write the HTML and the terminal text. This module only names the
+//! library, the dialect billy reads, and how a document is handed to it, so that
+//! what is C-shaped stays here and what is shaped for a frontend stays there.
 
 const std = @import("std");
 const Io = std.Io;
@@ -31,7 +31,7 @@ pub const flags: c_uint = c.MD_FLAG_TABLES |
 /// Reads `text`, calling `parser`'s callbacks as each block, span and run of text
 /// goes by, with `userdata` handed back to every one of them. Fails only when
 /// md4c itself does; a callback that stops the parse (by returning non-zero) is
-/// the caller's to notice, which `html.zig` uses to stop on a failed write.
+/// the caller's to notice, which a renderer uses to stop on a failed write.
 pub fn parse(text: []const u8, parser: *const c.MD_PARSER, userdata: ?*anyopaque) !void {
     if (c.md_parse(text.ptr, @intCast(text.len), parser, userdata) < 0) return error.MarkdownFailed;
 }
