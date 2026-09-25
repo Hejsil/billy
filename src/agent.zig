@@ -159,6 +159,11 @@ const Terminal = struct {
             .prompt => |text| {
                 if (self.replay) try self.out.writeAll("\n");
                 try printPrompt(self.out, text, self.display);
+                // The prompt goes out as it is typed, before the request that
+                // answers it, so what was sent is on screen while the model
+                // works. Without this it waits in the buffer until the answer
+                // or a tool call flushes it.
+                try self.out.flush();
             },
             .answer => |content| try printAnswer(self.out, content, self.display),
             // The header goes out as the call begins, so a command that runs
