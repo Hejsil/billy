@@ -146,7 +146,7 @@ fn isDeepSeekPeak(unix_seconds: u64) bool {
 }
 
 /// The host name of `url`, without the scheme, port or path.
-fn hostOf(url: []const u8) ?[]const u8 {
+pub fn hostOf(url: []const u8) ?[]const u8 {
     const after_scheme = if (std.mem.indexOf(u8, url, "://")) |i| url[i + 3 ..] else url;
     const end = std.mem.indexOfAny(u8, after_scheme, "/:") orelse after_scheme.len;
     const host = after_scheme[0..end];

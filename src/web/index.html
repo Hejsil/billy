@@ -114,7 +114,7 @@
   details.tool { margin-bottom: 16px; }
   summary.tool-head {
     color: var(--dim); font-size: 12px; cursor: pointer; list-style: none;
-    display: flex; align-items: center; gap: 6px;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
     /* One line, so a call stays a single compact row; a long description is cut
        off with an ellipsis rather than wrapping. */
     white-space: nowrap; overflow: hidden;
@@ -153,6 +153,30 @@
      gap of its own. */
   .tool-body { margin: 5px 0 0 14px; }
   .tool-body > :last-child { margin-bottom: 0; }
+
+  /* The favicon bubbles of a web search: one small round bubble per source, on
+     its own row under the head. They are in the summary, so which sources were
+     found shows whether the call is open or collapsed. Each holds the source's
+     own favicon, cropped to fill the circle, and opens it. */
+  .tool-head .favs {
+    flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 5px; margin-left: 14px;
+  }
+  .fav {
+    position: relative; width: 16px; height: 16px; border-radius: 50%; flex: none;
+    display: block; overflow: hidden; background: var(--line); text-decoration: none;
+  }
+  /* The letter sits behind the icon, so a source with no favicon still reads as a
+     small bubble with its initial rather than a broken image: the icon covers it
+     when it loads, and removes itself when it does not. */
+  .fav .letter {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: var(--dim); font-size: 9px; font-weight: 600; text-transform: uppercase; line-height: 1;
+  }
+  .fav img {
+    position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block;
+  }
+  .fav:hover img { filter: brightness(1.3); }
+  .fav:hover .letter { color: var(--text); }
   pre.diff .removed { color: var(--del); }
   pre.diff .added { color: var(--add); }
   pre.diff .context, pre.diff .elided { color: var(--dim); }

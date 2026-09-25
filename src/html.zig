@@ -18,6 +18,7 @@ const agent = @import("agent.zig");
 const diffing = @import("diff.zig");
 const md = @import("md.zig");
 const models = @import("models.zig");
+const search = @import("search.zig");
 const Session = @import("Session.zig");
 const Tools = @import("Tools.zig");
 
@@ -953,7 +954,7 @@ fn pill(status: Status, out: *Io.Writer) !void {
 /// its name, the pill of its status when it has one, and what the call acted on.
 /// A collapsed call shows this line and nothing else, so it says which tool ran,
 /// what it ran on, and whether it worked.
-fn toolSummary(call: Tools.Call, status: ?Status, out: *Io.Writer) !void {
+fn toolSummary(call: Tools.Call, result: []const u8, status: ?Status, out: *Io.Writer) !void {
     const head = Tools.Heading.of(call);
     try out.writeAll("<summary class=\"tool-head\">");
     try out.print("<span class=\"glyph hue-{s}\">", .{@tagName(head.hue)});
@@ -977,7 +978,73 @@ fn toolSummary(call: Tools.Call, status: ?Status, out: *Io.Writer) !void {
         try escape(target, out);
         try out.writeAll("</span>");
     }
+    // A web search shows the sources it found as favicons, on their own row under
+    // the head. They are part of the summary, so a page shows them whether the
+    // call is open or collapsed.
+    if (call == .web_search) try favicons(result, out);
     try out.writeAll("</summary>\n");
+}
+
+/// Writes the favicons of a web search: one small round bubble per result,
+/// holding the source's own favicon and opening its url. They sit in the
+/// summary, so a page shows which sources were found without expanding the call.
+///
+/// A bubble is written only for a result with an `http(s)` address, since the
+/// favicon is fetched from its host and the bubble opens it. A result billy
+/// cannot link to is left to the body, and nothing is written at all for text
+/// that is not a list of results, such as a search that matched nothing.
+fn favicons(result: []const u8, out: *Io.Writer) !void {
+    if (!hasFavicon(result)) return;
+    try out.writeAll("<span class=\"favs\">");
+    var origin_buffer: [256]u8 = undefined;
+    var results = search.parseResults(result);
+    while (results.next()) |found| {
+        const origin = originOf(found.url, &origin_buffer) orelse continue;
+        try favicon(found, origin, out);
+    }
+    try out.writeAll("</span>");
+}
+
+/// Whether any result of `result` has an `http(s)` address, and so a favicon to
+/// show. The span of bubbles is only opened when there is one, so a search that
+/// yielded none leaves no empty element behind.
+fn hasFavicon(result: []const u8) bool {
+    var origin_buffer: [256]u8 = undefined;
+    var results = search.parseResults(result);
+    while (results.next()) |found| {
+        if (originOf(found.url, &origin_buffer) != null) return true;
+    }
+    return false;
+}
+
+/// Writes one favicon bubble: the source's favicon, filling the round bubble and
+/// cropping to it, with the source's first letter behind it so a site that has no
+/// favicon still reads as a small bubble rather than a broken image. The host is
+/// the bubble's tooltip, and the whole bubble opens the result.
+fn favicon(found: search.Found, origin: []const u8, out: *Io.Writer) !void {
+    const host = models.hostOf(found.url) orelse return;
+    try out.writeAll("<a class=\"fav\" href=\"");
+    try escape(found.url, out);
+    try out.writeAll("\" title=\"");
+    try escape(host, out);
+    try out.writeAll("\" target=\"_blank\" rel=\"noopener noreferrer\" onclick=\"event.stopPropagation()\">");
+    try out.writeAll("<span class=\"letter\">");
+    try escape(host[0..1], out);
+    try out.writeAll("</span><img src=\"");
+    try escape(origin, out);
+    try out.writeAll("/favicon.ico\" alt=\"\" onerror=\"this.remove()\"></a>");
+}
+
+/// The origin of `url` -- its scheme and host, without the path -- written into
+/// `buffer`, or null when it is not an `http(s)` address with a host. A result's
+/// favicon is fetched from its origin, so a bubble only makes sense for a result
+/// whose origin is one billy will fetch from.
+fn originOf(url: []const u8, buffer: []u8) ?[]const u8 {
+    const sep = std.mem.indexOf(u8, url, "://") orelse return null;
+    const scheme = url[0..sep];
+    if (!std.ascii.eqlIgnoreCase(scheme, "http") and !std.ascii.eqlIgnoreCase(scheme, "https")) return null;
+    const host = models.hostOf(url) orelse return null;
+    return std.fmt.bufPrint(buffer, "{s}://{s}", .{ scheme, host }) catch null;
 }
 
 /// Writes the body of a tool call: what a page shows once the call is expanded.
@@ -1060,8 +1127,9 @@ pub fn block(gpa: std.mem.Allocator, b: agent.Block, out: *Io.Writer) !void {
             try out.writeAll("<details class=\"tool\">");
             // A call still running shows a grey pill with an ellipsis, which the
             // result replaces with the status when it arrives. Only bash has a
-            // status, so any other tool shows no pill.
-            try toolSummary(call, if (hasStatus(call)) .running else null, out);
+            // status, so any other tool shows no pill. A call has no result yet,
+            // so a search shows no favicons while it runs.
+            try toolSummary(call, "", if (hasStatus(call)) .running else null, out);
             try out.writeAll("<div class=\"tool-body\"></div></details>\n");
         },
         .tool_end => |tool| {
@@ -1070,7 +1138,7 @@ pub fn block(gpa: std.mem.Allocator, b: agent.Block, out: *Io.Writer) !void {
             else
                 null;
             try out.writeAll("<details class=\"tool\">");
-            try toolSummary(tool.call, status, out);
+            try toolSummary(tool.call, tool.result, status, out);
             try out.writeAll("<div class=\"tool-body\">");
             try toolBody(gpa, tool.call, tool.result, out);
             try out.writeAll("</div></details>\n");
@@ -1243,7 +1311,7 @@ test "a bash call shows its command, and a write shows what it wrote" {
         .name = "bash",
         .arguments = "{\"command\":\"ls -la <x>\"}",
     } });
-    try toolSummary(bash, null, &out.writer);
+    try toolSummary(bash, "", null, &out.writer);
     try toolBody(arena, bash, "some output", &out.writer);
     // The command is escaped like any other text, and its trailing newline does
     // not add a blank line; the result follows it in the same body. The head
@@ -1264,7 +1332,7 @@ test "a bash call shows its command, and a write shows what it wrote" {
         .name = "bash",
         .arguments = "{\"command\":\"cd /tmp\\nls\"}",
     } });
-    try toolSummary(multi, null, &out.writer);
+    try toolSummary(multi, "", null, &out.writer);
     try std.testing.expectEqualStrings(
         "<summary class=\"tool-head\"><span class=\"glyph hue-cyan\">❯</span> " ++
             "<span class=\"name\">bash</span> <span class=\"target\">cd /tmp</span></summary>\n",
@@ -1278,7 +1346,7 @@ test "a bash call shows its command, and a write shows what it wrote" {
         .name = "bash",
         .arguments = "{\"command\":\"cargo test --all\",\"description\":\"run the test suite\"}",
     } });
-    try toolSummary(described, null, &out.writer);
+    try toolSummary(described, "", null, &out.writer);
     try std.testing.expectEqualStrings(
         "<summary class=\"tool-head\"><span class=\"glyph hue-cyan\">❯</span> " ++
             "<span class=\"name\">bash</span> <span class=\"target\">run the test suite</span></summary>\n",
@@ -1304,6 +1372,71 @@ test "a bash call shows its command, and a write shows what it wrote" {
     );
 }
 
+test "a web search shows its sources as favicons in the summary" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    const call = Tools.parse(arena, .{ .id = "1", .function = .{
+        .name = "web_search",
+        .arguments = "{\"query\":\"zig lang\"}",
+    } });
+
+    // The results as the search wrote them, parsed back into one bubble per
+    // source. A bubble holds the source's own favicon, is titled by its host and
+    // opens it in a new tab, and the letter behind the icon is there for a source
+    // whose favicon does not load.
+    try block(gpa, .{ .tool_end = .{
+        .call = call,
+        .result = "1. Zig\n   https://ziglang.org\n   A language.\n\n2. Docs\n   https://ziglang.org/documentation\n",
+    } }, &out.writer);
+    try std.testing.expectEqualStrings(
+        "<details class=\"tool\"><summary class=\"tool-head\">" ++
+            "<span class=\"glyph hue-magenta\">⌕</span> <span class=\"name\">web_search</span>" ++
+            " <span class=\"target\">zig lang</span>" ++
+            "<span class=\"favs\">" ++
+            "<a class=\"fav\" href=\"https://ziglang.org\" title=\"ziglang.org\"" ++
+            " target=\"_blank\" rel=\"noopener noreferrer\" onclick=\"event.stopPropagation()\">" ++
+            "<span class=\"letter\">z</span><img src=\"https://ziglang.org/favicon.ico\"" ++
+            " alt=\"\" onerror=\"this.remove()\"></a>" ++
+            "<a class=\"fav\" href=\"https://ziglang.org/documentation\" title=\"ziglang.org\"" ++
+            " target=\"_blank\" rel=\"noopener noreferrer\" onclick=\"event.stopPropagation()\">" ++
+            "<span class=\"letter\">z</span><img src=\"https://ziglang.org/favicon.ico\"" ++
+            " alt=\"\" onerror=\"this.remove()\"></a>" ++
+            "</span></summary>\n" ++
+            "<div class=\"tool-body\"><pre class=\"result\">1. Zig\n   https://ziglang.org\n   A language.\n\n" ++
+            "2. Docs\n   https://ziglang.org/documentation</pre>\n</div></details>\n",
+        out.written(),
+    );
+}
+
+test "a search with nothing to link to shows no favicons" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    const call = Tools.parse(arena, .{ .id = "1", .function = .{
+        .name = "web_search",
+        .arguments = "{\"query\":\"nothing\"}",
+    } });
+
+    // A search that matched nothing, and one whose only result is not an `http(s)`
+    // address, both leave no bubbles -- and no empty span behind them.
+    for ([_][]const u8{ "(no results)", "1. Odd\n   javascript:alert(1)\n" }) |result| {
+        try block(gpa, .{ .tool_end = .{ .call = call, .result = result } }, &out.writer);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "favs") == null);
+        out.clearRetainingCapacity();
+    }
+}
+
 test "an edit is shown as the diff of the strings it worked on" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -1317,7 +1450,7 @@ test "an edit is shown as the diff of the strings it worked on" {
         .name = "edit",
         .arguments = "{\"path\":\"a.zig\",\"old_string\":\"old\",\"new_string\":\"new\"}",
     } });
-    try toolSummary(edit, null, &out.writer);
+    try toolSummary(edit, "", null, &out.writer);
     // The diff is the body, and the result of the edit shows nothing of its own
     // -- it would only repeat the diff.
     try toolBody(arena, edit, "replaced 1 occurrence(s) in a.zig", &out.writer);
