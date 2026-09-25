@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const Mock = @import("mock.zig");
 
 /// The backends billy can search with. The name is what the configuration holds,
 /// stored as the variant itself so an unknown name is refused when the file is
@@ -177,77 +178,21 @@ test "a query that matched nothing says so" {
     try std.testing.expectEqualStrings("(no results)", text);
 }
 
-/// Stands in for the backend over a real socket: it records what the client put
-/// on the connection and answers with a fixed Tavily-shaped body. A live
-/// connection is the only way to see the request the client actually sends.
-const TestBackend = struct {
-    /// The request body as it arrived, owned by `std.testing.allocator`.
-    body: ?[]u8 = null,
-    /// The authorization header as it arrived, owned by `std.testing.allocator`.
-    authorization: ?[]u8 = null,
-    /// The first failure the server ran into, so the test reports it rather than
-    /// the connection simply hanging.
-    err: ?anyerror = null,
+test "a tavily search posts the query and reads the results back" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
 
+    // A backend standing in for Tavily, answering with a fixed reply and
+    // recording what it was sent.
     const reply =
         \\{"query":"zig lang","results":[
         \\ {"title":"Zig Programming Language","url":"https://ziglang.org","content":"A language."},
         \\ {"title":"Docs","url":"https://ziglang.org/documentation","content":""}]}
     ;
-
-    fn serve(io: Io, listener: *std.Io.net.Server, self: *TestBackend) Io.Cancelable!void {
-        self.run(io, listener) catch |err| {
-            self.err = err;
-        };
-    }
-
-    fn run(self: *TestBackend, io: Io, listener: *std.Io.net.Server) !void {
-        var stream = try listener.accept(io);
-        defer stream.close(io);
-
-        var in_buffer: [4096]u8 = undefined;
-        var out_buffer: [4096]u8 = undefined;
-        var reader = stream.reader(io, &in_buffer);
-        var writer = stream.writer(io, &out_buffer);
-        var server: std.http.Server = .init(&reader.interface, &writer.interface);
-
-        var request = try server.receiveHead();
-        var headers = request.iterateHeaders();
-        while (headers.next()) |header| {
-            if (std.ascii.eqlIgnoreCase(header.name, "authorization")) {
-                self.authorization = try std.testing.allocator.dupe(u8, header.value);
-            }
-        }
-
-        var body_buffer: [4096]u8 = undefined;
-        const body_reader = request.readerExpectNone(&body_buffer);
-        self.body = try body_reader.allocRemaining(std.testing.allocator, .unlimited);
-
-        try request.respond(reply, .{ .keep_alive = false });
-    }
-};
-
-test "a tavily search posts the query and reads the results back" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    var listener = try address.listen(io, .{ .reuse_address = true });
-    defer listener.deinit(io);
-
-    var backend: TestBackend = .{};
-    defer {
-        if (backend.body) |body| gpa.free(body);
-        if (backend.authorization) |authorization| gpa.free(authorization);
-    }
-
+    var mock = try Mock.start(gpa, io, "/search", 1, Mock.fixed(reply));
+    defer mock.deinit(io);
     var group: Io.Group = .init;
-    try group.concurrent(io, TestBackend.serve, .{ io, &listener, &backend });
-
-    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/search", .{
-        listener.socket.address.getPort(),
-    });
-    defer gpa.free(endpoint);
+    try group.concurrent(io, Mock.serve, .{ io, &mock });
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -264,17 +209,17 @@ test "a tavily search posts the query and reads the results back" {
     // reports anything not freed.
     var reply_state = std.heap.ArenaAllocator.init(gpa);
     defer reply_state.deinit();
-    const text = try client.tavily(reply_state.allocator(), "zig lang", endpoint, 3);
+    const text = try client.tavily(reply_state.allocator(), "zig lang", mock.url, 3);
     try group.await(io);
-    if (backend.err) |err| return err;
+    if (mock.err) |err| return err;
 
     // The query and the count went out as Tavily's body, the key as a bearer
     // token, and the reply became the numbered list the model reads.
     try std.testing.expectEqualStrings(
         "{\"query\":\"zig lang\",\"max_results\":3,\"search_depth\":\"basic\",\"include_answer\":false}",
-        backend.body.?,
+        mock.bodies.items[0],
     );
-    try std.testing.expectEqualStrings("Bearer secret", backend.authorization.?);
+    try std.testing.expectEqualStrings("Bearer secret", mock.authorization.?);
     try std.testing.expectEqualStrings(
         "1. Zig Programming Language\nhttps://ziglang.org\nA language.\n\n" ++
             "2. Docs\nhttps://ziglang.org/documentation\n",
