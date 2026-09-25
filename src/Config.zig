@@ -440,27 +440,30 @@ pub fn defaultDir(gpa: std.mem.Allocator, environ: *const std.process.Environ.Ma
 }
 
 test "defaultDir follows the XDG base directory specification" {
-    const arena = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(arena);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
+    const gpa = std.testing.allocator;
 
-    var environ: std.process.Environ.Map = .init(arena);
+    var environ: std.process.Environ.Map = .init(gpa);
     defer environ.deinit();
 
-    try std.testing.expectError(error.HomeNotSet, defaultDir(allocator, &environ));
+    try std.testing.expectError(error.HomeNotSet, defaultDir(gpa, &environ));
 
     try environ.put("HOME", "/home/user");
-    try std.testing.expectEqualStrings("/home/user/.config/billy", try defaultDir(allocator, &environ));
+    try expectDir("/home/user/.config/billy", try defaultDir(gpa, &environ), gpa);
 
     try environ.put("XDG_CONFIG_HOME", "/config");
-    try std.testing.expectEqualStrings("/config/billy", try defaultDir(allocator, &environ));
+    try expectDir("/config/billy", try defaultDir(gpa, &environ), gpa);
 
     // An empty or relative XDG_CONFIG_HOME is ignored.
     try environ.put("XDG_CONFIG_HOME", "");
-    try std.testing.expectEqualStrings("/home/user/.config/billy", try defaultDir(allocator, &environ));
+    try expectDir("/home/user/.config/billy", try defaultDir(gpa, &environ), gpa);
     try environ.put("XDG_CONFIG_HOME", "relative");
-    try std.testing.expectEqualStrings("/home/user/.config/billy", try defaultDir(allocator, &environ));
+    try expectDir("/home/user/.config/billy", try defaultDir(gpa, &environ), gpa);
+}
+
+/// Checks a path `defaultDir` built, freeing it: the caller owns what it returns.
+fn expectDir(expected: []const u8, actual: []const u8, gpa: std.mem.Allocator) !void {
+    defer gpa.free(actual);
+    try std.testing.expectEqualStrings(expected, actual);
 }
 
 test "open writes the defaults when the file is missing" {
@@ -672,9 +675,8 @@ test "the file is indented, so it can be read and edited by hand" {
     config.max_turns = 3;
     try config.save(std.testing.io, tmp.dir);
 
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const text = try tmp.dir.readFileAlloc(std.testing.io, file_name, arena_state.allocator(), .limited(max_config_bytes));
+    const text = try tmp.dir.readFileAlloc(std.testing.io, file_name, gpa, .limited(max_config_bytes));
+    defer gpa.free(text);
     try std.testing.expectEqualStrings(
         \\{
         \\  "version": 1,
