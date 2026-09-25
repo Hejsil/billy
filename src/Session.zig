@@ -417,6 +417,12 @@ pub const Conversation = struct {
 
 /// Writes one message as the `messages` array of a request holds it, with every
 /// string read out of the pool.
+///
+/// The field order is `llm.Message`'s, so a request built from the session is
+/// the bytes the resolved conversation would send. The session file uses the
+/// same function, so the stored form and the sent form cannot drift, and a
+/// message never carries both a call and its own id, so the single order serves
+/// both.
 fn writeMessage(session: *const Session, json: anytype, message: Message) !void {
     try json.beginObject();
     try json.objectField("role");
@@ -431,21 +437,7 @@ fn writeMessage(session: *const Session, json: anytype, message: Message) !void 
     if (calls.len > 0) {
         try json.objectField("tool_calls");
         try json.beginArray();
-        for (calls) |call| {
-            try json.beginObject();
-            try json.objectField("id");
-            try json.write(session.string(call.id) orelse "");
-            try json.objectField("type");
-            try json.write(session.string(call.type) orelse "");
-            try json.objectField("function");
-            try json.beginObject();
-            try json.objectField("name");
-            try json.write(session.string(call.function.name) orelse "");
-            try json.objectField("arguments");
-            try json.write(session.string(call.function.arguments) orelse "");
-            try json.endObject();
-            try json.endObject();
-        }
+        for (calls) |call| try json.write(call.resolve(session));
         try json.endArray();
     }
 
@@ -749,32 +741,7 @@ pub fn save(session: *Session) !void {
     }
     try json.objectField("messages");
     try json.beginArray();
-    for (session.messages.items) |message| {
-        try json.beginObject();
-        if (session.string(message.role)) |role| {
-            try json.objectField("role");
-            try json.write(role);
-        }
-        if (session.string(message.content)) |content| {
-            try json.objectField("content");
-            try json.write(content);
-        }
-        if (session.string(message.tool_call_id)) |tool_call_id| {
-            try json.objectField("tool_call_id");
-            try json.write(tool_call_id);
-        }
-
-        const tool_calls = message.tool_calls.resolve(session);
-        if (tool_calls.len != 0) {
-            try json.objectField("tool_calls");
-            try json.beginArray();
-            for (tool_calls) |tool_call| {
-                try json.write(tool_call.resolve(session));
-            }
-            try json.endArray();
-        }
-        try json.endObject();
-    }
+    for (session.messages.items) |message| try writeMessage(session, &json, message);
     try json.endArray();
     // The indices of the compaction summaries, sorted, so a resume knows where
     // the conversation a request carries begins.
