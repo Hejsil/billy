@@ -28,6 +28,11 @@ pub const Config = struct {
     cwd: []const u8,
     /// Home directory, so the header can shorten a path inside it; null when unset.
     home: ?[]const u8,
+    /// Directory holding the user's own instructions file, read into every
+    /// session's prompt ahead of the project's; null in a test, or when there is
+    /// no such file. Borrowed from the setup, which owns it and outlives the
+    /// runner, so nothing here closes it.
+    user_instructions_dir: ?Io.Dir = null,
     /// What is known about the provider and model: the context window and the
     /// prices. Null for a model billy does not know, in which case the header
     /// leaves out the context gauge and the cost.
@@ -283,6 +288,19 @@ fn projectInstructions(io: Io, gpa: std.mem.Allocator, dir: Io.Dir) !?[]const u8
     }
 }
 
+/// The user's own instructions, read from the configuration directory alone and
+/// null when it holds none. Unlike the project's there is no parent to walk up
+/// to: the configuration directory is a single directory, wherever it is, so
+/// this is one read.
+///
+/// They join every session's prompt, ahead of the project's own, so a rule that
+/// holds everywhere is set once rather than copied into each project.
+///
+/// The result is owned by `gpa`; the caller frees it once the prompt is built.
+fn globalInstructions(io: Io, gpa: std.mem.Allocator, dir: Io.Dir) !?[]const u8 {
+    return instructionsIn(io, gpa, dir, &instruction_files, "The user's");
+}
+
 /// Whether `dir` holds an entry named `name`.
 fn dirHas(io: Io, dir: Io.Dir, name: []const u8) bool {
     _ = dir.statFile(io, name, .{}) catch return false;
@@ -494,12 +512,17 @@ pub const Runner = struct {
     /// resume, so the request sent then matches the earlier run byte for byte and
     /// hits the prompt cache. Both are therefore set only on a session that has
     /// neither, so a new session gets the current ones while a resumed one keeps
-    /// what it was saved with. The project's own instructions are read from the
-    /// session's directory and are part of the prompt, so they are sent with
-    /// every request.
+    /// what it was saved with. The user's instructions are read from the
+    /// configuration directory and the project's from the session's directory,
+    /// and both are part of the prompt, so they are sent with every request.
     pub fn prepare(runner: *Runner, session: *Session) !void {
         if (!session.hasSystemPrompt()) {
-            const prompt_text = try leadPrompt(runner.io, runner.gpa, runner.work_dir);
+            const prompt_text = try leadPrompt(
+                runner.io,
+                runner.gpa,
+                runner.work_dir,
+                runner.config.user_instructions_dir,
+            );
             defer runner.gpa.free(prompt_text);
             try session.setSystemPrompt(prompt_text);
         }
@@ -526,6 +549,7 @@ pub const Runner = struct {
             runner.io,
             runner.gpa,
             runner.work_dir,
+            runner.config.user_instructions_dir,
             runner.tool_set.definitions(),
             session,
         ) catch |err| std.log.warn("could not refresh the prompt and tools: {s}", .{@errorName(err)});
@@ -828,7 +852,7 @@ fn turn(
                 break :blk false;
             };
             if (compacted) {
-                refreshLead(io, tool_set.gpa, tool_set.dir, tool_set.definitions(), session) catch |err|
+                refreshLead(io, tool_set.gpa, tool_set.dir, config.user_instructions_dir, tool_set.definitions(), session) catch |err|
                     std.log.warn("could not refresh the prompt and tools: {s}", .{@errorName(err)});
             }
         }
@@ -884,22 +908,35 @@ fn turn(
     try emitter.show(.{ .notice = stopped });
 }
 
-/// The system prompt a session runs with: billy's own, and the project's
-/// instructions when it has any, which are read from the session's directory and
-/// are part of the prompt. The caller owns the text and frees it.
-fn leadPrompt(io: Io, gpa: std.mem.Allocator, dir: Io.Dir) ![]u8 {
-    const instructions = try projectInstructions(io, gpa, dir);
-    defer if (instructions) |text| gpa.free(text);
-    if (instructions) |text|
-        return std.fmt.allocPrint(gpa, "{s}\n\n{s}", .{ system_prompt, text });
-    return gpa.dupe(u8, system_prompt);
+/// The system prompt a session runs with: billy's own, the user's own
+/// instructions when the configuration directory holds any, and the project's
+/// instructions when it has them, which are read from the session's directory.
+/// The user's come first, then the project's, so the more particular rules are
+/// read last.
+///
+/// All of it is the prompt rather than the conversation, so it is sent with every
+/// request and survives whatever context trimming happens later. That is what
+/// keeps the rules the user and the project care about from being dropped
+/// partway through a long session. The caller owns the text and frees it.
+fn leadPrompt(io: Io, gpa: std.mem.Allocator, dir: Io.Dir, user_dir: ?Io.Dir) ![]u8 {
+    const user = if (user_dir) |config_dir| try globalInstructions(io, gpa, config_dir) else null;
+    defer if (user) |text| gpa.free(text);
+    const project = try projectInstructions(io, gpa, dir);
+    defer if (project) |text| gpa.free(text);
+
+    var text: std.Io.Writer.Allocating = .init(gpa);
+    errdefer text.deinit();
+    try text.writer.writeAll(system_prompt);
+    if (user) |instructions| try text.writer.print("\n\n{s}", .{instructions});
+    if (project) |instructions| try text.writer.print("\n\n{s}", .{instructions});
+    return text.toOwnedSlice();
 }
 
 /// Refreshes the prompt and the tools a session opens its requests with, so a
-/// session that has been running a while picks up a changed prompt, project
-/// instructions or tool set. The refreshed session is written out, since a
-/// compaction is the only caller and the file has just been rewritten with the
-/// summary.
+/// session that has been running a while picks up a changed prompt, the user's
+/// instructions, the project's instructions or tool set. The refreshed session is
+/// written out, since a compaction is the only caller and the file has just been
+/// rewritten with the summary.
 ///
 /// This runs after a compaction, which is the one moment replacing the front of a
 /// request costs no cache that was not already being thrown away: the
@@ -910,10 +947,11 @@ fn refreshLead(
     io: Io,
     gpa: std.mem.Allocator,
     dir: Io.Dir,
+    user_dir: ?Io.Dir,
     definitions: []const Session.Definition,
     session: *Session,
 ) !void {
-    const prompt_text = try leadPrompt(io, gpa, dir);
+    const prompt_text = try leadPrompt(io, gpa, dir, user_dir);
     defer gpa.free(prompt_text);
     try session.setSystemPrompt(prompt_text);
     try session.setTools(definitions);
@@ -1732,6 +1770,105 @@ test "the nearest instructions win over an ancestor's" {
     try std.testing.expect(std.mem.endsWith(u8, text, "inner"));
 }
 
+test "the user's instructions are read from the configuration directory" {
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "Be terse.\n" });
+
+    const text = (try globalInstructions(std.testing.io, gpa, tmp.dir)).?;
+    defer gpa.free(text);
+    // The heading names the user rather than the project, so the two sections of
+    // a prompt read apart.
+    try std.testing.expectEqualStrings(
+        "The user's instructions follow, read from AGENTS.md.\n\nBe terse.",
+        text,
+    );
+}
+
+test "the user's instructions are read from the directory alone, not above it" {
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A file above the directory handed in is not found: the configuration
+    // directory is read on its own, with no project above it to walk up to.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "outer" });
+    try tmp.dir.createDirPath(std.testing.io, "nested");
+    var nested = try tmp.dir.openDir(std.testing.io, "nested", .{});
+    defer nested.close(std.testing.io);
+
+    try std.testing.expect((try globalInstructions(std.testing.io, gpa, nested)) == null);
+}
+
+test "a user's instructions file that is missing or empty is not used" {
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.testing.expect((try globalInstructions(std.testing.io, gpa, tmp.dir)) == null);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "  \n\n" });
+    try std.testing.expect((try globalInstructions(std.testing.io, gpa, tmp.dir)) == null);
+}
+
+test "the prompt is billy's own, the user's instructions, then the project's" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Two directories: the configuration one holding the user's file, and the
+    // project one the session works in, which is separate so neither search can
+    // wander into the other.
+    var config = std.testing.tmpDir(.{});
+    defer config.cleanup();
+    var project = std.testing.tmpDir(.{});
+    defer project.cleanup();
+    // A repository root, so the project search stops here rather than walking up
+    // into whatever holds the test's temporary directory.
+    try project.dir.createDirPath(io, ".git");
+
+    // With neither file, the prompt is billy's own text alone.
+    {
+        const text = try leadPrompt(io, gpa, project.dir, config.dir);
+        defer gpa.free(text);
+        try std.testing.expectEqualStrings(system_prompt, text);
+    }
+
+    // The user's instructions are read from the configuration directory and
+    // joined after billy's own text, with no project file needed for them.
+    try config.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "USER RULES" });
+    {
+        const text = try leadPrompt(io, gpa, project.dir, config.dir);
+        defer gpa.free(text);
+        try std.testing.expectEqualStrings(
+            system_prompt ++ "\n\nThe user's instructions follow, read from AGENTS.md.\n\nUSER RULES",
+            text,
+        );
+    }
+
+    // The project's follow the user's, so the more particular rules are read
+    // last, and all three are there.
+    try project.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "PROJECT RULES" });
+    {
+        const text = try leadPrompt(io, gpa, project.dir, config.dir);
+        defer gpa.free(text);
+        const user = std.mem.indexOf(u8, text, "USER RULES") orelse return error.TestUnexpectedResult;
+        const local = std.mem.indexOf(u8, text, "PROJECT RULES") orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOf(u8, text, system_prompt) != null);
+        try std.testing.expect(user < local);
+    }
+
+    // A project on its own still works, when the configuration holds no file.
+    try config.dir.deleteFile(io, "AGENTS.md");
+    {
+        const text = try leadPrompt(io, gpa, project.dir, null);
+        defer gpa.free(text);
+        try std.testing.expect(std.mem.indexOf(u8, text, "PROJECT RULES") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "USER RULES") == null);
+    }
+}
+
 test "sameDir tells a directory from its parent and root from itself" {
     const io = std.testing.io;
 
@@ -1959,7 +2096,7 @@ test "refreshLead replaces the prompt, the project instructions and the tools" {
     try session.setSystemPrompt("OLD PROMPT");
     try session.setTools(&old_tools);
 
-    try refreshLead(io, gpa, tmp.dir, &new_tools, &session);
+    try refreshLead(io, gpa, tmp.dir, null, &new_tools, &session);
 
     // The prompt is the current one: billy's own text with the project's
     // instructions after it, and none of the old prompt left.
@@ -1981,6 +2118,40 @@ test "refreshLead replaces the prompt, the project instructions and the tools" {
     defer resumed.deinit();
     try std.testing.expectEqualStrings(prompt_text, resumed.systemPrompt().?);
     try std.testing.expectEqual(2, resumed.tools.len);
+}
+
+test "prepare gives a fresh session the user's instructions from the configuration" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // The configuration directory holds the user's file; the session works
+    // elsewhere, so the instructions can only have come from the configuration.
+    var config_dir = std.testing.tmpDir(.{});
+    defer config_dir.cleanup();
+    try config_dir.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "USER RULES" });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+    var config = testConfig("m", "/work", null);
+    config.user_instructions_dir = config_dir.dir;
+    // `Runner.init` opens the directory it works in, so it has to be one that
+    // exists; the session's recorded directory is separate.
+    const work_dir = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(work_dir);
+    var runner = try Runner.init(io, gpa, config, work_dir, &http);
+    defer runner.deinit();
+
+    try runner.prepare(&session);
+
+    // The prompt the session runs with carries the user's instructions, so the
+    // configuration directory is read for every session and not only a project.
+    try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, system_prompt) != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, "USER RULES") != null);
 }
 
 test "the terminal shows a tool call the way a replay does" {

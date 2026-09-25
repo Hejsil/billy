@@ -199,6 +199,10 @@ pub fn agentConfig(setup: *const Setup, cwd: []const u8, style: styling.Style) a
         .bash_timeout_s = settings.tools.bash.timeout_s,
         .cwd = cwd,
         .home = setup.environ.get("HOME"),
+        // The user's own instructions, which live beside the configuration and
+        // join every session's prompt. The setup owns the directory and outlives
+        // every runner built from this.
+        .user_instructions_dir = setup.config_dir,
         .model_info = models.lookup(models.Provider.fromUrl(setup.base_url), setup.model),
         .compact_at = settings.compact_at,
         .title = settings.title,
