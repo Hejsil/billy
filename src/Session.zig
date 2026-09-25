@@ -1275,15 +1275,6 @@ const Ordering = struct {
     }
 };
 
-/// Whether the session `id` has a file in `dir`: whether it has been written
-/// out yet, which a session handed out but not yet asked anything has not.
-pub fn exists(dir: Io.Dir, io: Io, session_id: []const u8) bool {
-    var buffer: [max_id_len + extension.len]u8 = undefined;
-    const file = fileName(session_id, &buffer) orelse return false;
-    _ = dir.statFile(io, file, .{}) catch return false;
-    return true;
-}
-
 /// The name of the session file for `session_id`, written into `buffer`, or null
 /// when it could not name a session.
 fn fileName(session_id: []const u8, buffer: []u8) ?[]const u8 {

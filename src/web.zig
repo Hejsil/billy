@@ -133,16 +133,12 @@ const Registry = struct {
     io: Io,
     gpa: std.mem.Allocator,
     mutex: Io.Mutex = .init,
-    /// The ids of sessions handed out but not written yet, oldest first.
-    reserved: std.ArrayListUnmanaged([]const u8) = .empty,
     /// The ids of sessions a turn is running for right now, each with the id
     /// that names it owned as the key. A session can only be asked one thing at
     /// a time, so a second ask while one runs is refused.
     busy: std.StringHashMapUnmanaged(void) = .empty,
 
     fn deinit(registry: *Registry) void {
-        for (registry.reserved.items) |id| registry.gpa.free(id);
-        registry.reserved.deinit(registry.gpa);
         var running = registry.busy.keyIterator();
         while (running.next()) |id| registry.gpa.free(id.*);
         registry.busy.deinit(registry.gpa);
@@ -172,61 +168,6 @@ const Registry = struct {
         registry.mutex.lockUncancelable(registry.io);
         defer registry.mutex.unlock(registry.io);
         if (registry.busy.fetchRemove(id)) |removed| registry.gpa.free(removed.key);
-    }
-
-    /// Records `id` as a session that has been handed out and has no file yet.
-    fn reserve(registry: *Registry, id: []const u8) !void {
-        const owned = try registry.gpa.dupe(u8, id);
-        errdefer registry.gpa.free(owned);
-
-        registry.mutex.lockUncancelable(registry.io);
-        defer registry.mutex.unlock(registry.io);
-        try registry.reserved.append(registry.gpa, owned);
-    }
-
-    /// Whether `id` is one handed out but not written yet.
-    fn isReserved(registry: *Registry, id: []const u8) bool {
-        registry.mutex.lockUncancelable(registry.io);
-        defer registry.mutex.unlock(registry.io);
-        for (registry.reserved.items) |held| {
-            if (std.mem.eql(u8, held, id)) return true;
-        }
-        return false;
-    }
-
-    /// Adds the reserved ids that have no file yet to `sessions`, oldest first,
-    /// and forgets the ones that do.
-    ///
-    /// A session that has been asked something is written out, so it is listed
-    /// from disk like every other; keeping it reserved as well would list it
-    /// twice. Forgetting it is also what keeps the reserved list from growing
-    /// without bound as sessions are started.
-    ///
-    /// The ids are borrowed, which is safe because a reserved id is never freed
-    /// while it is listed and the lock is held for the walk.
-    fn takeReserved(
-        registry: *Registry,
-        dir: Io.Dir,
-        io: Io,
-        sessions: *std.ArrayList(Listed),
-        gpa: std.mem.Allocator,
-    ) !void {
-        registry.mutex.lockUncancelable(registry.io);
-        defer registry.mutex.unlock(registry.io);
-
-        var index: usize = 0;
-        while (index < registry.reserved.items.len) {
-            const id = registry.reserved.items[index];
-            if (Session.exists(dir, io, id)) {
-                // Written out, so it is listed from disk and no longer reserved.
-                registry.gpa.free(id);
-                _ = registry.reserved.orderedRemove(index);
-                continue;
-            }
-            // Handed out but not written, so it has no file and no title.
-            try sessions.append(gpa, .{ .id = id, .title = "" });
-            index += 1;
-        }
     }
 };
 
@@ -310,7 +251,7 @@ fn route(
                 .keep_alive = false,
             });
         }
-        if (std.mem.eql(u8, path, "/api/sessions")) return listSessions(setup, registry, request, answered);
+        if (std.mem.eql(u8, path, "/api/sessions")) return listSessions(setup, request, answered);
         if (std.mem.startsWith(u8, path, "/api/sessions/")) {
             const rest = path["/api/sessions/".len..];
             // `{id}/message` is a prompt, which is a POST; everything under the
@@ -318,11 +259,11 @@ fn route(
             if (std.mem.endsWith(u8, rest, "/message")) {
                 return reply(request, .text, "method not allowed\n", .method_not_allowed, answered);
             }
-            return openSession(setup, registry, request, rest, answered);
+            return openSession(setup, request, rest, answered);
         }
     }
     if (request.head.method == .POST) {
-        if (std.mem.eql(u8, path, "/api/sessions")) return startSession(setup, registry, request, answered);
+        if (std.mem.eql(u8, path, "/api/sessions")) return createSession(setup, registry, http, request, answered);
         const prefix = "/api/sessions/";
         if (std.mem.startsWith(u8, path, prefix)) {
             const rest = path[prefix.len..];
@@ -353,9 +294,8 @@ const Listed = struct {
 /// them.
 const Listing = struct { sessions: []const Listed };
 
-/// `GET /api/sessions`: every session, the ones started but not written yet
-/// first, then the ones on disk, newest written first.
-fn listSessions(setup: *Setup, registry: *Registry, request: *std.http.Server.Request, answered: *bool) !void {
+/// `GET /api/sessions`: every session on disk, newest written first.
+fn listSessions(setup: *Setup, request: *std.http.Server.Request, answered: *bool) !void {
     const gpa = setup.gpa;
 
     // What is on disk. Each id and title is its own allocation, freed once the
@@ -372,7 +312,6 @@ fn listSessions(setup: *Setup, registry: *Registry, request: *std.http.Server.Re
 
     var sessions: std.ArrayList(Listed) = .empty;
     defer sessions.deinit(gpa);
-    try registry.takeReserved(setup.sessions, setup.io, &sessions, gpa);
     for (stored) |named| try sessions.append(gpa, .{ .id = named.id, .title = named.title });
 
     var body: std.Io.Writer.Allocating = .init(gpa);
@@ -398,7 +337,6 @@ const Opened = struct {
 /// a failure. Any other missing id is a 404.
 fn openSession(
     setup: *Setup,
-    registry: *Registry,
     request: *std.http.Server.Request,
     id: []const u8,
     answered: *bool,
@@ -407,7 +345,7 @@ fn openSession(
 
     var body: std.Io.Writer.Allocating = .init(gpa);
     defer body.deinit();
-    const opened = writeSession(setup, registry, gpa, id, &body.writer) catch |err| switch (err) {
+    const opened = writeSession(setup, gpa, id, &body.writer) catch |err| switch (err) {
         // An id that could not be a session name is a bad request, not a missing
         // session.
         error.InvalidSessionId => return reply(request, .text, "bad session id\n", .bad_request, answered),
@@ -422,19 +360,12 @@ fn openSession(
 /// out.
 fn writeSession(
     setup: *Setup,
-    registry: *Registry,
     gpa: std.mem.Allocator,
     id: []const u8,
     out: *Io.Writer,
 ) !bool {
     var session = Session.open(setup.io, setup.sessions, gpa, id, setup.cwd) catch |err| switch (err) {
-        error.SessionNotFound => {
-            // A session started but not yet written has no file to open; it is
-            // an empty conversation with a header, not a missing page.
-            if (!registry.isReserved(id)) return false;
-            try writeEmpty(gpa, setup, id, out);
-            return true;
-        },
+        error.SessionNotFound => return false,
         else => return err,
     };
     defer session.deinit();
@@ -459,25 +390,6 @@ fn writeSession(
     return true;
 }
 
-/// Writes the page of a session that has no file yet: what it will be, with
-/// nothing in it and nothing spent.
-fn writeEmpty(gpa: std.mem.Allocator, setup: *Setup, id: []const u8, out: *Io.Writer) !void {
-    var header: std.Io.Writer.Allocating = .init(gpa);
-    defer header.deinit();
-    try html.header(.{
-        .id = id,
-        .model = setup.model,
-        .cwd = setup.cwd,
-        .home = setup.environ.get("HOME"),
-        .context_tokens = 0,
-        .model_info = models.lookup(models.Provider.fromUrl(setup.base_url), setup.model),
-        .cost = 0,
-    }, &header.writer);
-
-    // A session started but not asked yet runs in the web's default mode.
-    try writeOpened(out, header.written(), "", @tagName(default_mode));
-}
-
 /// Writes the two halves of a session's page as the JSON object the page reads.
 fn writeOpened(out: *Io.Writer, header: []const u8, blocks: []const u8, session_mode: []const u8) !void {
     try std.json.Stringify.value(Opened{
@@ -490,27 +402,6 @@ fn writeOpened(out: *Io.Writer, header: []const u8, blocks: []const u8, session_
 /// The mode a web session starts in, so a new one opens in ask unless the first
 /// prompt says otherwise. The terminal keeps general as its own default.
 const default_mode: mode.Mode = .ask;
-
-/// `POST /api/sessions`: hands out the id of a session that does not exist yet.
-///
-/// Nothing is written. The id is what the page opens, and the session comes into
-/// being when it is first asked something.
-fn startSession(setup: *Setup, registry: *Registry, request: *std.http.Server.Request, answered: *bool) !void {
-    const gpa = setup.gpa;
-
-    // Opening a session that is not resumed gives it a fresh id and writes
-    // nothing, which is exactly the id wanted here.
-    var fresh = try Session.open(setup.io, setup.sessions, gpa, null, setup.cwd);
-    defer fresh.deinit();
-    const id = try gpa.dupe(u8, fresh.id());
-    defer gpa.free(id);
-    try registry.reserve(id);
-
-    var body: std.Io.Writer.Allocating = .init(gpa);
-    defer body.deinit();
-    try std.json.Stringify.value(Listed{ .id = id, .title = "" }, .{}, &body.writer);
-    return reply(request, .json, body.written(), .created, answered);
-}
 
 /// What a reply is, so the browser is told how to read it.
 const ContentType = enum {
@@ -547,34 +438,6 @@ fn reply(
         .extra_headers = &.{content_type.header()},
         .keep_alive = false,
     });
-}
-
-test "a session that is handed out is listed before it is written" {
-    const gpa = std.testing.allocator;
-    var registry = Registry{ .io = std.testing.io, .gpa = gpa };
-    defer registry.deinit();
-
-    try std.testing.expect(!registry.isReserved("later"));
-    try registry.reserve("later");
-    try std.testing.expect(registry.isReserved("later"));
-    try std.testing.expect(!registry.isReserved("later still"));
-
-    // A reserved id reaches the listing, in the order it was handed out, and
-    // before what is already on disk.
-    var sessions: std.ArrayList(Listed) = .empty;
-    defer sessions.deinit(gpa);
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try registry.takeReserved(tmp.dir, std.testing.io, &sessions, gpa);
-    try sessions.append(gpa, .{ .id = "on-disk", .title = "" });
-
-    var body: std.Io.Writer.Allocating = .init(gpa);
-    defer body.deinit();
-    try std.json.Stringify.value(Listing{ .sessions = sessions.items }, .{}, &body.writer);
-    try std.testing.expectEqualStrings(
-        "{\"sessions\":[{\"id\":\"later\",\"title\":\"\"},{\"id\":\"on-disk\",\"title\":\"\"}]}",
-        body.written(),
-    );
 }
 
 test "a session is taken for a turn, and refused while one runs" {
@@ -687,7 +550,6 @@ test "the address to listen on is read from what was asked for" {
     try std.testing.expectError(error.InvalidHost, listenAddress("", 8787));
 }
 
-/// The prompt a page sends: what the user typed.
 /// The prompt a page sends: what the user typed, and the mode the page chose for
 /// a new session. `mode` is null for a session that already has a conversation,
 /// whose mode is fixed on the session.
@@ -696,15 +558,66 @@ const Prompt = struct {
     mode: ?mode.Mode = null,
 };
 
+/// Reads the prompt a POST carries, or replies with why it could not and returns
+/// null, so the caller has nothing more to do.
+fn readPrompt(setup: *Setup, request: *std.http.Server.Request, answered: *bool) !?std.json.Parsed(Prompt) {
+    const gpa = setup.gpa;
+
+    // The prompt is read first, so a request with nothing usable in it is
+    // refused before a session is taken or made.
+    var body_buffer: [4096]u8 = undefined;
+    const body_reader = request.readerExpectNone(&body_buffer);
+    const body = body_reader.allocRemaining(gpa, .limited(1 << 20)) catch {
+        try reply(request, .text, "cannot read the prompt\n", .bad_request, answered);
+        return null;
+    };
+    defer gpa.free(body);
+
+    return std.json.parseFromSlice(Prompt, gpa, body, .{
+        .ignore_unknown_fields = true,
+    }) catch {
+        try reply(request, .text, "the prompt is not JSON\n", .bad_request, answered);
+        return null;
+    };
+}
+
+/// `POST /api/sessions`: starts a session with the page's first prompt and
+/// answers with the run as it happens.
+///
+/// A new session has no id on the page until it is asked something, so the id it
+/// is given here is the first event of the stream: that is how the page learns it
+/// and adds the session to its list.
+fn createSession(
+    setup: *Setup,
+    registry: *Registry,
+    http: *std.http.Client,
+    request: *std.http.Server.Request,
+    answered: *bool,
+) !void {
+    const gpa = setup.gpa;
+    const parsed = (try readPrompt(setup, request, answered)) orelse return;
+    defer parsed.deinit();
+
+    // A fresh session with a new id and no file: the first message writes it.
+    var session = try Session.open(setup.io, setup.sessions, gpa, null, setup.cwd);
+    defer session.deinit();
+    if (!try registry.claim(session.id()))
+        return reply(request, .text, "the session is busy\n", .conflict, answered);
+    defer registry.release(session.id());
+
+    // The mode the page chose, or a `/ask`/`/general` command in the prompt,
+    // which wins over the choice.
+    const choice = mode.Mode.start(parsed.value.text, parsed.value.mode orelse default_mode);
+    if (choice.text.len == 0)
+        return reply(request, .text, "the prompt is empty\n", .bad_request, answered);
+    var config = setup.agentConfig(session.cwd, .plain);
+    config.mode = choice.mode;
+
+    try serveTurn(setup, http, request, answered, &session, config, choice.text, session.id());
+}
+
 /// `POST /api/sessions/{id}/message`: asks the session `text`, answering with the
 /// run as it happens.
-///
-/// The answer is `text/event-stream`, one event per thing the run shows: a
-/// `block` for each finished block (a prompt, a reply, a line billy writes), a
-/// `tool_begin` and `tool_end` for the two halves of a tool call, a `header` with
-/// the new gauge and cost, an `error` when the run fails, and `done` at the end.
-/// Each is written and flushed as it happens, so the page fills in while the
-/// model works rather than after it has finished.
 ///
 /// A session a turn is already running for answers 409: one thing at a time.
 fn askSession(
@@ -716,19 +629,10 @@ fn askSession(
     answered: *bool,
 ) !void {
     const gpa = setup.gpa;
-
-    // The prompt is read first, so a request with nothing usable in it is
-    // refused before the session is taken.
-    var body_buffer: [4096]u8 = undefined;
-    const body_reader = request.readerExpectNone(&body_buffer);
-    const body = body_reader.allocRemaining(gpa, .limited(1 << 20)) catch
-        return reply(request, .text, "cannot read the prompt\n", .bad_request, answered);
-    defer gpa.free(body);
-
-    const parsed = std.json.parseFromSlice(Prompt, gpa, body, .{
-        .ignore_unknown_fields = true,
-    }) catch return reply(request, .text, "the prompt is not JSON\n", .bad_request, answered);
+    const parsed = (try readPrompt(setup, request, answered)) orelse return;
     defer parsed.deinit();
+    if (parsed.value.text.len == 0)
+        return reply(request, .text, "the prompt is empty\n", .bad_request, answered);
 
     // Taken for the whole turn, and given back however the turn ends.
     if (!try registry.claim(id))
@@ -737,33 +641,38 @@ fn askSession(
 
     // The session is opened fresh for this turn and dropped at the end, so it is
     // always what is on disk; a session changed by another billy in between is
-    // read rather than overwritten. A session started but not written yet has no
-    // file, which is not an error: opening it here is what writes it.
+    // read rather than overwritten. It runs in the mode stored with it.
     var session = Session.open(setup.io, setup.sessions, gpa, id, setup.cwd) catch |err| switch (err) {
-        error.SessionNotFound => if (!registry.isReserved(id))
-            return reply(request, .text, "no such session\n", .not_found, answered)
-        else
-            try Session.create(setup.io, setup.sessions, gpa, id, setup.cwd),
+        error.SessionNotFound => return reply(request, .text, "no such session\n", .not_found, answered),
         else => return err,
     };
     defer session.deinit();
 
-    // The first prompt of a new session sets its mode: the mode the page chose,
-    // or a `/ask`/`/general` command in the prompt, which wins over the choice. A
-    // resumed session keeps the mode it was saved with.
-    var text = parsed.value.text;
-    var config = setup.agentConfig(session.cwd, .plain);
-    if (session.messages.items.len == 0) {
-        const choice = mode.Mode.start(text, parsed.value.mode orelse default_mode);
-        config.mode = choice.mode;
-        text = choice.text;
-    }
-    if (text.len == 0)
-        return reply(request, .text, "the prompt is empty\n", .bad_request, answered);
+    try serveTurn(setup, http, request, answered, &session, setup.agentConfig(session.cwd, .plain), parsed.value.text, null);
+}
 
+/// Answers one prompt as the run happens: the run's blocks as the events of a
+/// stream, written and flushed one at a time rather than gathered, so a page sees
+/// each block the moment it is done and a slow tool call start long before it
+/// finishes.
+///
+/// A session created by this request has no id on the page yet, so its id is sent
+/// as the first event, before anything else; `announce_id` is null for a session
+/// the page already has.
+fn serveTurn(
+    setup: *Setup,
+    http: *std.http.Client,
+    request: *std.http.Server.Request,
+    answered: *bool,
+    session: *Session,
+    config: agent.Config,
+    text: []const u8,
+    announce_id: ?[]const u8,
+) !void {
+    const gpa = setup.gpa;
     var runner = try Runner.init(setup.io, gpa, config, session.cwd, http);
     defer runner.deinit();
-    try runner.prepare(&session);
+    try runner.prepare(session);
 
     // The head of the reply goes out before the run starts, so the page can read
     // the stream while the model is working. From here on a failure is part of
@@ -781,17 +690,19 @@ fn askSession(
     var stream = Stream{ .body = &body_writer, .gpa = gpa };
     const emitter = stream.emitter();
 
+    if (announce_id) |id| try stream.send("session", SessionEvent{ .id = id });
+
     // A session asked for the first time is named at once, from what was asked,
     // so the page's list shows a name before the model has answered; the model's
     // own title, if it gives one, arrives with the list the page refreshes when
     // the turn ends.
     if (session.messages.items.len == 0) {
-        _ = try agent.nameFromPrompt(&session, text);
+        _ = try agent.nameFromPrompt(session, text);
         if (session.title()) |title| try stream.send("title", TitleEvent{ .title = title });
     }
 
-    runner.compactIfNeeded(emitter, &session);
-    runner.ask(emitter, &session, text) catch |err| {
+    runner.compactIfNeeded(emitter, session);
+    runner.ask(emitter, session, text) catch |err| {
         std.log.err("a request failed: {s}", .{@errorName(err)});
         try stream.fail(@errorName(err));
     };
@@ -823,6 +734,9 @@ const FailedEvent = struct { message: []const u8 };
 /// What a new title is sent as, once a session's first turn has named it, so the
 /// page can show it in the list without asking for the list again.
 const TitleEvent = struct { title: []const u8 };
+
+/// What a new session's id is sent as, first, so the page can add it to the list.
+const SessionEvent = struct { id: []const u8 };
 
 /// Turns the blocks of a run into the events of a stream as they happen.
 ///

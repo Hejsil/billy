@@ -374,7 +374,9 @@ async function open(id) {
 // Sends what was typed and shows the answer as it arrives. The whole exchange is
 // one request: the server streams each block of it back as it is finished.
 async function send(text) {
-  if (working || selected === null || text.trim() === '') return;
+  if (working || text.trim() === '') return;
+  // A session with no id yet is a new one: its first message creates it.
+  const creating = selected === null;
   working = true;
   form.classList.add('working');
   input.disabled = true;
@@ -385,7 +387,8 @@ async function send(text) {
   grow();
 
   try {
-    const res = await fetch('/api/sessions/' + encodeURIComponent(selected) + '/message', {
+    const url = creating ? '/api/sessions' : '/api/sessions/' + encodeURIComponent(selected) + '/message';
+    const res = await fetch(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ text: text, mode: modeSelect.value }),
@@ -457,6 +460,11 @@ function handleFrame(frame) {
     }
     openCall = null;
     scrollToEnd();
+  } else if (event === 'session') {
+    // The first message created a session; its id is here, so the page adds it
+    // to the list and marks it as the one being asked.
+    selected = JSON.parse(data).id;
+    refresh(selected);
   } else if (event === 'header') {
     headerBox.innerHTML = JSON.parse(data).html;
   } else if (event === 'title') {
@@ -534,31 +542,32 @@ input.addEventListener('keydown', (event) => {
   }
 });
 
-document.getElementById('new').onclick = async () => {
-  // A new session may not be started mid-turn either: it would take the view
-  // away from the turn that is still running.
+// Clears the view to a session that has not been asked anything: no id, an empty
+// conversation, and the mode picker ready. Nothing is created on the server until
+// the first message is sent.
+function newDraft() {
   if (working) return;
+  selected = null;
+  openCall = null;
+  headerBox.innerHTML = '';
+  conversation.innerHTML = '';
+  modeSelect.value = 'ask';
+  modeSelect.disabled = false;
+  input.value = '';
+  grow();
+  for (const item of list.children) item.classList.remove('selected');
   closeDrawer();
-  try {
-    const res = await fetch('/api/sessions', { method: 'POST' });
-    if (!res.ok) {
-      note('could not start a session (' + res.status + ')');
-      return;
-    }
-    const started = await res.json();
-    await refresh(started.id);
-    await open(started.id);
-  } catch (err) {
-    note('lost the connection: ' + err.message);
-  }
-};
+  input.focus();
+}
 
-// Open the newest session there is, so the page is not blank when there is one.
+document.getElementById('new').onclick = newDraft;
+
+// The page opens on a fresh session, so there is nothing to pick before asking
+// something. The list is still read, so it is there behind the menu.
 (async () => {
   const sessions = await refresh();
   if (sessions === null) note('could not reach the server');
-  else if (sessions.length > 0) await open(sessions[0].id);
-  else input.focus();
+  newDraft();
 })();
 </script>
 </body>
