@@ -490,6 +490,24 @@ test "a session's page is written as the JSON the page reads" {
     try std.testing.expectEqualStrings("ask", parsed.value.mode);
 }
 
+test "a parsed prompt is copied, so the body it came from can be freed" {
+    const gpa = std.testing.allocator;
+
+    // The body lives in a buffer that is overwritten after the parse, standing
+    // in for the request body being freed. A borrowed string would follow the
+    // overwrite and read as the overwrites; a copied one is unaffected.
+    var buffer: [64]u8 = @splat(' ');
+    const json = "{\"text\":\"hello\",\"mode\":\"ask\"}";
+    @memcpy(buffer[0..json.len], json);
+
+    const parsed = try parsePrompt(gpa, buffer[0..json.len]);
+    defer parsed.deinit();
+    @memset(buffer[0..json.len], 'x');
+
+    try std.testing.expectEqualStrings("hello", parsed.value.text);
+    try std.testing.expectEqual(Mode.ask, parsed.value.mode.?);
+}
+
 test "the page the browser is given is the one that was written" {
     // The embedded page is served whole, so it is its own file and nothing is
     // built to serve it.
@@ -573,12 +591,22 @@ fn readPrompt(setup: *Setup, request: *std.http.Server.Request, answered: *bool)
     };
     defer gpa.free(body);
 
-    return std.json.parseFromSlice(Prompt, gpa, body, .{
-        .ignore_unknown_fields = true,
-    }) catch {
+    // The strings are copied out of `body`, which is freed on the way out, so
+    // the value stands on its own.
+    return parsePrompt(gpa, body) catch {
         try reply(request, .text, "the prompt is not JSON\n", .bad_request, answered);
         return null;
     };
+}
+
+/// Parses the prompt out of a request body. Every string is copied out of
+/// `body`, so the value does not point into it and outlives it: a borrowed slice
+/// would dangle once the body is freed.
+fn parsePrompt(gpa: std.mem.Allocator, body: []const u8) !std.json.Parsed(Prompt) {
+    return std.json.parseFromSlice(Prompt, gpa, body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
 }
 
 /// `POST /api/sessions`: starts a session with the page's first prompt and
