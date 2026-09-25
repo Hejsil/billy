@@ -59,7 +59,26 @@ pub fn build(b: *std.Build) void {
     exe_tests.link_gc_sections = true;
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
-    const test_step = b.step("test", "Run tests");
+    const test_step = b.step("test", "Run the tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    const fmt = b.addFmt(.{
+        .paths = &.{ "src", "build.zig", "build.zig.zon" },
+        .check = true,
+    });
+    const fmt_step = b.step("fmt", "Check that every source file is formatted");
+    fmt_step.dependOn(&fmt.step);
+
+    // `zig build` does the whole lot: it builds and installs billy, runs the
+    // tests, and checks the formatting, so one command is the whole check. The
+    // steps are named, so a narrower thing is one word away: `zig build install`
+    // builds and installs alone, `zig build test` runs the tests alone, and
+    // `zig build fmt` checks the formatting alone. See `b.default_step`: it is
+    // the install step until it is set to something else, so it is set here.
+    const all = b.step("all", "Build and install billy, run the tests, and check formatting");
+    all.dependOn(b.getInstallStep());
+    all.dependOn(test_step);
+    all.dependOn(fmt_step);
+    b.default_step = all;
 }

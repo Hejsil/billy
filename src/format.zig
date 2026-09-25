@@ -207,4 +207,3 @@ test "each side is written to its own fresh file" {
     defer gpa.free(contents);
     try std.testing.expectEqualStrings("one", contents);
 }
-
