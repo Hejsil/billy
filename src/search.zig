@@ -1,9 +1,11 @@
-//! Web search: one query out to a backend, a short list of results back.
+//! Web search and fetch: a query out to a backend for a list of results, and a
+//! url in for its content.
 //!
 //! Only Tavily so far. Which backend is the configuration's choice, so a second
-//! is a variant in `Provider`, its endpoint beside it, a branch in
-//! `Client.search`, and the credential it is asked with in `credentials.Service`;
-//! nothing outside those files names a backend.
+//! is a variant in `Provider`, its endpoints beside it, a branch in
+//! `Client.search` and `Client.extract`, and the credential it is asked with in
+//! `credentials.Service`; nothing outside those files names a backend. A `raw`
+//! fetch skips the backend and reads the url directly.
 
 const std = @import("std");
 const Io = std.Io;
@@ -21,6 +23,13 @@ pub const Provider = enum {
             .tavily => "https://api.tavily.com/search",
         };
     }
+
+    /// Where a url is extracted.
+    fn extractEndpoint(provider: Provider) []const u8 {
+        return switch (provider) {
+            .tavily => "https://api.tavily.com/extract",
+        };
+    }
 };
 
 /// What the configuration says about searching, with the key already resolved.
@@ -35,6 +44,11 @@ pub const Config = struct {
 /// Most results a backend is asked for, whatever the configuration says, so one
 /// query cannot be turned into a wall of text.
 const result_limit = 20;
+
+/// Most bytes a direct fetch keeps, so one large response cannot exhaust memory.
+/// A page comes through the backend instead, which trims it; this is for the
+/// `raw` path, where an API or a file is small.
+const max_fetch_bytes = 1 << 20;
 
 pub const Client = struct {
     io: Io,
@@ -55,6 +69,95 @@ pub const Client = struct {
         return switch (client.provider) {
             .tavily => client.tavily(arena, query, client.provider.endpoint(), requested),
         };
+    }
+
+    /// Fetches one url and returns its content as the text the model reads,
+    /// which `arena` owns.
+    ///
+    /// A page is extracted by the backend, which reads it and returns it as
+    /// markdown, so billy does not parse HTML itself. `raw` reads the url
+    /// directly instead, for an address whose bytes are what is wanted, such as
+    /// an API returning JSON: extraction escapes text as markdown, which would
+    /// mangle it.
+    pub fn extract(client: *Client, arena: std.mem.Allocator, url: []const u8, raw: bool) ![]const u8 {
+        if (raw) return client.get(arena, url);
+        return switch (client.provider) {
+            .tavily => client.tavilyExtract(arena, url, client.provider.extractEndpoint()),
+        };
+    }
+
+    /// One Tavily extraction. The url's content is the backend's markdown; a url
+    /// the backend could not read comes back as `error.FetchFailed`.
+    fn tavilyExtract(
+        client: *Client,
+        arena: std.mem.Allocator,
+        url: []const u8,
+        endpoint: []const u8,
+    ) ![]const u8 {
+        const body = try std.json.Stringify.valueAlloc(client.gpa, ExtractRequest{
+            .urls = &.{url},
+        }, .{ .emit_null_optional_fields = false });
+        defer client.gpa.free(body);
+
+        const authorization = try std.fmt.allocPrint(client.gpa, "Bearer {s}", .{client.api_key});
+        defer client.gpa.free(authorization);
+
+        var body_writer: std.Io.Writer.Allocating = .init(client.gpa);
+        defer body_writer.deinit();
+
+        const result = try client.http.fetch(.{
+            .location = .{ .url = endpoint },
+            .method = .POST,
+            .payload = body,
+            .response_writer = &body_writer.writer,
+            .headers = .{
+                .content_type = .{ .override = "application/json" },
+                .authorization = .{ .override = authorization },
+            },
+        });
+
+        const text = body_writer.written();
+        if (result.status.class() != .success) {
+            std.log.err("fetch: HTTP {d}: {s}", .{ @intFromEnum(result.status), text });
+            return error.FetchFailed;
+        }
+        // The response buffer is freed when this function returns, so the strings
+        // in the parsed results are copies in `arena`.
+        const parsed = std.json.parseFromSliceLeaky(ExtractResponse, arena, text, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        }) catch |err| {
+            std.log.err("fetch: HTTP {d}: {s}", .{ @intFromEnum(result.status), text });
+            return err;
+        };
+        if (parsed.results.len == 0) {
+            for (parsed.failed_results) |failed| {
+                std.log.warn("fetch: {s}: {s}", .{ failed.url, failed.@"error" });
+            }
+            return error.FetchFailed;
+        }
+        return parsed.results[0].raw_content;
+    }
+
+    /// Reads `url` directly with a GET, which is what `raw` extraction does: the
+    /// bytes as the server sent them, capped so one large response cannot exhaust
+    /// memory.
+    fn get(client: *Client, arena: std.mem.Allocator, url: []const u8) ![]const u8 {
+        var body_writer: std.Io.Writer.Allocating = .init(client.gpa);
+        defer body_writer.deinit();
+
+        const result = try client.http.fetch(.{
+            .location = .{ .url = url },
+            .method = .GET,
+            .response_writer = &body_writer.writer,
+        });
+        const text = body_writer.written();
+        if (result.status.class() != .success) {
+            std.log.err("fetch: HTTP {d}: {s}", .{ @intFromEnum(result.status), text });
+            return error.FetchFailed;
+        }
+        const kept = text[0..@min(text.len, max_fetch_bytes)];
+        return arena.dupe(u8, kept);
     }
 
     /// One Tavily search, posted to `endpoint`, which is the provider's own or a
@@ -132,6 +235,28 @@ const Response = struct {
         title: []const u8 = "",
         url: []const u8 = "",
         content: []const u8 = "",
+    };
+};
+
+/// The body a Tavily extraction is posted with. The basic depth is the fast,
+/// cheaper one, which is enough for a page's text.
+const ExtractRequest = struct {
+    urls: []const []const u8,
+};
+
+/// The part of a Tavily extraction response billy uses: the content of each url
+/// it read, and why it could not read the others.
+const ExtractResponse = struct {
+    results: []const Result = &.{},
+    failed_results: []const Failed = &.{},
+
+    pub const Result = struct {
+        raw_content: []const u8 = "",
+    };
+
+    pub const Failed = struct {
+        url: []const u8 = "",
+        @"error": []const u8 = "",
     };
 };
 
@@ -385,4 +510,99 @@ test "a tavily search posts the query and reads the results back" {
             "2. Docs\n   https://ziglang.org/documentation\n",
         text,
     );
+}
+
+test "a tavily extraction posts the url and reads its content back" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const reply = "{\"results\":[{\"url\":\"https://ziglang.org\",\"raw_content\":\"# Zig\\n\\nA language.\"}],\"failed_results\":[]}";
+    var mock = try Mock.start(gpa, io, "/extract", 1, Mock.fixed(reply));
+    defer mock.deinit(io);
+    var group: Io.Group = .init;
+    try group.concurrent(io, Mock.serve, .{ io, &mock });
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+    var client: Client = .{
+        .io = io,
+        .gpa = gpa,
+        .provider = .tavily,
+        .api_key = "secret",
+        .max_results = 3,
+        .http = &http,
+    };
+    var reply_state = std.heap.ArenaAllocator.init(gpa);
+    defer reply_state.deinit();
+    const text = try client.tavilyExtract(reply_state.allocator(), "https://ziglang.org", mock.url);
+    try group.await(io);
+    if (mock.err) |err| return err;
+
+    // The url went out as Tavily's body and the key as a bearer token.
+    try std.testing.expectEqualStrings("{\"urls\":[\"https://ziglang.org\"]}", mock.bodies.items[0]);
+    try std.testing.expectEqualStrings("Bearer secret", mock.authorization.?);
+    try std.testing.expectEqualStrings("# Zig\n\nA language.", text);
+}
+
+test "a url tavily could not read is a failure, not empty content" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const reply = "{\"results\":[],\"failed_results\":[{\"url\":\"https://nope.invalid\",\"error\":\"not found\"}]}";
+    var mock = try Mock.start(gpa, io, "/extract", 1, Mock.fixed(reply));
+    defer mock.deinit(io);
+    var group: Io.Group = .init;
+    try group.concurrent(io, Mock.serve, .{ io, &mock });
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+    var client: Client = .{
+        .io = io,
+        .gpa = gpa,
+        .provider = .tavily,
+        .api_key = "secret",
+        .max_results = 3,
+        .http = &http,
+    };
+    var reply_state = std.heap.ArenaAllocator.init(gpa);
+    defer reply_state.deinit();
+    try std.testing.expectError(
+        error.FetchFailed,
+        client.tavilyExtract(reply_state.allocator(), "https://nope.invalid", mock.url),
+    );
+    try group.await(io);
+    if (mock.err) |err| return err;
+}
+
+test "a raw fetch reads the url directly, without the backend" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // The bytes come back exactly as sent, so a JSON body is not escaped as
+    // markdown, which is what the backend would do to it.
+    const reply = "{\"node_id\":\"abc\",\"full_name\":\"a/b\"}";
+    var mock = try Mock.start(gpa, io, "/api", 1, Mock.fixed(reply));
+    defer mock.deinit(io);
+    var group: Io.Group = .init;
+    try group.concurrent(io, Mock.serve, .{ io, &mock });
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+    var client: Client = .{
+        .io = io,
+        .gpa = gpa,
+        .provider = .tavily,
+        .api_key = "secret",
+        .max_results = 3,
+        .http = &http,
+    };
+    var reply_state = std.heap.ArenaAllocator.init(gpa);
+    defer reply_state.deinit();
+    const text = try client.extract(reply_state.allocator(), mock.url, true);
+    try group.await(io);
+    if (mock.err) |err| return err;
+
+    // No authorization went out: the url was read directly, not through Tavily.
+    try std.testing.expect(mock.authorization == null);
+    try std.testing.expectEqualStrings(reply, text);
 }

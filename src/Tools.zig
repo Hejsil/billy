@@ -54,6 +54,7 @@ pub const Call = union(enum) {
     edit: Edit,
     bash: Bash,
     web_search: WebSearch,
+    web_fetch: WebFetch,
     /// A call naming a tool this harness does not implement.
     unknown: []const u8,
     /// A known tool whose arguments could not be read; `name` is still known.
@@ -92,6 +93,14 @@ pub const Call = union(enum) {
         query: []const u8,
     };
 
+    pub const WebFetch = struct {
+        url: []const u8,
+        /// Read the url directly instead of extracting a page, for an address
+        /// whose bytes are wanted as they are, such as a JSON API. Extraction
+        /// escapes its text as markdown, which would mangle it.
+        raw: bool = false,
+    };
+
     pub const Malformed = struct {
         name: []const u8,
         reason: anyerror,
@@ -114,9 +123,9 @@ bash_timeout_s: usize,
 /// How the lines billy prints itself are decorated. Shared with the
 /// transcript, so a replayed session looks like the run it continues.
 style: Style,
-/// The web search client, or null when no backend is configured. A null
-/// leaves `web_search` out of the tool set billy offers, so the model is never
-/// given a tool that could not run.
+/// The web search and fetch client, or null when no backend is configured. A
+/// null leaves `web_search` and `web_fetch` out of the tool set billy offers, so
+/// the model is never given a tool that could not run.
 search: ?Search.Client,
 
 /// What a tool set is built from, gathered into one so the constructor reads
@@ -168,13 +177,13 @@ pub fn init(options: Options) !Tools {
 }
 
 /// The definitions a session should be given: the tools the mode allows, in the
-/// spec table's order, with the search tool last when a backend is configured.
-/// The strings are the spec table's own, which are comptime, so this builds
-/// nothing; the session interns and stores them.
+/// spec table's order, with the web tools last when a backend is configured. The
+/// strings are the spec table's own, which are comptime, so this builds nothing;
+/// the session interns and stores them.
 pub fn definitions(tools: *const Tools, mode: Mode) []const Session.Definition {
     return switch (mode) {
-        .general => if (tools.search != null) &specs_with_search else &specs,
-        .chat => if (tools.search != null) &chat_specs_with_search else &chat_specs,
+        .general => if (tools.search != null) &specs_with_web else &specs,
+        .chat => if (tools.search != null) &chat_specs_with_web else &chat_specs,
     };
 }
 
@@ -187,6 +196,7 @@ pub fn callName(call: Call) []const u8 {
         .edit => "edit",
         .bash => "bash",
         .web_search => "web_search",
+        .web_fetch => "web_fetch",
         .unknown => |name| name,
         .malformed => |bad| bad.name,
     };
@@ -315,6 +325,7 @@ fn dispatch(tools: *Tools, call: Call, out: *Io.Writer) !void {
         .edit => |args| try tools.edit(args, out),
         .bash => |args| try tools.bash(args, out),
         .web_search => |args| try tools.webSearch(args, out),
+        .web_fetch => |args| try tools.webFetch(args, out),
         .unknown => |name| try fail(out, "unknown tool '{s}'", .{name}),
         .malformed => |bad| try fail(
             out,
@@ -456,6 +467,21 @@ fn webSearch(tools: *Tools, args: Call.WebSearch, out: *Io.Writer) !void {
     defer arena_state.deinit();
     const text = client.search(arena_state.allocator(), args.query) catch |err|
         return fail(out, "search failed: {s}", .{@errorName(err)});
+    try out.writeAll(text);
+}
+
+/// Fetches one url and writes its content as text. A page is extracted by the
+/// backend; `raw` reads the url directly, for an API or a file. Like a search, a
+/// fetch is offered only when a backend is configured, which is what the client
+/// carries.
+fn webFetch(tools: *Tools, args: Call.WebFetch, out: *Io.Writer) !void {
+    if (args.url.len == 0) return fail(out, "no url to fetch", .{});
+    const client = if (tools.search) |*client| client else return fail(out, "web fetch is not configured", .{});
+
+    var arena_state = std.heap.ArenaAllocator.init(tools.gpa);
+    defer arena_state.deinit();
+    const text = client.extract(arena_state.allocator(), args.url, args.raw) catch |err|
+        return fail(out, "fetch failed: {s}", .{@errorName(err)});
     try out.writeAll(text);
 }
 
@@ -744,6 +770,10 @@ pub fn parseCallNamed(arena: std.mem.Allocator, name: []const u8, arguments: []c
         return .{ .web_search = fromJson(Call.WebSearch, arena, arguments) catch |reason|
             return .{ .malformed = .{ .name = name, .reason = reason } } };
     }
+    if (std.mem.eql(u8, name, "web_fetch")) {
+        return .{ .web_fetch = fromJson(Call.WebFetch, arena, arguments) catch |reason|
+            return .{ .malformed = .{ .name = name, .reason = reason } } };
+    }
     return .{ .unknown = name };
 }
 
@@ -784,6 +814,7 @@ const marks = struct {
     const edit = Mark{ .glyph = "✎", .hue = .yellow };
     const bash = Mark{ .glyph = "❯", .hue = .cyan };
     const search = Mark{ .glyph = "⌕", .hue = .magenta };
+    const fetch = Mark{ .glyph = "⇣", .hue = .magenta };
     /// A call that could not be named: a tool billy does not implement, or
     /// arguments that could not be read.
     const unknown = Mark{ .glyph = "?", .hue = .red };
@@ -819,6 +850,7 @@ pub const Heading = struct {
             // description has none, and its heading comes out with no target.
             .bash => |args| .marked(marks.bash, "bash", headerLine(args.description orelse "")),
             .web_search => |args| .marked(marks.search, "web_search", args.query),
+            .web_fetch => |args| .marked(marks.fetch, "web_fetch", args.url),
             .unknown => |name| .marked(marks.unknown, name, ""),
             .malformed => |bad| .marked(marks.unknown, bad.name, ""),
         };
@@ -1164,9 +1196,27 @@ const search_spec = Session.Definition{
         "\"required\":[\"query\"]}",
 };
 
-/// `specs` with the search tool appended, for a run that has a backend. The
-/// order is what keeps the set growing by appending rather than reordering.
-const specs_with_search = specs ++ [_]Session.Definition{search_spec};
+/// The tool that fetches one url, offered with web search since both need a
+/// backend's key. A page is returned as the markdown the backend extracted; a
+/// JSON or plain-text address is read directly with `raw`, so its bytes are not
+/// escaped.
+const fetch_spec = Session.Definition{
+    .name = "web_fetch",
+    .description = "Fetch a url and return its content. A page comes back as markdown; set raw for an API or a file, whose bytes are returned as they are.",
+    .parameters = "{\"type\":\"object\",\"properties\":{" ++
+        "\"url\":{\"type\":\"string\",\"description\":\"The url to fetch.\"}," ++
+        "\"raw\":{\"type\":\"boolean\",\"description\":\"Read the url directly instead of extracting a page, for JSON or plain text, whose bytes would be changed by extraction. Defaults to false.\"}}," ++
+        "\"required\":[\"url\"]}",
+};
+
+/// The tools a backend adds: web search and web fetch. They come last, after the
+/// tools every session has, so a session that gains them appends to the set
+/// rather than reordering it.
+const web_specs = [_]Session.Definition{ search_spec, fetch_spec };
+
+/// `specs` with the web tools appended, for a run that has a backend. The order
+/// is what keeps the set growing by appending rather than reordering.
+const specs_with_web = specs ++ web_specs;
 
 /// Why the filtered specs are returned by value rather than as a slice: a slice
 /// would point into a comptime local, which a global const may not hold.
@@ -1192,7 +1242,7 @@ fn allowedSpecs(comptime source: []const Session.Definition, comptime mode: Mode
 }
 
 const chat_specs = allowedSpecs(&specs, .chat);
-const chat_specs_with_search = allowedSpecs(&specs_with_search, .chat);
+const chat_specs_with_web = allowedSpecs(&specs_with_web, .chat);
 
 test "exit codes of signals follow the shell convention" {
     try std.testing.expectEqual(0, formatting.exitCode(.{ .exited = 0 }));
@@ -1248,6 +1298,14 @@ test "describe frames a call and its output" {
         "web_search",
         "{\"query\":\"zig lang\"}",
         "1. Zig\n   https://ziglang.org",
+        .{},
+    );
+    // A web fetch shows the url it fetched, and the content it got back.
+    try expectDescribe(
+        "⇣ web_fetch https://ziglang.org\n▾ output\n# Zig\n\nA language.\n\n",
+        "web_fetch",
+        "{\"url\":\"https://ziglang.org\"}",
+        "# Zig\n\nA language.",
         .{},
     );
     // A tool that is not implemented shows its name, and the reason it could not
@@ -2005,27 +2063,30 @@ test "the definitions cover every tool the loop dispatches" {
     }
 }
 
-test "web search is offered only when a backend is configured" {
+test "the web tools are offered only when a backend is configured" {
     const gpa = std.testing.allocator;
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
     var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
     defer http.deinit();
 
-    // Without a backend the search tool is not offered at all, and the tools
-    // every session has come first so the set only grows.
+    // Without a backend neither web tool is offered at all, and the tools every
+    // session has come first so the set only grows.
     var plain = try definitionsToolSet(Io.Dir.cwd(), gpa, &http, false);
     const without = plain.definitions(.general);
     try std.testing.expectEqual(specs.len, without.len);
     for (without) |definition| {
         try std.testing.expect(!std.mem.eql(u8, definition.name, "web_search"));
+        try std.testing.expect(!std.mem.eql(u8, definition.name, "web_fetch"));
     }
 
-    // With one it is appended, so a session that gains it keeps the tools it had.
+    // With one they are appended, so a session that gains them keeps the tools it
+    // had.
     var searched = try definitionsToolSet(Io.Dir.cwd(), gpa, &http, true);
     const with = searched.definitions(.general);
-    try std.testing.expectEqual(specs.len + 1, with.len);
-    try std.testing.expectEqualStrings("web_search", with[with.len - 1].name);
+    try std.testing.expectEqual(specs.len + web_specs.len, with.len);
+    try std.testing.expectEqualStrings("web_search", with[with.len - 2].name);
+    try std.testing.expectEqualStrings("web_fetch", with[with.len - 1].name);
 }
 
 test "the tools work in the directory they are given, wherever billy runs" {

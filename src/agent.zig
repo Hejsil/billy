@@ -2300,9 +2300,9 @@ const Recorder = struct {
         const seen: Seen = switch (block) {
             .prompt => |text| .{ .prompt = try self.keeper(text) },
             .answer => |text| .{ .answer = try self.keeper(text) },
-            .tool_begin => |call| .{ .tool_begin = try self.keeper(callName(call)) },
+            .tool_begin => |call| .{ .tool_begin = try self.keeper(Tools.callName(call)) },
             .tool_end => |tool| .{ .tool_end = .{
-                .name = try self.keeper(callName(tool.call)),
+                .name = try self.keeper(Tools.callName(tool.call)),
                 .result = try self.keeper(tool.result),
             } },
             .compacted => |compaction| .{ .compacted = .{
@@ -2319,19 +2319,6 @@ const Recorder = struct {
     /// as the recorder rather than as long as the block.
     fn keeper(self: *Recorder, text: []const u8) ![]const u8 {
         return self.gpa.dupe(u8, text);
-    }
-
-    /// The name of the tool a call names, so a test can say which one ran.
-    fn callName(call: Tools.Call) []const u8 {
-        return switch (call) {
-            .read => "read",
-            .write => "write",
-            .edit => "edit",
-            .bash => "bash",
-            .web_search => "web_search",
-            .unknown => |name| name,
-            .malformed => |bad| bad.name,
-        };
     }
 
     fn selfOf(context: *anyopaque) *Recorder {
