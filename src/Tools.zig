@@ -170,6 +170,7 @@ pub fn init(options: Options) !Tools {
             .gpa = options.gpa,
             .provider = config.provider,
             .api_key = config.api_key,
+            .url = config.url,
             .max_results = config.max_results,
             .http = options.http,
         } else null,

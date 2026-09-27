@@ -136,7 +136,24 @@ pub fn open(init: std.process.Init, out: *Io.Writer) !Setup {
     };
     errdefer sessions.close(io);
 
-    const search_config = try searchConfig(&store, environ, settings.config);
+    const search_config = searchConfig(&store, environ, settings.config) catch |err| {
+        switch (err) {
+            error.MissingApiKey => {
+                // The backend is named, so a service is one of the ones reached
+                // with a key.
+                const service = credentials.searchService(settings.config.tools.web_search.provider.?).?;
+                std.log.err(
+                    "run `billy login {s}`, or set {s} to use web search, or clear tools.web_search in the configuration",
+                    .{ service.name(), service.variable() },
+                );
+            },
+            error.MissingSearchUrl => std.log.err(
+                "set tools.web_search.searxng.url to your SearXNG instance, or clear tools.web_search in the configuration",
+                .{},
+            ),
+        }
+        return err;
+    };
 
     return .{
         .io = io,
@@ -172,19 +189,24 @@ fn searchConfig(
     environ: *const std.process.Environ.Map,
     settings: Config,
 ) !?Search.Config {
-    const provider = settings.tools.web_search.provider orelse return null;
-    const service = credentials.searchService(provider);
-    const key = credentials.credential(store, environ, service) orelse {
-        std.log.err(
-            "run `billy login {s}`, or set {s} to use web search, or clear tools.web_search in the configuration",
-            .{ service.name(), service.variable() },
-        );
-        return error.MissingApiKey;
+    const web = settings.tools.web_search;
+    const provider = web.provider orelse return null;
+
+    // A backend billy knows how to reach needs a key; SearXNG is self-hosted and
+    // needs the instance named instead of a key. What went wrong is left to the
+    // caller to report, so this only says which of the two it was.
+    const key = if (credentials.searchService(provider)) |service|
+        credentials.credential(store, environ, service) orelse return error.MissingApiKey
+    else blk: {
+        if (web.searxng.url == null or web.searxng.url.?.len == 0) return error.MissingSearchUrl;
+        break :blk "";
     };
+
     return .{
         .provider = provider,
         .api_key = key,
-        .max_results = settings.tools.web_search.max_results,
+        .url = web.searxng.url orelse "",
+        .max_results = web.max_results,
     };
 }
 
@@ -240,4 +262,35 @@ pub fn agentConfig(setup: *const Setup, cwd: []const u8, style: styling.Style) a
         // its key is set; the tool is left out of the request otherwise.
         .search = setup.search,
     };
+}
+
+test "a backend billy knows needs a key, and SearXNG needs an instance instead" {
+    const gpa = std.testing.allocator;
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    const store: credentials.Store = .{};
+
+    // Nothing named is no search at all.
+    var off = Config.init(gpa);
+    defer off.deinit();
+    try std.testing.expect((try searchConfig(&store, &environ, off)) == null);
+
+    // A backend billy knows is asked for a key, and one that is not set is an
+    // error rather than a silent "no search".
+    var naming = Config.init(gpa);
+    defer naming.deinit();
+    naming.tools.web_search.provider = .tavily;
+    try std.testing.expectError(error.MissingApiKey, searchConfig(&store, &environ, naming));
+
+    // SearXNG needs no key, but needs the instance named.
+    var searx = Config.init(gpa);
+    defer searx.deinit();
+    searx.tools.web_search.provider = .searxng;
+    try std.testing.expectError(error.MissingSearchUrl, searchConfig(&store, &environ, searx));
+
+    searx.tools.web_search.searxng.url = "https://searx.example.org";
+    const config = (try searchConfig(&store, &environ, searx)).?;
+    try std.testing.expectEqual(Search.Provider.searxng, config.provider);
+    try std.testing.expectEqualStrings("", config.api_key);
+    try std.testing.expectEqualStrings("https://searx.example.org", config.url);
 }

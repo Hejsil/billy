@@ -1,7 +1,8 @@
 //! Web search and fetch: a query out to a backend for a list of results, and a
 //! url in for its content.
 //!
-//! Tavily, Exa and Brave so far. Which backend is the configuration's choice, so another
+//! Tavily, Exa, Brave and SearXNG so far. Which backend is the configuration's
+//! choice, so another
 //! is a variant in `Provider`, its endpoints beside it, a branch in
 //! `Client.search` and `Client.extract`, and the credential it is asked with in
 //! `credentials.Service`; nothing outside those files names a backend. Every
@@ -19,6 +20,7 @@ pub const Provider = enum {
     tavily,
     exa,
     brave,
+    searxng,
 
     /// Where a query is sent. A backend that takes a GET carries the query in
     /// the url; one that takes a POST carries it in a JSON body.
@@ -27,6 +29,9 @@ pub const Provider = enum {
             .tavily => "https://api.tavily.com/search",
             .exa => "https://api.exa.ai/search",
             .brave => "https://api.search.brave.com/res/v1/web/search",
+            // SearXNG is self-hosted, so it has no endpoint billy knows: the
+            // instance the configuration names is used instead.
+            .searxng => "",
         };
     }
 
@@ -36,8 +41,8 @@ pub const Provider = enum {
         return switch (provider) {
             .tavily => "https://api.tavily.com/extract",
             .exa => "https://api.exa.ai/contents",
-            // Brave has no extraction: `Client.extract` reads the url itself.
-            .brave => null,
+            // These have no extraction: `Client.extract` reads the url itself.
+            .brave, .searxng => null,
         };
     }
 };
@@ -46,7 +51,12 @@ pub const Provider = enum {
 /// A null of this in a tool set is what leaves web search out of a request.
 pub const Config = struct {
     provider: Provider,
+    /// The key the backend is asked with. Empty for one that needs none, which
+    /// is SearXNG, whose instance the user runs.
     api_key: []const u8,
+    /// The SearXNG instance to query, which the configuration names since a
+    /// self-hosted backend has no endpoint billy knows. Unused by the others.
+    url: []const u8 = "",
     /// Results asked for per query. The backend may return fewer.
     max_results: usize,
 };
@@ -77,6 +87,8 @@ pub const Client = struct {
     gpa: std.mem.Allocator,
     provider: Provider,
     api_key: []const u8,
+    /// The SearXNG instance, for the one backend that is self-hosted.
+    url: []const u8 = "",
     max_results: usize,
     /// The one HTTP client of the run, borrowed by pointer so a query shares
     /// connections and scanned certificates with everything else that makes a
@@ -93,6 +105,7 @@ pub const Client = struct {
             .tavily => client.tavily(arena, query, endpoint, requested),
             .exa => client.exa(arena, query, endpoint, requested),
             .brave => client.brave(arena, query, endpoint, requested),
+            .searxng => client.searxng(arena, query, client.url, requested),
         };
     }
 
@@ -111,7 +124,7 @@ pub const Client = struct {
                     .exa => client.exaContents(arena, url, endpoint),
                     // Only a backend with an extraction endpoint is above; a
                     // backend without one is reading the url by now.
-                    .brave => unreachable,
+                    .brave, .searxng => unreachable,
                 };
             }
         }
@@ -191,6 +204,28 @@ pub const Client = struct {
         }, "search")) orelse return error.SearchFailed;
         const parsed = try parse(BraveResponse, arena, text, "search");
         return render(arena, try mapped(arena, parsed.web.results, "description"));
+    }
+
+    /// One SearXNG search, sent as a GET to the instance the configuration
+    /// names. SearXNG needs no key, and answers with the same shape of results
+    /// whatever engines it searched. It takes no result count, so the cap is
+    /// applied here.
+    fn searxng(
+        client: *Client,
+        arena: std.mem.Allocator,
+        query: []const u8,
+        base: []const u8,
+        max_results: usize,
+    ) ![]const u8 {
+        const endpoint = try std.fmt.allocPrint(arena, "{s}/search", .{
+            std.mem.trimEnd(u8, base, "/"),
+        });
+        const url = try queryUrl(arena, endpoint, query, "&format=json", .{});
+        const text = (try client.request(arena, .GET, url, null, &.{}, "search")) orelse
+            return error.SearchFailed;
+        const parsed = try parse(SearxngResponse, arena, text, "search");
+        const results = parsed.results[0..@min(parsed.results.len, max_results)];
+        return render(arena, try mapped(arena, results, "content"));
     }
 
     /// One Exa search, posted to `endpoint`. Exa would return the whole page of
@@ -363,6 +398,19 @@ const TavilyExtractResult = struct {
 const TavilyExtractFailure = struct {
     url: []const u8 = "",
     @"error": []const u8 = "",
+};
+
+/// The part of a SearXNG response billy uses, which is the same from every
+/// engine it searched.
+const SearxngResponse = struct {
+    results: []const SearxngResult = &.{},
+};
+
+/// One SearXNG result: its snippet is the `content` field.
+const SearxngResult = struct {
+    title: []const u8 = "",
+    url: []const u8 = "",
+    content: []const u8 = "",
 };
 
 /// The part of a Brave search response billy uses. The results sit under `web`,
@@ -917,4 +965,42 @@ test "a backend with no extraction reads the url itself" {
     try std.testing.expectEqualStrings(reply, try client.extract(reply_state.allocator(), mock.url, false));
     try group.await(io);
     if (mock.err) |err| return err;
+}
+
+test "a searxng search sends the query to the instance, and caps the results" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const reply = "{\"results\":[" ++
+        "{\"title\":\"Zig\",\"url\":\"https://ziglang.org\",\"content\":\"A language.\"}," ++
+        "{\"title\":\"Docs\",\"url\":\"https://ziglang.org/documentation\",\"content\":\"\"}]}";
+    // The instance is the mock's base, which SearXNG's `/search` is added to.
+    var mock = try Mock.start(gpa, io, "", 1, Mock.fixed(reply));
+    defer mock.deinit(io);
+    var group: Io.Group = .init;
+    try group.concurrent(io, Mock.serve, .{ io, &mock });
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+    var client: Client = .{
+        .io = io,
+        .gpa = gpa,
+        .provider = .searxng,
+        .api_key = "",
+        .url = mock.url,
+        .max_results = 5,
+        .http = &http,
+    };
+    var reply_state = std.heap.ArenaAllocator.init(gpa);
+    defer reply_state.deinit();
+    // The cap is applied here, since SearXNG takes no result count: only the
+    // first of the two results is rendered.
+    const text = try client.searxng(reply_state.allocator(), "zig lang", mock.url, 1);
+    try group.await(io);
+    if (mock.err) |err| return err;
+
+    // The query is a GET with no key: SearXNG is the user's own instance.
+    try std.testing.expectEqualStrings("", mock.bodies.items[0]);
+    try std.testing.expect(mock.header("authorization") == null);
+    try std.testing.expectEqualStrings("1. Zig\n   https://ziglang.org\n   A language.\n", text);
 }

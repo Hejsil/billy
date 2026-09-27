@@ -83,11 +83,13 @@ pub fn modelService(provider: models.Provider) Service {
 }
 
 /// The service holding the key for the search backend `provider`.
-pub fn searchService(provider: search.Provider) Service {
+pub fn searchService(provider: search.Provider) ?Service {
     return switch (provider) {
         .tavily => .tavily,
         .exa => .exa,
         .brave => .brave,
+        // SearXNG is self-hosted and needs no key.
+        .searxng => null,
     };
 }
 
@@ -616,4 +618,13 @@ test "load refuses a damaged or future credentials file" {
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{\"version\":99}" });
     try std.testing.expectError(error.UnsupportedCredentialsVersion, load(std.testing.io, tmp.dir, allocator));
+}
+
+test "a backend billy reaches has a service, and a self-hosted one does not" {
+    // Every backend but SearXNG is reached with a key, which is what a service
+    // is. SearXNG is the user's own, so it has none.
+    try std.testing.expectEqual(Service.tavily, searchService(.tavily).?);
+    try std.testing.expectEqual(Service.exa, searchService(.exa).?);
+    try std.testing.expectEqual(Service.brave, searchService(.brave).?);
+    try std.testing.expect(searchService(.searxng) == null);
 }

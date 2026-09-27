@@ -52,6 +52,18 @@ pub const WebSearch = struct {
     /// Results asked for per query. The backend may return fewer, and billy caps
     /// it.
     max_results: usize = 5,
+    /// Settings for the SearXNG backend, under its own name. A backend that billy
+    /// knows the address of needs none of its own.
+    searxng: Searxng = .{},
+
+    /// Settings for SearXNG, which is self-hosted rather than a service billy
+    /// knows the address of.
+    pub const Searxng = struct {
+        /// The instance to search with, such as `https://searx.example.org`. It
+        /// must have the JSON format turned on, which SearXNG leaves off by
+        /// default.
+        url: ?[]const u8 = null,
+    };
 };
 
 /// Settings for the bash tool.
@@ -545,6 +557,23 @@ test "open reads the bash timeout from the file" {
     try std.testing.expectEqual(Stored.default.tools.bash.timeout_s, bare.config.tools.bash.timeout_s);
 }
 
+test "open reads a self-hosted backend's instance from the file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // SearXNG is the one backend with no address billy knows, so its instance is
+    // named under its own section. A backend billy knows leaves it unset.
+    var opened = try openFrom(&tmp, "{\"tools\":{\"web_search\":{" ++
+        "\"provider\":\"searxng\",\"searxng\":{\"url\":\"https://searx.example.org\"}}}}");
+    defer opened.config.deinit();
+    try std.testing.expectEqual(search.Provider.searxng, opened.config.tools.web_search.provider.?);
+    try std.testing.expectEqualStrings("https://searx.example.org", opened.config.tools.web_search.searxng.url.?);
+
+    var known = try openFrom(&tmp, "{\"tools\":{\"web_search\":{\"provider\":\"exa\"}}}");
+    defer known.config.deinit();
+    try std.testing.expect(known.config.tools.web_search.searxng.url == null);
+}
+
 test "open reads the web search provider and result count from the file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -609,7 +638,10 @@ test "the file is indented, so it can be read and edited by hand" {
         \\    },
         \\    "web_search": {
         \\      "provider": null,
-        \\      "max_results": 5
+        \\      "max_results": 5,
+        \\      "searxng": {
+        \\        "url": null
+        \\      }
         \\    }
         \\  }
         \\}
