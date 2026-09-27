@@ -57,10 +57,13 @@
   #list { list-style: none; margin: 0; padding: 6px; overflow-y: auto; flex: 1; }
   #list li {
     padding: 6px 8px; border-radius: 6px; cursor: pointer; color: var(--dim);
-    overflow: hidden;
+    display: flex; align-items: center; gap: 4px;
   }
   #list li:hover { background: #22242c; color: var(--text); }
   #list li.selected { background: #262a35; color: var(--text); }
+  /* The name takes the room, with the delete button beside it, so a long title
+     is cut off rather than pushing the button out of the item. */
+  #list .name { flex: 1; min-width: 0; }
   /* A session is shown by its title, with the id it can be resumed by under it
      in a smaller, dimmer line. A session that has not been named shows its id
      alone, in the place of the title. */
@@ -72,6 +75,15 @@
     white-space: nowrap;
   }
   #list li:not(.selected):hover .ident { color: var(--dim); }
+  /* The delete button sits at the right of a session row, dim until the row is
+     hovered so a list of sessions is not a list of crosses. */
+  #list .del {
+    flex: none; width: 22px; height: 22px; padding: 0; line-height: 1;
+    background: none; border: none; border-radius: 5px; cursor: pointer;
+    color: var(--dim); font: inherit; font-size: 13px; opacity: 0;
+  }
+  #list li:hover .del, #list .del:focus { opacity: 1; }
+  #list .del:hover { color: var(--del); background: rgba(247, 118, 142, 0.12); }
   #list .empty { color: var(--dim); cursor: default; padding: 6px 8px; }
   #list .empty:hover { background: none; }
 
@@ -235,6 +247,9 @@
     #new { width: 34px; height: 34px; font-size: 20px; }
     #list { padding: 8px; }
     #list li { padding: 10px 10px; }
+    /* A touch screen has no hover, so the delete button is always shown and big
+       enough to tap. */
+    #list .del { opacity: 1; width: 30px; height: 30px; font-size: 15px; }
     #header { padding: 8px 12px; }
     #conversation { padding: 12px; }
     #prompt { padding: 10px; }
@@ -312,7 +327,21 @@ async function refresh(select) {
   for (const session of sessions) {
     const item = document.createElement('li');
     item.dataset.id = session.id;
+    const name = document.createElement('div');
+    name.className = 'name';
+    item.append(name);
     setListedName(item, session.title);
+    // The delete button is a child of the row, so its click must not also open
+    // the session.
+    const del = document.createElement('button');
+    del.className = 'del';
+    del.title = 'delete this session';
+    del.textContent = '\u2715';
+    del.onclick = (event) => {
+      event.stopPropagation();
+      remove(session.id);
+    };
+    item.append(del);
     if (session.id === select) item.classList.add('selected');
     item.onclick = () => open(session.id);
     list.append(item);
@@ -325,16 +354,17 @@ async function refresh(select) {
 // named shows its id in the title's place. Every value is set as text, since an
 // id or a title could be anything.
 function setListedName(item, title) {
-  item.replaceChildren();
+  const column = item.querySelector('.name');
+  column.replaceChildren();
   const name = document.createElement('div');
   name.className = 'title';
   name.textContent = title || item.dataset.id;
-  item.append(name);
+  column.append(name);
   if (title) {
     const ident = document.createElement('div');
     ident.className = 'ident';
     ident.textContent = item.dataset.id;
-    item.append(ident);
+    column.append(ident);
   }
 }
 
@@ -369,6 +399,26 @@ async function open(id) {
   openCall = null;
   scrollToEnd();
   input.focus();
+}
+
+// Deletes a session for good. It is asked for first, since there is no trash to
+// recover it from; the list is refreshed after, and if the deleted session was
+// the one on screen the page clears to a new one.
+async function remove(id) {
+  if (working) return;
+  if (!confirm('delete this session? this cannot be undone')) return;
+  try {
+    const res = await fetch('/api/sessions/' + encodeURIComponent(id), { method: 'DELETE' });
+    if (!res.ok && res.status !== 404) {
+      note('could not delete the session (' + res.status + ')');
+      return;
+    }
+  } catch (err) {
+    note('lost the connection: ' + err.message);
+    return;
+  }
+  if (selected === id) newDraft();
+  refresh(selected);
 }
 
 // Sends what was typed and shows the answer as it arrives. The whole exchange is

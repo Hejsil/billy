@@ -274,12 +274,49 @@ fn route(
         }
     }
 
+    if (request.head.method == .DELETE) {
+        const prefix = "/api/sessions/";
+        if (std.mem.startsWith(u8, path, prefix)) {
+            const rest = path[prefix.len..];
+            if (!std.mem.endsWith(u8, rest, "/message") and rest.len > 0) {
+                return deleteSession(setup, registry, request, rest, answered);
+            }
+        }
+    }
+
     answered.* = true;
     return request.respond("not found\n", .{
         .status = .not_found,
         .extra_headers = &.{ContentType.text.header()},
         .keep_alive = false,
     });
+}
+
+/// `DELETE /api/sessions/{id}`: removes a session for good. There is no trash,
+/// so this cannot be undone.
+///
+/// A session a turn is running for answers 409, since removing it under the turn
+/// would leave the run writing to a file that is gone. An id with no file is a
+/// 404, so deleting one twice says the second was nothing.
+fn deleteSession(
+    setup: *Setup,
+    registry: *Registry,
+    request: *std.http.Server.Request,
+    id: []const u8,
+    answered: *bool,
+) !void {
+    // Taken for the moment it takes to remove, so a turn cannot start against a
+    // session that is being removed. Given back whether or not it is removed.
+    if (!try registry.claim(id))
+        return reply(request, .text, "the session is busy\n", .conflict, answered);
+    defer registry.release(id);
+
+    Session.delete(setup.io, setup.sessions, id) catch |err| switch (err) {
+        error.InvalidSessionId => return reply(request, .text, "bad session id\n", .bad_request, answered),
+        error.SessionNotFound => return reply(request, .text, "no such session\n", .not_found, answered),
+        else => return err,
+    };
+    return reply(request, .text, "", .ok, answered);
 }
 
 /// One session as the listing shows it: just its id, which is what names it.

@@ -1282,6 +1282,18 @@ fn fileName(session_id: []const u8, buffer: []u8) ?[]const u8 {
     return std.fmt.bufPrint(buffer, "{s}{s}", .{ session_id, extension }) catch null;
 }
 
+/// Deletes the session `id` from `dir`, so it is gone for good: billy keeps no
+/// trash. A session that has no file is `error.SessionNotFound`, and an id that
+/// could not name one is `error.InvalidSessionId`.
+pub fn delete(io: Io, dir: Io.Dir, session_id: []const u8) !void {
+    var buffer: [max_id_len + extension.len]u8 = undefined;
+    const file = fileName(session_id, &buffer) orelse return error.InvalidSessionId;
+    dir.deleteFile(io, file) catch |err| switch (err) {
+        error.FileNotFound => return error.SessionNotFound,
+        else => return err,
+    };
+}
+
 /// The id in `file_name`, which is the name with the extension taken off, or null
 /// when the name is not that of a session file.
 fn idInName(file_name: []const u8) ?[]const u8 {
@@ -1410,6 +1422,40 @@ test "a session can be started for an id that has no file yet" {
         error.InvalidSessionId,
         Session.create(std.testing.io, tmp.dir, gpa, "../escape", "/work"),
     );
+}
+
+test "a session is deleted for good, and only that session" {
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Two sessions, so the delete can be seen to remove one and leave the other.
+    var kept = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    defer kept.deinit();
+    try kept.append(.{ .role = "user", .content = "keep me" });
+    const kept_id = try gpa.dupe(u8, kept.id());
+    defer gpa.free(kept_id);
+
+    var gone = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    defer gone.deinit();
+    try gone.append(.{ .role = "user", .content = "delete me" });
+    const gone_id = try gpa.dupe(u8, gone.id());
+    defer gpa.free(gone_id);
+
+    try Session.delete(std.testing.io, tmp.dir, gone_id);
+
+    // The one deleted is gone, and cannot be deleted again.
+    try std.testing.expectError(error.SessionNotFound, reopen(&tmp, gpa, gone_id));
+    try std.testing.expectError(error.SessionNotFound, Session.delete(std.testing.io, tmp.dir, gone_id));
+
+    // The other is untouched.
+    var still = try reopen(&tmp, gpa, kept_id);
+    defer still.deinit();
+    try std.testing.expectEqualStrings("keep me", still.contentOf(still.messages.items[0]).?);
+
+    // An id that could not name a session is refused rather than looked for.
+    try std.testing.expectError(error.InvalidSessionId, Session.delete(std.testing.io, tmp.dir, "../escape"));
 }
 
 test "a new session is written out by its first message" {
