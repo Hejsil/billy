@@ -718,6 +718,19 @@ fn serveTurn(
     var stream = Stream{ .body = &body_writer, .gpa = gpa };
     const emitter = stream.emitter();
 
+    // A `/compact` command folds the conversation into a summary and stops,
+    // rather than being sent to the model. It comes before the session is
+    // announced, so a `/compact` on a session that has nothing to fold leaves the
+    // page with no new session to show.
+    if (agent.Command.of(text)) |cmd| {
+        switch (cmd) {
+            .compact => if (!runner.compact(emitter, session)) try stream.fail("nothing to compact"),
+        }
+        try sendHeader(setup, gpa, session, &stream);
+        try stream.done();
+        return;
+    }
+
     if (announce_id) |id| try stream.send("session", SessionEvent{ .id = id });
 
     // A session asked for the first time is named at once, from what was asked,
@@ -737,6 +750,13 @@ fn serveTurn(
 
     // What the run left the session at, so the page shows the new gauge and
     // cost, and knows the turn is over.
+    try sendHeader(setup, gpa, session, &stream);
+    try stream.done();
+}
+
+/// Sends the header line the page shows above a conversation: the session's state
+/// now, so the gauge and cost are current.
+fn sendHeader(setup: *Setup, gpa: std.mem.Allocator, session: *const Session, stream: *Stream) !void {
     var header: std.Io.Writer.Allocating = .init(gpa);
     defer header.deinit();
     try html.header(.{
@@ -749,7 +769,6 @@ fn serveTurn(
         .cost = session.cost,
     }, &header.writer);
     try stream.send("header", HtmlEvent{ .html = header.written() });
-    try stream.done();
 }
 
 /// The event a block and a header are sent as: the HTML of one piece of the

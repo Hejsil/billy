@@ -14,6 +14,20 @@ const styling = @import("style.zig");
 const term = @import("term.zig");
 const Mode = @import("mode.zig").Mode;
 
+/// A command a prompt can be on its own, which billy runs itself rather than
+/// sending to the model. A command is the whole line, so a prompt that merely
+/// starts with one is still a prompt.
+pub const Command = enum {
+    /// Fold the conversation into a summary now, whatever its size.
+    compact,
+
+    /// Reads `text` as a command, or null when it is an ordinary prompt.
+    pub fn of(text: []const u8) ?Command {
+        if (std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "/compact")) return .compact;
+        return null;
+    }
+};
+
 pub const Config = struct {
     api_key: []const u8,
     /// Full URL of the chat completions endpoint.
@@ -551,11 +565,32 @@ pub const Runner = struct {
     /// not fatal: the conversation is left as it is and the request goes out with
     /// it, which is what would have happened without compaction at all.
     pub fn compactIfNeeded(runner: *Runner, emitter: Emitter, session: *Session) void {
-        const compacted = maybeCompact(runner.io, &runner.client, emitter, runner.config, session) catch |err| {
+        const compacted = maybeCompact(runner.io, &runner.client, emitter, runner.config, session, false) catch |err| {
             std.log.warn("compaction failed: {s}", .{@errorName(err)});
             return;
         };
-        if (!compacted) return;
+        if (compacted) runner.refresh(session);
+    }
+
+    /// Compacts the conversation now, whatever it has grown to, because the user
+    /// asked with `/compact` rather than because a request would not fit. Says
+    /// whether it compacted anything: a conversation with nothing new since the
+    /// last compaction has nothing to fold in, and neither has one that has not
+    /// been asked anything. A failure is logged and reads as nothing compacted.
+    pub fn compact(runner: *Runner, emitter: Emitter, session: *Session) bool {
+        const compacted = maybeCompact(runner.io, &runner.client, emitter, runner.config, session, true) catch |err| {
+            std.log.warn("compaction failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        if (compacted) runner.refresh(session);
+        return compacted;
+    }
+
+    /// Re-reads the prompt and the tools into the session, so a session that has
+    /// been running a while picks up a changed prompt, instruction files or tool
+    /// set. A compaction is the one moment replacing the front of a request costs
+    /// no cache that was not already being thrown away.
+    fn refresh(runner: *Runner, session: *Session) void {
         refreshLead(
             runner.io,
             runner.gpa,
@@ -640,6 +675,17 @@ pub fn run(
         try sessionHeader(&header.writer, runner.config, session.id(), session.context_tokens, session.cost);
         const line = (try editor.readLine(header.written(), prompt)) orelse break;
         if (line.len == 0) continue;
+        // A command billy runs itself rather than sending to the model.
+        if (Command.of(line)) |cmd| {
+            switch (cmd) {
+                .compact => {
+                    if (!started or !runner.compact(emitter, session))
+                        try emitter.show(.{ .notice = "nothing to compact" });
+                },
+            }
+            try out.flush();
+            continue;
+        }
         // The first prompt of a new session sets its mode: `/chat` opens the
         // chat mode, and anything else the general one. The lead is prepared from
         // the mode before the first request, so nothing is sent before it is
@@ -861,7 +907,7 @@ fn turn(
         // compaction refreshes the prompt and tools before the next request, so
         // the turn picks up the current ones.
         if (!compact_failed) {
-            const compacted = maybeCompact(io, client, emitter, config, session) catch |err| blk: {
+            const compacted = maybeCompact(io, client, emitter, config, session, false) catch |err| blk: {
                 std.log.warn("compaction failed: {s}", .{@errorName(err)});
                 compact_failed = true;
                 break :blk false;
@@ -1130,9 +1176,14 @@ fn maybeCompact(
     emitter: Emitter,
     config: Config,
     session: *Session,
+    force: bool,
 ) !bool {
-    const threshold = compactThreshold(config);
-    if (threshold == 0 or session.context_tokens < threshold) return false;
+    // A manual compaction folds the conversation in whatever it has grown to; an
+    // automatic one only runs once the context has filled past the threshold.
+    if (!force) {
+        const threshold = compactThreshold(config);
+        if (threshold == 0 or session.context_tokens < threshold) return false;
+    }
 
     // Nothing has been added since the last compaction, so there is nothing new
     // to fold in: compacting again would only summarize the summary, and would
@@ -1999,7 +2050,7 @@ test "maybeCompact folds the conversation into a summary at its end" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var terminal = testTerminal(&out.writer, .{});
-    try std.testing.expect(try maybeCompact(io, &client, terminal.emitter(), config, &session));
+    try std.testing.expect(try maybeCompact(io, &client, terminal.emitter(), config, &session, false));
 
     try group.await(io);
     if (mock.err) |err| return err;
@@ -2056,19 +2107,79 @@ test "maybeCompact does nothing below the threshold, off, or with nothing new" {
 
     // Below the threshold.
     session.context_tokens = 100;
-    try std.testing.expect(!try maybeCompact(io, undefined, emitter, config, &session));
+    try std.testing.expect(!try maybeCompact(io, undefined, emitter, config, &session, false));
     // Turned off.
     session.context_tokens = 999;
     config.compact_at = 0;
-    try std.testing.expect(!try maybeCompact(io, undefined, emitter, config, &session));
+    try std.testing.expect(!try maybeCompact(io, undefined, emitter, config, &session, false));
     // A model with no known window has no threshold to measure against.
     config.compact_at = 80;
     config.model_info = null;
-    try std.testing.expect(!try maybeCompact(io, undefined, emitter, config, &session));
+    try std.testing.expect(!try maybeCompact(io, undefined, emitter, config, &session, false));
 
     // Nothing was added, and nothing was printed.
     try std.testing.expectEqual(1, session.messages.items.len);
     try std.testing.expectEqualStrings("", out.written());
+}
+
+test "a forced compaction folds the conversation in whatever its size" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    try session.setSystemPrompt("s");
+    try session.append(.{ .role = "user", .content = "hello" });
+    try session.append(.{ .role = "assistant", .content = "hi" });
+
+    var config = testConfig("m", "/work", null);
+    config.model_info = .{ .provider = .deepseek, .model = "m", .context_window = 1000, .price = .{} };
+    // Compaction is off, so only a manual one runs.
+    config.compact_at = 0;
+
+    var mock = try Mock.start(gpa, io, "/chat/completions", 1, Mock.fixed(
+        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"the summary\"}}]," ++
+            "\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"total_tokens\":105}}",
+    ));
+    defer mock.deinit(io);
+    var group: Io.Group = .init;
+    try group.concurrent(io, Mock.serve, .{ io, &mock });
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+    var client: llm.Client = .{ .gpa = gpa, .io = io, .api_key = "k", .url = mock.url, .model = "m", .http = &http };
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var terminal = testTerminal(&out.writer, .{});
+    // Forced, so the threshold and the setting are ignored.
+    try std.testing.expect(try maybeCompact(io, &client, terminal.emitter(), config, &session, true));
+    try group.await(io);
+    if (mock.err) |err| return err;
+
+    // The summary is folded in, and the pair reads as one line.
+    try std.testing.expectEqual(4, session.messages.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "compacted") != null);
+
+    // Forcing again does nothing: the summary is the last message, so there is
+    // nothing new to fold in, and a request would only re-summarize it.
+    out.clearRetainingCapacity();
+    try std.testing.expect(!try maybeCompact(io, &client, terminal.emitter(), config, &session, true));
+    try std.testing.expectEqualStrings("", out.written());
+}
+
+test "the compact command is read from a prompt" {
+    try std.testing.expectEqual(Command.compact, Command.of("/compact").?);
+    // The whitespace around a pasted line does not matter.
+    try std.testing.expectEqual(Command.compact, Command.of("  /compact\n").?);
+    // Only the whole line is a command: a prompt that starts with one is a
+    // prompt, and so is anything else.
+    try std.testing.expect(Command.of("/compact this") == null);
+    try std.testing.expect(Command.of("hello") == null);
+    try std.testing.expect(Command.of("/chat") == null);
 }
 
 test "maybeCompact does not compact a summary that stands alone" {
@@ -2092,7 +2203,7 @@ test "maybeCompact does not compact a summary that stands alone" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var terminal = testTerminal(&out.writer, .{});
-    try std.testing.expect(!try maybeCompact(io, undefined, terminal.emitter(), config, &session));
+    try std.testing.expect(!try maybeCompact(io, undefined, terminal.emitter(), config, &session, false));
 
     try std.testing.expectEqual(2, session.messages.items.len);
     try std.testing.expectEqualStrings("", out.written());
