@@ -1,7 +1,7 @@
 //! Web search and fetch: a query out to a backend for a list of results, and a
 //! url in for its content.
 //!
-//! Tavily and Exa so far. Which backend is the configuration's choice, so another
+//! Tavily, Exa and Brave so far. Which backend is the configuration's choice, so another
 //! is a variant in `Provider`, its endpoints beside it, a branch in
 //! `Client.search` and `Client.extract`, and the credential it is asked with in
 //! `credentials.Service`; nothing outside those files names a backend. Every
@@ -18,6 +18,7 @@ const Mock = @import("mock.zig");
 pub const Provider = enum {
     tavily,
     exa,
+    brave,
 
     /// Where a query is sent. A backend that takes a GET carries the query in
     /// the url; one that takes a POST carries it in a JSON body.
@@ -25,6 +26,7 @@ pub const Provider = enum {
         return switch (provider) {
             .tavily => "https://api.tavily.com/search",
             .exa => "https://api.exa.ai/search",
+            .brave => "https://api.search.brave.com/res/v1/web/search",
         };
     }
 
@@ -34,6 +36,8 @@ pub const Provider = enum {
         return switch (provider) {
             .tavily => "https://api.tavily.com/extract",
             .exa => "https://api.exa.ai/contents",
+            // Brave has no extraction: `Client.extract` reads the url itself.
+            .brave => null,
         };
     }
 };
@@ -88,6 +92,7 @@ pub const Client = struct {
         return switch (client.provider) {
             .tavily => client.tavily(arena, query, endpoint, requested),
             .exa => client.exa(arena, query, endpoint, requested),
+            .brave => client.brave(arena, query, endpoint, requested),
         };
     }
 
@@ -104,6 +109,9 @@ pub const Client = struct {
                 return switch (client.provider) {
                     .tavily => client.tavilyExtract(arena, url, endpoint),
                     .exa => client.exaContents(arena, url, endpoint),
+                    // Only a backend with an extraction endpoint is above; a
+                    // backend without one is reading the url by now.
+                    .brave => unreachable,
                 };
             }
         }
@@ -164,6 +172,25 @@ pub const Client = struct {
             return error.FetchFailed;
         }
         return parsed.results[0].raw_content;
+    }
+
+    /// One Brave search, sent as a GET with the query in the url. Brave wants
+    /// its key in `x-subscription-token`, not an auth header, and the reply's
+    /// results sit under `web`.
+    fn brave(
+        client: *Client,
+        arena: std.mem.Allocator,
+        query: []const u8,
+        endpoint: []const u8,
+        max_results: usize,
+    ) ![]const u8 {
+        const url = try queryUrl(arena, endpoint, query, "&count={d}", .{max_results});
+        const text = (try client.request(arena, .GET, url, null, &.{
+            .{ .name = "x-subscription-token", .value = client.api_key },
+            .{ .name = "accept", .value = "application/json" },
+        }, "search")) orelse return error.SearchFailed;
+        const parsed = try parse(BraveResponse, arena, text, "search");
+        return render(arena, try mapped(arena, parsed.web.results, "description"));
     }
 
     /// One Exa search, posted to `endpoint`. Exa would return the whole page of
@@ -263,6 +290,27 @@ fn parse(comptime T: type, arena: std.mem.Allocator, text: []const u8, what: []c
     };
 }
 
+/// A url carrying `query` as the `q` parameter, followed by `tail`, which is
+/// whatever else the backend wants such as a result count. The query is
+/// percent-encoded, so a space or an `&` in it is part of the value rather than
+/// breaking the url.
+fn queryUrl(
+    arena: std.mem.Allocator,
+    base: []const u8,
+    query: []const u8,
+    comptime tail: []const u8,
+    tail_args: anytype,
+) ![]const u8 {
+    var url: std.Io.Writer.Allocating = .init(arena);
+    try url.writer.print("{s}?q=", .{base});
+    for (query) |c| switch (c) {
+        'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_', '~' => try url.writer.writeByte(c),
+        else => try url.writer.print("%{x:0>2}", .{c}),
+    };
+    try url.writer.print(tail, tail_args);
+    return url.toOwnedSlice();
+}
+
 /// A backend's results in the one shape `render` writes, where `snippet` names
 /// the field that backend puts its text in.
 fn mapped(arena: std.mem.Allocator, backend_results: anytype, comptime snippet: []const u8) ![]const Result {
@@ -315,6 +363,23 @@ const TavilyExtractResult = struct {
 const TavilyExtractFailure = struct {
     url: []const u8 = "",
     @"error": []const u8 = "",
+};
+
+/// The part of a Brave search response billy uses. The results sit under `web`,
+/// which a query that matched nothing leaves out, so it defaults to none.
+const BraveResponse = struct {
+    web: Web = .{},
+
+    const Web = struct {
+        results: []const BraveResult = &.{},
+    };
+};
+
+/// One Brave result: its snippet is the `description` field.
+const BraveResult = struct {
+    title: []const u8 = "",
+    url: []const u8 = "",
+    description: []const u8 = "",
 };
 
 /// The body an Exa search is posted with. The text it returns is capped, so a
@@ -774,4 +839,82 @@ test "an exa extraction posts the url and reads its text back" {
     try std.testing.expectEqualStrings("{\"urls\":[\"https://ziglang.org\"]}", mock.bodies.items[0]);
     try std.testing.expectEqualStrings("secret", mock.header("x-api-key").?);
     try std.testing.expectEqualStrings("# Zig\n\nA language.", text);
+}
+
+test "a query is percent-encoded into a url" {
+    const gpa = std.testing.allocator;
+    // A space, `&`, `/` and a non-ASCII character are all part of the query
+    // value, not the url around it.
+    const url = try queryUrl(gpa, "https://x/search", "a b&c/dé", "&count={d}", .{3});
+    defer gpa.free(url);
+    try std.testing.expectEqualStrings("https://x/search?q=a%20b%26c%2fd%c3%a9&count=3", url);
+}
+
+test "a brave search sends the query in the url and reads the results back" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const reply = "{\"web\":{\"results\":[" ++
+        "{\"title\":\"Zig\",\"url\":\"https://ziglang.org\",\"description\":\"A language.\"}," ++
+        "{\"title\":\"Docs\",\"url\":\"https://ziglang.org/documentation\"}]}}";
+    var mock = try Mock.start(gpa, io, "/res/v1/web/search", 1, Mock.fixed(reply));
+    defer mock.deinit(io);
+    var group: Io.Group = .init;
+    try group.concurrent(io, Mock.serve, .{ io, &mock });
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+    var client: Client = .{
+        .io = io,
+        .gpa = gpa,
+        .provider = .brave,
+        .api_key = "secret",
+        .max_results = 3,
+        .http = &http,
+    };
+    var reply_state = std.heap.ArenaAllocator.init(gpa);
+    defer reply_state.deinit();
+    const text = try client.brave(reply_state.allocator(), "zig lang", mock.url, 3);
+    try group.await(io);
+    if (mock.err) |err| return err;
+
+    // The query is a GET, so nothing was posted; the key went out in Brave's own
+    // header, and the reply rendered as the list the model reads.
+    try std.testing.expectEqualStrings("", mock.bodies.items[0]);
+    try std.testing.expectEqualStrings("secret", mock.header("x-subscription-token").?);
+    try std.testing.expectEqualStrings("application/json", mock.header("accept").?);
+    try std.testing.expectEqualStrings(
+        "1. Zig\n   https://ziglang.org\n   A language.\n\n" ++
+            "2. Docs\n   https://ziglang.org/documentation\n",
+        text,
+    );
+}
+
+test "a backend with no extraction reads the url itself" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Brave has no extraction endpoint, so a fetch reads the url directly and
+    // returns its bytes, even without `raw`.
+    const reply = "<html>a page</html>";
+    var mock = try Mock.start(gpa, io, "/page", 1, Mock.fixed(reply));
+    defer mock.deinit(io);
+    var group: Io.Group = .init;
+    try group.concurrent(io, Mock.serve, .{ io, &mock });
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+    var client: Client = .{
+        .io = io,
+        .gpa = gpa,
+        .provider = .brave,
+        .api_key = "secret",
+        .max_results = 3,
+        .http = &http,
+    };
+    var reply_state = std.heap.ArenaAllocator.init(gpa);
+    defer reply_state.deinit();
+    try std.testing.expectEqualStrings(reply, try client.extract(reply_state.allocator(), mock.url, false));
+    try group.await(io);
+    if (mock.err) |err| return err;
 }
