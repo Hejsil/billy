@@ -980,7 +980,7 @@ fn hasFavicon(result: []const u8) bool {
 /// cropping to it, with the source's first letter behind it so a site that has no
 /// favicon still reads as a small bubble rather than a broken image. The host is
 /// the bubble's tooltip, and the whole bubble opens the result.
-fn favicon(found: search.Found, origin: []const u8, out: *Io.Writer) !void {
+fn favicon(found: search.Result, origin: []const u8, out: *Io.Writer) !void {
     const host = models.hostOf(found.url) orelse return;
     try out.writeAll("<a class=\"fav\" href=\"");
     try escape(found.url, out);

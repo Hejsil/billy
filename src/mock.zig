@@ -35,11 +35,16 @@ connections: usize = 0,
 bodies: std.ArrayList([]const u8) = .empty,
 /// The length the last request announced, when it carried one.
 content_length: ?u64 = null,
-/// The authorization header the last request carried, owned by `gpa`.
-authorization: ?[]u8 = null,
+/// The headers the last request carried, owned by `gpa`, in the order they
+/// arrived. Each request replaces them, so what a test reads is the request it
+/// just made.
+headers: std.ArrayList(Header) = .empty,
 /// The first failure the server ran into, so a test reports it rather than
 /// hanging on a connection.
 err: ?anyerror = null,
+
+/// One header a request carried, its name and value owned by `gpa`.
+pub const Header = struct { name: []const u8, value: []const u8 };
 
 /// What one request is answered with.
 pub const Answer = struct {
@@ -82,7 +87,26 @@ pub fn deinit(mock: *Mock, io: Io) void {
     mock.gpa.free(mock.url);
     for (mock.bodies.items) |body| mock.gpa.free(body);
     mock.bodies.deinit(mock.gpa);
-    if (mock.authorization) |value| mock.gpa.free(value);
+    mock.clearHeaders();
+    mock.headers.deinit(mock.gpa);
+}
+
+/// The value the last request carried for `name`, or null when it carried none.
+/// The name is matched the way HTTP does, ignoring case.
+pub fn header(mock: *const Mock, name: []const u8) ?[]const u8 {
+    var found: ?[]const u8 = null;
+    for (mock.headers.items) |one| {
+        if (std.ascii.eqlIgnoreCase(one.name, name)) found = one.value;
+    }
+    return found;
+}
+
+fn clearHeaders(mock: *Mock) void {
+    for (mock.headers.items) |one| {
+        mock.gpa.free(one.name);
+        mock.gpa.free(one.value);
+    }
+    mock.headers.clearRetainingCapacity();
 }
 
 /// The accept loop, for a test to hand to `Io.Group.concurrent`. A failure is
@@ -118,11 +142,13 @@ fn serveConnection(mock: *Mock, io: Io, stream: Io.net.Stream) !void {
         var request = server.receiveHead() catch return; // the client closed it
 
         mock.content_length = request.head.content_length;
+        mock.clearHeaders();
         var headers = request.iterateHeaders();
-        while (headers.next()) |header| {
-            if (!std.ascii.eqlIgnoreCase(header.name, "authorization")) continue;
-            if (mock.authorization) |old| mock.gpa.free(old);
-            mock.authorization = try mock.gpa.dupe(u8, header.value);
+        while (headers.next()) |one| {
+            try mock.headers.append(mock.gpa, .{
+                .name = try mock.gpa.dupe(u8, one.name),
+                .value = try mock.gpa.dupe(u8, one.value),
+            });
         }
 
         var body_buffer: [8192]u8 = undefined;

@@ -33,6 +33,7 @@ pub const Service = enum {
     deepseek,
     openai,
     tavily,
+    exa,
 
     /// The name the service is stored and typed under, which is the variant's.
     pub fn name(service: Service) []const u8 {
@@ -46,6 +47,7 @@ pub const Service = enum {
             .deepseek => "DEEPSEEK_API_KEY",
             .openai => "OPENAI_API_KEY",
             .tavily => "TAVILY_API_KEY",
+            .exa => "EXA_API_KEY",
         };
     }
 
@@ -55,6 +57,7 @@ pub const Service = enum {
             .deepseek => "DeepSeek API key",
             .openai => "OpenAI API key",
             .tavily => "Tavily web search API key",
+            .exa => "Exa web search API key",
         };
     }
 
@@ -80,6 +83,7 @@ pub fn modelService(provider: models.Provider) Service {
 pub fn searchService(provider: search.Provider) Service {
     return switch (provider) {
         .tavily => .tavily,
+        .exa => .exa,
     };
 }
 
@@ -123,6 +127,7 @@ pub const Store = struct {
     deepseek: ?[]const u8 = null,
     openai: ?[]const u8 = null,
     tavily: ?[]const u8 = null,
+    exa: ?[]const u8 = null,
 
     /// The key stored for `service`, or null when none is.
     pub fn get(store: *const Store, service: Service) ?[]const u8 {
@@ -350,7 +355,7 @@ test "a service names its variable and what its key is for" {
 
     try std.testing.expectEqual(Service.tavily, Service.fromName("tavily").?);
     try std.testing.expect(Service.fromName("google") == null);
-    try std.testing.expectEqual(3, Service.all().len);
+    try std.testing.expectEqual(4, Service.all().len);
 }
 
 test "load of a file that is not there is an empty store" {
@@ -559,6 +564,7 @@ test "the listing shows each service and where its key comes from" {
         \\deepseek  DeepSeek API key           stored
         \\openai    OpenAI API key             not set
         \\tavily    Tavily web search API key  set in TAVILY_API_KEY
+        \\exa       Exa web search API key     not set
         \\
         \\`billy login <service>` stores a key in /data/billy/credentials.json
         \\
@@ -583,6 +589,7 @@ test "the listing names a service that has no key of any kind" {
         \\deepseek  DeepSeek API key           not set
         \\openai    OpenAI API key             not set
         \\tavily    Tavily web search API key  not set
+        \\exa       Exa web search API key     not set
         \\
         \\`billy login <service>` stores a key in /c
         \\
