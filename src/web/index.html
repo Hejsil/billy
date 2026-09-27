@@ -75,15 +75,16 @@
     white-space: nowrap;
   }
   #list li:not(.selected):hover .ident { color: var(--dim); }
-  /* The delete button sits at the right of a session row, dim until the row is
-     hovered so a list of sessions is not a list of crosses. */
-  #list .del {
+  /* The rename and delete buttons sit at the right of a session row, dim until
+     the row is hovered so a list of sessions is not a row of buttons. */
+  #list .act {
     flex: none; width: 22px; height: 22px; padding: 0; line-height: 1;
     background: none; border: none; border-radius: 5px; cursor: pointer;
     color: var(--dim); font: inherit; font-size: 13px; opacity: 0;
   }
-  #list li:hover .del, #list .del:focus { opacity: 1; }
-  #list .del:hover { color: var(--del); background: rgba(247, 118, 142, 0.12); }
+  #list li:hover .act, #list .act:focus { opacity: 1; }
+  #list .act.ren:hover { color: var(--accent); background: rgba(122, 162, 247, 0.12); }
+  #list .act.del:hover { color: var(--del); background: rgba(247, 118, 142, 0.12); }
   #list .empty { color: var(--dim); cursor: default; padding: 6px 8px; }
   #list .empty:hover { background: none; }
 
@@ -247,9 +248,9 @@
     #new { width: 34px; height: 34px; font-size: 20px; }
     #list { padding: 8px; }
     #list li { padding: 10px 10px; }
-    /* A touch screen has no hover, so the delete button is always shown and big
+    /* A touch screen has no hover, so the buttons are always shown and big
        enough to tap. */
-    #list .del { opacity: 1; width: 30px; height: 30px; font-size: 15px; }
+    #list .act { opacity: 1; width: 30px; height: 30px; font-size: 15px; }
     #header { padding: 8px 12px; }
     #conversation { padding: 12px; }
     #prompt { padding: 10px; }
@@ -331,17 +332,10 @@ async function refresh(select) {
     name.className = 'name';
     item.append(name);
     setListedName(item, session.title);
-    // The delete button is a child of the row, so its click must not also open
-    // the session.
-    const del = document.createElement('button');
-    del.className = 'del';
-    del.title = 'delete this session';
-    del.textContent = '\u2715';
-    del.onclick = (event) => {
-      event.stopPropagation();
-      remove(session.id);
-    };
-    item.append(del);
+    // Rename and delete sit at the right of the row. Each is a child, so its
+    // click must not also open the session.
+    item.append(action('ren', '\u270e', 'rename this session', () => rename(session.id, session.title)));
+    item.append(action('del', '\u2715', 'delete this session', () => remove(session.id)));
     if (session.id === select) item.classList.add('selected');
     item.onclick = () => open(session.id);
     list.append(item);
@@ -399,6 +393,43 @@ async function open(id) {
   openCall = null;
   scrollToEnd();
   input.focus();
+}
+
+// One of a session row's buttons: a glyph that runs `run`, and does not open the
+// session when it is clicked.
+function action(name, glyph, label, run) {
+  const button = document.createElement('button');
+  button.className = 'act ' + name;
+  button.title = label;
+  button.textContent = glyph;
+  button.onclick = (event) => {
+    event.stopPropagation();
+    run();
+  };
+  return button;
+}
+
+// Renames a session. The new name is asked for with a prompt, and sent to the
+// server, which trims and cuts it. The list is refreshed so the row shows it.
+async function rename(id, current) {
+  if (working) return;
+  const typed = prompt('rename this session', current || '');
+  if (typed === null || typed.trim() === '') return;
+  try {
+    const res = await fetch('/api/sessions/' + encodeURIComponent(id), {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: typed }),
+    });
+    if (!res.ok) {
+      note('could not rename the session (' + res.status + ')');
+      return;
+    }
+  } catch (err) {
+    note('lost the connection: ' + err.message);
+    return;
+  }
+  refresh(selected);
 }
 
 // Deletes a session for good. It is asked for first, since there is no trash to

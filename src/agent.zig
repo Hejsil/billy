@@ -1055,10 +1055,6 @@ const title_prompt =
     \\as plain text, with no quotes, no trailing punctuation and no explanation.
 ;
 
-/// Longest a title is kept. A model that ignores the instruction is cut here
-/// rather than dropped, and the list cuts it again to fit.
-const max_title_len = 80;
-
 /// Asks the model for a short title for `session` and records it, so a frontend
 /// can list the session by name. It is called after the session's first turn, so
 /// there is an answer to name.
@@ -1094,7 +1090,7 @@ fn cleanTitle(gpa: std.mem.Allocator, raw: []const u8) !?[]u8 {
     const unquoted = std.mem.trim(u8, std.mem.trim(u8, line, " \t\r"), "\"'`");
     const text = std.mem.trim(u8, unquoted, " \t\r");
     if (text.len == 0) return null;
-    return try gpa.dupe(u8, utf8Cut(text, max_title_len));
+    return try gpa.dupe(u8, text);
 }
 
 /// A title derived from the first thing asked, so a session is named the moment
@@ -1103,18 +1099,11 @@ fn cleanTitle(gpa: std.mem.Allocator, raw: []const u8) !?[]u8 {
 /// a coding session is usually already a serviceable name.
 fn provisionalTitle(text: []const u8) []const u8 {
     const line = std.mem.sliceTo(text, '\n');
-    return utf8Cut(std.mem.trim(u8, line, " \t\r"), max_title_len);
+    return std.mem.trim(u8, line, " \t\r");
 }
 
 /// `text` cut to at most `len` bytes, without splitting a character. A byte that
 /// continues a UTF-8 sequence is not a place to end.
-fn utf8Cut(text: []const u8, len: usize) []const u8 {
-    if (text.len <= len) return text;
-    var end = len;
-    while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
-    return text[0..end];
-}
-
 /// Names `session` from `text`, the first thing asked, if it has no title yet,
 /// so a session is named the moment it starts rather than only once the model has
 /// answered. Returns whether it named it.
@@ -2596,12 +2585,12 @@ test "a title is cut to one clean line, or dropped when there is none" {
     try std.testing.expect((try cleanTitle(gpa, "")) == null);
     try std.testing.expect((try cleanTitle(gpa, "   \n  ")) == null);
 
-    // A title longer than the limit is cut to the limit.
+    // A long title is kept whole: there is no limit.
     const long = (try cleanTitle(gpa, "x" ** 200)).?;
     defer gpa.free(long);
-    try std.testing.expectEqual(max_title_len, long.len);
+    try std.testing.expectEqual(@as(usize, 200), long.len);
 
-    // A provisional title is the first line of what was asked, trimmed and cut.
+    // A provisional title is the first line of what was asked, trimmed.
     try std.testing.expectEqualStrings(
         "add a title to sessions",
         provisionalTitle("add a title to sessions\nand lots of detail follows"),

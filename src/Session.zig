@@ -496,10 +496,11 @@ pub fn title(session: *const Session) ?[]const u8 {
     return session.string(session.title_index);
 }
 
-/// Names the session, replacing any title it had. The title is held in the pool
-/// and reaches the file with the next save.
+/// Names the session, replacing any title it had. The whitespace around it is
+/// trimmed and the title itself is kept as written. It is held in the pool and
+/// reaches the file with the next save.
 pub fn setTitle(session: *Session, text: []const u8) !void {
-    session.title_index = try session.internString(text);
+    session.title_index = try session.internString(std.mem.trim(u8, text, " \t\r\n"));
 }
 
 /// A tool call as the transcript reads it: the id that names the result which
@@ -1151,13 +1152,9 @@ fn listIn(dir: Io.Dir, io: Io, gpa: std.mem.Allocator) ![]Named {
     return names.toOwnedSlice(gpa);
 }
 
-/// Longest a title stored in a file is read as. A title is a short line, so a
-/// value longer than this is not one billy wrote and is not read.
-const max_stored_title_len = 256;
-
-/// The reader a session file's title is read with. It is big enough to hold a
-/// whole title, so the quote that closes one is found within a single read
-/// rather than the reader having to grow.
+/// The first buffer a session file's title is read into. It is big enough for an
+/// ordinary title, so the quote that closes one is found in the first read; a
+/// longer title grows the buffer rather than being refused.
 const title_read_buffer_len = 1024;
 
 /// The title stored in the session file `file_name`, or "" when it has none.
@@ -1169,9 +1166,23 @@ fn readTitle(io: Io, gpa: std.mem.Allocator, dir: Io.Dir, file_name: []const u8)
     var file = dir.openFile(io, file_name, .{}) catch return gpa.dupe(u8, "");
     defer file.close(io);
 
-    var buffer: [title_read_buffer_len]u8 = undefined;
-    var reader = file.reader(io, &buffer);
-    return (try titleFrom(&reader.interface, gpa)) orelse gpa.dupe(u8, "");
+    // The read buffer starts big enough for a normal title and doubles until the
+    // title is found, so a title has no length limit. A session's title is at the
+    // front of the file, so a normal one is read in the first buffer and the
+    // growing only happens for an unusually long title. The reader reads
+    // positionally, so each try starts at the front again.
+    var cap: usize = title_read_buffer_len;
+    while (true) : (cap *= 2) {
+        const buffer = gpa.alloc(u8, cap) catch break;
+        defer gpa.free(buffer);
+        var reader = file.reader(io, buffer);
+        const read = titleFrom(&reader.interface, gpa) catch |err| switch (err) {
+            error.StreamTooLong => continue,
+            else => break,
+        };
+        return read orelse gpa.dupe(u8, "");
+    }
+    return gpa.dupe(u8, "");
 }
 
 /// Reads the title out of the front of a session file, or null when it has none.
@@ -1210,8 +1221,13 @@ fn titleFrom(reader: *Io.Reader, gpa: std.mem.Allocator) !?[]u8 {
 fn takeString(reader: *Io.Reader, gpa: std.mem.Allocator) !?[]u8 {
     var raw: std.ArrayList(u8) = .empty;
     defer raw.deinit(gpa);
-    while (raw.items.len <= max_stored_title_len) {
-        const run = (reader.takeDelimiter('"') catch return null) orelse return null;
+    while (true) {
+        // A value the reader's buffer cannot hold is its own error rather than
+        // "no title", so the caller can read it with a bigger buffer.
+        const run = (reader.takeDelimiter('"') catch |err| switch (err) {
+            error.StreamTooLong => return error.StreamTooLong,
+            error.ReadFailed => return null,
+        }) orelse return null;
         try raw.appendSlice(gpa, run);
         if (endsEscaped(raw.items)) {
             // The run ended on an escaped quote, so that quote is part of the
@@ -1219,14 +1235,8 @@ fn takeString(reader: *Io.Reader, gpa: std.mem.Allocator) !?[]u8 {
             try raw.append(gpa, '"');
             continue;
         }
-        const value = try unescape(gpa, raw.items);
-        if (value.len > max_stored_title_len) {
-            gpa.free(value);
-            return null;
-        }
-        return value;
+        return try unescape(gpa, raw.items);
     }
-    return null;
 }
 
 /// Whether `bytes` ends in an odd number of backslashes, so the byte after it --
@@ -1640,8 +1650,10 @@ test "a listing carries each session's title" {
     defer tmp.cleanup();
 
     // One session named with a long title, one with a short title, and one that
-    // has not been named.
-    const long_title = "a long title, close to the most a title may be, so the reader has to read well past the fields before it";
+    // has not been named. The long one is longer than the first read buffer, so
+    // it is read back only because the reader grows.
+    const long_title = "a long title " ** 199 ++ "ends here";
+    try std.testing.expect(long_title.len > title_read_buffer_len);
     var long = try newSession(&tmp, gpa);
     defer long.deinit();
     try long.setTitle(long_title);
@@ -1674,6 +1686,24 @@ test "a listing carries each session's title" {
     }
 }
 
+test "a title is trimmed and cut to the most a title may be when it is set" {
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var session = try newSession(&tmp, gpa);
+    defer session.deinit();
+
+    // The whitespace a paste brings is not part of the title.
+    try session.setTitle("  Fix the parser\n");
+    try std.testing.expectEqualStrings("Fix the parser", session.title().?);
+
+    // A title of any length is kept whole: there is no limit.
+    const long = "\u{20AC}" ** 500;
+    try session.setTitle(long);
+    try std.testing.expectEqualStrings(long, session.title().?);
+}
+
 test "the title is read from the front of a session file, unescaped" {
     const gpa = std.testing.allocator;
 
@@ -1697,14 +1727,8 @@ test "the title is read from the front of a session file, unescaped" {
     // Something that is not a session at all.
     try std.testing.expect((try titleOf(gpa, "not json at all")) == null);
 
-    // A value longer than a title may be is not one billy wrote, so it is not
-    // read: neither a long value the reader can still hold, nor one it cannot.
-    const too_long = "x" ** (max_stored_title_len + 1);
-    var over: std.Io.Writer.Allocating = .init(gpa);
-    defer over.deinit();
-    try over.writer.print("{{\"version\":3,\"title\":\"{s}\",\"messages\":[]}}", .{too_long});
-    try std.testing.expect((try titleOf(gpa, over.written())) == null);
-    try std.testing.expect((try titleOf(gpa, "{\"version\":3,\"title\":\"" ++ ("y" ** 4096) ++ "\"}")) == null);
+    // A title of any length is read, however long: there is no limit.
+    try expectTitle(gpa, "y" ** 4096, "{\"version\":3,\"title\":\"" ++ ("y" ** 4096) ++ "\"}");
 }
 
 /// Reads the title out of `front`, which stands in for the start of a session

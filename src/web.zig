@@ -274,6 +274,15 @@ fn route(
         }
     }
 
+    if (request.head.method == .PATCH) {
+        const prefix = "/api/sessions/";
+        if (std.mem.startsWith(u8, path, prefix)) {
+            const rest = path[prefix.len..];
+            if (rest.len > 0 and !std.mem.endsWith(u8, rest, "/message")) {
+                return renameSession(setup, registry, request, rest, answered);
+            }
+        }
+    }
     if (request.head.method == .DELETE) {
         const prefix = "/api/sessions/";
         if (std.mem.startsWith(u8, path, prefix)) {
@@ -316,6 +325,53 @@ fn deleteSession(
         error.SessionNotFound => return reply(request, .text, "no such session\n", .not_found, answered),
         else => return err,
     };
+    return reply(request, .text, "", .ok, answered);
+}
+
+/// The body a rename sends: the session's new name.
+const Rename = struct { title: []const u8 };
+
+/// `PATCH /api/sessions/{id}`: renames a session. The name is trimmed and cut the
+/// way a model's title is (`Session.setTitle`), and written out at once, so the
+/// list shows it. A session a turn is running for answers 409, since renaming it
+/// would race the turn writing the same file.
+fn renameSession(
+    setup: *Setup,
+    registry: *Registry,
+    request: *std.http.Server.Request,
+    id: []const u8,
+    answered: *bool,
+) !void {
+    const gpa = setup.gpa;
+
+    var body_buffer: [4096]u8 = undefined;
+    const body_reader = request.readerExpectNone(&body_buffer);
+    const body = body_reader.allocRemaining(gpa, .limited(1 << 16)) catch
+        return reply(request, .text, "cannot read the title\n", .bad_request, answered);
+    defer gpa.free(body);
+
+    const parsed = std.json.parseFromSlice(Rename, gpa, body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return reply(request, .text, "the title is not JSON\n", .bad_request, answered);
+    defer parsed.deinit();
+    // A title of nothing is refused rather than stored: a session with an empty
+    // name reads as one that was never named.
+    const title = std.mem.trim(u8, parsed.value.title, " \t\r\n");
+    if (title.len == 0) return reply(request, .text, "the title is empty\n", .bad_request, answered);
+
+    if (!try registry.claim(id))
+        return reply(request, .text, "the session is busy\n", .conflict, answered);
+    defer registry.release(id);
+
+    var session = Session.open(setup.io, setup.sessions, gpa, id, setup.cwd) catch |err| switch (err) {
+        error.InvalidSessionId => return reply(request, .text, "bad session id\n", .bad_request, answered),
+        error.SessionNotFound => return reply(request, .text, "no such session\n", .not_found, answered),
+        else => return err,
+    };
+    defer session.deinit();
+    try session.setTitle(title);
+    try session.save();
     return reply(request, .text, "", .ok, answered);
 }
 
