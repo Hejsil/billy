@@ -12,6 +12,7 @@ const Io = std.Io;
 const agent = @import("agent.zig");
 const Config = @import("Config.zig");
 const credentials = @import("credentials.zig");
+const Health = @import("Health.zig");
 const models = @import("models.zig");
 const Search = @import("search.zig");
 const Session = @import("Session.zig");
@@ -53,6 +54,11 @@ model: []const u8,
 /// Web search, when the configuration names a backend and its key is set. Null
 /// leaves `web_search` out of the tools the model is offered.
 search: ?Search.Config,
+/// Which search backends are worth trying, so one that just failed is set aside
+/// until the wait it was given is over. Held here rather than built per turn, so
+/// a backend stays set aside across turns and the web server's many connections
+/// share it. The agent configuration points at it, so it must not move.
+health: Health,
 
 /// Reads the configuration, the credentials and the directories billy keeps its
 /// files in, and reports what could not be read.
@@ -172,10 +178,13 @@ pub fn open(init: std.process.Init, out: *Io.Writer) !Setup {
         .url = url,
         .model = model,
         .search = search_config,
+        // The waits search backends were last given, read from disk.
+        .health = try Health.load(io, init.gpa, data_dir),
     };
 }
 
 pub fn deinit(setup: *Setup) void {
+    setup.health.deinit();
     setup.settings.deinit();
     setup.sessions.close(setup.io);
     setup.config_dir.close(setup.io);
@@ -229,7 +238,7 @@ fn searchConfig(
 ///
 /// Nothing is allocated here: every string is one the setup already holds, so
 /// asking for this once a turn costs nothing that would have to be freed.
-pub fn agentConfig(setup: *const Setup, cwd: []const u8, style: styling.Style) agent.Config {
+pub fn agentConfig(setup: *Setup, cwd: []const u8, style: styling.Style) agent.Config {
     const settings = &setup.settings;
     return .{
         .api_key = setup.api_key,
@@ -269,8 +278,13 @@ pub fn agentConfig(setup: *const Setup, cwd: []const u8, style: styling.Style) a
             .style = style,
         },
         // Web search is offered only when the configuration names a backend and
-        // its key is set; the tool is left out of the request otherwise.
-        .search = setup.search,
+        // its key is set; the tool is left out of the request otherwise. The
+        // waits travel with it, so a backend that just failed is skipped.
+        .search = if (setup.search) |search| .{
+            .backends = search.backends,
+            .max_results = search.max_results,
+            .health = &setup.health,
+        } else null,
     };
 }
 

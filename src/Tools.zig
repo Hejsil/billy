@@ -170,6 +170,7 @@ pub fn init(options: Options) !Tools {
             .gpa = options.gpa,
             .backends = config.backends,
             .max_results = config.max_results,
+            .health = config.health,
             .http = options.http,
         } else null,
     };
@@ -464,8 +465,16 @@ fn webSearch(tools: *Tools, args: Call.WebSearch, out: *Io.Writer) !void {
     // the text has been written on.
     var arena_state = std.heap.ArenaAllocator.init(tools.gpa);
     defer arena_state.deinit();
-    const text = client.search(arena_state.allocator(), args.query) catch |err|
-        return fail(out, "search failed: {s}", .{@errorName(err)});
+    const text = client.search(arena_state.allocator(), args.query) catch |err| switch (err) {
+        // Every backend is set aside after failing, which is what the user can
+        // fix: one backend is a single point of failure.
+        error.AllBackendsSetAside => return fail(
+            out,
+            "every search backend is set aside after failing; add another to tools.web_search.providers, or wait",
+            .{},
+        ),
+        else => return fail(out, "search failed: {s}", .{@errorName(err)}),
+    };
     try out.writeAll(text);
 }
 

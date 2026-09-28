@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const Health = @import("Health.zig");
 const Mock = @import("mock.zig");
 
 /// A message in the conversation, as sent to and received from the API.
@@ -219,7 +220,7 @@ pub const Client = struct {
 
         var response = try req.receiveHead(&.{});
         const status = response.head.status;
-        const retry_after_ms = retryAfterMs(response.head.bytes);
+        const retry_after_ms = Health.retryAfterMs(response.head.bytes);
 
         // The body of the response is read the way `fetch` reads it, so that a
         // provider answering with a compressed body still parses.
@@ -361,22 +362,6 @@ fn transportWorthRetrying(err: anyerror) bool {
     };
 }
 
-/// The wait a `Retry-After` header asked for, in milliseconds, or null when
-/// there is none. Only the seconds form is read; an HTTP-date is left to the
-/// backoff, which is close enough for a retry.
-fn retryAfterMs(head: []const u8) ?u64 {
-    var lines = std.mem.splitSequence(u8, head, "\r\n");
-    _ = lines.next(); // the status line
-    while (lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        if (!std.ascii.eqlIgnoreCase(line[0..colon], "retry-after")) continue;
-        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        const seconds = std.fmt.parseInt(u64, value, 10) catch return null;
-        return std.math.mul(u64, seconds, 1000) catch std.math.maxInt(u64);
-    }
-    return null;
-}
-
 /// Writes one request body. Called twice for a request: once into a counter, to
 /// learn the length the head has to carry, and once onto the connection.
 fn writeBody(writer: *Io.Writer, request: anytype) !void {
@@ -481,21 +466,6 @@ test "a request reaches the wire with the body the head promised" {
     try std.testing.expectEqualStrings(expected, mock.bodies.items[0]);
     try std.testing.expectEqualStrings("hi there", completion.message.content.?);
     try std.testing.expectEqual(9, completion.usage.total_tokens);
-}
-
-test "retryAfterMs reads the seconds form and ignores the rest" {
-    try std.testing.expectEqual(
-        @as(?u64, 2000),
-        retryAfterMs("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 2\r\nContent-Length: 0\r\n\r\n"),
-    );
-    // The header name is matched however it is spelled.
-    try std.testing.expectEqual(
-        @as(?u64, 5000),
-        retryAfterMs("HTTP/1.1 503\r\nretry-after: 5\r\n\r\n"),
-    );
-    // No header, and the HTTP-date form, are left to the backoff.
-    try std.testing.expect(retryAfterMs("HTTP/1.1 200 OK\r\n\r\n") == null);
-    try std.testing.expect(retryAfterMs("HTTP/1.1 429\r\nRetry-After: Wed, 21 Oct 2026 07:28:00 GMT\r\n\r\n") == null);
 }
 
 test "worthRetrying is a rate limit or a server error" {
