@@ -169,6 +169,12 @@ pub const Client = struct {
     /// so billy does not parse HTML itself. A `raw` fetch, and a backend with no
     /// extraction endpoint, read the url directly instead: the bytes come back as
     /// the server sent them, which is what an API returning JSON wants.
+    ///
+    /// A backend that answered but could not read the url is not set aside: the
+    /// next backend is tried, and the url read directly if none reads it. Only a
+    /// backend that did not answer, or answered without a success, is set aside.
+    /// This is what keeps one unreadable url from taking search down with it,
+    /// since the waits are keyed by backend and shared with `search`.
     pub fn extract(client: *Client, arena: std.mem.Allocator, url: []const u8, raw: bool) ![]const u8 {
         const now_ms = client.nowMs();
         if (!raw) {
@@ -176,6 +182,17 @@ pub const Client = struct {
                 if (backend.provider.extractEndpoint() == null) continue;
                 if (client.setAside(backend.provider, now_ms)) continue;
                 const text = client.backendExtract(arena, backend, url) catch |err| {
+                    // A url the backend could not read is not a backend that is
+                    // down: it answered, so the next backend is tried without
+                    // setting this one aside. Anything else -- no answer, or an
+                    // answer that is not a success -- is a failure of the
+                    // backend itself, and it waits.
+                    if (err == error.UrlUnreadable) {
+                        std.log.warn("fetch: {s} could not read the url, trying the next", .{
+                            @tagName(backend.provider),
+                        });
+                        continue;
+                    }
                     try client.giveUp(backend.provider, now_ms);
                     std.log.warn("fetch: {s} failed: {s}, trying the next", .{
                         @tagName(backend.provider), @errorName(err),
@@ -256,7 +273,8 @@ pub const Client = struct {
     }
 
     /// One Tavily extraction. The url's text is the backend's; a url the backend
-    /// could not read comes back as `error.FetchFailed`.
+    /// could not read comes back as `error.UrlUnreadable`, which is not a failure
+    /// of the backend.
     fn tavilyExtract(
         client: *Client,
         arena: std.mem.Allocator,
@@ -280,7 +298,7 @@ pub const Client = struct {
             for (parsed.failed_results) |failed| {
                 std.log.warn("fetch: {s}: {s}", .{ failed.url, failed.@"error" });
             }
-            return error.FetchFailed;
+            return error.UrlUnreadable;
         }
         return parsed.results[0].raw_content;
     }
@@ -352,7 +370,9 @@ pub const Client = struct {
         return render(arena, try mapped(arena, parsed.results, "text"));
     }
 
-    /// One Exa extraction, posted to `endpoint`.
+    /// One Exa extraction, posted to `endpoint`. A url the backend could not
+    /// read comes back as `error.UrlUnreadable`, which is not a failure of the
+    /// backend.
     fn exaContents(
         client: *Client,
         arena: std.mem.Allocator,
@@ -369,7 +389,7 @@ pub const Client = struct {
             .{ .name = "x-api-key", .value = api_key },
         }, "fetch")) orelse return error.FetchFailed;
         const parsed = try parse(ExaContentsResponse, arena, text, "fetch");
-        if (parsed.results.len == 0 or parsed.results[0].text.len == 0) return error.FetchFailed;
+        if (parsed.results.len == 0 or parsed.results[0].text.len == 0) return error.UrlUnreadable;
         return parsed.results[0].text;
     }
 
@@ -896,7 +916,7 @@ test "a tavily extraction posts the url and reads its content back" {
     try std.testing.expectEqualStrings("# Zig\n\nA language.", text);
 }
 
-test "a url tavily could not read is a failure, not empty content" {
+test "a url tavily could not read is not a failure of the backend" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -917,11 +937,64 @@ test "a url tavily could not read is a failure, not empty content" {
     var reply_state = std.heap.ArenaAllocator.init(gpa);
     defer reply_state.deinit();
     try std.testing.expectError(
-        error.FetchFailed,
+        error.UrlUnreadable,
         client.tavilyExtract(reply_state.allocator(), "secret", mock.url, "https://nope.invalid"),
     );
     try group.await(io);
     if (mock.err) |err| return err;
+}
+
+test "a url no backend could read does not set the backend aside" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Two requests: Tavily answers the extraction without the url's text, and
+    // the direct read that follows gets the page.
+    var mock = try Mock.start(gpa, io, "/extract", 2, struct {
+        fn answer(number: usize, _: []const u8) Mock.Answer {
+            if (number == 1) return .{
+                .body = "{\"results\":[],\"failed_results\":[{\"url\":\"https://nope.invalid\",\"error\":\"not found\"}]}",
+            };
+            return .{ .body = "<html>a page</html>" };
+        }
+    }.answer);
+    defer mock.deinit(io);
+    var group: Io.Group = .init;
+    try group.concurrent(io, Mock.serve, .{ io, &mock });
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+
+    var health = try Health.load(io, gpa, tmp.dir);
+    defer health.deinit();
+    var client: Client = .{
+        .io = io,
+        .gpa = gpa,
+        .health = &health,
+        .backends = &.{.{ .provider = .tavily, .api_key = "secret", .endpoint = mock.url }},
+        .max_results = 3,
+        .http = &http,
+    };
+    var reply_state = std.heap.ArenaAllocator.init(gpa);
+    defer reply_state.deinit();
+
+    // Tavily could not read the url, so the url is read directly instead.
+    try std.testing.expectEqualStrings(
+        "<html>a page</html>",
+        try client.extract(reply_state.allocator(), mock.url, false),
+    );
+    try group.await(io);
+    if (mock.err) |err| return err;
+
+    // Tavily answered, so it is not set aside: a search after this fetch still
+    // reaches it. The direct read carried no key, so it was not Tavily's.
+    try std.testing.expect(!health.skips("tavily", Io.Clock.now(.real, io).toMilliseconds()));
+    try std.testing.expectEqual(@as(usize, 0), health.entries.count());
+    try std.testing.expectEqual(@as(usize, 2), mock.served);
+    try std.testing.expect(mock.header("authorization") == null);
 }
 
 test "a raw fetch reads the url directly, without the backend" {
