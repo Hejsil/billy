@@ -10,6 +10,7 @@
 const std = @import("std");
 const Io = std.Io;
 const agent = @import("agent.zig");
+const llm = @import("llm.zig");
 const Config = @import("Config.zig");
 const credentials = @import("credentials.zig");
 const Health = @import("Health.zig");
@@ -191,6 +192,18 @@ pub fn deinit(setup: *Setup) void {
     setup.data_dir.close(setup.io);
 }
 
+/// What the configuration's `reasoning` asks of the model's thinking: `off` for
+/// none, `default` to leave it to the model's provider, and any other name as an
+/// effort level of the provider's own. A level billy does not know is passed on
+/// rather than refused, since the levels are the provider's to name, and one
+/// that is not a level at all comes back as the provider's own refusal rather
+/// than as a wait that was never set.
+fn reasoningOf(setting: []const u8) llm.Reasoning {
+    if (std.mem.eql(u8, setting, "off")) return .off;
+    if (std.mem.eql(u8, setting, "default")) return .provider_default;
+    return .{ .effort = setting };
+}
+
 /// The web search settings for a configuration that names a backend, or null
 /// when it names none. A backend named without its key is an error rather than a
 /// silent "no search": the configuration asked for the tool, and leaving it out
@@ -255,6 +268,13 @@ pub fn agentConfig(setup: *Setup, cwd: []const u8, style: styling.Style) agent.C
         .model_info = models.lookup(models.Provider.fromUrl(setup.base_url), setup.model),
         .compact_at = settings.compact_at,
         .title = settings.title,
+        // A model whose provider billy does not know is left alone: the fields
+        // are one provider's own, and an endpoint that does not know them may
+        // refuse a request that carries them.
+        .reasoning = if (models.Provider.fromUrl(setup.base_url) != null)
+            reasoningOf(settings.reasoning)
+        else
+            .provider_default,
         // How billy lays out and decorates what it shows. A bash command is laid
         // out by its format script, so the user reads the command the way it
         // runs; an edit is shown as a diff, laid out by its own script when one
@@ -326,4 +346,13 @@ test "each backend resolves its own key, and SearXNG its instance" {
     try std.testing.expectEqual(Search.Provider.searxng, config.backends[0].provider);
     try std.testing.expectEqualStrings("", config.backends[0].api_key);
     try std.testing.expectEqualStrings("https://searx.example.org", config.backends[0].endpoint.?);
+}
+
+test "the reasoning setting names what billy asks of the model's thinking" {
+    // The two names billy knows, and any other name as an effort level of the
+    // provider's own, which is passed on rather than refused.
+    try std.testing.expectEqual(llm.Reasoning.off, reasoningOf("off"));
+    try std.testing.expectEqual(llm.Reasoning.provider_default, reasoningOf("default"));
+    try std.testing.expectEqualStrings("high", reasoningOf("high").effort);
+    try std.testing.expectEqualStrings("low", reasoningOf("low").effort);
 }

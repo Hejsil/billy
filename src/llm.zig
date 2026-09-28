@@ -11,6 +11,11 @@ pub const Message = struct {
     content: ?[]const u8 = null,
     tool_calls: ?[]const ToolCall = null,
     tool_call_id: ?[]const u8 = null,
+    /// What a reasoning model thought before it answered, which the API reports
+    /// beside `content`. A provider that wants it back on the next request is
+    /// sent it from here; a provider that does not, or does not have one, is
+    /// sent nothing, since the field is written only when it is set.
+    reasoning_content: ?[]const u8 = null,
 };
 
 pub const ToolCall = struct {
@@ -65,6 +70,21 @@ pub const Completion = struct {
     }
 };
 
+/// What a request asks of a provider's thinking, for a model that has it.
+/// Thinking is a provider's own default and most providers have none, so a
+/// provider nothing is asked of is left to do whatever it does.
+pub const Reasoning = union(enum) {
+    /// Say nothing, which leaves the model on its provider's own default.
+    provider_default,
+    /// Ask for no thinking.
+    off,
+    /// Ask for a level of thinking, by the name the provider gives it.
+    effort: []const u8,
+};
+
+/// The thinking toggle, in the shape the API takes it: `{"type": "..."}`.
+pub const Thinking = struct { type: []const u8 };
+
 /// The body of one completion request.
 ///
 /// `Messages` and `Tools` are whatever the conversation and the tool
@@ -78,6 +98,21 @@ fn Request(comptime Messages: type, comptime Tools: type) type {
         messages: Messages,
         tools: Tools,
         stream: bool = false,
+        /// The thinking toggle. Null sends none, which is what leaves the model
+        /// on its own default.
+        thinking: ?Thinking = null,
+        /// How hard the model should think, by the provider's own name for the
+        /// level. Null sends none.
+        reasoning_effort: ?[]const u8 = null,
+
+        /// The two thinking controls `reasoning` asks for.
+        fn controls(reasoning: Reasoning) struct { thinking: ?Thinking, reasoning_effort: ?[]const u8 } {
+            return switch (reasoning) {
+                .provider_default => .{ .thinking = null, .reasoning_effort = null },
+                .off => .{ .thinking = .{ .type = "disabled" }, .reasoning_effort = null },
+                .effort => |level| .{ .thinking = null, .reasoning_effort = level },
+            };
+        }
     };
 }
 
@@ -138,6 +173,8 @@ pub const Client = struct {
     /// request, chat and search alike, shares its connections and its scanned
     /// certificates. The run owns it and outlives this.
     http: *std.http.Client,
+    /// What the request asks of the model's thinking.
+    reasoning: Reasoning = .provider_default,
 
     /// Sends the conversation and returns the next assistant message together
     /// with the tokens the request used.
@@ -159,10 +196,14 @@ pub const Client = struct {
         const authorization = try std.fmt.allocPrint(client.gpa, "Bearer {s}", .{client.api_key});
         defer client.gpa.free(authorization);
 
-        const request: Request(@TypeOf(messages), @TypeOf(tools)) = .{
+        const Request_ = Request(@TypeOf(messages), @TypeOf(tools));
+        const controls = Request_.controls(client.reasoning);
+        const request: Request_ = .{
             .model = client.model,
             .messages = messages,
             .tools = tools,
+            .thinking = controls.thinking,
+            .reasoning_effort = controls.reasoning_effort,
         };
 
         var attempt: usize = 0;
@@ -375,6 +416,35 @@ fn writeBody(writer: *Io.Writer, request: anytype) !void {
 /// Stands for the tools of a request that has none. The request is generic over
 /// the tools, so a test that sends none still names a type for them.
 const NoTools = struct {};
+
+test "what a request asks of the model's thinking, by setting" {
+    const gpa = std.testing.allocator;
+    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+
+    // The three shapes, and the field each puts on the wire: none at all for the
+    // model's own default, the toggle for no thinking, and the level for an
+    // effort the provider named. Never two of them, which would ask twice.
+    const cases = [_]struct { reasoning: Reasoning, has: []const u8, has_not: []const u8 }{
+        .{ .reasoning = .provider_default, .has = "", .has_not = "thinking" },
+        .{ .reasoning = .off, .has = "\"thinking\":{\"type\":\"disabled\"}", .has_not = "reasoning_effort" },
+        .{ .reasoning = .{ .effort = "high" }, .has = "\"reasoning_effort\":\"high\"", .has_not = "thinking" },
+    };
+    for (cases) |case| {
+        const Request_ = Request(@TypeOf(&messages), []const NoTools);
+        const controls = Request_.controls(case.reasoning);
+        const request: Request_ = .{
+            .model = "m",
+            .messages = &messages,
+            .tools = &.{},
+            .thinking = controls.thinking,
+            .reasoning_effort = controls.reasoning_effort,
+        };
+        const body = try std.json.Stringify.valueAlloc(gpa, request, .{ .emit_null_optional_fields = false });
+        defer gpa.free(body);
+        if (case.has.len > 0) try std.testing.expect(std.mem.indexOf(u8, body, case.has) != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, case.has_not) == null);
+    }
+}
 
 test "a request counts out to exactly the body it writes" {
     const gpa = std.testing.allocator;

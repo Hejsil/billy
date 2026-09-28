@@ -61,6 +61,8 @@ pub const Config = struct {
     /// Whether the model is asked for a short title for a session, after its
     /// first turn, so a frontend can list it by name. Mirrors the configuration.
     title: bool = true,
+    /// What the request asks of the model's thinking, from the configuration.
+    reasoning: llm.Reasoning = .provider_default,
     /// What the session may do and what its prompt says, decided when it starts.
     /// See `mode.zig`.
     mode: Mode = .general,
@@ -511,6 +513,7 @@ pub const Runner = struct {
                 .url = config.url,
                 .model = config.model,
                 .http = http,
+                .reasoning = config.reasoning,
             },
         };
     }

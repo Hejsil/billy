@@ -172,6 +172,9 @@ pub const Message = struct {
     role: StringIndex,
     content: StringIndex = .none,
     tool_call_id: StringIndex = .none,
+    /// What the model thought before this message, for a provider that reports
+    /// it and wants it sent back. `.none` for a model that reports none.
+    reasoning: StringIndex = .none,
     tool_calls: ToolCallIndex = .empty,
 
     /// The message as the API client takes it, with every string resolved out of
@@ -189,6 +192,7 @@ pub const Message = struct {
             .role = session.string(message.role) orelse "",
             .content = session.string(message.content),
             .tool_call_id = session.string(message.tool_call_id),
+            .reasoning_content = session.string(message.reasoning),
             .tool_calls = calls,
         };
     }
@@ -444,6 +448,15 @@ fn writeMessage(session: *const Session, json: anytype, message: Message) !void 
         try json.objectField("tool_call_id");
         try json.write(tool_call_id);
     }
+
+    // Sent back so a provider that concatenates its own reasoning into the
+    // context on the next request has it to send. Written last, after every
+    // other field, so a message that carries none is byte for byte the message
+    // it was before this field existed and a cached prefix still matches.
+    if (session.string(message.reasoning)) |reasoning| {
+        try json.objectField("reasoning_content");
+        try json.write(reasoning);
+    }
     try json.endObject();
 }
 
@@ -630,6 +643,7 @@ fn appendMessage(session: *Session, message: llm.Message) !void {
         .role = try session.internString(message.role),
         .content = try session.internString(message.content),
         .tool_call_id = try session.internString(message.tool_call_id),
+        .reasoning = try session.internString(message.reasoning_content),
         .tool_calls = interned_tool_calls,
     });
 }
