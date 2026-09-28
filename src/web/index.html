@@ -85,6 +85,15 @@
   #list li:hover .act, #list .act:focus { opacity: 1; }
   #list .act.ren:hover { color: var(--accent); background: rgba(122, 162, 247, 0.12); }
   #list .act.del:hover { color: var(--del); background: rgba(247, 118, 142, 0.12); }
+  /* Where the screen is wide enough to hover, the buttons take no room either
+     until the row is hovered, so a long title is only ever cut short for
+     buttons that are on screen. Their own spacing comes with them, so what they
+     take when they appear is what they took before. */
+  @media (min-width: 721px) {
+    #list li { gap: 0; }
+    #list .act { width: 0; overflow: hidden; }
+    #list li:hover .act, #list .act:focus { width: 22px; margin-left: 4px; }
+  }
   #list .empty { color: var(--dim); cursor: default; padding: 6px 8px; }
   #list .empty:hover { background: none; }
 
