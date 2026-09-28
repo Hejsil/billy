@@ -136,21 +136,23 @@ pub fn open(init: std.process.Init, out: *Io.Writer) !Setup {
     };
     errdefer sessions.close(io);
 
-    const search_config = searchConfig(&store, environ, settings.config) catch |err| {
+    var blame: Search.Provider = .tavily;
+    const search_config = searchConfig(arena, &store, environ, settings.config, &blame) catch |err| {
         switch (err) {
             error.MissingApiKey => {
                 // The backend is named, so a service is one of the ones reached
                 // with a key.
-                const service = credentials.searchService(settings.config.tools.web_search.provider.?).?;
+                const service = credentials.searchService(blame).?;
                 std.log.err(
-                    "run `billy login {s}`, or set {s} to use web search, or clear tools.web_search in the configuration",
-                    .{ service.name(), service.variable() },
+                    "run `billy login {s}`, or set {s} to use {s}, or clear tools.web_search in the configuration",
+                    .{ service.name(), service.variable(), @tagName(blame) },
                 );
             },
             error.MissingSearchUrl => std.log.err(
                 "set tools.web_search.searxng.url to your SearXNG instance, or clear tools.web_search in the configuration",
                 .{},
             ),
+            else => {},
         }
         return err;
     };
@@ -185,29 +187,37 @@ pub fn deinit(setup: *Setup) void {
 /// silent "no search": the configuration asked for the tool, and leaving it out
 /// without a word would look like a bug.
 fn searchConfig(
+    arena: std.mem.Allocator,
     store: *const credentials.Store,
     environ: *const std.process.Environ.Map,
     settings: Config,
+    blame: *Search.Provider,
 ) !?Search.Config {
     const web = settings.tools.web_search;
-    const provider = web.provider orelse return null;
+    if (web.providers.len == 0) return null;
 
-    // A backend billy knows how to reach needs a key; SearXNG is self-hosted and
-    // needs the instance named instead of a key. What went wrong is left to the
-    // caller to report, so this only says which of the two it was.
-    const key = if (credentials.searchService(provider)) |service|
-        credentials.credential(store, environ, service) orelse return error.MissingApiKey
-    else blk: {
-        if (web.searxng.url == null or web.searxng.url.?.len == 0) return error.MissingSearchUrl;
-        break :blk "";
-    };
-
-    return .{
-        .provider = provider,
-        .api_key = key,
-        .url = web.searxng.url orelse "",
-        .max_results = web.max_results,
-    };
+    // Each backend resolves its own key, or, for the one that is self-hosted,
+    // needs the instance named instead. What went wrong is left to the caller to
+    // report, which is what `blame` is for, so this only says which it was.
+    const backends = try arena.alloc(Search.Backend, web.providers.len);
+    for (web.providers, backends) |provider, *backend| {
+        blame.* = provider;
+        const service = credentials.searchService(provider);
+        backend.* = .{
+            .provider = provider,
+            .api_key = if (service) |one|
+                credentials.credential(store, environ, one) orelse return error.MissingApiKey
+            else blk: {
+                // A backend billy knows the address of needs only its key; one it
+                // does not, SearXNG, needs the instance named.
+                if (web.searxng.url == null or web.searxng.url.?.len == 0) return error.MissingSearchUrl;
+                break :blk "";
+            },
+            // Only a self-hosted backend is reached somewhere billy does not know.
+            .endpoint = if (service == null) web.searxng.url else null,
+        };
+    }
+    return .{ .backends = backends, .max_results = web.max_results };
 }
 
 /// The agent configuration for a session working in `cwd`, with its blocks
@@ -264,33 +274,42 @@ pub fn agentConfig(setup: *const Setup, cwd: []const u8, style: styling.Style) a
     };
 }
 
-test "a backend billy knows needs a key, and SearXNG needs an instance instead" {
+test "each backend resolves its own key, and SearXNG its instance" {
     const gpa = std.testing.allocator;
+    // The backends are built in the arena the setup runs in, which owns them.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
     var environ: std.process.Environ.Map = .init(gpa);
     defer environ.deinit();
     const store: credentials.Store = .{};
+    var blame: Search.Provider = .tavily;
 
     // Nothing named is no search at all.
     var off = Config.init(gpa);
     defer off.deinit();
-    try std.testing.expect((try searchConfig(&store, &environ, off)) == null);
+    try std.testing.expect((try searchConfig(arena, &store, &environ, off, &blame)) == null);
 
     // A backend billy knows is asked for a key, and one that is not set is an
-    // error rather than a silent "no search".
+    // error rather than a silent "no search". The backend at fault is reported.
     var naming = Config.init(gpa);
     defer naming.deinit();
-    naming.tools.web_search.provider = .tavily;
-    try std.testing.expectError(error.MissingApiKey, searchConfig(&store, &environ, naming));
+    naming.tools.web_search.providers = &.{.tavily};
+    try std.testing.expectError(error.MissingApiKey, searchConfig(arena, &store, &environ, naming, &blame));
+    try std.testing.expectEqual(Search.Provider.tavily, blame);
 
     // SearXNG needs no key, but needs the instance named.
     var searx = Config.init(gpa);
     defer searx.deinit();
-    searx.tools.web_search.provider = .searxng;
-    try std.testing.expectError(error.MissingSearchUrl, searchConfig(&store, &environ, searx));
+    searx.tools.web_search.providers = &.{.searxng};
+    try std.testing.expectError(error.MissingSearchUrl, searchConfig(arena, &store, &environ, searx, &blame));
 
+    // Every named backend becomes a backend to try, in the order named.
     searx.tools.web_search.searxng.url = "https://searx.example.org";
-    const config = (try searchConfig(&store, &environ, searx)).?;
-    try std.testing.expectEqual(Search.Provider.searxng, config.provider);
-    try std.testing.expectEqualStrings("", config.api_key);
-    try std.testing.expectEqualStrings("https://searx.example.org", config.url);
+    const config = (try searchConfig(arena, &store, &environ, searx, &blame)).?;
+    try std.testing.expectEqual(@as(usize, 1), config.backends.len);
+    try std.testing.expectEqual(Search.Provider.searxng, config.backends[0].provider);
+    try std.testing.expectEqualStrings("", config.backends[0].api_key);
+    try std.testing.expectEqualStrings("https://searx.example.org", config.backends[0].endpoint.?);
 }

@@ -39,16 +39,17 @@ pub const Tools = struct {
 
 /// Settings for the web search tool.
 pub const WebSearch = struct {
-    /// The backend to search with, or null to leave web search out of the tools
-    /// the model is offered, which is the default: a fresh configuration has no
-    /// key to search with. The names are the variants of `search.Provider`, and
-    /// one it does not know makes the file corrupt rather than reading as "no
-    /// search".
+    /// The backends to search with, in the order they are tried: the first that
+    /// answers is used, so a backend that is down or rate-limited falls through
+    /// to the next. Empty leaves web search out of the tools the model is
+    /// offered, which is the default: a fresh configuration has no key to search
+    /// with. The names are the variants of `search.Provider`, and one billy does
+    /// not know makes the file corrupt rather than reading as "no search".
     ///
     /// The key a backend needs is read from the credential `billy login` stored
     /// for it, or from its environment variable when none is stored, and never
     /// from this file, which is written to disk in the clear.
-    provider: ?search.Provider = null,
+    providers: []const search.Provider = &.{},
     /// Results asked for per query. The backend may return fewer, and billy caps
     /// it.
     max_results: usize = 5,
@@ -344,22 +345,23 @@ fn parseValue(comptime T: type, arena: std.mem.Allocator, value: []const u8) err
     }
 }
 
-/// Whether a value of `T` is one a path can name: a string, a number, a boolean,
-/// an enum, an optional of one of those, or a struct whose fields are all such
-/// values, section by section. Anything else is not a setting the file holds, so
-/// a path never reaches it and the walk leaves it alone.
+/// Whether a path can reach `T`: a value a string can set, or a section the walk
+/// goes into. A section is walked into whatever it holds, since a field a path
+/// cannot name -- a list, say -- leaves the fields beside it reachable.
 fn isSettable(comptime T: type) bool {
+    if (@typeInfo(T) == .@"struct") return true;
+    return isSettableValue(T);
+}
+
+/// Whether a value of `T` can be set from one string: a string, a number, a
+/// boolean, an enum, or an optional of one of those. Anything else is not a
+/// setting a path can name, so the walk leaves it alone.
+fn isSettableValue(comptime T: type) bool {
     return switch (@typeInfo(T)) {
-        .optional => |optional| isSettable(optional.child),
+        .optional => |optional| isSettableValue(optional.child),
         .int, .bool => true,
         .@"enum" => true,
         .pointer => |pointer| pointer.size == .slice and pointer.child == u8,
-        .@"struct" => |structure| blk: {
-            for (structure.fields) |field| {
-                if (!isSettable(field.type)) break :blk false;
-            }
-            break :blk true;
-        },
         else => false,
     };
 }
@@ -564,34 +566,37 @@ test "open reads a self-hosted backend's instance from the file" {
     // SearXNG is the one backend with no address billy knows, so its instance is
     // named under its own section. A backend billy knows leaves it unset.
     var opened = try openFrom(&tmp, "{\"tools\":{\"web_search\":{" ++
-        "\"provider\":\"searxng\",\"searxng\":{\"url\":\"https://searx.example.org\"}}}}");
+        "\"providers\":[\"searxng\"],\"searxng\":{\"url\":\"https://searx.example.org\"}}}}");
     defer opened.config.deinit();
-    try std.testing.expectEqual(search.Provider.searxng, opened.config.tools.web_search.provider.?);
+    try std.testing.expectEqual(search.Provider.searxng, opened.config.tools.web_search.providers[0]);
     try std.testing.expectEqualStrings("https://searx.example.org", opened.config.tools.web_search.searxng.url.?);
 
-    var known = try openFrom(&tmp, "{\"tools\":{\"web_search\":{\"provider\":\"exa\"}}}");
+    var known = try openFrom(&tmp, "{\"tools\":{\"web_search\":{\"providers\":[\"exa\"]}}}");
     defer known.config.deinit();
     try std.testing.expect(known.config.tools.web_search.searxng.url == null);
 }
 
-test "open reads the web search provider and result count from the file" {
+test "open reads the web search backends and result count from the file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var opened = try openFrom(&tmp, "{\"tools\":{\"web_search\":{\"provider\":\"tavily\",\"max_results\":3}}}");
+    // The backends are kept in the order they are named, since that is the order
+    // they are tried.
+    var opened = try openFrom(&tmp, "{\"tools\":{\"web_search\":{" ++
+        "\"providers\":[\"tavily\",\"brave\"],\"max_results\":3}}}");
     defer opened.config.deinit();
-    try std.testing.expectEqual(search.Provider.tavily, opened.config.tools.web_search.provider.?);
+    try std.testing.expectEqualSlices(search.Provider, &.{ .tavily, .brave }, opened.config.tools.web_search.providers);
     try std.testing.expectEqual(3, opened.config.tools.web_search.max_results);
 
-    // The defaults leave it off, and the count ready for a provider to be named.
+    // The defaults leave it off, and the count ready for a backend to be named.
     var bare = try openFrom(&tmp, "{}");
     defer bare.config.deinit();
-    try std.testing.expect(bare.config.tools.web_search.provider == null);
+    try std.testing.expectEqual(@as(usize, 0), bare.config.tools.web_search.providers.len);
     try std.testing.expectEqual(Stored.default.tools.web_search.max_results, bare.config.tools.web_search.max_results);
 
     // A name that is not a backend makes the file unusable rather than reading
     // as "no search", so a typo is not silently dropped.
-    try std.testing.expectError(error.CorruptConfig, openFrom(&tmp, "{\"tools\":{\"web_search\":{\"provider\":\"google\"}}}"));
+    try std.testing.expectError(error.CorruptConfig, openFrom(&tmp, "{\"tools\":{\"web_search\":{\"providers\":[\"google\"]}}}"));
 }
 
 test "save round-trips a custom max_turns" {
@@ -637,7 +642,7 @@ test "the file is indented, so it can be read and edited by hand" {
         \\      "format": null
         \\    },
         \\    "web_search": {
-        \\      "provider": null,
+        \\      "providers": [],
         \\      "max_results": 5,
         \\      "searxng": {
         \\        "url": null
@@ -656,12 +661,12 @@ test "save round-trips a configured search backend" {
     // as the variant it names.
     var config = Config.init(std.testing.allocator);
     defer config.deinit();
-    config.tools.web_search = .{ .provider = .tavily, .max_results = 4 };
+    config.tools.web_search = .{ .providers = &.{.tavily}, .max_results = 4 };
     try config.save(std.testing.io, tmp.dir);
 
     var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
     defer opened.config.deinit();
-    try std.testing.expectEqual(search.Provider.tavily, opened.config.tools.web_search.provider.?);
+    try std.testing.expectEqual(search.Provider.tavily, opened.config.tools.web_search.providers[0]);
     try std.testing.expectEqual(4, opened.config.tools.web_search.max_results);
 }
 
@@ -704,10 +709,10 @@ test "set names a setting by its dotted path" {
     try config.set("compact_at", "0");
     try std.testing.expectEqual(0, config.compact_at);
 
-    try config.set("tools.web_search.provider", "tavily");
-    try std.testing.expectEqual(search.Provider.tavily, config.tools.web_search.provider.?);
     try config.set("tools.web_search.max_results", "3");
     try std.testing.expectEqual(3, config.tools.web_search.max_results);
+    try config.set("tools.web_search.searxng.url", "https://searx.example.org");
+    try std.testing.expectEqualStrings("https://searx.example.org", config.tools.web_search.searxng.url.?);
 }
 
 test "set writes null to clear a setting that has no value" {
@@ -718,9 +723,9 @@ test "set writes null to clear a setting that has no value" {
     try config.set("tools.edit.format", "null");
     try std.testing.expect(config.tools.edit.format == null);
 
-    try config.set("tools.web_search.provider", "tavily");
-    try config.set("tools.web_search.provider", "null");
-    try std.testing.expect(config.tools.web_search.provider == null);
+    try config.set("tools.web_search.searxng.url", "https://searx.example.org");
+    try config.set("tools.web_search.searxng.url", "null");
+    try std.testing.expect(config.tools.web_search.searxng.url == null);
 }
 
 test "set refuses a setting that is unknown, a section, or a bad value" {
@@ -738,7 +743,9 @@ test "set refuses a setting that is unknown, a section, or a bad value" {
     try std.testing.expectError(error.NotASection, config.set("tools.bash.format.x", "y"));
     // Text that is not the kind of value the setting takes.
     try std.testing.expectError(error.InvalidValue, config.set("tools.bash.timeout_s", "soon"));
-    try std.testing.expectError(error.InvalidValue, config.set("tools.web_search.provider", "google"));
+    // A list setting is edited in the file, not named by a path, so it is not a
+    // setting the command knows.
+    try std.testing.expectError(error.UnknownOption, config.set("tools.web_search.providers", "tavily"));
     // A value the file itself would refuse is refused before it is written, and
     // the setting keeps what it had.
     try std.testing.expectError(error.InvalidValue, config.set("tools.bash.timeout_s", "0"));
@@ -755,14 +762,14 @@ test "a setting set by path is written and read back" {
     defer config.deinit();
     try config.set("tools.bash.format", "shfmt");
     try config.set("tools.bash.timeout_s", "45");
-    try config.set("tools.web_search.provider", "tavily");
+    try config.set("tools.web_search.searxng.url", "https://searx.example.org");
     try config.save(std.testing.io, tmp.dir);
 
     var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
     defer opened.config.deinit();
     try std.testing.expectEqualStrings("shfmt", opened.config.tools.bash.format.?);
     try std.testing.expectEqual(45, opened.config.tools.bash.timeout_s);
-    try std.testing.expectEqual(search.Provider.tavily, opened.config.tools.web_search.provider.?);
+    try std.testing.expectEqualStrings("https://searx.example.org", opened.config.tools.web_search.searxng.url.?);
 }
 
 test "run sets a setting in the file, creating it when it is missing" {

@@ -168,9 +168,7 @@ pub fn init(options: Options) !Tools {
         .search = if (options.search) |config| .{
             .io = options.io,
             .gpa = options.gpa,
-            .provider = config.provider,
-            .api_key = config.api_key,
-            .url = config.url,
+            .backends = config.backends,
             .max_results = config.max_results,
             .http = options.http,
         } else null,
@@ -2032,8 +2030,7 @@ fn definitionsToolSet(
         .gpa = gpa,
         .bash_timeout_s = 120,
         .search = if (with_search) .{
-            .provider = .tavily,
-            .api_key = "key",
+            .backends = &.{.{ .provider = .tavily, .api_key = "key" }},
             .max_results = 3,
         } else null,
         .http = http,

@@ -47,17 +47,32 @@ pub const Provider = enum {
     }
 };
 
-/// What the configuration says about searching, with the key already resolved.
-/// A null of this in a tool set is what leaves web search out of a request.
-pub const Config = struct {
+/// One backend to search with, and what it is asked with: the key, from the
+/// credential `billy login` stored or its environment variable, and the instance
+/// for a backend that is the user's own.
+pub const Backend = struct {
     provider: Provider,
     /// The key the backend is asked with. Empty for one that needs none, which
     /// is SearXNG, whose instance the user runs.
-    api_key: []const u8,
-    /// The SearXNG instance to query, which the configuration names since a
-    /// self-hosted backend has no endpoint billy knows. Unused by the others.
-    url: []const u8 = "",
-    /// Results asked for per query. The backend may return fewer.
+    api_key: []const u8 = "",
+    /// Where the backend is reached, when it is not the address billy knows:
+    /// SearXNG's instance, or, in a test, the server standing in for a backend.
+    /// Null uses the backend's own address.
+    endpoint: ?[]const u8 = null,
+
+    /// The address to send to: the one named for this backend, or the backend's
+    /// own.
+    fn reach(backend: Backend) []const u8 {
+        return backend.endpoint orelse backend.provider.endpoint();
+    }
+};
+
+/// What the configuration says about searching, with the keys already resolved:
+/// the backends to try, in order, and how many results to ask for. A null of
+/// this in a tool set is what leaves web search out of a request.
+pub const Config = struct {
+    backends: []const Backend,
+    /// Results asked for per query. A backend may return fewer.
     max_results: usize,
 };
 
@@ -85,10 +100,9 @@ const max_fetch_bytes = 1 << 20;
 pub const Client = struct {
     io: Io,
     gpa: std.mem.Allocator,
-    provider: Provider,
-    api_key: []const u8,
-    /// The SearXNG instance, for the one backend that is self-hosted.
-    url: []const u8 = "",
+    /// The backends to try, in order: the first that answers is used, so a
+    /// backend that is down or rate-limited falls through to the next.
+    backends: []const Backend = &.{},
     max_results: usize,
     /// The one HTTP client of the run, borrowed by pointer so a query shares
     /// connections and scanned certificates with everything else that makes a
@@ -100,12 +114,33 @@ pub const Client = struct {
     /// them. `arena` owns the result, which is what the caller keeps.
     pub fn search(client: *Client, arena: std.mem.Allocator, query: []const u8) ![]const u8 {
         const requested = std.math.clamp(client.max_results, 1, result_limit);
-        const endpoint = client.provider.endpoint();
-        return switch (client.provider) {
-            .tavily => client.tavily(arena, query, endpoint, requested),
-            .exa => client.exa(arena, query, endpoint, requested),
-            .brave => client.brave(arena, query, endpoint, requested),
-            .searxng => client.searxng(arena, query, client.url, requested),
+        var failed: ?anyerror = null;
+        for (client.backends) |backend| {
+            const text = client.backendSearch(arena, backend, query, requested) catch |err| {
+                std.log.warn("search: {s} failed: {s}, trying the next", .{
+                    @tagName(backend.provider), @errorName(err),
+                });
+                failed = err;
+                continue;
+            };
+            return text;
+        }
+        return failed orelse error.SearchFailed;
+    }
+
+    /// Runs one query against one backend, whichever it is.
+    fn backendSearch(
+        client: *Client,
+        arena: std.mem.Allocator,
+        backend: Backend,
+        query: []const u8,
+        max_results: usize,
+    ) ![]const u8 {
+        return switch (backend.provider) {
+            .tavily => client.tavily(arena, backend.api_key, backend.reach(), query, max_results),
+            .exa => client.exa(arena, backend.api_key, backend.reach(), query, max_results),
+            .brave => client.brave(arena, backend.api_key, backend.reach(), query, max_results),
+            .searxng => client.searxng(arena, backend.reach(), query, max_results),
         };
     }
 
@@ -118,17 +153,29 @@ pub const Client = struct {
     /// the server sent them, which is what an API returning JSON wants.
     pub fn extract(client: *Client, arena: std.mem.Allocator, url: []const u8, raw: bool) ![]const u8 {
         if (!raw) {
-            if (client.provider.extractEndpoint()) |endpoint| {
-                return switch (client.provider) {
-                    .tavily => client.tavilyExtract(arena, url, endpoint),
-                    .exa => client.exaContents(arena, url, endpoint),
-                    // Only a backend with an extraction endpoint is above; a
-                    // backend without one is reading the url by now.
-                    .brave, .searxng => unreachable,
+            for (client.backends) |backend| {
+                if (backend.provider.extractEndpoint() == null) continue;
+                const text = client.backendExtract(arena, backend, url) catch |err| {
+                    std.log.warn("fetch: {s} failed: {s}, trying the next", .{
+                        @tagName(backend.provider), @errorName(err),
+                    });
+                    continue;
                 };
+                return text;
             }
         }
         return client.get(arena, url);
+    }
+
+    /// Extracts one url with one backend, whichever it is. Only a backend with an
+    /// extraction endpoint is passed here.
+    fn backendExtract(client: *Client, arena: std.mem.Allocator, backend: Backend, url: []const u8) ![]const u8 {
+        return switch (backend.provider) {
+            .tavily => client.tavilyExtract(arena, backend.api_key, backend.reach(), url),
+            .exa => client.exaContents(arena, backend.api_key, backend.reach(), url),
+            // Only a backend with an extraction endpoint is passed here.
+            .brave, .searxng => unreachable,
+        };
     }
 
     /// One Tavily search, posted to `endpoint`, which is the provider's own or a
@@ -138,8 +185,9 @@ pub const Client = struct {
     fn tavily(
         client: *Client,
         arena: std.mem.Allocator,
-        query: []const u8,
+        api_key: []const u8,
         endpoint: []const u8,
+        query: []const u8,
         max_results: usize,
     ) ![]const u8 {
         const body = try std.json.Stringify.valueAlloc(client.gpa, TavilyRequest{
@@ -148,7 +196,7 @@ pub const Client = struct {
         }, .{ .emit_null_optional_fields = false });
         defer client.gpa.free(body);
 
-        const auth = try std.fmt.allocPrint(client.gpa, "Bearer {s}", .{client.api_key});
+        const auth = try std.fmt.allocPrint(client.gpa, "Bearer {s}", .{api_key});
         defer client.gpa.free(auth);
 
         const text = (try client.request(arena, .POST, endpoint, body, &.{
@@ -163,15 +211,16 @@ pub const Client = struct {
     fn tavilyExtract(
         client: *Client,
         arena: std.mem.Allocator,
-        url: []const u8,
+        api_key: []const u8,
         endpoint: []const u8,
+        url: []const u8,
     ) ![]const u8 {
         const body = try std.json.Stringify.valueAlloc(client.gpa, TavilyExtractRequest{
             .urls = &.{url},
         }, .{ .emit_null_optional_fields = false });
         defer client.gpa.free(body);
 
-        const auth = try std.fmt.allocPrint(client.gpa, "Bearer {s}", .{client.api_key});
+        const auth = try std.fmt.allocPrint(client.gpa, "Bearer {s}", .{api_key});
         defer client.gpa.free(auth);
 
         const text = (try client.request(arena, .POST, endpoint, body, &.{
@@ -193,13 +242,14 @@ pub const Client = struct {
     fn brave(
         client: *Client,
         arena: std.mem.Allocator,
-        query: []const u8,
+        api_key: []const u8,
         endpoint: []const u8,
+        query: []const u8,
         max_results: usize,
     ) ![]const u8 {
         const url = try queryUrl(arena, endpoint, query, "&count={d}", .{max_results});
         const text = (try client.request(arena, .GET, url, null, &.{
-            .{ .name = "x-subscription-token", .value = client.api_key },
+            .{ .name = "x-subscription-token", .value = api_key },
             .{ .name = "accept", .value = "application/json" },
         }, "search")) orelse return error.SearchFailed;
         const parsed = try parse(BraveResponse, arena, text, "search");
@@ -213,8 +263,8 @@ pub const Client = struct {
     fn searxng(
         client: *Client,
         arena: std.mem.Allocator,
-        query: []const u8,
         base: []const u8,
+        query: []const u8,
         max_results: usize,
     ) ![]const u8 {
         const endpoint = try std.fmt.allocPrint(arena, "{s}/search", .{
@@ -234,8 +284,9 @@ pub const Client = struct {
     fn exa(
         client: *Client,
         arena: std.mem.Allocator,
-        query: []const u8,
+        api_key: []const u8,
         endpoint: []const u8,
+        query: []const u8,
         max_results: usize,
     ) ![]const u8 {
         const body = try std.json.Stringify.valueAlloc(client.gpa, ExaRequest{
@@ -246,7 +297,7 @@ pub const Client = struct {
         defer client.gpa.free(body);
 
         const text = (try client.request(arena, .POST, endpoint, body, &.{
-            .{ .name = "x-api-key", .value = client.api_key },
+            .{ .name = "x-api-key", .value = api_key },
         }, "search")) orelse return error.SearchFailed;
         const parsed = try parse(ExaResponse, arena, text, "search");
         return render(arena, try mapped(arena, parsed.results, "text"));
@@ -256,8 +307,9 @@ pub const Client = struct {
     fn exaContents(
         client: *Client,
         arena: std.mem.Allocator,
-        url: []const u8,
+        api_key: []const u8,
         endpoint: []const u8,
+        url: []const u8,
     ) ![]const u8 {
         const body = try std.json.Stringify.valueAlloc(client.gpa, ExaContentsRequest{
             .urls = &.{url},
@@ -265,7 +317,7 @@ pub const Client = struct {
         defer client.gpa.free(body);
 
         const text = (try client.request(arena, .POST, endpoint, body, &.{
-            .{ .name = "x-api-key", .value = client.api_key },
+            .{ .name = "x-api-key", .value = api_key },
         }, "fetch")) orelse return error.FetchFailed;
         const parsed = try parse(ExaContentsResponse, arena, text, "fetch");
         if (parsed.results.len == 0 or parsed.results[0].text.len == 0) return error.FetchFailed;
@@ -306,7 +358,10 @@ pub const Client = struct {
         });
         const text = body_writer.written();
         if (result.status.class() != .success) {
-            std.log.err("{s}: HTTP {d}: {s}", .{ what, @intFromEnum(result.status), text });
+            // A backend failing is a warning rather than an error: with more
+            // than one backend the caller tries the next, and the failure is
+            // reported to the model as the result of the call.
+            std.log.warn("{s}: HTTP {d}: {s}", .{ what, @intFromEnum(result.status), text });
             return null;
         }
         return try arena.dupe(u8, text);
@@ -320,7 +375,7 @@ fn parse(comptime T: type, arena: std.mem.Allocator, text: []const u8, what: []c
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     }) catch |err| {
-        std.log.err("{s}: cannot read the reply: {s}", .{ what, @errorName(err) });
+        std.log.warn("{s}: cannot read the reply: {s}", .{ what, @errorName(err) });
         return err;
     };
 }
@@ -690,8 +745,6 @@ test "a tavily search posts the query and reads the results back" {
     var client: Client = .{
         .io = io,
         .gpa = gpa,
-        .provider = .tavily,
-        .api_key = "secret",
         .max_results = 3,
         .http = &http,
     };
@@ -700,7 +753,7 @@ test "a tavily search posts the query and reads the results back" {
     // reports anything not freed.
     var reply_state = std.heap.ArenaAllocator.init(gpa);
     defer reply_state.deinit();
-    const text = try client.tavily(reply_state.allocator(), "zig lang", mock.url, 3);
+    const text = try client.tavily(reply_state.allocator(), "secret", mock.url, "zig lang", 3);
     try group.await(io);
     if (mock.err) |err| return err;
 
@@ -733,14 +786,12 @@ test "a tavily extraction posts the url and reads its content back" {
     var client: Client = .{
         .io = io,
         .gpa = gpa,
-        .provider = .tavily,
-        .api_key = "secret",
         .max_results = 3,
         .http = &http,
     };
     var reply_state = std.heap.ArenaAllocator.init(gpa);
     defer reply_state.deinit();
-    const text = try client.tavilyExtract(reply_state.allocator(), "https://ziglang.org", mock.url);
+    const text = try client.tavilyExtract(reply_state.allocator(), "secret", mock.url, "https://ziglang.org");
     try group.await(io);
     if (mock.err) |err| return err;
 
@@ -765,8 +816,6 @@ test "a url tavily could not read is a failure, not empty content" {
     var client: Client = .{
         .io = io,
         .gpa = gpa,
-        .provider = .tavily,
-        .api_key = "secret",
         .max_results = 3,
         .http = &http,
     };
@@ -774,7 +823,7 @@ test "a url tavily could not read is a failure, not empty content" {
     defer reply_state.deinit();
     try std.testing.expectError(
         error.FetchFailed,
-        client.tavilyExtract(reply_state.allocator(), "https://nope.invalid", mock.url),
+        client.tavilyExtract(reply_state.allocator(), "secret", mock.url, "https://nope.invalid"),
     );
     try group.await(io);
     if (mock.err) |err| return err;
@@ -797,8 +846,6 @@ test "a raw fetch reads the url directly, without the backend" {
     var client: Client = .{
         .io = io,
         .gpa = gpa,
-        .provider = .tavily,
-        .api_key = "secret",
         .max_results = 3,
         .http = &http,
     };
@@ -832,14 +879,12 @@ test "an exa search posts the query and reads the results back" {
     var client: Client = .{
         .io = io,
         .gpa = gpa,
-        .provider = .exa,
-        .api_key = "secret",
         .max_results = 3,
         .http = &http,
     };
     var reply_state = std.heap.ArenaAllocator.init(gpa);
     defer reply_state.deinit();
-    const text = try client.exa(reply_state.allocator(), "zig lang", mock.url, 3);
+    const text = try client.exa(reply_state.allocator(), "secret", mock.url, "zig lang", 3);
     try group.await(io);
     if (mock.err) |err| return err;
 
@@ -873,14 +918,12 @@ test "an exa extraction posts the url and reads its text back" {
     var client: Client = .{
         .io = io,
         .gpa = gpa,
-        .provider = .exa,
-        .api_key = "secret",
         .max_results = 3,
         .http = &http,
     };
     var reply_state = std.heap.ArenaAllocator.init(gpa);
     defer reply_state.deinit();
-    const text = try client.exaContents(reply_state.allocator(), "https://ziglang.org", mock.url);
+    const text = try client.exaContents(reply_state.allocator(), "secret", mock.url, "https://ziglang.org");
     try group.await(io);
     if (mock.err) |err| return err;
 
@@ -915,14 +958,12 @@ test "a brave search sends the query in the url and reads the results back" {
     var client: Client = .{
         .io = io,
         .gpa = gpa,
-        .provider = .brave,
-        .api_key = "secret",
         .max_results = 3,
         .http = &http,
     };
     var reply_state = std.heap.ArenaAllocator.init(gpa);
     defer reply_state.deinit();
-    const text = try client.brave(reply_state.allocator(), "zig lang", mock.url, 3);
+    const text = try client.brave(reply_state.allocator(), "secret", mock.url, "zig lang", 3);
     try group.await(io);
     if (mock.err) |err| return err;
 
@@ -955,8 +996,9 @@ test "a backend with no extraction reads the url itself" {
     var client: Client = .{
         .io = io,
         .gpa = gpa,
-        .provider = .brave,
-        .api_key = "secret",
+        // Brave has no extraction endpoint, so the backend list is skipped and
+        // the url is read directly.
+        .backends = &.{.{ .provider = .brave, .api_key = "secret" }},
         .max_results = 3,
         .http = &http,
     };
@@ -985,9 +1027,6 @@ test "a searxng search sends the query to the instance, and caps the results" {
     var client: Client = .{
         .io = io,
         .gpa = gpa,
-        .provider = .searxng,
-        .api_key = "",
-        .url = mock.url,
         .max_results = 5,
         .http = &http,
     };
@@ -995,7 +1034,7 @@ test "a searxng search sends the query to the instance, and caps the results" {
     defer reply_state.deinit();
     // The cap is applied here, since SearXNG takes no result count: only the
     // first of the two results is rendered.
-    const text = try client.searxng(reply_state.allocator(), "zig lang", mock.url, 1);
+    const text = try client.searxng(reply_state.allocator(), mock.url, "zig lang", 1);
     try group.await(io);
     if (mock.err) |err| return err;
 
@@ -1003,4 +1042,78 @@ test "a searxng search sends the query to the instance, and caps the results" {
     try std.testing.expectEqualStrings("", mock.bodies.items[0]);
     try std.testing.expect(mock.header("authorization") == null);
     try std.testing.expectEqualStrings("1. Zig\n   https://ziglang.org\n   A language.\n", text);
+}
+
+test "the backends are tried in order until one answers" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // The first reply is a server error and the second is results, so the first
+    // backend fails and the second answers.
+    var mock = try Mock.start(gpa, io, "/search", 2, struct {
+        fn answer(number: usize, _: []const u8) Mock.Answer {
+            if (number == 1) return .{ .status = .internal_server_error, .body = "{}" };
+            return .{ .body = "{\"results\":[{\"title\":\"Zig\",\"url\":\"https://ziglang.org\",\"content\":\"A language.\"}]}" };
+        }
+    }.answer);
+    defer mock.deinit(io);
+    var group: Io.Group = .init;
+    try group.concurrent(io, Mock.serve, .{ io, &mock });
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+    // Two backends, both standing in for the same server, so what is tested is
+    // the order rather than which backend it is.
+    var client: Client = .{
+        .io = io,
+        .gpa = gpa,
+        .backends = &.{
+            .{ .provider = .tavily, .api_key = "a", .endpoint = mock.url },
+            .{ .provider = .tavily, .api_key = "b", .endpoint = mock.url },
+        },
+        .max_results = 3,
+        .http = &http,
+    };
+    var reply_state = std.heap.ArenaAllocator.init(gpa);
+    defer reply_state.deinit();
+    const text = try client.search(reply_state.allocator(), "zig lang");
+    try group.await(io);
+    if (mock.err) |err| return err;
+
+    // Both were tried: the first failed and the second answered.
+    try std.testing.expectEqual(@as(usize, 2), mock.served);
+    try std.testing.expectEqualStrings("1. Zig\n   https://ziglang.org\n   A language.\n", text);
+}
+
+test "a search fails only when every backend has failed" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var mock = try Mock.start(gpa, io, "/search", 2, struct {
+        fn answer(_: usize, _: []const u8) Mock.Answer {
+            return .{ .status = .internal_server_error, .body = "{}" };
+        }
+    }.answer);
+    defer mock.deinit(io);
+    var group: Io.Group = .init;
+    try group.concurrent(io, Mock.serve, .{ io, &mock });
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+    var client: Client = .{
+        .io = io,
+        .gpa = gpa,
+        .backends = &.{
+            .{ .provider = .tavily, .api_key = "a", .endpoint = mock.url },
+            .{ .provider = .brave, .api_key = "b", .endpoint = mock.url },
+        },
+        .max_results = 3,
+        .http = &http,
+    };
+    var reply_state = std.heap.ArenaAllocator.init(gpa);
+    defer reply_state.deinit();
+    try std.testing.expectError(error.SearchFailed, client.search(reply_state.allocator(), "zig lang"));
+    try group.await(io);
+    if (mock.err) |err| return err;
+    try std.testing.expectEqual(@as(usize, 2), mock.served);
 }
