@@ -909,18 +909,18 @@ fn pill(status: Status, out: *Io.Writer) !void {
     }
 }
 
-/// Writes the `<summary>` of a tool call's `<details>`: the glyph of the tool,
-/// its name, the pill of its status when it has one, and what the call acted on.
-/// A collapsed call shows this line and nothing else, so it says which tool ran,
+/// Writes the `<summary>` of a tool call's `<details>`: the name of the tool,
+/// the pill of its status when it has one, and what the call acted on. A
+/// collapsed call shows this line and nothing else, so it says which tool ran,
 /// what it ran on, and whether it worked.
+///
+/// No glyph: a tool call is already drawn as a folded block of its own, and the
+/// marks that tell one apart from a prompt in the terminal have nothing to add
+/// to a page, which has room to draw that difference itself.
 fn toolSummary(call: Tools.Call, result: []const u8, status: ?Status, out: *Io.Writer) !void {
     const head = Tools.Heading.of(call);
     try out.writeAll("<summary class=\"tool-head\">");
-    try out.print("<span class=\"glyph hue-{s}\">", .{@tagName(head.hue)});
-    try escape(head.glyph, out);
-    try out.writeAll("</span> <span class=\"name\">");
-    try escape(head.name, out);
-    try out.writeAll("</span>");
+    try out.print("<span class=\"name\">{s}</span>", .{head.name});
     // The status sits right after the name, before what the call acted on, so a
     // status is in the same place on every row.
     if (status) |state| try pill(state, out);
@@ -1143,7 +1143,7 @@ test "a tool call is rendered as a whole element, both halves" {
     try block(gpa, .{ .tool_begin = call }, &out.writer);
     try std.testing.expectEqualStrings(
         "<details class=\"tool\"><summary class=\"tool-head\">" ++
-            "<span class=\"glyph hue-blue\">▸</span> <span class=\"name\">read</span>" ++
+            "<span class=\"name\">read</span>" ++
             " <span class=\"target\">a.zig</span></summary>\n" ++
             "<div class=\"tool-body\"></div></details>\n",
         out.written(),
@@ -1155,7 +1155,7 @@ test "a tool call is rendered as a whole element, both halves" {
     try block(gpa, .{ .tool_end = .{ .call = call, .result = "1\tconst x = 1;" } }, &out.writer);
     try std.testing.expectEqualStrings(
         "<details class=\"tool\"><summary class=\"tool-head\">" ++
-            "<span class=\"glyph hue-blue\">▸</span> <span class=\"name\">read</span>" ++
+            "<span class=\"name\">read</span>" ++
             " <span class=\"target\">a.zig</span></summary>\n" ++
             "<div class=\"tool-body\"><pre class=\"result\">1\tconst x = 1;</pre>\n</div></details>\n",
         out.written(),
@@ -1185,7 +1185,7 @@ test "a bash call shows its exit status in the head and its streams in the body"
     } }, &out.writer);
     try std.testing.expectEqualStrings(
         "<details class=\"tool\"><summary class=\"tool-head\">" ++
-            "<span class=\"glyph hue-cyan\">❯</span> <span class=\"name\">bash</span>" ++
+            "<span class=\"name\">bash</span>" ++
             "<span class=\"exit failed\" title=\"exit code 2\">✗ 2</span>" ++
             " <span class=\"target\">make</span></summary>\n" ++
             "<div class=\"tool-body\"><pre class=\"command\">make</pre>\n" ++
@@ -1230,7 +1230,7 @@ test "a running call shows a grey pill, and a finished one the status" {
     try block(gpa, .{ .tool_begin = bash }, &out.writer);
     try std.testing.expectEqualStrings(
         "<details class=\"tool\"><summary class=\"tool-head\">" ++
-            "<span class=\"glyph hue-cyan\">❯</span> <span class=\"name\">bash</span>" ++
+            "<span class=\"name\">bash</span>" ++
             "<span class=\"exit running\" title=\"running\">…</span>" ++
             " <span class=\"target\">build it</span></summary>\n" ++
             "<div class=\"tool-body\"></div></details>\n",
@@ -1277,7 +1277,7 @@ test "a bash call shows its command, and a write shows what it wrote" {
     // carries the first line of the command too, so a collapsed call says what it
     // ran.
     try std.testing.expectEqualStrings(
-        "<summary class=\"tool-head\"><span class=\"glyph hue-cyan\">❯</span> " ++
+        "<summary class=\"tool-head\">" ++
             "<span class=\"name\">bash</span> <span class=\"target\">ls -la &lt;x&gt;</span></summary>\n" ++
             "<pre class=\"command\">ls -la &lt;x&gt;</pre>\n" ++
             "<pre class=\"result\">some output</pre>\n",
@@ -1293,7 +1293,7 @@ test "a bash call shows its command, and a write shows what it wrote" {
     } });
     try toolSummary(multi, "", null, &out.writer);
     try std.testing.expectEqualStrings(
-        "<summary class=\"tool-head\"><span class=\"glyph hue-cyan\">❯</span> " ++
+        "<summary class=\"tool-head\">" ++
             "<span class=\"name\">bash</span> <span class=\"target\">cd /tmp</span></summary>\n",
         out.written(),
     );
@@ -1307,7 +1307,7 @@ test "a bash call shows its command, and a write shows what it wrote" {
     } });
     try toolSummary(described, "", null, &out.writer);
     try std.testing.expectEqualStrings(
-        "<summary class=\"tool-head\"><span class=\"glyph hue-cyan\">❯</span> " ++
+        "<summary class=\"tool-head\">" ++
             "<span class=\"name\">bash</span> <span class=\"target\">run the test suite</span></summary>\n",
         out.written(),
     );
@@ -1355,7 +1355,7 @@ test "a web search shows its sources as favicons in the summary" {
     } }, &out.writer);
     try std.testing.expectEqualStrings(
         "<details class=\"tool\"><summary class=\"tool-head\">" ++
-            "<span class=\"glyph hue-magenta\">⌕</span> <span class=\"name\">web_search</span>" ++
+            "<span class=\"name\">web_search</span>" ++
             " <span class=\"target\">zig lang</span>" ++
             "<span class=\"favs\">" ++
             "<a class=\"fav\" href=\"https://ziglang.org\" title=\"ziglang.org\"" ++
@@ -1414,7 +1414,7 @@ test "an edit is shown as the diff of the strings it worked on" {
     // -- it would only repeat the diff.
     try toolBody(arena, edit, "replaced 1 occurrence(s) in a.zig", &out.writer);
     try std.testing.expectEqualStrings(
-        "<summary class=\"tool-head\"><span class=\"glyph hue-yellow\">✎</span> " ++
+        "<summary class=\"tool-head\">" ++
             "<span class=\"name\">edit</span> <span class=\"target\">a.zig</span></summary>\n" ++
             "<pre class=\"diff\"><span class=\"removed\">-old</span>\n" ++
             "<span class=\"added\">+new</span>\n</pre>\n",
