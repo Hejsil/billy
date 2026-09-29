@@ -180,11 +180,16 @@
   details.tool[open] summary.tool-head::before { transform: rotate(90deg); }
   .tool-head .name { color: var(--text); font-weight: 600; flex: none; }
   .tool-head .target { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-  /* The exit status: a fixed-width pill between the tool's name and what it acted
-     on, so a status is always in the same place and the description after it
-     always lines up. Grey with an ellipsis while the call runs; the colour of the
-     exit and the code once it has one; grey and empty for a finished call whose
-     status was never recorded. */
+  /* What a call produced, on its own row under the head: a bash call's exit
+     status, and the bubbles of a web search's sources. It is in the summary, so
+     it shows whether the call is open or collapsed, and it comes after the head
+     in the markup, so it takes the whole row and the head keeps the first.
+     The status pill keeps the width of the longest status it holds, so a code
+     one or two digits wide does not make the bubble jump about. */
+  .tool-head .produced {
+    flex-basis: 100%; display: flex; flex-wrap: wrap; align-items: center;
+    gap: 5px; margin-left: 14px;
+  }
   .tool-head .exit {
     flex: none; display: inline-flex; align-items: center; justify-content: center;
     width: 4.5em; height: 18px; padding: 0 6px; border-radius: 9px;
@@ -199,13 +204,8 @@
   .tool-body { margin: 5px 0 0 14px; }
   .tool-body > :last-child { margin-bottom: 0; }
 
-  /* The favicon bubbles of a web search: one small round bubble per source, on
-     its own row under the head. They are in the summary, so which sources were
-     found shows whether the call is open or collapsed. Each holds the source's
+  /* One small round bubble per source of a web search. Each holds the source's
      own favicon, cropped to fill the circle, and opens it. */
-  .tool-head .favs {
-    flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 5px; margin-left: 14px;
-  }
   .fav {
     position: relative; width: 16px; height: 16px; border-radius: 50%; flex: none;
     display: block; overflow: hidden; background: var(--line); text-decoration: none;

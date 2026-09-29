@@ -921,9 +921,6 @@ fn toolSummary(call: Tools.Call, result: []const u8, status: ?Status, out: *Io.W
     const head = Tools.Heading.of(call);
     try out.writeAll("<summary class=\"tool-head\">");
     try out.print("<span class=\"name\">{s}</span>", .{head.name});
-    // The status sits right after the name, before what the call acted on, so a
-    // status is in the same place on every row.
-    if (status) |state| try pill(state, out);
     // What the call acts on. A bash call's heading carries the model's
     // description of what the command does, so a collapsed call says what it is
     // for. A call from before the tool asked for one has no description, so the
@@ -937,10 +934,17 @@ fn toolSummary(call: Tools.Call, result: []const u8, status: ?Status, out: *Io.W
         try escape(target, out);
         try out.writeAll("</span>");
     }
-    // A web search shows the sources it found as favicons, on their own row under
-    // the head. They are part of the summary, so a page shows them whether the
-    // call is open or collapsed.
-    if (call == .web_search) try favicons(result, out);
+    // What the call produced, on a row of its own under the head: the status a
+    // bash call exited with, and the sources a web search found. It is written
+    // after the head in the markup, which is what puts it on the next row, so a
+    // long target is never cut short to make room for it. Both are in the
+    // summary, so a page shows them whether the call is open or collapsed.
+    if (status != null or call == .web_search) {
+        try out.writeAll("<span class=\"produced\">");
+        if (status) |state| try pill(state, out);
+        if (call == .web_search) try favicons(result, out);
+        try out.writeAll("</span>");
+    }
     try out.writeAll("</summary>\n");
 }
 
@@ -953,27 +957,12 @@ fn toolSummary(call: Tools.Call, result: []const u8, status: ?Status, out: *Io.W
 /// cannot link to is left to the body, and nothing is written at all for text
 /// that is not a list of results, such as a search that matched nothing.
 fn favicons(result: []const u8, out: *Io.Writer) !void {
-    if (!hasFavicon(result)) return;
-    try out.writeAll("<span class=\"favs\">");
     var origin_buffer: [256]u8 = undefined;
     var results = search.parseResults(result);
     while (results.next()) |found| {
         const origin = originOf(found.url, &origin_buffer) orelse continue;
         try favicon(found, origin, out);
     }
-    try out.writeAll("</span>");
-}
-
-/// Whether any result of `result` has an `http(s)` address, and so a favicon to
-/// show. The span of bubbles is only opened when there is one, so a search that
-/// yielded none leaves no empty element behind.
-fn hasFavicon(result: []const u8) bool {
-    var origin_buffer: [256]u8 = undefined;
-    var results = search.parseResults(result);
-    while (results.next()) |found| {
-        if (originOf(found.url, &origin_buffer) != null) return true;
-    }
-    return false;
 }
 
 /// Writes one favicon bubble: the source's favicon, filling the round bubble and
@@ -1185,9 +1174,9 @@ test "a bash call shows its exit status in the head and its streams in the body"
     } }, &out.writer);
     try std.testing.expectEqualStrings(
         "<details class=\"tool\"><summary class=\"tool-head\">" ++
-            "<span class=\"name\">bash</span>" ++
-            "<span class=\"exit failed\" title=\"exit code 2\">✗ 2</span>" ++
-            " <span class=\"target\">make</span></summary>\n" ++
+            "<span class=\"name\">bash</span> <span class=\"target\">make</span>" ++
+            "<span class=\"produced\">" ++
+            "<span class=\"exit failed\" title=\"exit code 2\">✗ 2</span></span></summary>\n" ++
             "<div class=\"tool-body\"><pre class=\"command\">make</pre>\n" ++
             "<pre class=\"stdout\">built</pre>\n" ++
             "<pre class=\"stderr\">boom</pre>\n</div></details>\n",
@@ -1230,9 +1219,9 @@ test "a running call shows a grey pill, and a finished one the status" {
     try block(gpa, .{ .tool_begin = bash }, &out.writer);
     try std.testing.expectEqualStrings(
         "<details class=\"tool\"><summary class=\"tool-head\">" ++
-            "<span class=\"name\">bash</span>" ++
-            "<span class=\"exit running\" title=\"running\">…</span>" ++
-            " <span class=\"target\">build it</span></summary>\n" ++
+            "<span class=\"name\">bash</span> <span class=\"target\">build it</span>" ++
+            "<span class=\"produced\">" ++
+            "<span class=\"exit running\" title=\"running\">…</span></span></summary>\n" ++
             "<div class=\"tool-body\"></div></details>\n",
         out.written(),
     );
@@ -1357,7 +1346,7 @@ test "a web search shows its sources as favicons in the summary" {
         "<details class=\"tool\"><summary class=\"tool-head\">" ++
             "<span class=\"name\">web_search</span>" ++
             " <span class=\"target\">zig lang</span>" ++
-            "<span class=\"favs\">" ++
+            "<span class=\"produced\">" ++
             "<a class=\"fav\" href=\"https://ziglang.org\" title=\"ziglang.org\"" ++
             " target=\"_blank\" rel=\"noopener noreferrer\" onclick=\"event.stopPropagation()\">" ++
             "<span class=\"letter\">z</span><img src=\"https://ziglang.org/favicon.ico\"" ++
@@ -1388,10 +1377,12 @@ test "a search with nothing to link to shows no favicons" {
     } });
 
     // A search that matched nothing, and one whose only result is not an `http(s)`
-    // address, both leave no bubbles -- and no empty span behind them.
+    // address, both leave no bubbles. The row they would have sat in is still
+    // there, empty, since a status and the sources share it.
     for ([_][]const u8{ "(no results)", "1. Odd\n   javascript:alert(1)\n" }) |result| {
         try block(gpa, .{ .tool_end = .{ .call = call, .result = result } }, &out.writer);
-        try std.testing.expect(std.mem.indexOf(u8, out.written(), "favs") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "<a class=\"fav\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "<span class=\"produced\"></span>") != null);
         out.clearRetainingCapacity();
     }
 }
