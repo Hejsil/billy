@@ -293,118 +293,122 @@ test "retryAfterMs reads the seconds form and ignores the rest" {
     try std.testing.expect(retryAfterMs("HTTP/1.1 429\r\nRetry-After: Wed, 21 Oct 2026 07:28:00 GMT\r\n\r\n") == null);
 }
 
+const Test = struct {
+    health: Health,
+    tmp: std.testing.TmpDir,
+
+    pub fn init(data: ?[]const u8) !Test {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+
+        if (data) |d| {
+            try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = d });
+        }
+
+        const health = try Health.load(std.testing.io, std.testing.allocator, tmp.dir);
+        return Test{ .health = health, .tmp = tmp };
+    }
+
+    fn write(t: *Test, data: []const u8) !void {
+        try t.tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = data });
+    }
+
+    fn reload(t: *Test) !void {
+        t.health.deinit();
+        t.health = try Health.load(std.testing.io, std.testing.allocator, t.tmp.dir);
+    }
+
+    fn deinit(t: *Test) void {
+        t.health.deinit();
+        t.tmp.cleanup();
+    }
+};
+
 test "a failed backend is skipped until its wait is over, and the wait is kept" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var t = try Test.init(null);
+    defer t.deinit();
 
-    var health = try Health.load(std.testing.io, gpa, tmp.dir);
-    defer health.deinit();
-    try std.testing.expect(!health.skips("a", 1000));
+    try std.testing.expect(!t.health.skips("a", 1000));
 
-    try health.record("a", null, 1000);
+    try t.health.record("a", null, 1000);
     // Set aside from the moment it failed until the wait is up, and no longer.
-    try std.testing.expect(health.skips("a", 1000));
-    try std.testing.expect(health.skips("a", 1000 + base_wait_ms - 1));
-    try std.testing.expect(!health.skips("a", 1000 + base_wait_ms));
+    try std.testing.expect(t.health.skips("a", 1000));
+    try std.testing.expect(t.health.skips("a", 1000 + base_wait_ms - 1));
+    try std.testing.expect(!t.health.skips("a", 1000 + base_wait_ms));
     // A backend that did not fail is left alone.
-    try std.testing.expect(!health.skips("b", 0));
+    try std.testing.expect(!t.health.skips("b", 0));
 
     // A new table, as a restart makes, reads the wait back from the file.
-    var reread = try Health.load(std.testing.io, gpa, tmp.dir);
-    defer reread.deinit();
-    try std.testing.expect(reread.skips("a", 1000 + base_wait_ms - 1));
-    try std.testing.expect(!reread.skips("a", 1000 + base_wait_ms));
-    try std.testing.expect(!reread.skips("b", 0));
+    try t.reload();
+    try std.testing.expect(t.health.skips("a", 1000 + base_wait_ms - 1));
+    try std.testing.expect(!t.health.skips("a", 1000 + base_wait_ms));
+    try std.testing.expect(!t.health.skips("b", 0));
 }
 
 test "a backend that answers is cleared, and the file with it" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var t = try Test.init(null);
+    defer t.deinit();
 
-    var health = try Health.load(std.testing.io, gpa, tmp.dir);
-    defer health.deinit();
-    try health.record("a", null, 1000);
-    try std.testing.expect(health.skips("a", 1000));
+    try t.health.record("a", null, 1000);
+    try std.testing.expect(t.health.skips("a", 1000));
 
-    try health.clear("a");
-    try std.testing.expect(!health.skips("a", 1000));
+    try t.health.clear("a");
+    try std.testing.expect(!t.health.skips("a", 1000));
+
     // Nothing is left on disk for it either.
-    var reread = try Health.load(std.testing.io, gpa, tmp.dir);
-    defer reread.deinit();
-    try std.testing.expect(!reread.skips("a", 0));
+    try t.reload();
+    try std.testing.expect(!t.health.skips("a", 0));
 }
 
 test "a backend that asks to be waited for is set aside for what it asked" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var health = try Health.load(std.testing.io, gpa, tmp.dir);
-    defer health.deinit();
+    var t = try Test.init(null);
+    defer t.deinit();
 
     // The backend's own wait is used, not the backoff.
-    try health.record("a", 5_000, 0);
-    try std.testing.expect(health.skips("a", 4_999));
-    try std.testing.expect(!health.skips("a", 5_000));
+    try t.health.record("a", 5_000, 0);
+    try std.testing.expect(t.health.skips("a", 4_999));
+    try std.testing.expect(!t.health.skips("a", 5_000));
 
     // One longer than the cap is brought back to it, so a backend cannot set
     // billy aside for longer than the longest wait.
-    try health.record("a", max_wait_ms * 10, 0);
-    try std.testing.expect(health.skips("a", max_wait_ms - 1));
-    try std.testing.expect(!health.skips("a", max_wait_ms));
+    try t.health.record("a", max_wait_ms * 10, 0);
+    try std.testing.expect(t.health.skips("a", max_wait_ms - 1));
+    try std.testing.expect(!t.health.skips("a", max_wait_ms));
 }
 
 test "a wait further off than the cap is brought back to it on reading" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
     // A file with a wait far in the future, as a clock that jumped back would
     // leave behind. It is capped rather than locking the backend out for good.
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = file_name,
-        .data = "{\"version\":1,\"entries\":{\"a\":{\"until_ms\":99999999999999,\"failures\":3}}}",
-    });
+    var t = try Test.init("{\"version\":1,\"entries\":{\"a\":{\"until_ms\":99999999999999,\"failures\":3}}}");
+    defer t.deinit();
 
     const now = Io.Clock.now(.real, std.testing.io).toMilliseconds();
-    var health = try Health.load(std.testing.io, gpa, tmp.dir);
-    defer health.deinit();
-    try std.testing.expect(health.skips("a", now + max_wait_ms - 1000));
-    try std.testing.expect(!health.skips("a", now + max_wait_ms + 1000));
+    try std.testing.expect(t.health.skips("a", now + max_wait_ms - 1000));
+    try std.testing.expect(!t.health.skips("a", now + max_wait_ms + 1000));
 }
 
 test "a name that cannot be held is left out, and the rest of the file still reads" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
     // A name with a NUL in it cannot be held, since a NUL is what ends a name in
     // the pool. It is dropped rather than making the whole file unreadable.
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = file_name,
-        .data = "{\"version\":1,\"entries\":{" ++
+    var t = try Test.init(
+        "{\"version\":1,\"entries\":{" ++
             "\"a\\u0000b\":{\"until_ms\":100000,\"failures\":1}," ++
             "\"b\":{\"until_ms\":100000,\"failures\":2}}}",
-    });
+    );
+    defer t.deinit();
 
-    var health = try Health.load(std.testing.io, gpa, tmp.dir);
-    defer health.deinit();
-    try std.testing.expect(health.skips("b", 0));
-    try std.testing.expectEqual(@as(usize, 1), health.entries.count());
+    try std.testing.expect(t.health.skips("b", 0));
+    try std.testing.expectEqual(@as(usize, 1), t.health.entries.count());
     // The name the file held, and nothing of the one that was dropped.
-    try std.testing.expectEqualStrings("b\x00", health.strings.items);
+    try std.testing.expectEqualStrings("b\x00", t.health.strings.items);
 }
 
 test "a file that cannot be read or understood leaves the table empty" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
     // No file at all, which is the first run of a fresh installation.
-    var fresh = try Health.load(std.testing.io, gpa, tmp.dir);
-    defer fresh.deinit();
-    try std.testing.expectEqual(@as(usize, 0), fresh.entries.count());
+    var t = try Test.init(null);
+    defer t.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), t.health.entries.count());
 
     // A file of something else, and one of a newer layout, are both left alone.
     for ([_][]const u8{
@@ -414,10 +418,9 @@ test "a file that cannot be read or understood leaves the table empty" {
         "{\"version\":1,\"entries\":{\"a\":1}}",
         "{\"version\":1,\"entries\":{\"a\":{\"until_ms\":\"soon\",\"failures\":1}}}",
     }) |broken| {
-        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = broken });
-        var health = try Health.load(std.testing.io, gpa, tmp.dir);
-        defer health.deinit();
-        try std.testing.expectEqual(@as(usize, 0), health.entries.count());
+        try t.write(broken);
+        try t.reload();
+        try std.testing.expectEqual(@as(usize, 0), t.health.entries.count());
     }
 }
 
@@ -430,47 +433,42 @@ test "a backend is set aside for longer with each failure, up to the cap" {
 }
 
 test "only a recorded name reaches the pool, and then only once" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var health = try Health.load(std.testing.io, gpa, tmp.dir);
-    defer health.deinit();
+    var t = try Test.init(null);
+    defer t.deinit();
 
     // Asking about a name nothing is held for leaves nothing behind, however
     // often it is asked, and neither does clearing one.
-    try std.testing.expect(!health.skips("nope", 0));
-    try std.testing.expect(!health.skips("nope", 0));
-    try health.clear("nope");
-    try std.testing.expectEqual(@as(usize, 0), health.strings.items.len);
-    try std.testing.expectEqual(@as(usize, 0), health.entries.count());
+    try std.testing.expect(!t.health.skips("nope", 0));
+    try std.testing.expect(!t.health.skips("nope", 0));
+    try t.health.clear("nope");
+    try std.testing.expectEqual(@as(usize, 0), t.health.strings.items.len);
+    try std.testing.expectEqual(@as(usize, 0), t.health.entries.count());
 
     // Two names cost one copy each, and a repeated name costs none.
-    try health.record("tavily", null, 0);
-    try health.record("brave", null, 0);
-    try health.record("tavily", null, 0);
-    try std.testing.expectEqual(@as(usize, "tavily\x00brave\x00".len), health.strings.items.len);
-    try std.testing.expectEqual(@as(usize, 2), health.entries.count());
+    try t.health.record("tavily", null, 0);
+    try t.health.record("brave", null, 0);
+    try t.health.record("tavily", null, 0);
+    try std.testing.expectEqual(@as(usize, "tavily\x00brave\x00".len), t.health.strings.items.len);
+    try std.testing.expectEqual(@as(usize, 2), t.health.entries.count());
     // A name that is in the pool is still found by the text it is held as, and
     // one that is not is not.
-    try std.testing.expect(health.skips("tavily", 0));
-    try std.testing.expect(!health.skips("tavilyx", 0));
-    try std.testing.expect(!health.skips("tavil", 0));
+    try std.testing.expect(t.health.skips("tavily", 0));
+    try std.testing.expect(!t.health.skips("tavilyx", 0));
+    try std.testing.expect(!t.health.skips("tavil", 0));
 }
 
 test "the file holds the waits of every backend that failed, by name" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var health = try Health.load(std.testing.io, gpa, tmp.dir);
-    defer health.deinit();
+    var t = try Test.init(null);
+    defer t.deinit();
 
-    try health.record("searxng", null, 0);
-    try health.record("brave", null, 0);
-    try health.clear("brave");
-    try health.record("tavily", 60_000, 0);
+    try t.health.record("searxng", null, 0);
+    try t.health.record("brave", null, 0);
+    try t.health.clear("brave");
+    try t.health.record("tavily", 60_000, 0);
 
     var buffer: [1 << 12]u8 = undefined;
-    const written = try tmp.dir.readFile(std.testing.io, file_name, &buffer);
+    const written = try t.tmp.dir.readFile(std.testing.io, file_name, &buffer);
+
     // One entry per backend that failed, and none for one that answered. This
     // is the whole file, so a field the parser does not know is caught here.
     try std.testing.expectEqualStrings(
@@ -491,29 +489,28 @@ test "the file holds the waits of every backend that failed, by name" {
 }
 
 test "the file holds the waits in the order they were recorded" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var health = try Health.load(std.testing.io, gpa, tmp.dir);
-    defer health.deinit();
+    var t = try Test.init(null);
+    defer t.deinit();
 
     // Written as the table holds them rather than sorted, since sorting is what
     // a copy of the table would be for. The names do not read in this order.
-    try health.record("tavily", null, 0);
-    try health.record("brave", null, 0);
+    try t.health.record("tavily", null, 0);
+    try t.health.record("brave", null, 0);
 
     var buffer: [1 << 12]u8 = undefined;
-    const written = try tmp.dir.readFile(std.testing.io, file_name, &buffer);
+    const written = try t.tmp.dir.readFile(std.testing.io, file_name, &buffer);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"tavily\"").? <
         std.mem.indexOf(u8, written, "\"brave\"").?);
 
     // Reading it back keeps that order, so a file billy did not write last is
     // not reshuffled by the next write.
-    var reread = try Health.load(std.testing.io, gpa, tmp.dir);
-    defer reread.deinit();
-    try reread.record("exa", null, 0);
+    try t.reload();
+
+    try t.health.record("exa", null, 0);
+
     var after: [1 << 12]u8 = undefined;
-    const rewritten = try tmp.dir.readFile(std.testing.io, file_name, &after);
+    const rewritten = try t.tmp.dir.readFile(std.testing.io, file_name, &after);
+
     try std.testing.expect(std.mem.indexOf(u8, rewritten, "\"tavily\"").? <
         std.mem.indexOf(u8, rewritten, "\"brave\"").?);
     try std.testing.expect(std.mem.indexOf(u8, rewritten, "\"brave\"").? <
@@ -521,20 +518,17 @@ test "the file holds the waits in the order they were recorded" {
 }
 
 test "writing the waits allocates nothing" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var health = try Health.load(std.testing.io, gpa, tmp.dir);
-    defer health.deinit();
+    var t = try Test.init(null);
+    defer t.deinit();
 
-    try health.record("tavily", null, 0);
-    try health.record("brave", null, 0);
+    try t.health.record("tavily", null, 0);
+    try t.health.record("brave", null, 0);
 
     // A table that cannot allocate still writes, and still clears: the waits are
     // written out of what is held, rather than into a copy of them first.
-    var failing: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = 0 });
-    health.gpa = failing.allocator();
-    try health.clear("brave");
-    try health.record("tavily", 60_000, 0);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    t.health.gpa = failing.allocator();
+    try t.health.clear("brave");
+    try t.health.record("tavily", 60_000, 0);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
 }
