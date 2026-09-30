@@ -997,7 +997,9 @@ fn originOf(url: []const u8, buffer: []u8) ?[]const u8 {
 
 /// Writes the body of a tool call: what a page shows once the call is expanded.
 /// That is what the call meant to do -- an edit's diff, or the command a bash
-/// call runs -- and then what it produced.
+/// call runs -- and then what it produced. A call that is still running has
+/// nothing produced yet, and its result is the empty string, so the body is what
+/// it means to do and nothing more.
 fn toolBody(gpa: std.mem.Allocator, call: Tools.Call, result: []const u8, out: *Io.Writer) !void {
     switch (call) {
         // The change the call means to make, from the call alone, so a replayed
@@ -1024,6 +1026,9 @@ fn toolBody(gpa: std.mem.Allocator, call: Tools.Call, result: []const u8, out: *
 /// call that failed shows billy's message for the failure whatever it was asked
 /// to do. Anything else shows the text the call returned.
 fn toolResult(call: Tools.Call, result: []const u8, out: *Io.Writer) !void {
+    // A call still running has produced nothing, so there is no result to show
+    // and no empty element to leave behind.
+    if (result.len == 0) return;
     const text = std.mem.trimEnd(u8, result, "\n");
     if (std.mem.startsWith(u8, result, "error: ")) {
         return element("pre", "error", text, out);
@@ -1035,7 +1040,8 @@ fn toolResult(call: Tools.Call, result: []const u8, out: *Io.Writer) !void {
             // The status is the badge in the summary, so the body is only what
             // the command printed. A result billy did not write is shown as it
             // is, so a session saved before the status was written still shows
-            // everything.
+            // everything. A call that has not run yet has no output, and the
+            // guard at the top has already left.
             const output = Tools.bashOutput(result) orelse
                 return element("pre", "result", text, out);
             if (output.stdout.len > 0)
@@ -1078,7 +1084,15 @@ pub fn block(gpa: std.mem.Allocator, b: agent.Block, out: *Io.Writer) !void {
             // status, so any other tool shows no pill. A call has no result yet,
             // so a search shows no favicons while it runs.
             try toolSummary(call, "", if (hasStatus(call)) .running else null, out);
-            try out.writeAll("<div class=\"tool-body\"></div></details>\n");
+            // What the call means to do is already known, so it is shown while
+            // the call runs: the command a bash call is about to run, and the
+            // change an edit means to make. Without it a long command would be
+            // invisible until it finished, which is the one moment a reader most
+            // wants to see what is being run. What the call produces is not known
+            // yet, so there is none of that.
+            try out.writeAll("<div class=\"tool-body\">");
+            try toolBody(gpa, call, "", out);
+            try out.writeAll("</div></details>\n");
         },
         .tool_end => |tool| {
             const status: ?Status = if (hasStatus(tool.call))
@@ -1215,14 +1229,15 @@ test "a running call shows a grey pill, and a finished one the status" {
     } });
 
     // The half a stream sends while the command runs: a grey pill with an
-    // ellipsis, where the status will go.
+    // ellipsis, where the status will go, and the command it is about to run,
+    // which is the one moment a reader most wants to see it.
     try block(gpa, .{ .tool_begin = bash }, &out.writer);
     try std.testing.expectEqualStrings(
         "<details class=\"tool\"><summary class=\"tool-head\">" ++
             "<span class=\"name\">bash</span> <span class=\"target\">build it</span>" ++
             "<span class=\"produced\">" ++
             "<span class=\"exit running\" title=\"running\">…</span></span></summary>\n" ++
-            "<div class=\"tool-body\"></div></details>\n",
+            "<div class=\"tool-body\"><pre class=\"command\">make</pre>\n</div></details>\n",
         out.written(),
     );
     out.clearRetainingCapacity();
