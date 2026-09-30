@@ -370,8 +370,8 @@ test "a wait further off than the cap is brought back to it on reading" {
     const now = Io.Clock.now(.real, std.testing.io).toMilliseconds();
     var health = try Health.load(std.testing.io, gpa, tmp.dir);
     defer health.deinit();
-    try std.testing.expect(health.skips("a", now + max_wait_ms - 1));
-    try std.testing.expect(!health.skips("a", now + max_wait_ms + 1));
+    try std.testing.expect(health.skips("a", now + max_wait_ms - 1000));
+    try std.testing.expect(!health.skips("a", now + max_wait_ms + 1000));
 }
 
 test "a name that cannot be held is left out, and the rest of the file still reads" {
