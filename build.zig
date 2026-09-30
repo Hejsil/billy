@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const filters = b.option([]const []const u8, "filter", "Run only tests whose names contain this substring") orelse &.{};
 
     // Markdown. The C library is built into the `billy` module, so every target
     // that uses the module -- the executable and the module's own tests -- gets
@@ -49,6 +50,7 @@ pub fn build(b: *std.Build) void {
 
     const mod_tests = b.addTest(.{
         .root_module = mod,
+        .filters = filters,
     });
     mod_tests.link_gc_sections = true;
     const run_mod_tests = b.addRunArtifact(mod_tests);
