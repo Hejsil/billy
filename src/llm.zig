@@ -3,7 +3,7 @@
 const std = @import("std");
 const Io = std.Io;
 const Health = @import("Health.zig");
-const Mock = @import("mock.zig");
+const Mock = @import("Mock.zig");
 
 /// A message in the conversation, as sent to and received from the API.
 pub const Message = struct {
@@ -505,13 +505,12 @@ test "a request reaches the wire with the body the head promised" {
     );
     defer gpa.free(expected);
 
-    var mock = try Mock.start(gpa, io, "/chat/completions", 1, Mock.fixed(
+    var mock = try Mock.start("/chat/completions", 1, Mock.fixed(
         "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hi there\"}}]," ++
             "\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}",
     ));
-    defer mock.deinit(io);
-    var group: Io.Group = .init;
-    try group.concurrent(io, Mock.serve, .{ io, &mock });
+    defer mock.deinit();
+    try mock.serve();
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -527,7 +526,7 @@ test "a request reaches the wire with the body the head promised" {
     const completion = try client.complete(gpa, &messages, @as([]const NoTools, &.{}));
     defer completion.deinit();
 
-    try group.await(io);
+    try mock.group.await(io);
     if (mock.err) |err| return err;
 
     // The head carried the counted length, and the bytes behind it are exactly
@@ -637,15 +636,14 @@ test "a request that is rate limited is tried again and succeeds" {
 
     // Two failures, then the answer: three requests, and the client should make
     // exactly that many.
-    var mock = try Mock.start(gpa, io, "/chat/completions", 3, retrying(2));
-    defer mock.deinit(io);
-    var group: Io.Group = .init;
-    try group.concurrent(io, Mock.serve, .{ io, &mock });
+    var mock = try Mock.start("/chat/completions", 3, retrying(2));
+    defer mock.deinit();
+    try mock.serve();
 
     const completion = try completeAgainst(gpa, io, mock.url, 4);
     defer completion.deinit();
 
-    try group.await(io);
+    try mock.group.await(io);
     if (mock.err) |err| return err;
 
     try std.testing.expectEqual(@as(usize, 3), mock.served);
@@ -658,14 +656,13 @@ test "a request that keeps failing is given up on after max_attempts" {
     const io = std.testing.io;
 
     // Every request fails, so the client tries as many times as it is allowed.
-    var mock = try Mock.start(gpa, io, "/chat/completions", 3, retrying(3));
-    defer mock.deinit(io);
-    var group: Io.Group = .init;
-    try group.concurrent(io, Mock.serve, .{ io, &mock });
+    var mock = try Mock.start("/chat/completions", 3, retrying(3));
+    defer mock.deinit();
+    try mock.serve();
 
     try std.testing.expectError(error.HttpStatus, completeAgainst(gpa, io, mock.url, 3));
 
-    try group.await(io);
+    try mock.group.await(io);
     if (mock.err) |err| return err;
     try std.testing.expectEqual(@as(usize, 3), mock.served);
 }
@@ -686,10 +683,9 @@ test "the HTTP client is kept, so requests reuse one connection" {
             };
         }
     }.answer;
-    var mock = try Mock.start(gpa, io, "/chat/completions", 2, keep_alive);
-    defer mock.deinit(io);
-    var group: Io.Group = .init;
-    try group.concurrent(io, Mock.serve, .{ io, &mock });
+    var mock = try Mock.start("/chat/completions", 2, keep_alive);
+    defer mock.deinit();
+    try mock.serve();
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -713,7 +709,7 @@ test "the HTTP client is kept, so requests reuse one connection" {
         try std.testing.expectEqualStrings("hi", completion.message.content.?);
     }
 
-    try group.await(io);
+    try mock.group.await(io);
     if (mock.err) |err| return err;
     try std.testing.expectEqual(@as(usize, 1), mock.connections);
     try std.testing.expectEqual(@as(usize, 2), mock.served);

@@ -1,13 +1,5 @@
 //! A stand-in provider for the tests: a real HTTP server a client can be pointed
 //! at instead of a live service.
-//!
-//! Every test that needs one used to carry its own accept loop -- six copies of
-//! the same forty-odd lines. This is the one copy. It listens, reads each
-//! request, records what it was sent, and answers with whatever the test's
-//! `answer` function returns.
-//!
-//! It is not a part of billy; it is only reached from tests, so it is not
-//! exported from `root.zig`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -15,44 +7,45 @@ const Io = std.Io;
 const Mock = @This();
 
 gpa: std.mem.Allocator,
-/// How many requests to answer before it stops, so a test's mock does not wait
-/// on a connection that never comes.
+
+/// How many requests to answer before it stops
 requests: usize,
+
 /// What to answer a request with, given the request's number (1-based) and its
-/// body as it arrived.
+/// body as it arrived
 answer: *const fn (number: usize, body: []const u8) Answer,
 
-/// The address it listens on, as the full URL a client is pointed at.
+/// The address it listens on, as the full URL a client is pointed at
 url: []const u8,
+
 /// The socket it accepts on.
 listener: std.Io.net.Server,
 
-/// How many requests it has answered, and how many connections it accepted: a
-/// client that reuses a connection is seen as fewer connections than requests.
+/// How many requests it has answered, and how many connections it accepted
 served: usize = 0,
 connections: usize = 0,
-/// The body of each request, in the order they arrived, owned by `gpa`.
+
+/// The body of each request, in the order they arrived
 bodies: std.ArrayList([]const u8) = .empty,
-/// The length the last request announced, when it carried one.
+
+/// The length the last request announced, when it carried one
 content_length: ?u64 = null,
-/// The headers the last request carried, owned by `gpa`, in the order they
-/// arrived. Each request replaces them, so what a test reads is the request it
-/// just made.
+
+/// The headers the last request carried, in the order they arrived
 headers: std.ArrayList(Header) = .empty,
-/// The first failure the server ran into, so a test reports it rather than
-/// hanging on a connection.
+
+/// The first failure the server ran into
 err: ?anyerror = null,
 
-/// One header a request carried, its name and value owned by `gpa`.
+group: Io.Group = .init,
+
+/// One header a request carried
 pub const Header = struct { name: []const u8, value: []const u8 };
 
-/// What one request is answered with.
+/// What one request is answered with
 pub const Answer = struct {
-    /// The body to send. It has to outlive the reply, so it is a string the
-    /// program holds rather than one built for the reply alone.
     body: []const u8,
     status: std.http.Status = .ok,
-    /// Whether to leave the connection open for another request.
     keep_alive: bool = false,
 };
 
@@ -60,12 +53,12 @@ pub const Answer = struct {
 /// a model, `/search` for the search backend. The caller starts `serve` in a
 /// group and then points a client at `mock.url`.
 pub fn start(
-    gpa: std.mem.Allocator,
-    io: Io,
     path: []const u8,
     requests: usize,
     answer: *const fn (usize, []const u8) Answer,
 ) !Mock {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
     var address = try Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = try address.listen(io, .{ .reuse_address = true });
     errdefer listener.deinit(io);
@@ -81,8 +74,9 @@ pub fn start(
     };
 }
 
-/// Stops listening and frees everything the mock recorded.
-pub fn deinit(mock: *Mock, io: Io) void {
+/// Stops listening and frees everything the mock recorded
+pub fn deinit(mock: *Mock) void {
+    const io = std.testing.io;
     mock.listener.deinit(io);
     mock.gpa.free(mock.url);
     for (mock.bodies.items) |body| mock.gpa.free(body);
@@ -109,15 +103,19 @@ fn clearHeaders(mock: *Mock) void {
     mock.headers.clearRetainingCapacity();
 }
 
-/// The accept loop, for a test to hand to `Io.Group.concurrent`. A failure is
-/// kept on the mock, which a test reports once the group has finished.
-pub fn serve(io: Io, mock: *Mock) Io.Cancelable!void {
-    mock.run(io) catch |err| {
+/// Starts the accept loop in a group, and then runs the mock until it has answered
+pub fn serve(mock: *Mock) !void {
+    try mock.group.concurrent(std.testing.io, Mock.serveInGroup, .{mock});
+}
+
+fn serveInGroup(mock: *Mock) Io.Cancelable!void {
+    mock.run() catch |err| {
         mock.err = err;
     };
 }
 
-fn run(mock: *Mock, io: Io) !void {
+fn run(mock: *Mock) !void {
+    const io = std.testing.io;
     while (mock.served < mock.requests) {
         var stream = try mock.listener.accept(io);
         mock.connections += 1;

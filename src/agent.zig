@@ -6,7 +6,7 @@ const Io = std.Io;
 const llm = @import("llm.zig");
 const models = @import("models.zig");
 const Tools = @import("Tools.zig");
-const Mock = @import("mock.zig");
+const Mock = @import("Mock.zig");
 const search = @import("search.zig");
 const LineEditor = @import("LineEditor.zig");
 const Session = @import("Session.zig");
@@ -2020,13 +2020,12 @@ test "maybeCompact folds the conversation into a summary at its end" {
 
     // A server standing in for the model, answering the compaction request with a
     // fixed summary and recording the body it was sent.
-    var mock = try Mock.start(gpa, io, "/chat/completions", 1, Mock.fixed(
+    var mock = try Mock.start("/chat/completions", 1, Mock.fixed(
         "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"the summary\"}}]," ++
             "\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"total_tokens\":105}}",
     ));
-    defer mock.deinit(io);
-    var group: Io.Group = .init;
-    try group.concurrent(io, Mock.serve, .{ io, &mock });
+    defer mock.deinit();
+    try mock.serve();
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -2044,7 +2043,7 @@ test "maybeCompact folds the conversation into a summary at its end" {
     var terminal = testTerminal(&out.writer, .{});
     try std.testing.expect(try maybeCompact(io, &client, terminal.emitter(), config, &session, false));
 
-    try group.await(io);
+    try mock.group.await(io);
     if (mock.err) |err| return err;
 
     // The request carried the whole conversation, tool call and result included,
@@ -2132,13 +2131,12 @@ test "a forced compaction folds the conversation in whatever its size" {
     // Compaction is off, so only a manual one runs.
     config.compact_at = 0;
 
-    var mock = try Mock.start(gpa, io, "/chat/completions", 1, Mock.fixed(
+    var mock = try Mock.start("/chat/completions", 1, Mock.fixed(
         "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"the summary\"}}]," ++
             "\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"total_tokens\":105}}",
     ));
-    defer mock.deinit(io);
-    var group: Io.Group = .init;
-    try group.concurrent(io, Mock.serve, .{ io, &mock });
+    defer mock.deinit();
+    try mock.serve();
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -2149,7 +2147,7 @@ test "a forced compaction folds the conversation in whatever its size" {
     var terminal = testTerminal(&out.writer, .{});
     // Forced, so the threshold and the setting are ignored.
     try std.testing.expect(try maybeCompact(io, &client, terminal.emitter(), config, &session, true));
-    try group.await(io);
+    try mock.group.await(io);
     if (mock.err) |err| return err;
 
     // The summary is folded in, and the pair reads as one line.
@@ -2457,10 +2455,9 @@ test "a turn shows the tool it runs and then the answer" {
                 "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}" };
         }
     }.answer;
-    var mock = try Mock.start(gpa, io, "/chat/completions", 2, answering);
-    defer mock.deinit(io);
-    var group: Io.Group = .init;
-    try group.concurrent(io, Mock.serve, .{ io, &mock });
+    var mock = try Mock.start("/chat/completions", 2, answering);
+    defer mock.deinit();
+    try mock.serve();
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -2483,7 +2480,7 @@ test "a turn shows the tool it runs and then the answer" {
     var recorder = Recorder{ .gpa = arena_state.allocator() };
     try turn(io, &client, &tool_set, recorder.emitter(), testConfig("m", "/work", null), &session);
 
-    try group.await(io);
+    try mock.group.await(io);
     if (mock.err) |err| return err;
 
     // The call is shown as it begins, so its header could go up while it ran,
@@ -2529,11 +2526,9 @@ test "the first turn names the session, and the naming is not part of it" {
                 "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}" };
         }
     }.answer;
-    var mock = try Mock.start(gpa, io, "/chat/completions", 2, answering);
-    defer mock.deinit(io);
-    var group: Io.Group = .init;
-    defer group.cancel(io);
-    try group.concurrent(io, Mock.serve, .{ io, &mock });
+    var mock = try Mock.start("/chat/completions", 2, answering);
+    defer mock.deinit();
+    try mock.serve();
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -2554,7 +2549,7 @@ test "the first turn names the session, and the naming is not part of it" {
     var terminal = testTerminal(&out.writer, .{});
     try runner.ask(terminal.emitter(), &session, "the flaky test keeps failing, please fix it");
 
-    try group.await(io);
+    try mock.group.await(io);
     if (mock.err) |err| return err;
 
     // The model's title is kept, and the session was saved with it.

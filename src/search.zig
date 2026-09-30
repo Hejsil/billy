@@ -12,7 +12,7 @@
 const std = @import("std");
 const Io = std.Io;
 const Health = @import("Health.zig");
-const Mock = @import("mock.zig");
+const Mock = @import("Mock.zig");
 
 /// The backends billy can search with. The name is what the configuration holds,
 /// stored as the variant itself so an unknown name is refused when the file is
@@ -850,10 +850,9 @@ test "a tavily search posts the query and reads the results back" {
         \\ {"title":"Zig Programming Language","url":"https://ziglang.org","content":"A language."},
         \\ {"title":"Docs","url":"https://ziglang.org/documentation","content":""}]}
     ;
-    var mock = try Mock.start(gpa, io, "/search", 1, Mock.fixed(reply));
-    defer mock.deinit(io);
-    var group: Io.Group = .init;
-    try group.concurrent(io, Mock.serve, .{ io, &mock });
+    var mock = try Mock.start("/search", 1, Mock.fixed(reply));
+    defer mock.deinit();
+    try mock.serve();
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -869,7 +868,7 @@ test "a tavily search posts the query and reads the results back" {
     var reply_state = std.heap.ArenaAllocator.init(gpa);
     defer reply_state.deinit();
     const text = try client.tavily(reply_state.allocator(), "secret", mock.url, "zig lang", 3);
-    try group.await(io);
+    try mock.group.await(io);
     if (mock.err) |err| return err;
 
     // The query and the count went out as Tavily's body, the key as a bearer
@@ -891,10 +890,9 @@ test "a tavily extraction posts the url and reads its content back" {
     const io = std.testing.io;
 
     const reply = "{\"results\":[{\"url\":\"https://ziglang.org\",\"raw_content\":\"# Zig\\n\\nA language.\"}],\"failed_results\":[]}";
-    var mock = try Mock.start(gpa, io, "/extract", 1, Mock.fixed(reply));
-    defer mock.deinit(io);
-    var group: Io.Group = .init;
-    try group.concurrent(io, Mock.serve, .{ io, &mock });
+    var mock = try Mock.start("/extract", 1, Mock.fixed(reply));
+    defer mock.deinit();
+    try mock.serve();
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -907,7 +905,7 @@ test "a tavily extraction posts the url and reads its content back" {
     var reply_state = std.heap.ArenaAllocator.init(gpa);
     defer reply_state.deinit();
     const text = try client.tavilyExtract(reply_state.allocator(), "secret", mock.url, "https://ziglang.org");
-    try group.await(io);
+    try mock.group.await(io);
     if (mock.err) |err| return err;
 
     // The url went out as Tavily's body and the key as a bearer token.
@@ -921,10 +919,9 @@ test "a url tavily could not read is not a failure of the backend" {
     const io = std.testing.io;
 
     const reply = "{\"results\":[],\"failed_results\":[{\"url\":\"https://nope.invalid\",\"error\":\"not found\"}]}";
-    var mock = try Mock.start(gpa, io, "/extract", 1, Mock.fixed(reply));
-    defer mock.deinit(io);
-    var group: Io.Group = .init;
-    try group.concurrent(io, Mock.serve, .{ io, &mock });
+    var mock = try Mock.start("/extract", 1, Mock.fixed(reply));
+    defer mock.deinit();
+    try mock.serve();
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -940,7 +937,7 @@ test "a url tavily could not read is not a failure of the backend" {
         error.UrlUnreadable,
         client.tavilyExtract(reply_state.allocator(), "secret", mock.url, "https://nope.invalid"),
     );
-    try group.await(io);
+    try mock.group.await(io);
     if (mock.err) |err| return err;
 }
 
@@ -953,7 +950,7 @@ test "a url no backend could read does not set the backend aside" {
 
     // Two requests: Tavily answers the extraction without the url's text, and
     // the direct read that follows gets the page.
-    var mock = try Mock.start(gpa, io, "/extract", 2, struct {
+    var mock = try Mock.start("/extract", 2, struct {
         fn answer(number: usize, _: []const u8) Mock.Answer {
             if (number == 1) return .{
                 .body = "{\"results\":[],\"failed_results\":[{\"url\":\"https://nope.invalid\",\"error\":\"not found\"}]}",
@@ -961,9 +958,8 @@ test "a url no backend could read does not set the backend aside" {
             return .{ .body = "<html>a page</html>" };
         }
     }.answer);
-    defer mock.deinit(io);
-    var group: Io.Group = .init;
-    try group.concurrent(io, Mock.serve, .{ io, &mock });
+    defer mock.deinit();
+    try mock.serve();
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -986,7 +982,7 @@ test "a url no backend could read does not set the backend aside" {
         "<html>a page</html>",
         try client.extract(reply_state.allocator(), mock.url, false),
     );
-    try group.await(io);
+    try mock.group.await(io);
     if (mock.err) |err| return err;
 
     // Tavily answered, so it is not set aside: a search after this fetch still
@@ -1004,10 +1000,9 @@ test "a raw fetch reads the url directly, without the backend" {
     // The bytes come back exactly as sent, so a JSON body is not escaped as
     // markdown, which is what the backend would do to it.
     const reply = "{\"node_id\":\"abc\",\"full_name\":\"a/b\"}";
-    var mock = try Mock.start(gpa, io, "/api", 1, Mock.fixed(reply));
-    defer mock.deinit(io);
-    var group: Io.Group = .init;
-    try group.concurrent(io, Mock.serve, .{ io, &mock });
+    var mock = try Mock.start("/api", 1, Mock.fixed(reply));
+    defer mock.deinit();
+    try mock.serve();
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -1020,7 +1015,7 @@ test "a raw fetch reads the url directly, without the backend" {
     var reply_state = std.heap.ArenaAllocator.init(gpa);
     defer reply_state.deinit();
     const text = try client.extract(reply_state.allocator(), mock.url, true);
-    try group.await(io);
+    try mock.group.await(io);
     if (mock.err) |err| return err;
 
     // No authorization went out: the url was read directly, not through Tavily.
@@ -1037,10 +1032,9 @@ test "an exa search posts the query and reads the results back" {
         \\ {"title":"Zig Programming Language","url":"https://ziglang.org","text":"A language."},
         \\ {"title":"Docs","url":"https://ziglang.org/documentation","text":""}]}
     ;
-    var mock = try Mock.start(gpa, io, "/search", 1, Mock.fixed(reply));
-    defer mock.deinit(io);
-    var group: Io.Group = .init;
-    try group.concurrent(io, Mock.serve, .{ io, &mock });
+    var mock = try Mock.start("/search", 1, Mock.fixed(reply));
+    defer mock.deinit();
+    try mock.serve();
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -1053,7 +1047,7 @@ test "an exa search posts the query and reads the results back" {
     var reply_state = std.heap.ArenaAllocator.init(gpa);
     defer reply_state.deinit();
     const text = try client.exa(reply_state.allocator(), "secret", mock.url, "zig lang", 3);
-    try group.await(io);
+    try mock.group.await(io);
     if (mock.err) |err| return err;
 
     // The query, the count and the capped text went out as Exa's body (its field
@@ -1076,10 +1070,9 @@ test "an exa extraction posts the url and reads its text back" {
     const io = std.testing.io;
 
     const reply = "{\"results\":[{\"url\":\"https://ziglang.org\",\"text\":\"# Zig\\n\\nA language.\"}]}";
-    var mock = try Mock.start(gpa, io, "/contents", 1, Mock.fixed(reply));
-    defer mock.deinit(io);
-    var group: Io.Group = .init;
-    try group.concurrent(io, Mock.serve, .{ io, &mock });
+    var mock = try Mock.start("/contents", 1, Mock.fixed(reply));
+    defer mock.deinit();
+    try mock.serve();
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -1092,7 +1085,7 @@ test "an exa extraction posts the url and reads its text back" {
     var reply_state = std.heap.ArenaAllocator.init(gpa);
     defer reply_state.deinit();
     const text = try client.exaContents(reply_state.allocator(), "secret", mock.url, "https://ziglang.org");
-    try group.await(io);
+    try mock.group.await(io);
     if (mock.err) |err| return err;
 
     try std.testing.expectEqualStrings("{\"urls\":[\"https://ziglang.org\"]}", mock.bodies.items[0]);
@@ -1116,10 +1109,9 @@ test "a brave search sends the query in the url and reads the results back" {
     const reply = "{\"web\":{\"results\":[" ++
         "{\"title\":\"Zig\",\"url\":\"https://ziglang.org\",\"description\":\"A language.\"}," ++
         "{\"title\":\"Docs\",\"url\":\"https://ziglang.org/documentation\"}]}}";
-    var mock = try Mock.start(gpa, io, "/res/v1/web/search", 1, Mock.fixed(reply));
-    defer mock.deinit(io);
-    var group: Io.Group = .init;
-    try group.concurrent(io, Mock.serve, .{ io, &mock });
+    var mock = try Mock.start("/res/v1/web/search", 1, Mock.fixed(reply));
+    defer mock.deinit();
+    try mock.serve();
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -1132,7 +1124,7 @@ test "a brave search sends the query in the url and reads the results back" {
     var reply_state = std.heap.ArenaAllocator.init(gpa);
     defer reply_state.deinit();
     const text = try client.brave(reply_state.allocator(), "secret", mock.url, "zig lang", 3);
-    try group.await(io);
+    try mock.group.await(io);
     if (mock.err) |err| return err;
 
     // The query is a GET, so nothing was posted; the key went out in Brave's own
@@ -1154,10 +1146,9 @@ test "a backend with no extraction reads the url itself" {
     // Brave has no extraction endpoint, so a fetch reads the url directly and
     // returns its bytes, even without `raw`.
     const reply = "<html>a page</html>";
-    var mock = try Mock.start(gpa, io, "/page", 1, Mock.fixed(reply));
-    defer mock.deinit(io);
-    var group: Io.Group = .init;
-    try group.concurrent(io, Mock.serve, .{ io, &mock });
+    var mock = try Mock.start("/page", 1, Mock.fixed(reply));
+    defer mock.deinit();
+    try mock.serve();
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -1173,7 +1164,7 @@ test "a backend with no extraction reads the url itself" {
     var reply_state = std.heap.ArenaAllocator.init(gpa);
     defer reply_state.deinit();
     try std.testing.expectEqualStrings(reply, try client.extract(reply_state.allocator(), mock.url, false));
-    try group.await(io);
+    try mock.group.await(io);
     if (mock.err) |err| return err;
 }
 
@@ -1185,10 +1176,9 @@ test "a searxng search sends the query to the instance, and caps the results" {
         "{\"title\":\"Zig\",\"url\":\"https://ziglang.org\",\"content\":\"A language.\"}," ++
         "{\"title\":\"Docs\",\"url\":\"https://ziglang.org/documentation\",\"content\":\"\"}]}";
     // The instance is the mock's base, which SearXNG's `/search` is added to.
-    var mock = try Mock.start(gpa, io, "", 1, Mock.fixed(reply));
-    defer mock.deinit(io);
-    var group: Io.Group = .init;
-    try group.concurrent(io, Mock.serve, .{ io, &mock });
+    var mock = try Mock.start("", 1, Mock.fixed(reply));
+    defer mock.deinit();
+    try mock.serve();
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -1203,7 +1193,7 @@ test "a searxng search sends the query to the instance, and caps the results" {
     // The cap is applied here, since SearXNG takes no result count: only the
     // first of the two results is rendered.
     const text = try client.searxng(reply_state.allocator(), mock.url, "zig lang", 1);
-    try group.await(io);
+    try mock.group.await(io);
     if (mock.err) |err| return err;
 
     // The query is a GET with no key: SearXNG is the user's own instance.
@@ -1218,15 +1208,14 @@ test "the backends are tried in order until one answers" {
 
     // The first reply is a server error and the second is results, so the first
     // backend fails and the second answers.
-    var mock = try Mock.start(gpa, io, "/search", 2, struct {
+    var mock = try Mock.start("/search", 2, struct {
         fn answer(number: usize, _: []const u8) Mock.Answer {
             if (number == 1) return .{ .status = .internal_server_error, .body = "{}" };
             return .{ .body = "{\"results\":[{\"title\":\"Zig\",\"url\":\"https://ziglang.org\",\"content\":\"A language.\"}]}" };
         }
     }.answer);
-    defer mock.deinit(io);
-    var group: Io.Group = .init;
-    try group.concurrent(io, Mock.serve, .{ io, &mock });
+    defer mock.deinit();
+    try mock.serve();
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -1245,7 +1234,7 @@ test "the backends are tried in order until one answers" {
     var reply_state = std.heap.ArenaAllocator.init(gpa);
     defer reply_state.deinit();
     const text = try client.search(reply_state.allocator(), "zig lang");
-    try group.await(io);
+    try mock.group.await(io);
     if (mock.err) |err| return err;
 
     // Both were tried: the first failed and the second answered.
@@ -1257,14 +1246,13 @@ test "a search fails only when every backend has failed" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var mock = try Mock.start(gpa, io, "/search", 2, struct {
+    var mock = try Mock.start("/search", 2, struct {
         fn answer(_: usize, _: []const u8) Mock.Answer {
             return .{ .status = .internal_server_error, .body = "{}" };
         }
     }.answer);
-    defer mock.deinit(io);
-    var group: Io.Group = .init;
-    try group.concurrent(io, Mock.serve, .{ io, &mock });
+    defer mock.deinit();
+    try mock.serve();
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -1281,7 +1269,7 @@ test "a search fails only when every backend has failed" {
     var reply_state = std.heap.ArenaAllocator.init(gpa);
     defer reply_state.deinit();
     try std.testing.expectError(error.SearchFailed, client.search(reply_state.allocator(), "zig lang"));
-    try group.await(io);
+    try mock.group.await(io);
     if (mock.err) |err| return err;
     try std.testing.expectEqual(@as(usize, 2), mock.served);
 }
@@ -1295,15 +1283,14 @@ test "a backend that failed is set aside, so the next search skips it" {
 
     // Three requests: Tavily fails the first search, Brave answers it, and Brave
     // answers the second search, which never asks Tavily again.
-    var mock = try Mock.start(gpa, io, "/search", 3, struct {
+    var mock = try Mock.start("/search", 3, struct {
         fn answer(number: usize, _: []const u8) Mock.Answer {
             if (number == 1) return .{ .status = .internal_server_error, .body = "{}" };
             return .{ .body = "{\"web\":{\"results\":[{\"title\":\"Zig\",\"url\":\"https://ziglang.org\",\"description\":\"A language.\"}]}}" };
         }
     }.answer);
-    defer mock.deinit(io);
-    var group: Io.Group = .init;
-    try group.concurrent(io, Mock.serve, .{ io, &mock });
+    defer mock.deinit();
+    try mock.serve();
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
@@ -1336,7 +1323,7 @@ test "a backend that failed is set aside, so the next search skips it" {
     // Brave asks in the url, so the third request arriving with no body is
     // Brave answering, not Tavily being asked again.
     _ = try client.search(reply_state.allocator(), "zig lang");
-    try group.await(io);
+    try mock.group.await(io);
     if (mock.err) |err| return err;
 
     try std.testing.expectEqual(@as(usize, 3), mock.served);
@@ -1352,8 +1339,8 @@ test "a search with every backend set aside says so, without asking any" {
     defer tmp.cleanup();
 
     // A listener that never serves: no backend should be reached.
-    var mock = try Mock.start(gpa, io, "/search", 1, Mock.fixed("{}"));
-    defer mock.deinit(io);
+    var mock = try Mock.start("/search", 1, Mock.fixed("{}"));
+    defer mock.deinit();
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
