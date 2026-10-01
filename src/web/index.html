@@ -134,6 +134,13 @@
   .block.prompt .head .glyph { color: var(--accent); }
   .block.answer .head .glyph { color: var(--add); }
   .block :first-child { margin-top: 0; }
+  /* Text breaks wherever it has to. A reply, a prompt and a tool's output can
+     hold a run of characters with nothing to break at -- a comma-separated list
+     of bytes, a long url, a hash -- and a line with nowhere to wrap pushes the
+     whole page sideways, which on a phone is a long horizontal scroll. Prose is
+     unaffected: this only decides what happens where there is no space to break
+     at, so an ordinary sentence still wraps at its spaces. */
+  #conversation { overflow-wrap: anywhere; }
   .block p { margin: 0 0 8px; }
   .block ul, .block ol { margin: 0 0 8px; padding-left: 22px; }
   .block h1, .block h2, .block h3, .block h4, .block h5, .block h6 { font-size: 15px; margin: 12px 0 6px; }
