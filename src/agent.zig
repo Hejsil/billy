@@ -642,7 +642,7 @@ pub fn run(
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
 
-    var runner = try Runner.init(io, gpa, config, session.cwd, &http);
+    var runner = try Runner.init(io, gpa, config, session.cwd(), &http);
     defer runner.deinit();
     // A resumed session keeps the prompt and tools it was saved with, so it is
     // prepared here; a new one gets them when its first prompt names the mode.

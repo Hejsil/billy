@@ -103,7 +103,7 @@ const Stored = struct {
     cost: f64 = 0,
     /// The directory the session was started in. Empty for a session saved
     /// before it was recorded, which is read as the directory billy runs in.
-    cwd: []const u8 = "",
+    cwd: ?[]const u8 = null,
 
     const default = Stored{};
 };
@@ -292,8 +292,8 @@ cost: f64 = 0,
 /// The directory the session was started in. A resumed session keeps it, so
 /// billy works where the session did rather than wherever it is run from now;
 /// a session saved before it was recorded has none, and the run's own directory
-/// is used instead. Owned by `gpa`, even when it is the empty default.
-cwd: []const u8 = "",
+/// is used instead.
+interned_cwd: StringIndex = .none,
 
 /// Opens the session called `resume_id`, or starts a new one when it is null.
 ///
@@ -308,11 +308,11 @@ pub fn open(
     dir: std.Io.Dir,
     gpa: std.mem.Allocator,
     resume_id: ?[]const u8,
-    cwd: []const u8,
+    arg_cwd: []const u8,
 ) !Session {
     // A resume that fails part way leaves what it had read behind, since the
     // caller only gets the session on the way out.
-    var session = try named(io, dir, gpa, resume_id, cwd);
+    var session = try named(io, dir, gpa, resume_id, arg_cwd);
     errdefer session.deinit();
     if (resume_id != null) try session.load();
     return session;
@@ -325,13 +325,13 @@ pub fn open(
 /// it, and nothing is read because there is nothing to read. Nothing is written
 /// either, so the session comes into being with its first message; a run that
 /// is started and left alone leaves no file behind.
-pub fn create(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: []const u8, cwd: []const u8) !Session {
-    return named(io, dir, gpa, named_id, cwd);
+pub fn create(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: []const u8, arg_cwd: []const u8) !Session {
+    return named(io, dir, gpa, named_id, arg_cwd);
 }
 
 /// A session named `named_id`, or one given a fresh id when it is null, with
 /// nothing read from disk and nothing written.
-fn named(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: ?[]const u8, cwd: []const u8) !Session {
+fn named(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: ?[]const u8, arg_cwd: []const u8) !Session {
     var session: Session = .{ .io = io, .dir = dir, .gpa = gpa };
     errdefer session.deinit();
 
@@ -348,7 +348,7 @@ fn named(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: ?[]const
 
     // The session owns its directory rather than pointing into the caller's
     // memory, which it may outlive.
-    session.cwd = try gpa.dupe(u8, cwd);
+    session.interned_cwd = try session.internString(arg_cwd);
     return session;
 }
 
@@ -359,7 +359,6 @@ pub fn deinit(session: *Session) void {
     session.messages.deinit(session.gpa);
     session.compactions.deinit(session.gpa);
     session.gpa.free(session.tools);
-    session.gpa.free(session.cwd);
 }
 
 /// Names the session; also its file name without the extension. The buffer ends
@@ -371,6 +370,10 @@ pub fn id(session: *const Session) []const u8 {
 /// Name of the session file inside `dir`.
 pub fn name(session: *const Session) []const u8 {
     return std.mem.sliceTo(&session.name_buf, 0);
+}
+
+pub fn cwd(session: *const Session) []const u8 {
+    return session.string(session.interned_cwd) orelse "";
 }
 
 /// The conversation as a completion request carries it: the `messages` array of
@@ -783,7 +786,7 @@ pub fn save(session: *Session) !void {
     try json.write(session.cost);
 
     try json.objectField("cwd");
-    try json.write(session.cwd);
+    try json.write(session.cwd());
 
     try json.endObject();
 
@@ -826,12 +829,8 @@ fn load(session: *Session) !void {
     session.usage = stored.usage;
     session.context_tokens = stored.context_tokens;
     session.cost = stored.cost;
-
-    if (stored.cwd.len > 0) {
-        const owned = try session.gpa.dupe(u8, stored.cwd);
-        session.gpa.free(session.cwd);
-        session.cwd = owned;
-    }
+    if (stored.cwd) |stored_cwd|
+        session.interned_cwd = try session.internString(stored_cwd);
 }
 
 fn loadPromptAndMessages(
@@ -2128,7 +2127,7 @@ test "an equal string is interned once and shared" {
 
     // Each distinct string once, in the order it was first seen.
     try std.testing.expectEqualStrings(
-        "user\x00hello\x00assistant\x00call_1\x00function\x00read\x00{}\x00[]\x00",
+        "/work\x00user\x00hello\x00assistant\x00call_1\x00function\x00read\x00{}\x00[]\x00",
         session.strings.items,
     );
     // The two equal contents, and the repeated parts of the two tool calls,
@@ -2501,13 +2500,13 @@ test "the working directory is stored and restored on resume" {
     // A session started in one directory.
     var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/home/user/project");
     defer session.deinit();
-    try std.testing.expectEqualStrings("/home/user/project", session.cwd);
+    try std.testing.expectEqualStrings("/home/user/project", session.cwd());
     try session.append(.{ .role = "user", .content = "hello" });
 
     // Resumed from somewhere else, it keeps the directory it was started in.
     var resumed = try Session.open(std.testing.io, tmp.dir, gpa, session.id(), "/somewhere/else");
     defer resumed.deinit();
-    try std.testing.expectEqualStrings("/home/user/project", resumed.cwd);
+    try std.testing.expectEqualStrings("/home/user/project", resumed.cwd());
 }
 
 test "a session saved before the directory was recorded uses the run's own" {
@@ -2524,7 +2523,7 @@ test "a session saved before the directory was recorded uses the run's own" {
 
     var resumed = try Session.open(std.testing.io, tmp.dir, gpa, "old", "/now/here");
     defer resumed.deinit();
-    try std.testing.expectEqualStrings("/now/here", resumed.cwd);
+    try std.testing.expectEqualStrings("/now/here", resumed.cwd());
 }
 
 test "a resumed session frees everything it read back" {
@@ -2550,7 +2549,7 @@ test "a resumed session frees everything it read back" {
     var resumed = try reopen(&tmp, gpa, "big");
     defer resumed.deinit();
     try std.testing.expectEqual(2000, resumed.messages.items.len);
-    try std.testing.expectEqualStrings("/work", resumed.cwd);
+    try std.testing.expectEqualStrings("/work", resumed.cwd());
 }
 
 test "the id and file name read back from their fixed buffers" {

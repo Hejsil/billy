@@ -467,7 +467,7 @@ fn writeSession(
     try html.header(.{
         .id = session.id(),
         .model = setup.model,
-        .cwd = session.cwd,
+        .cwd = session.cwd(),
         .home = setup.environ.get("HOME"),
         .context_tokens = session.context_tokens,
         .model_info = models.lookup(models.Provider.fromUrl(setup.base_url), setup.model),
@@ -730,7 +730,7 @@ fn createSession(
     const choice = mode.Mode.start(parsed.value.text, parsed.value.mode orelse default_mode);
     if (choice.text.len == 0)
         return reply(request, .text, "the prompt is empty\n", .bad_request, answered);
-    var config = setup.agentConfig(session.cwd, .plain);
+    var config = setup.agentConfig(session.cwd(), .plain);
     config.mode = choice.mode;
 
     try serveTurn(setup, http, request, answered, &session, config, choice.text, session.id());
@@ -768,7 +768,7 @@ fn askSession(
     };
     defer session.deinit();
 
-    try serveTurn(setup, http, request, answered, &session, setup.agentConfig(session.cwd, .plain), parsed.value.text, null);
+    try serveTurn(setup, http, request, answered, &session, setup.agentConfig(session.cwd(), .plain), parsed.value.text, null);
 }
 
 /// Answers one prompt as the run happens: the run's blocks as the events of a
@@ -790,7 +790,7 @@ fn serveTurn(
     announce_id: ?[]const u8,
 ) !void {
     const gpa = setup.gpa;
-    var runner = try Runner.init(setup.io, gpa, config, session.cwd, http);
+    var runner = try Runner.init(setup.io, gpa, config, session.cwd(), http);
     defer runner.deinit();
     try runner.prepare(session);
 
@@ -854,7 +854,7 @@ fn sendHeader(setup: *Setup, gpa: std.mem.Allocator, session: *const Session, st
     try html.header(.{
         .id = session.id(),
         .model = setup.model,
-        .cwd = session.cwd,
+        .cwd = session.cwd(),
         .home = setup.environ.get("HOME"),
         .context_tokens = session.context_tokens,
         .model_info = models.lookup(models.Provider.fromUrl(setup.base_url), setup.model),
