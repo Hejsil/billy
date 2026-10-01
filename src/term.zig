@@ -604,38 +604,38 @@ const Markdown = struct {
         if (self.err == null) self.err = error.OutOfMemory;
         return false;
     }
+
+    /// The bytes of an md4c attribute, which is empty when it has no text.
+    fn attribute(value: md.c.MD_ATTRIBUTE) []const u8 {
+        if (value.text == null or value.size == 0) return "";
+        return value.text[0..value.size];
+    }
+
+    fn enterBlock(block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
+        const self: *Markdown = @ptrCast(@alignCast(userdata.?));
+        return @intFromBool(!self.openBlock(block_type, detail));
+    }
+
+    fn leaveBlock(block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
+        const self: *Markdown = @ptrCast(@alignCast(userdata.?));
+        return @intFromBool(!self.closeBlock(block_type, detail));
+    }
+
+    fn enterSpan(span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
+        const self: *Markdown = @ptrCast(@alignCast(userdata.?));
+        return @intFromBool(!self.openSpan(span_type, detail));
+    }
+
+    fn leaveSpan(span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
+        const self: *Markdown = @ptrCast(@alignCast(userdata.?));
+        return @intFromBool(!self.closeSpan(span_type, detail));
+    }
+
+    fn writeText(text_type: md.c.MD_TEXTTYPE, text: [*c]const md.c.MD_CHAR, size: md.c.MD_SIZE, userdata: ?*anyopaque) callconv(.c) c_int {
+        const self: *Markdown = @ptrCast(@alignCast(userdata.?));
+        return @intFromBool(!self.writeRun(text_type, text[0..size]));
+    }
 };
-
-/// The bytes of an md4c attribute, which is empty when it has no text.
-fn attribute(value: md.c.MD_ATTRIBUTE) []const u8 {
-    if (value.text == null or value.size == 0) return "";
-    return value.text[0..value.size];
-}
-
-fn enterBlock(block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
-    const self: *Markdown = @ptrCast(@alignCast(userdata.?));
-    return @intFromBool(!self.openBlock(block_type, detail));
-}
-
-fn leaveBlock(block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
-    const self: *Markdown = @ptrCast(@alignCast(userdata.?));
-    return @intFromBool(!self.closeBlock(block_type, detail));
-}
-
-fn enterSpan(span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
-    const self: *Markdown = @ptrCast(@alignCast(userdata.?));
-    return @intFromBool(!self.openSpan(span_type, detail));
-}
-
-fn leaveSpan(span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
-    const self: *Markdown = @ptrCast(@alignCast(userdata.?));
-    return @intFromBool(!self.closeSpan(span_type, detail));
-}
-
-fn writeText(text_type: md.c.MD_TEXTTYPE, text: [*c]const md.c.MD_CHAR, size: md.c.MD_SIZE, userdata: ?*anyopaque) callconv(.c) c_int {
-    const self: *Markdown = @ptrCast(@alignCast(userdata.?));
-    return @intFromBool(!self.writeRun(text_type, text[0..size]));
-}
 
 /// Renders `text` and compares it to `expected`, so a test reads as the text a
 /// terminal shows rather than as the buffer around it.
