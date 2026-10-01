@@ -21,12 +21,14 @@ pub fn dir(
             return std.fs.path.join(gpa, &.{ xdg, app_dir });
         }
     }
+
     const home = environ.get("HOME") orelse return error.HomeNotSet;
-    var parts: [4][]const u8 = undefined;
-    parts[0] = home;
-    for (fallback, 1..) |segment, i| parts[i] = segment;
-    parts[1 + fallback.len] = app_dir;
-    return std.fs.path.join(gpa, parts[0 .. 2 + fallback.len]);
+    const fallback_join = std.fs.path.fmtJoin(fallback);
+    return std.fmt.allocPrint(gpa, "{s}{c}{f}{c}{s}", .{
+        home,          std.fs.path.sep,
+        fallback_join, std.fs.path.sep,
+        app_dir,
+    });
 }
 
 /// Checks a path `dir` built, freeing it: the caller owns what it returns.
