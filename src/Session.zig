@@ -21,7 +21,6 @@
 //! session a kill left half written is still one that can continue.
 
 const std = @import("std");
-const Io = std.Io;
 const llm = @import("llm.zig");
 const ulid = @import("ulid.zig");
 const xdg = @import("xdg.zig");
@@ -218,10 +217,10 @@ pub const Definition = struct {
     parameters: []const u8,
 };
 
-io: Io,
+io: std.Io,
 
 /// Directory holding the session files. Owned by the caller.
-dir: Io.Dir,
+dir: std.Io.Dir,
 
 /// Owns the conversation and everything a resume read back, all freed by
 /// `deinit`.
@@ -305,8 +304,8 @@ cwd: []const u8 = "",
 /// Fails with `error.SessionNotFound` when the session is missing, and with
 /// `error.InvalidSessionId` when `resume_id` is not a usable name.
 pub fn open(
-    io: Io,
-    dir: Io.Dir,
+    io: std.Io,
+    dir: std.Io.Dir,
     gpa: std.mem.Allocator,
     resume_id: ?[]const u8,
     cwd: []const u8,
@@ -326,13 +325,13 @@ pub fn open(
 /// it, and nothing is read because there is nothing to read. Nothing is written
 /// either, so the session comes into being with its first message; a run that
 /// is started and left alone leaves no file behind.
-pub fn create(io: Io, dir: Io.Dir, gpa: std.mem.Allocator, named_id: []const u8, cwd: []const u8) !Session {
+pub fn create(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: []const u8, cwd: []const u8) !Session {
     return named(io, dir, gpa, named_id, cwd);
 }
 
 /// A session named `named_id`, or one given a fresh id when it is null, with
 /// nothing read from disk and nothing written.
-fn named(io: Io, dir: Io.Dir, gpa: std.mem.Allocator, named_id: ?[]const u8, cwd: []const u8) !Session {
+fn named(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: ?[]const u8, cwd: []const u8) !Session {
     var session: Session = .{ .io = io, .dir = dir, .gpa = gpa };
     errdefer session.deinit();
 
@@ -780,7 +779,7 @@ pub fn save(session: *Session) !void {
     var atomic = try session.dir.createFileAtomic(session.io, session.name(), .{ .replace = true });
     defer atomic.deinit(session.io);
 
-    var file: Io.File.Writer = atomic.file.writer(session.io, "");
+    var file: std.Io.File.Writer = atomic.file.writer(session.io, "");
     try file.interface.writeAll(text.written());
     try file.end();
 
@@ -1108,8 +1107,8 @@ fn usableName(text: []const u8) bool {
 /// in the handle it was opened on, so two listings sharing one would read over
 /// each other; the server asks from several connections at once, and this is what
 /// makes each of those impossible to get wrong.
-pub fn list(io: Io, path: []const u8, gpa: std.mem.Allocator) ![]Named {
-    var dir = try Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
+pub fn list(io: std.Io, path: []const u8, gpa: std.mem.Allocator) ![]Named {
+    var dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
     defer dir.close(io);
     return listIn(dir, io, gpa);
 }
@@ -1123,7 +1122,7 @@ pub const Named = struct {
 
 /// The ids of the sessions in `dir`, which must be a handle this listing has to
 /// itself. See `list`, which opens one.
-fn listIn(dir: Io.Dir, io: Io, gpa: std.mem.Allocator) ![]Named {
+fn listIn(dir: std.Io.Dir, io: std.Io, gpa: std.mem.Allocator) ![]Named {
     // The names and the times they were written are two lists kept in step: the
     // times are only there to order the names by, so sorting has to move both.
     var names: std.ArrayList(Named) = .empty;
@@ -1176,7 +1175,7 @@ const title_read_buffer_len = 1024;
 /// Only the front of the file is read, and only as far as the title: the fields
 /// it opens with are stepped over a token at a time, so a listing reads a few
 /// dozen bytes rather than the whole conversation, however large the file is.
-fn readTitle(io: Io, gpa: std.mem.Allocator, dir: Io.Dir, file_name: []const u8) ![]const u8 {
+fn readTitle(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir, file_name: []const u8) ![]const u8 {
     var file = dir.openFile(io, file_name, .{}) catch return gpa.dupe(u8, "");
     defer file.close(io);
 
@@ -1205,7 +1204,7 @@ fn readTitle(io: Io, gpa: std.mem.Allocator, dir: Io.Dir, file_name: []const u8)
 /// after the version. So only those two are looked at, and a file that does not
 /// name the session -- one saved before titles, or hand-written -- is recognized
 /// and left alone after a few bytes rather than scanned to its end.
-fn titleFrom(reader: *Io.Reader, gpa: std.mem.Allocator) !?[]u8 {
+fn titleFrom(reader: *std.Io.Reader, gpa: std.mem.Allocator) !?[]u8 {
     // `{"version":` up to the quote that closes the key.
     const opening = reader.takeDelimiter('"') catch return null;
     _ = opening orelse return null;
@@ -1232,7 +1231,7 @@ fn titleFrom(reader: *Io.Reader, gpa: std.mem.Allocator) !?[]u8 {
 /// closes the string only when it is not escaped, so a run that ends just before
 /// an escaped quote is read on: it stops at the first quote that is not escaped,
 /// which is the one that ends the value.
-fn takeString(reader: *Io.Reader, gpa: std.mem.Allocator) !?[]u8 {
+fn takeString(reader: *std.Io.Reader, gpa: std.mem.Allocator) !?[]u8 {
     var raw: std.ArrayList(u8) = .empty;
     defer raw.deinit(gpa);
     while (true) {
@@ -1309,7 +1308,7 @@ fn fileName(session_id: []const u8, buffer: []u8) ?[]const u8 {
 /// Deletes the session `id` from `dir`, so it is gone for good: billy keeps no
 /// trash. A session that has no file is `error.SessionNotFound`, and an id that
 /// could not name one is `error.InvalidSessionId`.
-pub fn delete(io: Io, dir: Io.Dir, session_id: []const u8) !void {
+pub fn delete(io: std.Io, dir: std.Io.Dir, session_id: []const u8) !void {
     var buffer: [max_id_len + extension.len]u8 = undefined;
     const file = fileName(session_id, &buffer) orelse return error.InvalidSessionId;
     dir.deleteFile(io, file) catch |err| switch (err) {
@@ -1551,7 +1550,7 @@ fn writeSessionAt(tmp: *std.testing.TmpDir, gpa: std.mem.Allocator, session_id: 
     defer gpa.free(file_name);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{}" });
     try tmp.dir.setTimestamps(std.testing.io, file_name, .{
-        .modify_timestamp = .{ .new = Io.Timestamp.fromNanoseconds(
+        .modify_timestamp = .{ .new = std.Io.Timestamp.fromNanoseconds(
             @as(i96, written_ms) * std.time.ns_per_ms,
         ) },
     });

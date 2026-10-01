@@ -10,7 +10,6 @@
 //! and what the model is sent keep the text that was written.
 
 const std = @import("std");
-const Io = std.Io;
 
 /// Room above the text when the laid-out text is read back, so a formatter that
 /// runs away cannot exhaust memory.
@@ -41,7 +40,7 @@ pub const Format = ?Formatter;
 pub const Formatter = struct {
     /// The shell script, run with `bash -c`.
     script: []const u8,
-    io: Io,
+    io: std.Io,
     /// Holds the laid-out text while it is printed.
     gpa: std.mem.Allocator,
 };
@@ -51,14 +50,14 @@ pub const Formatter = struct {
 /// so the caller can show the text as written. That is what no formatter gives,
 /// and a formatter that cannot be run, rejects the text, writes nothing or writes
 /// too much.
-pub fn apply(format: Format, text: []const u8, out: *Io.Writer) !bool {
+pub fn apply(format: Format, text: []const u8, out: *std.Io.Writer) !bool {
     return run(format, text, &.{}, out);
 }
 
 /// Runs `text` through the formatter with `args` after the script, so the script
 /// can name them `$1`, `$2`. The text still goes in on standard input, so a
 /// script that takes no arguments is unaffected. Everything else is as `apply`.
-fn run(format: Format, text: []const u8, args: []const []const u8, out: *Io.Writer) !bool {
+fn run(format: Format, text: []const u8, args: []const []const u8, out: *std.Io.Writer) !bool {
     const formatter = format orelse return false;
     std.debug.assert(args.len <= max_args);
 
@@ -82,14 +81,14 @@ fn run(format: Format, text: []const u8, args: []const []const u8, out: *Io.Writ
     // The text goes in on standard input, which is what the format script reads.
     // Closing the pipe is what tells it there is no more.
     var in_buffer: [4096]u8 = undefined;
-    var script: Io.File.Writer = .init(child.stdin.?, formatter.io, &in_buffer);
+    var script: std.Io.File.Writer = .init(child.stdin.?, formatter.io, &in_buffer);
     try script.interface.writeAll(text);
     try script.interface.flush();
     child.stdin.?.close(formatter.io);
     child.stdin = null;
 
     var out_buffer: [4096]u8 = undefined;
-    var reader: Io.File.Reader = .init(child.stdout.?, formatter.io, &out_buffer);
+    var reader: std.Io.File.Reader = .init(child.stdout.?, formatter.io, &out_buffer);
     const written = reader.interface.allocRemaining(
         formatter.gpa,
         .limited(text.len +| slack),
@@ -111,10 +110,10 @@ fn run(format: Format, text: []const u8, args: []const []const u8, out: *Io.Writ
 /// own files and passed as the script's first two arguments, so a two-file
 /// differ is handed the files it wants. The files are removed once the script has
 /// run, whether or not it could be used.
-pub fn runDiff(format: Format, text: []const u8, old: []const u8, new: []const u8, out: *Io.Writer) !bool {
+pub fn runDiff(format: Format, text: []const u8, old: []const u8, new: []const u8, out: *std.Io.Writer) !bool {
     const formatter = format orelse return false;
 
-    var dir = Io.Dir.openDirAbsolute(formatter.io, sides_dir, .{}) catch return false;
+    var dir = std.Io.Dir.openDirAbsolute(formatter.io, sides_dir, .{}) catch return false;
     defer dir.close(formatter.io);
 
     var old_buffer: [max_path]u8 = undefined;
@@ -133,7 +132,7 @@ pub fn runDiff(format: Format, text: []const u8, old: []const u8, new: []const u
 /// already taken is retried with a new suffix; the full path is written into
 /// `buffer` and returned, or null when the name could not be made free or the
 /// write failed.
-fn writeSide(io: Io, dir: Io.Dir, data: []const u8, kind: []const u8, buffer: []u8) ?[]const u8 {
+fn writeSide(io: std.Io, dir: std.Io.Dir, data: []const u8, kind: []const u8, buffer: []u8) ?[]const u8 {
     var attempt: usize = 0;
     while (attempt < name_attempts) : (attempt += 1) {
         var suffix: [suffix_bytes]u8 = undefined;
@@ -153,7 +152,7 @@ fn writeSide(io: Io, dir: Io.Dir, data: []const u8, kind: []const u8, buffer: []
         };
 
         var write_buffer: [4096]u8 = undefined;
-        var writer: Io.File.Writer = .init(file, io, &write_buffer);
+        var writer: std.Io.File.Writer = .init(file, io, &write_buffer);
         const wrote = blk: {
             writer.interface.writeAll(data) catch break :blk false;
             writer.interface.flush() catch break :blk false;
@@ -184,7 +183,7 @@ pub fn exitCode(term: std.process.Child.Term) u8 {
 
 test "each side is written to its own fresh file" {
     const gpa = std.testing.allocator;
-    var dir = try Io.Dir.openDirAbsolute(std.testing.io, sides_dir, .{});
+    var dir = try std.Io.Dir.openDirAbsolute(std.testing.io, sides_dir, .{});
     defer dir.close(std.testing.io);
 
     var first_buffer: [max_path]u8 = undefined;

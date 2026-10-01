@@ -6,7 +6,6 @@
 //! what is C-shaped stays here and what is shaped for a frontend stays there.
 
 const std = @import("std");
-const Io = std.Io;
 
 /// md4c, its entity table, and its own HTML renderer. The table is needed
 /// because a link address is decoded before it is trusted: a `javascript:`
@@ -72,7 +71,7 @@ pub fn appendCodepoint(value: *std.ArrayList(u8), gpa: std.mem.Allocator, codepo
 /// billy does not use this to render: md4c's renderer writes a link's address
 /// unchecked, which is the whole reason billy drives the parser itself. It is
 /// here as an independent implementation to compare against.
-pub fn oracleHtml(text: []const u8, out: *Io.Writer) !void {
+pub fn oracleHtml(text: []const u8, out: *std.Io.Writer) !void {
     var sink = Sink{ .out = out };
     _ = c.md_html(text.ptr, @intCast(text.len), emit, &sink, flags, 0);
     if (sink.err) |err| return err;
@@ -80,8 +79,8 @@ pub fn oracleHtml(text: []const u8, out: *Io.Writer) !void {
 
 /// Where the oracle renderer's output goes, and the first failure of writing it.
 const Sink = struct {
-    out: *Io.Writer,
-    err: ?Io.Writer.Error = null,
+    out: *std.Io.Writer,
+    err: ?std.Io.Writer.Error = null,
 };
 
 /// Writes one chunk of the oracle renderer's output; the failure, if any, is kept

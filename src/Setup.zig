@@ -8,7 +8,6 @@
 //! left to the caller, which builds the agent configuration from this.
 
 const std = @import("std");
-const Io = std.Io;
 const agent = @import("agent.zig");
 const llm = @import("llm.zig");
 const Config = @import("Config.zig");
@@ -21,7 +20,7 @@ const styling = @import("style.zig");
 
 const Setup = @This();
 
-io: Io,
+io: std.Io,
 /// Temporary allocations, and what a tool format script is given to lay its
 /// output out with.
 gpa: std.mem.Allocator,
@@ -31,13 +30,13 @@ environ: *const std.process.Environ.Map,
 /// the file, which `deinit` frees.
 settings: Config,
 /// Directory handle holding the session files.
-sessions: Io.Dir,
+sessions: std.Io.Dir,
 /// The path of the sessions directory, for a message that has to name it.
 sessions_path: []const u8,
 /// The directories billy's own files were found in, held so they stay open for
 /// as long as the credentials file might be written.
-data_dir: Io.Dir,
-config_dir: Io.Dir,
+data_dir: std.Io.Dir,
+config_dir: std.Io.Dir,
 
 /// Where billy was started. A new session records it, so a session continues
 /// where it was started rather than wherever it is picked up.
@@ -66,7 +65,7 @@ health: Health,
 ///
 /// `out` is for the note that the configuration file was created, which is the
 /// one thing here the user is told about.
-pub fn open(init: std.process.Init, out: *Io.Writer) !Setup {
+pub fn open(init: std.process.Init, out: *std.Io.Writer) !Setup {
     const io = init.io;
     const arena = init.arena.allocator();
     const environ = init.environ_map;
@@ -79,7 +78,7 @@ pub fn open(init: std.process.Init, out: *Io.Writer) !Setup {
         std.log.err("cannot find where to store billy's files: {s}", .{@errorName(err)});
         return err;
     };
-    var data_dir = Io.Dir.cwd().createDirPathOpen(io, data_dir_path, .{}) catch |err| {
+    var data_dir = std.Io.Dir.cwd().createDirPathOpen(io, data_dir_path, .{}) catch |err| {
         std.log.err("cannot use {s} for billy's files: {s}", .{ data_dir_path, @errorName(err) });
         return err;
     };
@@ -94,7 +93,7 @@ pub fn open(init: std.process.Init, out: *Io.Writer) !Setup {
         std.log.err("cannot find where to store the configuration: {s}", .{@errorName(err)});
         return err;
     };
-    var config_dir = Io.Dir.cwd().createDirPathOpen(io, config_dir_path, .{}) catch |err| {
+    var config_dir = std.Io.Dir.cwd().createDirPathOpen(io, config_dir_path, .{}) catch |err| {
         std.log.err("cannot use {s} for the configuration: {s}", .{ config_dir_path, @errorName(err) });
         return err;
     };
@@ -137,7 +136,7 @@ pub fn open(init: std.process.Init, out: *Io.Writer) !Setup {
         std.log.err("cannot find where to store sessions: {s}", .{@errorName(err)});
         return err;
     };
-    var sessions = Io.Dir.cwd().createDirPathOpen(io, sessions_path, .{}) catch |err| {
+    var sessions = std.Io.Dir.cwd().createDirPathOpen(io, sessions_path, .{}) catch |err| {
         std.log.err("cannot use {s} for sessions: {s}", .{ sessions_path, @errorName(err) });
         return err;
     };

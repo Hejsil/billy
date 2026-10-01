@@ -1,7 +1,6 @@
 //! The tools the agent can call, together with their JSON Schema descriptions.
 
 const std = @import("std");
-const Io = std.Io;
 const llm = @import("llm.zig");
 const Search = @import("search.zig");
 const formatting = @import("format.zig");
@@ -107,11 +106,11 @@ pub const Call = union(enum) {
     };
 };
 
-io: Io,
+io: std.Io,
 /// The directory the tools work in: the one the session was started in, so a
 /// resumed session reads and writes where it did rather than wherever billy
 /// happens to be run from. Every path a tool is given is relative to it.
-dir: Io.Dir,
+dir: std.Io.Dir,
 /// For temporary buffers.
 gpa: std.mem.Allocator,
 /// How a tool's block is laid out for the user. Shared with the transcript, so a
@@ -132,9 +131,9 @@ search: ?Search.Client,
 /// as what each value is rather than as a run of positional arguments, which
 /// had grown too long to read at the call site.
 pub const Options = struct {
-    io: Io,
+    io: std.Io,
     /// The directory the tools work in. See `Tools.dir`.
-    dir: Io.Dir,
+    dir: std.Io.Dir,
     /// For temporary buffers.
     gpa: std.mem.Allocator,
     /// How a tool's block is laid out for the user. Null layouts, for both a bash
@@ -210,7 +209,7 @@ pub fn callName(call: Call) []const u8 {
 /// left out, so a tool that returns a wall of text cannot fill the model's
 /// context. That is billy's rule for every call rather than a tool's, so it is
 /// applied here, where a call's result passes, and no tool has to know about it.
-pub fn run(tools: *Tools, call: Call, result: *Io.Writer) !void {
+pub fn run(tools: *Tools, call: Call, result: *std.Io.Writer) !void {
     var buffer: [result_buffer_len]u8 = undefined;
     var limited = Limited.init(result, &buffer, max_result_len);
     try tools.dispatch(call, &limited.writer);
@@ -245,14 +244,14 @@ const result_buffer_len = 4096;
 /// failed call by it.
 const Limited = struct {
     /// Where the bytes that fit are passed on.
-    inner: *Io.Writer,
+    inner: *std.Io.Writer,
     /// How many more bytes fit before the limit.
     remaining: usize,
     /// How many bytes were written past the limit and dropped.
     dropped: usize,
-    writer: Io.Writer,
+    writer: std.Io.Writer,
 
-    fn init(inner: *Io.Writer, buffer: []u8, limit: usize) Limited {
+    fn init(inner: *std.Io.Writer, buffer: []u8, limit: usize) Limited {
         return .{
             .inner = inner,
             .remaining = limit,
@@ -261,7 +260,7 @@ const Limited = struct {
         };
     }
 
-    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *Limited = @alignCast(@fieldParentPtr("writer", w));
 
         // What is gathered was written before the slices handed over now, so it
@@ -288,7 +287,7 @@ const Limited = struct {
 
     /// Hands on as much of `bytes` as the limit still allows, and counts the
     /// rest as dropped.
-    fn hand(self: *Limited, bytes: []const u8) Io.Writer.Error!void {
+    fn hand(self: *Limited, bytes: []const u8) std.Io.Writer.Error!void {
         const fits = @min(bytes.len, self.remaining);
         if (fits > 0) try self.inner.writeAll(bytes[0..fits]);
         self.remaining -= fits;
@@ -297,7 +296,7 @@ const Limited = struct {
 
     /// Hands on as many of `splat` copies of `pattern` as the limit allows, the
     /// whole copies in one write, and counts the rest as dropped.
-    fn repeat(self: *Limited, pattern: []const u8, splat: usize) Io.Writer.Error!void {
+    fn repeat(self: *Limited, pattern: []const u8, splat: usize) std.Io.Writer.Error!void {
         const offered = pattern.len * splat;
         const fits = @min(offered, self.remaining);
         self.remaining -= fits;
@@ -318,7 +317,7 @@ const Limited = struct {
 
 /// Runs a parsed call, writing the result of it -- or the reason it could not
 /// run -- to `out`, in the shape the model is given it.
-fn dispatch(tools: *Tools, call: Call, out: *Io.Writer) !void {
+fn dispatch(tools: *Tools, call: Call, out: *std.Io.Writer) !void {
     switch (call) {
         .read => |args| try tools.read(args, out),
         .write => |args| try tools.write(args, out),
@@ -335,7 +334,7 @@ fn dispatch(tools: *Tools, call: Call, out: *Io.Writer) !void {
     }
 }
 
-fn read(tools: *Tools, args: Call.Read, out: *Io.Writer) !void {
+fn read(tools: *Tools, args: Call.Read, out: *std.Io.Writer) !void {
     const contents = tools.dir.readFileAlloc(
         tools.io,
         args.path,
@@ -366,7 +365,7 @@ fn read(tools: *Tools, args: Call.Read, out: *Io.Writer) !void {
     if (shown == limit) try out.print("… {d} more lines\n", .{number - first + 1 - shown});
 }
 
-fn write(tools: *Tools, args: Call.Write, out: *Io.Writer) !void {
+fn write(tools: *Tools, args: Call.Write, out: *std.Io.Writer) !void {
     if (std.fs.path.dirname(args.path)) |parent| {
         tools.dir.createDirPath(tools.io, parent) catch |err|
             return fail(out, "cannot create {s}: {s}", .{ parent, @errorName(err) });
@@ -376,7 +375,7 @@ fn write(tools: *Tools, args: Call.Write, out: *Io.Writer) !void {
     try out.print("wrote {d} bytes to {s}", .{ args.content.len, args.path });
 }
 
-fn edit(tools: *Tools, args: Call.Edit, out: *Io.Writer) !void {
+fn edit(tools: *Tools, args: Call.Edit, out: *std.Io.Writer) !void {
     if (args.old_string.len == 0) return fail(out, "old_string must not be empty", .{});
 
     const contents = tools.dir.readFileAlloc(
@@ -412,7 +411,7 @@ fn edit(tools: *Tools, args: Call.Edit, out: *Io.Writer) !void {
     }
 }
 
-fn bash(tools: *Tools, args: Call.Bash, out: *Io.Writer) !void {
+fn bash(tools: *Tools, args: Call.Bash, out: *std.Io.Writer) !void {
     // The count the configuration holds is turned into the signed seconds
     // the clock takes. A value past what it can express is absurd but must
     // not overflow the cast, so it is clamped to the longest duration, which
@@ -458,7 +457,7 @@ fn bash(tools: *Tools, args: Call.Bash, out: *Io.Writer) !void {
 /// Runs one web search and writes its results as text. No backend is configured
 /// only when a resumed session carries the tool from a run that had one; the
 /// model is told so rather than the call failing outright.
-fn webSearch(tools: *Tools, args: Call.WebSearch, out: *Io.Writer) !void {
+fn webSearch(tools: *Tools, args: Call.WebSearch, out: *std.Io.Writer) !void {
     const client = if (tools.search) |*client| client else return fail(out, "web search is not configured", .{});
 
     // The search builds its answer in an arena of its own, which is dropped once
@@ -482,7 +481,7 @@ fn webSearch(tools: *Tools, args: Call.WebSearch, out: *Io.Writer) !void {
 /// backend; `raw` reads the url directly, for an API or a file. Like a search, a
 /// fetch is offered only when a backend is configured, which is what the client
 /// carries.
-fn webFetch(tools: *Tools, args: Call.WebFetch, out: *Io.Writer) !void {
+fn webFetch(tools: *Tools, args: Call.WebFetch, out: *std.Io.Writer) !void {
     if (args.url.len == 0) return fail(out, "no url to fetch", .{});
     const client = if (tools.search) |*client| client else return fail(out, "web fetch is not configured", .{});
 
@@ -495,7 +494,7 @@ fn webFetch(tools: *Tools, args: Call.WebFetch, out: *Io.Writer) !void {
 
 /// Writes a failure to `out` as the model is given it, so that it can react to
 /// it. A call that could not run still has a result, and this is its shape.
-fn fail(out: *Io.Writer, comptime format: []const u8, args: anytype) !void {
+fn fail(out: *std.Io.Writer, comptime format: []const u8, args: anytype) !void {
     try out.print("error: " ++ format, args);
 }
 
@@ -737,7 +736,7 @@ fn runCall(
     arena: std.mem.Allocator,
     tools: *Tools,
     call: llm.ToolCall,
-    result: *Io.Writer,
+    result: *std.Io.Writer,
 ) !Call {
     const parsed = parse(arena, call);
     try tools.run(parsed, result);
@@ -806,7 +805,7 @@ pub fn describe(
     result: []const u8,
     formats: Formats,
     style: Style,
-    out: *Io.Writer,
+    out: *std.Io.Writer,
 ) !void {
     try printHead(scratch, call, formats, style, out);
     try printResult(call, result, style, out);
@@ -884,7 +883,7 @@ pub fn headerLine(text: []const u8) []const u8 {
 /// bash command is laid out by the bash formatter, so it reads the way it runs;
 /// an edit is shown as the diff of the strings it works on; and a search shows
 /// the query it ran.
-pub fn printHead(scratch: std.mem.Allocator, call: Call, formats: Formats, style: Style, out: *Io.Writer) !void {
+pub fn printHead(scratch: std.mem.Allocator, call: Call, formats: Formats, style: Style, out: *std.Io.Writer) !void {
     const head = Heading.of(call);
     try styling.header(.{ .glyph = head.glyph, .hue = head.hue }, head.name, head.target, style, out);
     // What a call shows under its header: the change it means to make, or the
@@ -909,7 +908,7 @@ fn printDiff(
     new: []const u8,
     format: Format,
     style: Style,
-    out: *Io.Writer,
+    out: *std.Io.Writer,
 ) !void {
     const diff = try diffing.lines(scratch, old, new);
     defer scratch.free(diff);
@@ -962,12 +961,12 @@ const Ink = union(enum) {
 
 /// Prints a label such as `▾ stdout` in bold, so it reads as the heading of the
 /// lines under it rather than as the first of them.
-fn printLabel(name: []const u8, style: Style, out: *Io.Writer) !void {
+fn printLabel(name: []const u8, style: Style, out: *std.Io.Writer) !void {
     try out.print("{s}{s} {s}{s}\n", .{ style.on("1"), label_mark, name, style.off() });
 }
 
 /// Prints `text` in the way `ink` asks for.
-fn printInk(text: []const u8, ink: Ink, style: Style, out: *Io.Writer) !void {
+fn printInk(text: []const u8, ink: Ink, style: Style, out: *std.Io.Writer) !void {
     switch (ink) {
         .plain => try out.writeAll(text),
         .dim => try style.dim(text, out),
@@ -979,7 +978,7 @@ fn printInk(text: []const u8, ink: Ink, style: Style, out: *Io.Writer) !void {
 /// the formatter when the configuration sets one and exactly as the model wrote
 /// it when there is none, or the formatter cannot be used. The trailing newline
 /// is dropped, so the block ends where the command does.
-fn printScript(command: []const u8, format: Format, out: *Io.Writer) !void {
+fn printScript(command: []const u8, format: Format, out: *std.Io.Writer) !void {
     const script = std.mem.trimEnd(u8, command, "\n");
     if (!try formatting.apply(format, script, out)) try out.writeAll(script);
     try out.writeAll("\n");
@@ -989,7 +988,7 @@ fn printScript(command: []const u8, format: Format, out: *Io.Writer) !void {
 /// it put in the file; an edit shows nothing, since its result would only repeat
 /// the change shown above it. Anything that failed shows why instead, whatever
 /// it was asked to do.
-pub fn printResult(call: Call, result: []const u8, style: Style, out: *Io.Writer) !void {
+pub fn printResult(call: Call, result: []const u8, style: Style, out: *std.Io.Writer) !void {
     // A call that failed reports why, whatever it was asked to do. The whole
     // result is billy's own message, so it is shown the way billy shows a
     // failure.
@@ -1022,7 +1021,7 @@ pub fn printResult(call: Call, result: []const u8, style: Style, out: *Io.Writer
 ///
 /// The status and the split are read back from the result, which is what billy
 /// stored and handed the model, so a replayed session shows the same block.
-fn printBash(result: []const u8, style: Style, out: *Io.Writer) !void {
+fn printBash(result: []const u8, style: Style, out: *std.Io.Writer) !void {
     const parts = splitBash(result) orelse {
         // A result that is not one billy wrote is shown as it is, so a session
         // saved before the status was written still shows everything.
@@ -1045,7 +1044,7 @@ fn printBash(result: []const u8, style: Style, out: *Io.Writer) !void {
 /// in green when the command succeeded, `✗ exit 1` and the rest in red when it
 /// did not. The stored line reads `exit code: N` for the model; only the line
 /// the user sees is marked and shortened.
-fn printExit(status: []const u8, style: Style, out: *Io.Writer) !void {
+fn printExit(status: []const u8, style: Style, out: *std.Io.Writer) !void {
     const exit = parseExit(status);
     const mark = if (exit.ok) exit_marks.ok else exit_marks.failed;
     var buffer: [64]u8 = undefined;
@@ -1134,7 +1133,7 @@ fn splitBash(result: []const u8) ?BashResult {
 /// count of the rest is printed in place of them, so the block stays short
 /// without hiding that there was more. Every line is printed in `ink`, which is
 /// dim for a tool's output and a colour for billy's own message.
-fn printTruncated(text: []const u8, ink: Ink, style: Style, out: *Io.Writer) !void {
+fn printTruncated(text: []const u8, ink: Ink, style: Style, out: *std.Io.Writer) !void {
     const body = std.mem.trimEnd(u8, text, "\n");
     if (body.len == 0) return;
 
@@ -1419,7 +1418,7 @@ test "a bash block shows only the streams the command filled" {
 
     var tool_set = try Tools.init(.{
         .io = std.testing.io,
-        .dir = Io.Dir.cwd(),
+        .dir = std.Io.Dir.cwd(),
         .gpa = gpa,
         .bash_timeout_s = 120,
         .http = &http,
@@ -1651,7 +1650,7 @@ test "run logs exactly what describe prints" {
 
     var tool_set = try Tools.init(.{
         .io = std.testing.io,
-        .dir = Io.Dir.cwd(),
+        .dir = std.Io.Dir.cwd(),
         .gpa = gpa,
         .bash_timeout_s = 120,
         .http = &http,
@@ -1687,7 +1686,7 @@ test "the format changes what is shown and nothing else" {
     const format: Format = .{ .script = "tr a-z A-Z", .io = std.testing.io, .gpa = gpa };
     var tool_set = try Tools.init(.{
         .io = std.testing.io,
-        .dir = Io.Dir.cwd(),
+        .dir = std.Io.Dir.cwd(),
         .gpa = gpa,
         .formats = .{ .bash = format },
         .bash_timeout_s = 120,
@@ -1804,7 +1803,7 @@ test "a bash command that outlives the timeout is killed and reported" {
     // and the model is told so rather than left waiting for it to finish.
     var tool_set = try Tools.init(.{
         .io = std.testing.io,
-        .dir = Io.Dir.cwd(),
+        .dir = std.Io.Dir.cwd(),
         .gpa = gpa,
         .bash_timeout_s = 1,
         .http = &http,
@@ -2028,7 +2027,7 @@ test "a replacement matched exactly is not re-indented" {
 /// A tool set over `dir` for the definition tests, with a search backend when
 /// `with_search` is set.
 fn definitionsToolSet(
-    dir: Io.Dir,
+    dir: std.Io.Dir,
     gpa: std.mem.Allocator,
     http: *std.http.Client,
     with_search: bool,
@@ -2052,7 +2051,7 @@ test "the definitions cover every tool the loop dispatches" {
     defer log.deinit();
     var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
     defer http.deinit();
-    var tool_set = try definitionsToolSet(Io.Dir.cwd(), gpa, &http, false);
+    var tool_set = try definitionsToolSet(std.Io.Dir.cwd(), gpa, &http, false);
 
     // The names are exactly the tools the loop can dispatch, in the order the
     // model receives them, so it is never offered one that does not run.
@@ -2079,7 +2078,7 @@ test "the web tools are offered only when a backend is configured" {
 
     // Without a backend neither web tool is offered at all, and the tools every
     // session has come first so the set only grows.
-    var plain = try definitionsToolSet(Io.Dir.cwd(), gpa, &http, false);
+    var plain = try definitionsToolSet(std.Io.Dir.cwd(), gpa, &http, false);
     const without = plain.definitions(.general);
     try std.testing.expectEqual(specs.len, without.len);
     for (without) |definition| {
@@ -2089,7 +2088,7 @@ test "the web tools are offered only when a backend is configured" {
 
     // With one they are appended, so a session that gains them keeps the tools it
     // had.
-    var searched = try definitionsToolSet(Io.Dir.cwd(), gpa, &http, true);
+    var searched = try definitionsToolSet(std.Io.Dir.cwd(), gpa, &http, true);
     const with = searched.definitions(.general);
     try std.testing.expectEqual(specs.len + web_specs.len, with.len);
     try std.testing.expectEqualStrings("web_search", with[with.len - 2].name);
@@ -2221,13 +2220,13 @@ test "the limiting writer gathers writes, then passes on what fits" {
 const Counter = struct {
     written: usize = 0,
     hand_offs: usize = 0,
-    writer: Io.Writer,
+    writer: std.Io.Writer,
 
     fn init() Counter {
         return .{ .writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} } };
     }
 
-    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *Counter = @alignCast(@fieldParentPtr("writer", w));
         self.hand_offs += 1;
         var count: usize = data[data.len - 1].len * splat;

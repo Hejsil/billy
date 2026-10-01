@@ -5,7 +5,6 @@
 //! without editing, which keeps the harness usable from a pipe.
 
 const std = @import("std");
-const Io = std.Io;
 
 const LineEditor = @This();
 
@@ -40,9 +39,9 @@ const max_indent = 64;
 /// or too narrow to wrap the line against.
 const no_wrap = std.math.maxInt(usize) / 4;
 
-io: Io,
+io: std.Io,
 /// Destination for the prompt, the echoed line and the redraws.
-out: *Io.Writer,
+out: *std.Io.Writer,
 /// Owns the pool and the history, which outlive the call that filled them. The
 /// editor frees what it allocates in `deinit`, so the caller need not hold an
 /// allocator for it.
@@ -86,7 +85,7 @@ paste_cr: bool = false,
 
 /// `gpa` backs the line pool and the history the editor keeps; both are the
 /// editor's own and are freed by `deinit`.
-pub fn init(io: Io, out: *Io.Writer, gpa: std.mem.Allocator) LineEditor {
+pub fn init(io: std.Io, out: *std.Io.Writer, gpa: std.mem.Allocator) LineEditor {
     return .{ .io = io, .out = out, .gpa = gpa };
 }
 
@@ -113,7 +112,7 @@ fn historyLine(ed: *const LineEditor, index: usize) []const u8 {
 /// an empty line. The returned slice is kept in the editor's pool, so it is
 /// valid until the next line is submitted.
 pub fn readLine(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
-    const interactive = try Io.File.stdin().isTty(ed.io);
+    const interactive = try std.Io.File.stdin().isTty(ed.io);
     // The width is only wanted to fold a line being edited, which cannot
     // happen without a terminal.
     ed.width = if (interactive) ed.terminalWidth() else 0;
@@ -483,7 +482,7 @@ fn endPrompt(ed: *LineEditor, header: []const u8) !void {
 /// the candidates, and it is a terminal whenever a line is being edited, so
 /// in practice the width is known whenever it is wanted.
 fn terminalWidth(ed: *LineEditor) usize {
-    for ([_]Io.File{ Io.File.stdout(), Io.File.stdin(), Io.File.stderr() }) |file| {
+    for ([_]std.Io.File{ std.Io.File.stdout(), std.Io.File.stdin(), std.Io.File.stderr() }) |file| {
         if (ed.widthOf(file)) |width| return width;
     }
     return 0;
@@ -491,7 +490,7 @@ fn terminalWidth(ed: *LineEditor) usize {
 
 /// The columns `file` is, or null when it is not a terminal or its size
 /// cannot be read.
-fn widthOf(ed: *LineEditor, file: Io.File) ?usize {
+fn widthOf(ed: *LineEditor, file: std.Io.File) ?usize {
     const tty = file.isTty(ed.io) catch return null;
     if (!tty) return null;
     var size: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };

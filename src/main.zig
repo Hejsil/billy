@@ -1,5 +1,4 @@
 const std = @import("std");
-const Io = std.Io;
 
 const billy = @import("billy");
 
@@ -66,7 +65,7 @@ const serve_options =
 /// none, as `login` and `config` do: a subcommand lists only the subcommands it
 /// has, and a command that has none says nothing of them.
 fn printHelp(
-    out: *Io.Writer,
+    out: *std.Io.Writer,
     invocation: []const u8,
     description: []const u8,
     commands: ?[]const u8,
@@ -131,7 +130,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const out = &stdout_file_writer.interface;
     defer out.flush() catch {};
 
@@ -188,7 +187,7 @@ pub fn main(init: std.process.Init) !void {
 
 /// Reads a key for a service, or lists the services, so a run need not have the
 /// key exported. Only the credentials are read, since nothing else is touched.
-fn runLogin(init: std.process.Init, out: *Io.Writer, service: ?[]const u8) !void {
+fn runLogin(init: std.process.Init, out: *std.Io.Writer, service: ?[]const u8) !void {
     const io = init.io;
     const arena = init.arena.allocator();
     const environ = init.environ_map;
@@ -197,7 +196,7 @@ fn runLogin(init: std.process.Init, out: *Io.Writer, service: ?[]const u8) !void
         std.log.err("cannot find where to store billy's files: {s}", .{@errorName(err)});
         return err;
     };
-    var data_dir_handle = Io.Dir.cwd().createDirPathOpen(io, data_dir, .{}) catch |err| {
+    var data_dir_handle = std.Io.Dir.cwd().createDirPathOpen(io, data_dir, .{}) catch |err| {
         std.log.err("cannot use {s} for billy's files: {s}", .{ data_dir, @errorName(err) });
         return err;
     };
@@ -222,7 +221,7 @@ fn runLogin(init: std.process.Init, out: *Io.Writer, service: ?[]const u8) !void
 /// Runs one session in the terminal, resuming `resume_id` or starting a new one.
 fn runSession(
     init: std.process.Init,
-    out: *Io.Writer,
+    out: *std.Io.Writer,
     setup: *billy.Setup,
     resume_id: ?[]const u8,
 ) !void {

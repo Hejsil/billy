@@ -14,7 +14,6 @@
 //! in place of colour, so the text still reads as markdown when piped to a file.
 
 const std = @import("std");
-const Io = std.Io;
 const md = @import("md.zig");
 const styling = @import("style.zig");
 
@@ -35,7 +34,7 @@ const max_columns = 32;
 /// Writes `text`, read as markdown, as the terminal shows it. `style` decides
 /// whether bold, colour and links are written as escape codes or left out, which
 /// is what makes a pipe to a file read as plain structured text.
-pub fn write(gpa: std.mem.Allocator, text: []const u8, style: Style, out: *Io.Writer) !void {
+pub fn write(gpa: std.mem.Allocator, text: []const u8, style: Style, out: *std.Io.Writer) !void {
     var render = Markdown{ .gpa = gpa, .out = out, .style = style };
     defer render.deinit();
     var parser = Markdown.parser();
@@ -65,7 +64,7 @@ const Row = struct {
 /// on.
 const Markdown = struct {
     gpa: std.mem.Allocator,
-    out: *Io.Writer,
+    out: *std.Io.Writer,
     style: Style,
     /// The first failure, kept here because a callback returns a number, not an
     /// error.

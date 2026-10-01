@@ -6,7 +6,6 @@
 //! what leaves the command of a bash call to the format script that lays it out.
 
 const std = @import("std");
-const Io = std.Io;
 
 pub const Style = enum {
     plain,
@@ -15,23 +14,23 @@ pub const Style = enum {
     /// The style to use on the terminal billy prints to. Escape codes are for a
     /// terminal, which a pipe or a redirection is not: `supportsAnsiEscapeCodes`
     /// answers whether stdout is one.
-    pub fn detect(io: Io) Style {
-        const supported = Io.File.stdout().supportsAnsiEscapeCodes(io) catch return .plain;
+    pub fn detect(io: std.Io) Style {
+        const supported = std.Io.File.stdout().supportsAnsiEscapeCodes(io) catch return .plain;
         return if (supported) .ansi else .plain;
     }
 
     /// `text` in bold.
-    pub fn bold(style: Style, text: []const u8, out: *Io.Writer) !void {
+    pub fn bold(style: Style, text: []const u8, out: *std.Io.Writer) !void {
         try out.print("{s}{s}{s}", .{ style.on("1"), text, style.off() });
     }
 
     /// `text` dimmed, for structure that should sit behind the content.
-    pub fn dim(style: Style, text: []const u8, out: *Io.Writer) !void {
+    pub fn dim(style: Style, text: []const u8, out: *std.Io.Writer) !void {
         try out.print("{s}{s}{s}", .{ style.on("2"), text, style.off() });
     }
 
     /// `text` in `hue`.
-    pub fn color(style: Style, hue: Color, text: []const u8, out: *Io.Writer) !void {
+    pub fn color(style: Style, hue: Color, text: []const u8, out: *std.Io.Writer) !void {
         switch (style) {
             .plain => try out.writeAll(text),
             .ansi => try out.print("\x1b[{d}m{s}\x1b[0m", .{ @intFromEnum(hue), text }),
@@ -40,7 +39,7 @@ pub const Style = enum {
 
     /// `text` in `hue` and bold, for the one thing on a line that is the point
     /// of the line.
-    pub fn boldColor(style: Style, hue: Color, text: []const u8, out: *Io.Writer) !void {
+    pub fn boldColor(style: Style, hue: Color, text: []const u8, out: *std.Io.Writer) !void {
         switch (style) {
             .plain => try out.writeAll(text),
             .ansi => try out.print("\x1b[1;{d}m{s}\x1b[0m", .{ @intFromEnum(hue), text }),
@@ -87,7 +86,7 @@ pub const Mark = struct {
 };
 
 /// Prints a block header: `▸ read a.zig`.
-pub fn header(mark: Mark, name: []const u8, target: []const u8, style: Style, out: *Io.Writer) !void {
+pub fn header(mark: Mark, name: []const u8, target: []const u8, style: Style, out: *std.Io.Writer) !void {
     try style.color(mark.hue, mark.glyph, out);
     try out.writeAll(" ");
     try style.bold(name, out);

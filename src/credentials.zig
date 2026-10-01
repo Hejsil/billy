@@ -14,7 +14,6 @@
 //! to use.
 
 const std = @import("std");
-const Io = std.Io;
 const models = @import("models.zig");
 const search = @import("search.zig");
 
@@ -26,7 +25,7 @@ const format_version = 1;
 const max_credentials_bytes = 1 << 20;
 /// The mode the file is written with. A key is a secret, so the file is kept to
 /// the owner, unlike the configuration, which holds no secret.
-const secret_mode: Io.File.Permissions = @enumFromInt(0o600);
+const secret_mode: std.Io.File.Permissions = @enumFromInt(0o600);
 
 /// A service billy needs a credential for.
 pub const Service = enum {
@@ -166,7 +165,7 @@ const Stored = struct {
 
 /// Reads the stored credentials from `dir`. A missing file is an empty store,
 /// which is what a user who has never logged in has.
-pub fn load(io: Io, dir: Io.Dir, arena: std.mem.Allocator) !Store {
+pub fn load(io: std.Io, dir: std.Io.Dir, arena: std.mem.Allocator) !Store {
     const text = dir.readFileAlloc(io, file_name, arena, .limited(max_credentials_bytes)) catch |err| switch (err) {
         error.FileNotFound => return .{},
         else => return err,
@@ -187,7 +186,7 @@ pub fn load(io: Io, dir: Io.Dir, arena: std.mem.Allocator) !Store {
 /// It is written indented rather than compact, like the configuration and unlike
 /// a session file, since a file a user may open to look at is worth reading. The
 /// JSON is streamed straight onto the file, so writing it allocates nothing.
-pub fn save(store: *const Store, io: Io, dir: Io.Dir) !void {
+pub fn save(store: *const Store, io: std.Io, dir: std.Io.Dir) !void {
     var atomic = try dir.createFileAtomic(io, file_name, .{
         .replace = true,
         .permissions = secret_mode,
@@ -195,7 +194,7 @@ pub fn save(store: *const Store, io: Io, dir: Io.Dir) !void {
     defer atomic.deinit(io);
 
     var buffer: [4096]u8 = undefined;
-    var file: Io.File.Writer = .init(atomic.file, io, &buffer);
+    var file: std.Io.File.Writer = .init(atomic.file, io, &buffer);
     try std.json.Stringify.value(
         Stored{ .credentials = store.* },
         .{ .emit_null_optional_fields = false, .whitespace = .indent_2 },
@@ -213,10 +212,10 @@ pub fn save(store: *const Store, io: Io, dir: Io.Dir) !void {
 /// added here is owned the same way the ones already there are. It must be the
 /// same one, or the store would hold keys two allocators own.
 pub fn run(
-    io: Io,
-    out: *Io.Writer,
+    io: std.Io,
+    out: *std.Io.Writer,
     arena: std.mem.Allocator,
-    dir: Io.Dir,
+    dir: std.Io.Dir,
     dir_path: []const u8,
     store: *Store,
     environ: *const std.process.Environ.Map,
@@ -229,10 +228,10 @@ pub fn run(
 
 /// Reads a key for the named service and stores it, so the next run uses it.
 fn login(
-    io: Io,
-    out: *Io.Writer,
+    io: std.Io,
+    out: *std.Io.Writer,
     arena: std.mem.Allocator,
-    dir: Io.Dir,
+    dir: std.Io.Dir,
     path: []const u8,
     store: *Store,
     name: []const u8,
@@ -265,7 +264,7 @@ fn login(
 /// Prints the services billy needs a key for, each with the key it has: the
 /// stored one, the one in its environment variable, or none.
 fn list(
-    out: *Io.Writer,
+    out: *std.Io.Writer,
     store: *const Store,
     environ: *const std.process.Environ.Map,
     path: []const u8,
@@ -297,7 +296,7 @@ fn list(
     try out.print("\n`billy login <service>` stores a key in {s}\n", .{path});
 }
 
-fn spaces(out: *Io.Writer, count: usize) !void {
+fn spaces(out: *std.Io.Writer, count: usize) !void {
     var i: usize = 0;
     while (i < count) : (i += 1) try out.writeAll(" ");
 }
@@ -309,12 +308,12 @@ fn spaces(out: *Io.Writer, count: usize) !void {
 ///
 /// Returns null at end of input, before anything was typed.
 fn readSecret(
-    io: Io,
-    out: *Io.Writer,
+    io: std.Io,
+    out: *std.Io.Writer,
     arena: std.mem.Allocator,
     prompt: []const u8,
 ) !?[]const u8 {
-    const interactive = try Io.File.stdin().isTty(io);
+    const interactive = try std.Io.File.stdin().isTty(io);
     const saved = if (interactive) saved: {
         try out.writeAll(prompt);
         try out.flush();

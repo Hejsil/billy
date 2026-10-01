@@ -8,7 +8,6 @@
 //! newer billy does not break an older one.
 
 const std = @import("std");
-const Io = std.Io;
 const search = @import("search.zig");
 const xdg = @import("xdg.zig");
 
@@ -207,7 +206,7 @@ fn toStored(config: *const Config) Stored {
 /// `gpa` backs the configuration's own arena, where every string it reads and
 /// every buffer it parses through is kept; the caller frees them all at once
 /// with `deinit`.
-pub fn open(io: Io, dir: Io.Dir, gpa: std.mem.Allocator) !Opened {
+pub fn open(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator) !Opened {
     var config = Config.init(gpa);
     errdefer config.deinit();
     const arena = config.arena_state.allocator();
@@ -235,11 +234,11 @@ pub fn open(io: Io, dir: Io.Dir, gpa: std.mem.Allocator) !Opened {
 /// there to be read and edited by hand, while a session is only ever read
 /// back as a whole. The JSON is streamed straight onto the file, so writing it
 /// allocates nothing.
-pub fn save(config: *const Config, io: Io, dir: Io.Dir) !void {
+pub fn save(config: *const Config, io: std.Io, dir: std.Io.Dir) !void {
     var atomic = try dir.createFileAtomic(io, file_name, .{ .replace = true });
     defer atomic.deinit(io);
     var buffer: [4096]u8 = undefined;
-    var file: Io.File.Writer = .init(atomic.file, io, &buffer);
+    var file: std.Io.File.Writer = .init(atomic.file, io, &buffer);
     try std.json.Stringify.value(
         config.toStored(),
         .{ .whitespace = .indent_2 },
@@ -387,8 +386,8 @@ fn isSettableValue(comptime T: type) bool {
 /// directory `defaultDir` names, and `gpa` backs the configuration's own arena
 /// while it is read and written.
 pub fn run(
-    io: Io,
-    out: *Io.Writer,
+    io: std.Io,
+    out: *std.Io.Writer,
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
     environ: *const std.process.Environ.Map,
@@ -399,7 +398,7 @@ pub fn run(
         std.log.err("cannot find where to store the configuration: {s}", .{@errorName(err)});
         return err;
     };
-    var dir = Io.Dir.cwd().createDirPathOpen(io, dir_path, .{}) catch |err| {
+    var dir = std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{}) catch |err| {
         std.log.err("cannot use {s} for the configuration: {s}", .{ dir_path, @errorName(err) });
         return err;
     };
@@ -810,7 +809,7 @@ test "run sets a setting in the file, creating it when it is missing" {
     try run(std.testing.io, &sink.writer, arena, gpa, &environ, "tools.bash.format", "shfmt");
 
     const dir_path = try std.fs.path.join(arena, &.{ base, app_dir });
-    var dir = try Io.Dir.cwd().createDirPathOpen(std.testing.io, dir_path, .{});
+    var dir = try std.Io.Dir.cwd().createDirPathOpen(std.testing.io, dir_path, .{});
     defer dir.close(std.testing.io);
     var opened = try Config.open(std.testing.io, dir, gpa);
     defer opened.config.deinit();

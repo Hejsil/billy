@@ -10,7 +10,6 @@
 //! writes them. A `raw` fetch skips the backend and reads the url directly.
 
 const std = @import("std");
-const Io = std.Io;
 const Health = @import("Health.zig");
 const Mock = @import("Mock.zig");
 
@@ -102,7 +101,7 @@ const snippet_len = 500;
 const max_fetch_bytes = 1 << 20;
 
 pub const Client = struct {
-    io: Io,
+    io: std.Io,
     gpa: std.mem.Allocator,
     /// The backends to try, in order: the first that answers is used, so a
     /// backend that is down or rate-limited falls through to the next.
@@ -210,7 +209,7 @@ pub const Client = struct {
     /// The time now, in ms since the epoch, which decides whether a backend's
     /// wait is over.
     fn nowMs(client: *Client) i64 {
-        return Io.Clock.now(.real, client.io).toMilliseconds();
+        return std.Io.Clock.now(.real, client.io).toMilliseconds();
     }
 
     /// Whether `provider` is set aside at `now`, and so should be skipped.
@@ -686,7 +685,7 @@ const indent = "   ";
 /// Writes one field of a result on one line: the surrounding whitespace trimmed
 /// and every newline turned into a space, so the field stays on the one line the
 /// reading back expects, however the backend wrote it.
-fn writeField(out: *Io.Writer, text: []const u8) !void {
+fn writeField(out: *std.Io.Writer, text: []const u8) !void {
     for (std.mem.trim(u8, text, " \t\r\n")) |c| {
         try out.writeByte(switch (c) {
             '\n', '\r' => ' ',
@@ -987,7 +986,7 @@ test "a url no backend could read does not set the backend aside" {
 
     // Tavily answered, so it is not set aside: a search after this fetch still
     // reaches it. The direct read carried no key, so it was not Tavily's.
-    try std.testing.expect(!health.skips("tavily", Io.Clock.now(.real, io).toMilliseconds()));
+    try std.testing.expect(!health.skips("tavily", std.Io.Clock.now(.real, io).toMilliseconds()));
     try std.testing.expectEqual(@as(usize, 0), health.entries.count());
     try std.testing.expectEqual(@as(usize, 2), mock.served);
     try std.testing.expect(mock.header("authorization") == null);
@@ -1317,7 +1316,7 @@ test "a backend that failed is set aside, so the next search skips it" {
         "1. Zig\n   https://ziglang.org\n   A language.\n",
         try client.search(reply_state.allocator(), "zig lang"),
     );
-    try std.testing.expect(health.skips("tavily", Io.Clock.now(.real, io).toMilliseconds()));
+    try std.testing.expect(health.skips("tavily", std.Io.Clock.now(.real, io).toMilliseconds()));
 
     // The second search is Brave alone: Tavily posts its query as a body and
     // Brave asks in the url, so the third request arriving with no body is
@@ -1347,7 +1346,7 @@ test "a search with every backend set aside says so, without asking any" {
 
     var health = try Health.load(io, gpa, tmp.dir);
     defer health.deinit();
-    const now = Io.Clock.now(.real, io).toMilliseconds();
+    const now = std.Io.Clock.now(.real, io).toMilliseconds();
     try health.record("tavily", null, now);
     try health.record("brave", null, now);
 

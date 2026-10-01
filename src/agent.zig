@@ -2,7 +2,6 @@
 //! it asks for, and repeat until it answers with text.
 
 const std = @import("std");
-const Io = std.Io;
 const llm = @import("llm.zig");
 const models = @import("models.zig");
 const Tools = @import("Tools.zig");
@@ -47,7 +46,7 @@ pub const Config = struct {
     /// session's prompt ahead of the project's; null in a test, or when there is
     /// no such file. Borrowed from the setup, which owns it and outlives the
     /// runner, so nothing here closes it.
-    user_instructions_dir: ?Io.Dir = null,
+    user_instructions_dir: ?std.Io.Dir = null,
     /// What is known about the provider and model: the context window and the
     /// prices. Null for a model billy does not know, in which case the header
     /// leaves out the context gauge and the cost.
@@ -162,7 +161,7 @@ pub const Emitter = struct {
 /// reply's markdown laid out by the format script, and the tools laid out by
 /// theirs.
 const Terminal = struct {
-    out: *Io.Writer,
+    out: *std.Io.Writer,
     display: Display,
     /// For what showing a block builds, such as an edit's diff. Each block frees
     /// what it takes, so nothing is kept between them.
@@ -235,9 +234,9 @@ const max_instructions_len = 1 << 20;
 /// whole and nothing of it is changed. Only a file with no bytes at all is
 /// skipped, so a file of whitespace alone still heads a section.
 fn instructionsIn(
-    io: Io,
-    out: *Io.Writer,
-    dir: Io.Dir,
+    io: std.Io,
+    out: *std.Io.Writer,
+    dir: std.Io.Dir,
     names: []const []const u8,
     what: []const u8,
 ) !bool {
@@ -274,7 +273,7 @@ fn instructionsIn(
 /// are sent with every request and survive whatever context trimming happens
 /// later. That is what keeps the rules a project cares about from being dropped
 /// partway through a long session.
-fn projectInstructions(io: Io, out: *Io.Writer, dir: Io.Dir) !bool {
+fn projectInstructions(io: std.Io, out: *std.Io.Writer, dir: std.Io.Dir) !bool {
     var current = dir;
     // The directory the caller passed is theirs to close; every one opened here
     // while walking up is this function's.
@@ -313,12 +312,12 @@ fn projectInstructions(io: Io, out: *Io.Writer, dir: Io.Dir) !bool {
 ///
 /// They join every session's prompt, ahead of the project's own, so a rule that
 /// holds everywhere is set once rather than copied into each project.
-fn globalInstructions(io: Io, out: *Io.Writer, dir: Io.Dir) !bool {
+fn globalInstructions(io: std.Io, out: *std.Io.Writer, dir: std.Io.Dir) !bool {
     return instructionsIn(io, out, dir, &instruction_files, "The user's");
 }
 
 /// Whether `dir` holds an entry named `name`.
-fn dirHas(io: Io, dir: Io.Dir, name: []const u8) bool {
+fn dirHas(io: std.Io, dir: std.Io.Dir, name: []const u8) bool {
     _ = dir.statFile(io, name, .{}) catch return false;
     return true;
 }
@@ -327,7 +326,7 @@ fn dirHas(io: Io, dir: Io.Dir, name: []const u8) bool {
 /// has reached the filesystem root, where `..` names the root itself. Both are
 /// on the same filesystem, being a directory and its own parent, so the inode
 /// tells them apart.
-fn sameDir(io: Io, a: Io.Dir, b: Io.Dir) bool {
+fn sameDir(io: std.Io, a: std.Io.Dir, b: std.Io.Dir) bool {
     const one = a.statFile(io, ".", .{}) catch return false;
     const two = b.statFile(io, ".", .{}) catch return false;
     return one.inode == two.inode;
@@ -362,7 +361,7 @@ pub const marks = struct {
 /// allocates nothing; the caller holds the buffer, which it already has for
 /// the line editor.
 pub fn sessionHeader(
-    out: *Io.Writer,
+    out: *std.Io.Writer,
     config: Config,
     session_id: []const u8,
     context_tokens: usize,
@@ -395,7 +394,7 @@ pub fn costOf(price: models.Price, usage: llm.Usage) f64 {
 
 /// Writes a token count in a short form, such as `16k` or `128k`, with no
 /// decimals. Shared with the web header, so both show a count the same way.
-pub fn formatTokens(out: *Io.Writer, count: usize) !void {
+pub fn formatTokens(out: *std.Io.Writer, count: usize) !void {
     if (count < 1000) return out.print("{d}", .{count});
     if (count < 1_000_000) return formatScaled(out, count, 1000, 'k');
     return formatScaled(out, count, 1_000_000, 'M');
@@ -404,7 +403,7 @@ pub fn formatTokens(out: *Io.Writer, count: usize) !void {
 /// Writes `count` divided by `unit`, rounded to a whole number, with a trailing
 /// unit letter. The rounding is what makes a count readable without a decimal:
 /// half a thousand reads as the next thousand.
-fn formatScaled(out: *Io.Writer, count: usize, unit: usize, suffix: u8) !void {
+fn formatScaled(out: *std.Io.Writer, count: usize, unit: usize, suffix: u8) !void {
     try out.print("{d:.0}{c}", .{
         @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(unit)),
         suffix,
@@ -415,7 +414,7 @@ fn formatScaled(out: *Io.Writer, count: usize, unit: usize, suffix: u8) !void {
 /// that has started but is under one percent is reported as `<1%`, so the gauge
 /// does not read as empty. Shared with the web header, so both read it the same
 /// way.
-pub fn formatPercent(out: *Io.Writer, used: usize, total: usize) !void {
+pub fn formatPercent(out: *std.Io.Writer, used: usize, total: usize) !void {
     if (total == 0) return out.writeAll("0%");
     const percent = used * 100 / total;
     if (percent == 0 and used > 0) return out.writeAll("<1%");
@@ -427,7 +426,7 @@ pub fn formatPercent(out: *Io.Writer, used: usize, total: usize) !void {
 /// fixed number of places. The digits are formatted into a stack buffer first,
 /// since the trimmed amount is written before the ones it dropped are known.
 /// Shared with the web header, so both show the cost the same way.
-pub fn formatMoney(out: *Io.Writer, amount: f64) !void {
+pub fn formatMoney(out: *std.Io.Writer, amount: f64) !void {
     var buffer: [64]u8 = undefined;
     var formatted: std.Io.Writer = .fixed(&buffer);
     try formatted.print("{d:.2}", .{amount});
@@ -444,7 +443,7 @@ pub fn formatMoney(out: *Io.Writer, amount: f64) !void {
 /// Writes the working directory as shown in the header: shortened to `~` when it
 /// is inside the home directory, so a long path stays readable. Shared with the
 /// web header.
-pub fn displayPath(out: *Io.Writer, cwd: []const u8, home: ?[]const u8) !void {
+pub fn displayPath(out: *std.Io.Writer, cwd: []const u8, home: ?[]const u8) !void {
     if (home) |dir| {
         // Require a component boundary, so `/home/user2` is not shortened by a
         // `/home/user` home directory.
@@ -464,12 +463,12 @@ pub fn displayPath(out: *Io.Writer, cwd: []const u8, home: ?[]const u8) !void {
 /// The HTTP client is the run's own, borrowed by pointer, so every request of
 /// every session shares its connections and the certificates it scanned once.
 pub const Runner = struct {
-    io: Io,
+    io: std.Io,
     gpa: std.mem.Allocator,
     config: Config,
     /// The directory the session works in. For a resumed session it is the one
     /// the session was started in, wherever billy runs from now.
-    work_dir: Io.Dir,
+    work_dir: std.Io.Dir,
     /// The tools, working in `work_dir`.
     tool_set: Tools,
     /// The model client, sending the conversation to `config.url`.
@@ -477,13 +476,13 @@ pub const Runner = struct {
 
     /// Opens a session for asking things, working in `cwd` and sharing `http`.
     pub fn init(
-        io: Io,
+        io: std.Io,
         gpa: std.mem.Allocator,
         config: Config,
         cwd: []const u8,
         http: *std.http.Client,
     ) !Runner {
-        var work_dir = Io.Dir.openDirAbsolute(io, cwd, .{}) catch |err| {
+        var work_dir = std.Io.Dir.openDirAbsolute(io, cwd, .{}) catch |err| {
             std.log.err("cannot work in {s}: {s}", .{ cwd, @errorName(err) });
             return err;
         };
@@ -631,9 +630,9 @@ pub const Runner = struct {
 };
 
 pub fn run(
-    io: Io,
+    io: std.Io,
     gpa: std.mem.Allocator,
-    out: *Io.Writer,
+    out: *std.Io.Writer,
     config: Config,
     session: *Session,
 ) !void {
@@ -724,7 +723,7 @@ pub fn run(
 /// replayed prompt reads as the one that was typed.
 pub fn printTranscript(
     gpa: std.mem.Allocator,
-    out: *Io.Writer,
+    out: *std.Io.Writer,
     session: *const Session,
     display: Display,
     blocks: usize,
@@ -877,14 +876,14 @@ fn blocksIn(session: *const Session, messages: []const Session.Message, index: u
 /// Prints how many blocks a trimmed transcript left out, dimmed, so a resume does
 /// not read as the whole session. It is the count a short block gives of the
 /// lines it cut, standing where the blocks it names would have been.
-fn printElided(count: usize, style: styling.Style, out: *Io.Writer) !void {
+fn printElided(count: usize, style: styling.Style, out: *std.Io.Writer) !void {
     try out.print("{s}… {d} earlier blocks{s}\n", .{ style.on("2"), count, style.off() });
 }
 
 /// Runs the model until it replies with text instead of tool calls, showing what
 /// happens as blocks as it goes.
 fn turn(
-    io: Io,
+    io: std.Io,
     client: *llm.Client,
     tool_set: *Tools,
     emitter: Emitter,
@@ -1003,7 +1002,7 @@ fn runCalls(
 /// request and survives whatever context trimming happens later. That is what
 /// keeps the rules the user and the project care about from being dropped
 /// partway through a long session. The caller owns the text and frees it.
-fn leadPrompt(io: Io, gpa: std.mem.Allocator, dir: Io.Dir, user_dir: ?Io.Dir, mode: Mode) ![]u8 {
+fn leadPrompt(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir, user_dir: ?std.Io.Dir, mode: Mode) ![]u8 {
     var text: std.Io.Writer.Allocating = .init(gpa);
     errdefer text.deinit();
     // The mode's text first, then each section of instructions as it is found,
@@ -1031,10 +1030,10 @@ fn leadPrompt(io: Io, gpa: std.mem.Allocator, dir: Io.Dir, user_dir: ?Io.Dir, mo
 /// so the only shared prefix left to lose is the prompt and the tools
 /// themselves.
 fn refreshLead(
-    io: Io,
+    io: std.Io,
     gpa: std.mem.Allocator,
-    dir: Io.Dir,
-    user_dir: ?Io.Dir,
+    dir: std.Io.Dir,
+    user_dir: ?std.Io.Dir,
     mode: Mode,
     definitions: []const Session.Definition,
     session: *Session,
@@ -1068,7 +1067,7 @@ const title_prompt =
 /// usable leaves the session as it is, so the title it already has (the one
 /// derived from the first prompt) stands.
 fn titleSession(
-    io: Io,
+    io: std.Io,
     client: *llm.Client,
     config: Config,
     session: *Session,
@@ -1122,9 +1121,9 @@ pub fn nameFromPrompt(session: *Session, text: []const u8) !bool {
 
 /// The rates in effect right now. Zero for a model billy does not know, which
 /// has no prices to cost its tokens at.
-fn rateNow(io: Io, config: Config) models.Price {
+fn rateNow(io: std.Io, config: Config) models.Price {
     const info = config.model_info orelse return .{};
-    return info.priceAt(@intCast(Io.Clock.now(.real, io).toSeconds()));
+    return info.priceAt(@intCast(std.Io.Clock.now(.real, io).toSeconds()));
 }
 
 /// Sent as the last message of a compaction request, and stored with the summary
@@ -1163,7 +1162,7 @@ fn compactThreshold(config: Config) usize {
 /// it did. The caller refreshes the session's prompt and tools when it did, which
 /// is why the answer is reported rather than swallowed.
 fn maybeCompact(
-    io: Io,
+    io: std.Io,
     client: *llm.Client,
     emitter: Emitter,
     config: Config,
@@ -1207,7 +1206,7 @@ fn maybeCompact(
 /// like any other, but it must not move the context gauge: the conversation it
 /// was sent is about to be replaced by something far smaller.
 fn summarize(
-    io: Io,
+    io: std.Io,
     client: *llm.Client,
     config: Config,
     session: *Session,
@@ -1232,7 +1231,7 @@ fn summarize(
 /// that compacts shows the event rather than the two messages. It is headed like
 /// every other block, with its own mark, and opens with the blank line that
 /// separates it from the block before it.
-fn printCompacted(out: *Io.Writer, style: styling.Style) !void {
+fn printCompacted(out: *std.Io.Writer, style: styling.Style) !void {
     try out.writeAll("\n");
     try styling.header(marks.compacted, "compacted", "", style, out);
     try out.flush();
@@ -1245,7 +1244,7 @@ fn printCompacted(out: *Io.Writer, style: styling.Style) !void {
 ///
 /// The blank line keeps the prompt from reading as the label of the answer or
 /// the tool block that follows it, which begin on the very next row otherwise.
-fn printPrompt(gpa: std.mem.Allocator, out: *Io.Writer, text: []const u8, display: Display) !void {
+fn printPrompt(gpa: std.mem.Allocator, out: *std.Io.Writer, text: []const u8, display: Display) !void {
     try styling.header(marks.prompt, "prompt", "", display.style, out);
     try term.write(gpa, text, display.style, out);
     try out.writeAll("\n\n");
@@ -1253,7 +1252,7 @@ fn printPrompt(gpa: std.mem.Allocator, out: *Io.Writer, text: []const u8, displa
 
 /// Prints a reply under its own header, laid out as markdown. Only the display
 /// changes; the session and the model keep the text itself.
-fn printAnswer(gpa: std.mem.Allocator, out: *Io.Writer, content: ?[]const u8, display: Display) !void {
+fn printAnswer(gpa: std.mem.Allocator, out: *std.Io.Writer, content: ?[]const u8, display: Display) !void {
     try styling.header(marks.answer, "answer", "", display.style, out);
     const text = content orelse "";
     if (text.len == 0) {
@@ -1562,7 +1561,7 @@ fn testConfig(model: []const u8, cwd: []const u8, home: ?[]const u8) Config {
 /// A terminal a test can show blocks through and read back from `out`. The
 /// returned value has to outlive the emitter taken from it, since the emitter
 /// borrows it.
-fn testTerminal(out: *Io.Writer, display: Display) Terminal {
+fn testTerminal(out: *std.Io.Writer, display: Display) Terminal {
     return .{ .out = out, .display = display, .scratch = std.testing.allocator };
 }
 
@@ -1723,7 +1722,7 @@ test "cost follows the cache hit, miss and output prices" {
 /// Writes the section an instruction reader (`globalInstructions` or
 /// `projectInstructions`) produces for `dir` and compares it to `expected`, so a
 /// test reads as the section it lands in the prompt.
-fn expectInstructions(expected: []const u8, read: anytype, dir: Io.Dir) !void {
+fn expectInstructions(expected: []const u8, read: anytype, dir: std.Io.Dir) !void {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try std.testing.expect(try read(std.testing.io, &out.writer, dir));
@@ -1731,7 +1730,7 @@ fn expectInstructions(expected: []const u8, read: anytype, dir: Io.Dir) !void {
 }
 
 /// Checks that an instruction reader writes nothing for `dir`.
-fn expectNoInstructions(read: anytype, dir: Io.Dir) !void {
+fn expectNoInstructions(read: anytype, dir: std.Io.Dir) !void {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try std.testing.expect(!try read(std.testing.io, &out.writer, dir));
@@ -1955,7 +1954,7 @@ test "sameDir tells a directory from its parent and root from itself" {
 
     // At the filesystem root, `..` is the root itself, which is what ends a walk
     // that found no repository root above it.
-    var root = try Io.Dir.openDirAbsolute(io, "/", .{});
+    var root = try std.Io.Dir.openDirAbsolute(io, "/", .{});
     defer root.close(io);
     var root_up = try root.openDir(io, "..", .{});
     defer root_up.close(io);
@@ -2335,7 +2334,7 @@ test "the terminal shows a tool call the way a replay does" {
     defer http.deinit();
     var tool_set = try Tools.init(.{
         .io = std.testing.io,
-        .dir = Io.Dir.cwd(),
+        .dir = std.Io.Dir.cwd(),
         .gpa = gpa,
         .bash_timeout_s = 120,
         .http = &http,
@@ -2471,7 +2470,7 @@ test "a turn shows the tool it runs and then the answer" {
     };
     var tool_set = try Tools.init(.{
         .io = io,
-        .dir = Io.Dir.cwd(),
+        .dir = std.Io.Dir.cwd(),
         .gpa = gpa,
         .bash_timeout_s = 120,
         .http = &http,

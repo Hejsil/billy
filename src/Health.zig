@@ -13,7 +13,6 @@
 //! is reported, so a billy whose waits are not being kept says so.
 
 const std = @import("std");
-const Io = std.Io;
 
 const Health = @This();
 
@@ -87,15 +86,15 @@ const Names = struct {
     }
 };
 
-io: Io,
+io: std.Io,
 /// Owns the pool and the waits, which `deinit` frees.
 gpa: std.mem.Allocator,
 /// The directory the waits are read from and written to. Borrowed: the caller
 /// owns it and outlives this.
-dir: Io.Dir,
+dir: std.Io.Dir,
 /// Guards the pool and the waits, since the web server asks several searches at
 /// once and they share this table.
-mutex: Io.Mutex = .init,
+mutex: std.Io.Mutex = .init,
 /// The names the waits are held for, one NUL-terminated copy each, in the order
 /// they were first recorded. Two equal names share one offset.
 strings: std.ArrayList(u8) = .empty,
@@ -105,7 +104,7 @@ strings: std.ArrayList(u8) = .empty,
 entries: std.ArrayHashMapUnmanaged(Name, Wait, Names, true) = .empty,
 
 /// Reads the waits left by an earlier run.
-pub fn load(io: Io, gpa: std.mem.Allocator, dir: Io.Dir) !Health {
+pub fn load(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir) !Health {
     var health: Health = .{ .io = io, .gpa = gpa, .dir = dir };
     errdefer health.deinit();
     try health.read();
@@ -134,7 +133,7 @@ fn read(self: *Health) !void {
     }) catch return;
     if (stored.value.version > format_version) return;
 
-    const now = Io.Clock.now(.real, self.io).toMilliseconds();
+    const now = std.Io.Clock.now(.real, self.io).toMilliseconds();
     var read_entries = stored.value.entries.map.iterator();
     while (read_entries.next()) |entry| {
         // A name that cannot be held is left out rather than making the rest of
@@ -241,7 +240,7 @@ fn write(self: *Health) !void {
     defer atomic.deinit(self.io);
 
     var buffer: [4096]u8 = undefined;
-    var file: Io.File.Writer = .init(atomic.file, self.io, &buffer);
+    var file: std.Io.File.Writer = .init(atomic.file, self.io, &buffer);
 
     var json: std.json.Stringify = .{
         .writer = &file.interface,
@@ -382,7 +381,7 @@ test "a wait further off than the cap is brought back to it on reading" {
     var t = try Test.init("{\"version\":1,\"entries\":{\"a\":{\"until_ms\":99999999999999,\"failures\":3}}}");
     defer t.deinit();
 
-    const now = Io.Clock.now(.real, std.testing.io).toMilliseconds();
+    const now = std.Io.Clock.now(.real, std.testing.io).toMilliseconds();
     try std.testing.expect(t.health.skips("a", now + max_wait_ms - 1000));
     try std.testing.expect(!t.health.skips("a", now + max_wait_ms + 1000));
 }

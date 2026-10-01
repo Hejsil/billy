@@ -1,7 +1,6 @@
 //! OpenAI-compatible `/chat/completions` client with function calling.
 
 const std = @import("std");
-const Io = std.Io;
 const Health = @import("Health.zig");
 const Mock = @import("Mock.zig");
 
@@ -156,7 +155,7 @@ const Response = struct {
 
 pub const Client = struct {
     gpa: std.mem.Allocator,
-    io: Io,
+    io: std.Io,
     api_key: []const u8,
     /// Full URL of the chat completions endpoint.
     url: []const u8,
@@ -168,7 +167,7 @@ pub const Client = struct {
     /// The pause before the first retry, doubled for each one after it and
     /// jittered, so a burst of retries does not stay in step. A test sets it to
     /// zero, so a retry costs no real time.
-    retry_backoff: Io.Duration = .fromMilliseconds(500),
+    retry_backoff: std.Io.Duration = .fromMilliseconds(500),
     /// The one HTTP client of the run, borrowed by pointer so that every
     /// request, chat and search alike, shares its connections and its scanned
     /// certificates. The run owns it and outlives this.
@@ -299,7 +298,7 @@ pub const Client = struct {
 
     /// How long to wait before try `attempt + 1`. The exponential is jittered
     /// over its lower half, so the wait is long but the clients spread out.
-    fn pauseFor(client: *Client, attempt: usize, retry_after_ms: ?u64) Io.Duration {
+    fn pauseFor(client: *Client, attempt: usize, retry_after_ms: ?u64) std.Io.Duration {
         if (retry_after_ms) |ms| return .fromMilliseconds(@intCast(@min(ms, max_retry_after_ms)));
         const base: u64 = @intCast(@max(client.retry_backoff.toMilliseconds(), 0));
         // The shift is capped so that a long attempt count cannot overflow it;
@@ -405,7 +404,7 @@ fn transportWorthRetrying(err: anyerror) bool {
 
 /// Writes one request body. Called twice for a request: once into a counter, to
 /// learn the length the head has to carry, and once onto the connection.
-fn writeBody(writer: *Io.Writer, request: anytype) !void {
+fn writeBody(writer: *std.Io.Writer, request: anytype) !void {
     var json: std.json.Stringify = .{
         .writer = writer,
         .options = .{ .emit_null_optional_fields = false },
@@ -598,7 +597,7 @@ test "pauseFor honors Retry-After and otherwise backs off with jitter" {
 /// Runs one completion against `url`, with the retry backoff turned off so the
 /// test costs no real time. The caller owns the returned completion and frees it
 /// with `deinit`.
-fn completeAgainst(gpa: std.mem.Allocator, io: Io, url: []const u8, max_attempts: usize) !Completion {
+fn completeAgainst(gpa: std.mem.Allocator, io: std.Io, url: []const u8, max_attempts: usize) !Completion {
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
     var client: Client = .{

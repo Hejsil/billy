@@ -16,7 +16,6 @@
 //! something else is asked for, and why the help says so.
 
 const std = @import("std");
-const Io = std.Io;
 const agent = @import("agent.zig");
 const html = @import("html.zig");
 const models = @import("models.zig");
@@ -52,7 +51,7 @@ const max_connections = 64;
 ///
 /// The URL is printed once the socket is bound, so what is printed is the port
 /// that was actually taken, and not the one that was asked for.
-pub fn serve(setup: *Setup, out: *Io.Writer, host: []const u8, port: u16) !void {
+pub fn serve(setup: *Setup, out: *std.Io.Writer, host: []const u8, port: u16) !void {
     const address = listenAddress(host, port) catch |err| {
         std.log.err(
             "cannot listen on '{s}': {s}; give an address such as 127.0.0.1, 0.0.0.0 or 192.168.1.5",
@@ -82,14 +81,14 @@ pub fn serve(setup: *Setup, out: *Io.Writer, host: []const u8, port: u16) !void 
 
     // One task per connection, gathered so that they are all cancelled when the
     // loop ends, as they all share the listener's lifetime.
-    var group: Io.Group = .init;
+    var group: std.Io.Group = .init;
     defer group.cancel(setup.io);
 
     // At most `max_connections` are served at once. A permit is taken before a
     // connection is accepted, so one that arrives while the server is full waits
     // in the socket's backlog rather than being given a task of its own; the
     // permit is given back when the connection is answered and its task ends.
-    var slots: Io.Semaphore = .{ .permits = max_connections };
+    var slots: std.Io.Semaphore = .{ .permits = max_connections };
     while (true) {
         try slots.wait(setup.io);
         const stream = listener.accept(setup.io) catch |err| {
@@ -113,11 +112,11 @@ pub fn serve(setup: *Setup, out: *Io.Writer, host: []const u8, port: u16) !void 
 /// `localhost` is taken as the loopback address, which is what it means
 /// everywhere. Anything else has to be an address, since billy does not resolve
 /// names: `0.0.0.0` for every interface, or the address of one of them.
-fn listenAddress(host: []const u8, port: u16) !Io.net.IpAddress {
-    if (std.mem.eql(u8, host, "localhost")) return .{ .ip4 = Io.net.Ip4Address.loopback(port) };
+fn listenAddress(host: []const u8, port: u16) !std.Io.net.IpAddress {
+    if (std.mem.eql(u8, host, "localhost")) return .{ .ip4 = std.Io.net.Ip4Address.loopback(port) };
     // What was asked for that is not an address comes back as one error, since
     // what billy does not do is resolve a name; the caller says so.
-    return Io.net.IpAddress.parse(host, port) catch error.InvalidHost;
+    return std.Io.net.IpAddress.parse(host, port) catch error.InvalidHost;
 }
 
 /// What the server knows about sessions that their files do not say.
@@ -130,9 +129,9 @@ fn listenAddress(host: []const u8, port: u16) !Io.net.IpAddress {
 /// Every connection runs on its own task, so this is reached from several at
 /// once and a lock guards it.
 const Registry = struct {
-    io: Io,
+    io: std.Io,
     gpa: std.mem.Allocator,
-    mutex: Io.Mutex = .init,
+    mutex: std.Io.Mutex = .init,
     /// The ids of sessions a turn is running for right now, each with the id
     /// that names it owned as the key. A session can only be asked one thing at
     /// a time, so a second ask while one runs is refused.
@@ -181,8 +180,8 @@ fn handle(
     setup: *Setup,
     registry: *Registry,
     http: *std.http.Client,
-    stream: Io.net.Stream,
-    slots: *Io.Semaphore,
+    stream: std.Io.net.Stream,
+    slots: *std.Io.Semaphore,
 ) void {
     defer slots.post(setup.io);
     defer {
@@ -455,7 +454,7 @@ fn writeSession(
     setup: *Setup,
     gpa: std.mem.Allocator,
     id: []const u8,
-    out: *Io.Writer,
+    out: *std.Io.Writer,
 ) !bool {
     var session = Session.open(setup.io, setup.sessions, gpa, id, setup.cwd) catch |err| switch (err) {
         error.SessionNotFound => return false,
@@ -484,7 +483,7 @@ fn writeSession(
 }
 
 /// Writes the two halves of a session's page as the JSON object the page reads.
-fn writeOpened(out: *Io.Writer, header: []const u8, blocks: []const u8, session_mode: []const u8) !void {
+fn writeOpened(out: *std.Io.Writer, header: []const u8, blocks: []const u8, session_mode: []const u8) !void {
     try std.json.Stringify.value(Opened{
         .header = header,
         .blocks = blocks,
@@ -646,15 +645,15 @@ test "an event leaves the stream as it is written, without filling a buffer" {
 test "the address to listen on is read from what was asked for" {
     // An address is taken as itself, and the port carried through.
     const anywhere = try listenAddress("0.0.0.0", 8787);
-    try std.testing.expect(anywhere.eql(&(try Io.net.IpAddress.parse("0.0.0.0", 8787))));
+    try std.testing.expect(anywhere.eql(&(try std.Io.net.IpAddress.parse("0.0.0.0", 8787))));
 
     // `localhost` is the one name taken, and it names loopback.
     const here = try listenAddress("localhost", 8787);
-    try std.testing.expect(here.eql(&(try Io.net.IpAddress.parse("127.0.0.1", 8787))));
+    try std.testing.expect(here.eql(&(try std.Io.net.IpAddress.parse("127.0.0.1", 8787))));
 
     // A v6 address, and a port of zero, which asks the system for a free one.
     const v6 = try listenAddress("::1", 0);
-    try std.testing.expect(v6.eql(&(try Io.net.IpAddress.parse("::1", 0))));
+    try std.testing.expect(v6.eql(&(try std.Io.net.IpAddress.parse("::1", 0))));
 
     // A name billy does not resolve is refused rather than left to fail later.
     try std.testing.expectError(error.InvalidHost, listenAddress("example.com", 8787));

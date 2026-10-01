@@ -12,7 +12,6 @@
 //! name a file and a URL can both hold as it stands.
 
 const std = @import("std");
-const Io = std.Io;
 
 /// Characters in an id.
 pub const length = 26;
@@ -47,12 +46,12 @@ pub fn encode(buf: *[length]u8, time_ms: u48, random: [10]u8) void {
 /// from the platform's CSPRNG. That is what makes an id unique without asking
 /// whether it has been used: two billys on one machine cannot see each other's
 /// unstarted sessions, so there is nothing to ask.
-pub fn generate(io: Io, buf: *[length]u8) void {
+pub fn generate(io: std.Io, buf: *[length]u8) void {
     var random: [10]u8 = undefined;
     io.random(&random);
     // The epoch is the floor, and the low 48 bits are all an id has room for;
     // a clock before 1970 or after the year 10889 is not worth failing over.
-    const now_ms = Io.Clock.now(.real, io).toMilliseconds();
+    const now_ms = std.Io.Clock.now(.real, io).toMilliseconds();
     const time_ms: u48 = @truncate(@as(u64, @intCast(@max(now_ms, 0))));
     encode(buf, time_ms, random);
 }

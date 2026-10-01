@@ -2,7 +2,6 @@
 //! at instead of a live service.
 
 const std = @import("std");
-const Io = std.Io;
 
 const Mock = @This();
 
@@ -37,7 +36,7 @@ headers: std.ArrayList(Header) = .empty,
 /// The first failure the server ran into
 err: ?anyerror = null,
 
-group: Io.Group = .init,
+group: std.Io.Group = .init,
 
 /// One header a request carried
 pub const Header = struct { name: []const u8, value: []const u8 };
@@ -59,7 +58,7 @@ pub fn start(
 ) !Mock {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    var address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = try address.listen(io, .{ .reuse_address = true });
     errdefer listener.deinit(io);
     return .{
@@ -108,7 +107,7 @@ pub fn serve(mock: *Mock) !void {
     try mock.group.concurrent(std.testing.io, Mock.serveInGroup, .{mock});
 }
 
-fn serveInGroup(mock: *Mock) Io.Cancelable!void {
+fn serveInGroup(mock: *Mock) std.Io.Cancelable!void {
     mock.run() catch |err| {
         mock.err = err;
     };
@@ -129,7 +128,7 @@ fn run(mock: *Mock) !void {
 /// Answers requests on one connection until the client closes it or a reply asks
 /// not to keep it alive, which is what the client does after a reply it does not
 /// intend to reuse.
-fn serveConnection(mock: *Mock, io: Io, stream: Io.net.Stream) !void {
+fn serveConnection(mock: *Mock, io: std.Io, stream: std.Io.net.Stream) !void {
     var in_buffer: [4096]u8 = undefined;
     var out_buffer: [4096]u8 = undefined;
     var reader = stream.reader(io, &in_buffer);

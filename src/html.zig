@@ -13,7 +13,6 @@
 //! it ran and what it produced.
 
 const std = @import("std");
-const Io = std.Io;
 const agent = @import("agent.zig");
 const diffing = @import("diff.zig");
 const md = @import("md.zig");
@@ -26,7 +25,7 @@ const Tools = @import("Tools.zig");
 /// entities that mean the characters themselves. This is what every string
 /// coming from outside billy passes through before it reaches a page, so nothing
 /// a model or a file writes can become markup.
-pub fn escape(text: []const u8, out: *Io.Writer) !void {
+pub fn escape(text: []const u8, out: *std.Io.Writer) !void {
     var plain: usize = 0;
     for (text, 0..) |byte, i| {
         const entity = switch (byte) {
@@ -56,17 +55,17 @@ pub fn escape(text: []const u8, out: *Io.Writer) !void {
 /// byte is safe across calls because each byte is escaped on its own: no entity
 /// is ever split between one call and the next.
 const Escaping = struct {
-    inner: *Io.Writer,
-    writer: Io.Writer,
+    inner: *std.Io.Writer,
+    writer: std.Io.Writer,
 
-    fn init(inner: *Io.Writer) Escaping {
+    fn init(inner: *std.Io.Writer) Escaping {
         return .{
             .inner = inner,
             .writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
         };
     }
 
-    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *Escaping = @alignCast(@fieldParentPtr("writer", w));
 
         // The last slice is the one repeated `splat` times, so it is written
@@ -88,7 +87,7 @@ const Escaping = struct {
 /// Driving md4c's parser rather than its own renderer is what lets billy check a
 /// link's address before writing it: md4c renders a `javascript:` link as a link,
 /// and a reply must not be able to make one that runs code.
-pub fn markdown(gpa: std.mem.Allocator, text: []const u8, out: *Io.Writer) !void {
+pub fn markdown(gpa: std.mem.Allocator, text: []const u8, out: *std.Io.Writer) !void {
     var render = Markdown{ .gpa = gpa, .out = out };
     var parser = Markdown.parser();
     try md.parse(text, &parser, &render);
@@ -106,10 +105,10 @@ pub fn markdown(gpa: std.mem.Allocator, text: []const u8, out: *Io.Writer) !void
 /// (`safeAddress`).
 const Markdown = struct {
     gpa: std.mem.Allocator,
-    out: *Io.Writer,
+    out: *std.Io.Writer,
     /// The first failure of the writer. A callback returns a number, not an
     /// error, so the failure is kept here and reported once the parse is over.
-    err: ?Io.Writer.Error = null,
+    err: ?std.Io.Writer.Error = null,
     /// How deep inside an image label this is. The text of a label is an
     /// attribute, so no tags are written there and a line break becomes a space.
     image_depth: usize = 0,
@@ -476,7 +475,7 @@ fn writeText(text_type: md.c.MD_TEXTTYPE, text: [*c]const md.c.MD_CHAR, size: md
     return @intFromBool(!self.writeRun(text_type, text[0..size]));
 }
 
-pub fn diff(lines: []const diffing.Line, out: *Io.Writer) !void {
+pub fn diff(lines: []const diffing.Line, out: *std.Io.Writer) !void {
     try out.writeAll("<pre class=\"diff\">");
     for (lines) |line| {
         switch (line.kind) {
@@ -855,7 +854,7 @@ test "a diff of code is escaped like any other text" {
 
 /// Writes an element holding `text`, with the text escaped. The tag and the
 /// class are billy's own, written as they are; only the text comes from outside.
-fn element(comptime tag: []const u8, class: []const u8, text: []const u8, out: *Io.Writer) !void {
+fn element(comptime tag: []const u8, class: []const u8, text: []const u8, out: *std.Io.Writer) !void {
     try out.print("<{s} class=\"{s}\">", .{ tag, class });
     try escape(text, out);
     try out.print("</{s}>\n", .{tag});
@@ -888,7 +887,7 @@ fn hasStatus(call: Tools.Call) bool {
 /// finished call whose status was never recorded. The element is the same width
 /// in every case, so the description after it starts in the same place on every
 /// row.
-fn pill(status: Status, out: *Io.Writer) !void {
+fn pill(status: Status, out: *std.Io.Writer) !void {
     switch (status) {
         // No animation: the ellipsis alone says the call has not finished.
         .running => try out.writeAll("<span class=\"exit running\" title=\"running\">…</span>"),
@@ -917,7 +916,7 @@ fn pill(status: Status, out: *Io.Writer) !void {
 /// No glyph: a tool call is already drawn as a folded block of its own, and the
 /// marks that tell one apart from a prompt in the terminal have nothing to add
 /// to a page, which has room to draw that difference itself.
-fn toolSummary(call: Tools.Call, result: []const u8, status: ?Status, out: *Io.Writer) !void {
+fn toolSummary(call: Tools.Call, result: []const u8, status: ?Status, out: *std.Io.Writer) !void {
     const head = Tools.Heading.of(call);
     try out.writeAll("<summary class=\"tool-head\">");
     try out.print("<span class=\"name\">{s}</span>", .{head.name});
@@ -956,7 +955,7 @@ fn toolSummary(call: Tools.Call, result: []const u8, status: ?Status, out: *Io.W
 /// favicon is fetched from its host and the bubble opens it. A result billy
 /// cannot link to is left to the body, and nothing is written at all for text
 /// that is not a list of results, such as a search that matched nothing.
-fn favicons(result: []const u8, out: *Io.Writer) !void {
+fn favicons(result: []const u8, out: *std.Io.Writer) !void {
     var origin_buffer: [256]u8 = undefined;
     var results = search.parseResults(result);
     while (results.next()) |found| {
@@ -969,7 +968,7 @@ fn favicons(result: []const u8, out: *Io.Writer) !void {
 /// cropping to it, with the source's first letter behind it so a site that has no
 /// favicon still reads as a small bubble rather than a broken image. The host is
 /// the bubble's tooltip, and the whole bubble opens the result.
-fn favicon(found: search.Result, origin: []const u8, out: *Io.Writer) !void {
+fn favicon(found: search.Result, origin: []const u8, out: *std.Io.Writer) !void {
     const host = models.hostOf(found.url) orelse return;
     try out.writeAll("<a class=\"fav\" href=\"");
     try escape(found.url, out);
@@ -1000,7 +999,7 @@ fn originOf(url: []const u8, buffer: []u8) ?[]const u8 {
 /// call runs -- and then what it produced. A call that is still running has
 /// nothing produced yet, and its result is the empty string, so the body is what
 /// it means to do and nothing more.
-fn toolBody(gpa: std.mem.Allocator, call: Tools.Call, result: []const u8, out: *Io.Writer) !void {
+fn toolBody(gpa: std.mem.Allocator, call: Tools.Call, result: []const u8, out: *std.Io.Writer) !void {
     switch (call) {
         // The change the call means to make, from the call alone, so a replayed
         // session shows the same diff the run did.
@@ -1025,7 +1024,7 @@ fn toolBody(gpa: std.mem.Allocator, call: Tools.Call, result: []const u8, out: *
 /// command filled, without the status line the summary already carries; and a
 /// call that failed shows billy's message for the failure whatever it was asked
 /// to do. Anything else shows the text the call returned.
-fn toolResult(call: Tools.Call, result: []const u8, out: *Io.Writer) !void {
+fn toolResult(call: Tools.Call, result: []const u8, out: *std.Io.Writer) !void {
     // A call still running has produced nothing, so there is no result to show
     // and no empty element to leave behind.
     if (result.len == 0) return;
@@ -1065,7 +1064,7 @@ fn toolResult(call: Tools.Call, result: []const u8, out: *Io.Writer) !void {
 ///
 /// `gpa` is for what showing a block builds, which is an edit's diff; it is the
 /// caller's, freed before this returns.
-pub fn block(gpa: std.mem.Allocator, b: agent.Block, out: *Io.Writer) !void {
+pub fn block(gpa: std.mem.Allocator, b: agent.Block, out: *std.Io.Writer) !void {
     switch (b) {
         .prompt => |text| try titled(gpa, agent.marks.prompt.glyph, "prompt", text, out),
         .answer => |text| try titled(gpa, agent.marks.answer.glyph, "answer", text, out),
@@ -1116,7 +1115,7 @@ pub fn block(gpa: std.mem.Allocator, b: agent.Block, out: *Io.Writer) !void {
 
 /// Writes a block that is headed by a mark and holds markdown: a prompt or a
 /// reply.
-fn titled(gpa: std.mem.Allocator, glyph: []const u8, name: []const u8, text: []const u8, out: *Io.Writer) !void {
+fn titled(gpa: std.mem.Allocator, glyph: []const u8, name: []const u8, text: []const u8, out: *std.Io.Writer) !void {
     try out.print("<div class=\"block {s}\"><div class=\"head\">", .{name});
     try out.print("<span class=\"glyph\">", .{});
     try escape(glyph, out);
@@ -1468,7 +1467,7 @@ test "the blocks of a run are each rendered as what they are" {
 /// Writes a whole stored conversation as HTML, oldest block first: what the web
 /// page shows when a session is opened. `gpa` is the run's, for the scratch each
 /// block needs while it is written.
-pub fn conversation(gpa: std.mem.Allocator, session: *const Session, out: *Io.Writer) !void {
+pub fn conversation(gpa: std.mem.Allocator, session: *const Session, out: *std.Io.Writer) !void {
     var page = Page{ .gpa = gpa, .out = out };
     try agent.walk(gpa, session, 0, page.emitter());
 }
@@ -1477,7 +1476,7 @@ pub fn conversation(gpa: std.mem.Allocator, session: *const Session, out: *Io.Wr
 /// takes, so a conversation is rendered by the same walk a terminal replay is.
 const Page = struct {
     gpa: std.mem.Allocator,
-    out: *Io.Writer,
+    out: *std.Io.Writer,
 
     fn emitter(self: *Page) agent.Emitter {
         return .{ .context = self, .vtable = &.{ .block = show } };
@@ -1586,7 +1585,7 @@ pub const Header = struct {
 
 /// Writes the header as HTML. Every count is formatted by the same helpers the
 /// terminal header uses, so the two read the same numbers the same way.
-pub fn header(h: Header, out: *Io.Writer) !void {
+pub fn header(h: Header, out: *std.Io.Writer) !void {
     try out.writeAll("<div class=\"header\">");
     try part("id", h.id, out);
     try out.writeAll("<span class=\"sep\">·</span>");
@@ -1615,7 +1614,7 @@ pub fn header(h: Header, out: *Io.Writer) !void {
 
 /// Writes one part of the header as a span classed by what it is, with the text
 /// escaped. The dot between parts is a part of its own, so a page can space it.
-fn part(class: []const u8, text: []const u8, out: *Io.Writer) !void {
+fn part(class: []const u8, text: []const u8, out: *std.Io.Writer) !void {
     try out.print("<span class=\"{s}\">", .{class});
     try escape(text, out);
     try out.writeAll("</span>");
