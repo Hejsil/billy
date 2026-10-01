@@ -43,20 +43,6 @@ pub fn write(gpa: std.mem.Allocator, text: []const u8, style: Style, out: *std.I
     if (render.err) |err| return err;
 }
 
-/// One open list, so an ordered list can keep counting where it left off.
-const ListFrame = struct {
-    ordered: bool = false,
-    /// The number the next item of an ordered list is.
-    next: usize = 1,
-};
-
-/// A row of a table while it is buffered, waiting for the column widths to be
-/// known: a table cannot be aligned until all of it has been read.
-const Row = struct {
-    header: bool = false,
-    cells: std.ArrayList([]u8) = .empty,
-};
-
 /// Renders one document. It is the `userdata` md4c hands back to every callback,
 /// and holds both the writer each piece goes to and the state the text of one
 /// piece depends on -- how deep a list is, whether a code block is open, and so
@@ -112,6 +98,20 @@ const Markdown = struct {
     row: std.ArrayList([]u8) = .empty,
     cell: std.ArrayList(u8) = .empty,
     aligns: std.ArrayList(md.c.MD_ALIGN) = .empty,
+
+    /// One open list, so an ordered list can keep counting where it left off.
+    const ListFrame = struct {
+        ordered: bool = false,
+        /// The number the next item of an ordered list is.
+        next: usize = 1,
+    };
+
+    /// A row of a table while it is buffered, waiting for the column widths to be
+    /// known: a table cannot be aligned until all of it has been read.
+    const Row = struct {
+        header: bool = false,
+        cells: std.ArrayList([]u8) = .empty,
+    };
 
     fn parser() md.c.MD_PARSER {
         return .{
