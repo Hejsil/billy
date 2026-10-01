@@ -14,8 +14,8 @@ pub const Style = enum {
     /// The style to use on the terminal billy prints to. Escape codes are for a
     /// terminal, which a pipe or a redirection is not: `supportsAnsiEscapeCodes`
     /// answers whether stdout is one.
-    pub fn detect(io: std.Io) Style {
-        const supported = std.Io.File.stdout().supportsAnsiEscapeCodes(io) catch return .plain;
+    pub fn detect(io: std.Io, file: std.Io.File) Style {
+        const supported = file.supportsAnsiEscapeCodes(io) catch return .plain;
         return if (supported) .ansi else .plain;
     }
 
