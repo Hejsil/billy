@@ -729,60 +729,65 @@ pub fn recordCost(session: *Session, usage: llm.Usage, cost: f64) void {
     session.cost += cost;
 }
 
-/// Writes the conversation to the session file. The previous contents are
-/// replaced in one step, leaving them intact if writing fails part way.
 pub fn save(session: *Session) !void {
-    var text: std.Io.Writer.Allocating = .init(session.gpa);
-    defer text.deinit();
+    var atomic = try session.dir.createFileAtomic(session.io, session.name(), .{
+        .replace = true,
+    });
+    defer atomic.deinit(session.io);
+
+    var file_buf: [std.heap.page_size_min]u8 = undefined;
+    var file_writer = atomic.file.writer(session.io, &file_buf);
 
     var json: std.json.Stringify = .{
-        .writer = &text.writer,
+        .writer = &file_writer.interface,
         .options = .{ .emit_null_optional_fields = false },
     };
+
     try json.beginObject();
+
     try json.objectField("version");
     try json.write(Stored.default.version);
-    // The title is written first, so a listing reads it from the front of the
-    // file with a small read rather than the whole conversation.
+
     if (session.string(session.title_index)) |stored_title| {
         try json.objectField("title");
         try json.write(stored_title);
     }
-    // The system prompt is kept apart from the conversation, so it is written
-    // before it and only when there is one.
+
     if (session.string(session.system_prompt)) |prompt| {
         try json.objectField("system_prompt");
         try json.write(prompt);
     }
+
     try json.objectField("mode");
     try json.write(session.mode);
+
     try json.objectField("messages");
     try json.beginArray();
-    for (session.messages.items) |message| try writeMessage(session, &json, message);
+    for (session.messages.items) |message|
+        try writeMessage(session, &json, message);
     try json.endArray();
-    // The indices of the compaction summaries, sorted, so a resume knows where
-    // the conversation a request carries begins.
+
     try json.objectField("compactions");
     try json.write(session.compactions.items);
+
     try json.objectField("tools");
     try json.write(session.toolSet());
+
     try json.objectField("usage");
     try json.write(session.usage);
+
     try json.objectField("context_tokens");
     try json.write(session.context_tokens);
+
     try json.objectField("cost");
     try json.write(session.cost);
+
     try json.objectField("cwd");
     try json.write(session.cwd);
+
     try json.endObject();
 
-    var atomic = try session.dir.createFileAtomic(session.io, session.name(), .{ .replace = true });
-    defer atomic.deinit(session.io);
-
-    var file: std.Io.File.Writer = atomic.file.writer(session.io, "");
-    try file.interface.writeAll(text.written());
-    try file.end();
-
+    try file_writer.end();
     try atomic.replace(session.io);
 }
 
