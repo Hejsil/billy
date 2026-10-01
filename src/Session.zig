@@ -91,7 +91,7 @@ const Stored = struct {
     /// compaction is the message just before its summary; it is stored so the
     /// two read as a question and its answer, and shows in the transcript as one
     /// line along with the summary.
-    compactions: []const usize = &.{},
+    compactions: []const u32 = &.{},
     /// The tool definitions the conversation was started with.
     tools: []const StoredTool = &.{},
     /// Tokens billed over the whole session, summed over every request.
@@ -793,71 +793,40 @@ pub fn save(session: *Session) !void {
 
 /// Reads an existing session's file into `session`.
 fn load(session: *Session) !void {
+    var arena_allocator = std.heap.ArenaAllocator.init(session.gpa);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
     const text = session.dir.readFileAlloc(
         session.io,
         session.name(),
-        session.gpa,
+        arena,
         .limited(max_session_bytes),
     ) catch |err| switch (err) {
         error.FileNotFound => return error.SessionNotFound,
         else => return err,
     };
-    // The file's own bytes are not needed once it has been parsed.
-    defer session.gpa.free(text);
 
-    // The parse is freed on the way out: what the session keeps, the tools and
-    // the directory, is copied out of it first, so nothing points into it after
-    // this returns. The conversation is interned into the pool, which is what a
-    // session keeps its strings in.
-    var parsed = std.json.parseFromSlice(Stored, session.gpa, text, .{
+    const stored = std.json.parseFromSliceLeaky(Stored, arena, text, .{
         .ignore_unknown_fields = true,
-        .allocate = .alloc_always,
     }) catch return error.CorruptSession;
-    defer parsed.deinit();
-    const stored = parsed.value;
 
     if (stored.version > Stored.default.version)
         return error.UnsupportedSessionVersion;
 
-    // The title is optional and came after the version, so no migration or bump
-    // was needed for it.
-    if (stored.title) |stored_title| try session.setTitle(stored_title);
-
-    // The mode came after the version too; a file without one reads as general.
-    session.mode = stored.mode;
-
-    // The system prompt is its own field in a version 3 file. An older file
-    // instead holds it as the first message, sometimes as a leading run of them;
-    // that run is lifted out into the prompt and left out of the conversation, so
-    // a request built from the session opens the way it did before. The first of
-    // the run is the prompt, which is the one billy ever wrote.
-    var lead: usize = 0;
-    if (stored.system_prompt) |prompt| {
-        try session.setSystemPrompt(prompt);
-    } else {
-        while (lead < stored.messages.len and
-            std.mem.eql(u8, stored.messages[lead].role, "system")) lead += 1;
-        if (lead > 0) try session.setSystemPrompt(stored.messages[0].content orelse "");
-    }
-
-    // The conversation is kept as it is, so resuming reuses exactly what the
-    // earlier run sent.
-    for (stored.messages[lead..]) |message| {
-        try session.appendMessage(message);
-    }
+    const lead = try session.loadPromptAndMessages(stored.system_prompt, stored.messages);
     try session.loadCompactions(stored.compactions, lead);
-
-    // A run killed while a tool ran can leave the last turn without the results
-    // of its calls, which the API rejects on the next request. The turn is
-    // completed before anything reads the conversation.
+    try session.loadTools(stored.tools);
     try session.repairTail();
 
-    try session.loadTools(stored.tools);
+    if (stored.title) |stored_title|
+        try session.setTitle(stored_title);
+
+    session.mode = stored.mode;
     session.usage = stored.usage;
     session.context_tokens = stored.context_tokens;
     session.cost = stored.cost;
-    // A session saved before the directory was recorded has none, and the
-    // directory billy runs in now is kept.
+
     if (stored.cwd.len > 0) {
         const owned = try session.gpa.dupe(u8, stored.cwd);
         session.gpa.free(session.cwd);
@@ -865,28 +834,45 @@ fn load(session: *Session) !void {
     }
 }
 
+fn loadPromptAndMessages(
+    session: *Session,
+    system_prompt: ?[]const u8,
+    messages: []const llm.Message,
+) !usize {
+    // The system prompt is its own field in a version 3 file. An older file
+    // instead holds it as the first message, sometimes as a leading run of them;
+    // that run is lifted out into the prompt and left out of the conversation, so
+    // a request built from the session opens the way it did before. The first of
+    // the run is the prompt, which is the one billy ever wrote.
+    var lead: usize = 0;
+    if (system_prompt) |prompt| {
+        try session.setSystemPrompt(prompt);
+    } else {
+        while (lead < messages.len and
+            std.mem.eql(u8, messages[lead].role, "system")) lead += 1;
+        if (lead > 0)
+            try session.setSystemPrompt(messages[0].content orelse "");
+    }
+    for (messages[lead..]) |message| {
+        try session.appendMessage(message);
+    }
+
+    return lead;
+}
+
 /// Reads the compaction indices back against the conversation just loaded, so
 /// the sorted list a request and a transcript read is sound even if the file was
-/// written by hand: one past the end is dropped rather than trusted, the list is
-/// sorted, and a repeat is collapsed to the one copy of it. A migrated file's
-/// indices name the messages as they were stored, so each is shifted by the
-/// `lead` lifted out of the front of them.
-fn loadCompactions(session: *Session, stored: []const usize, lead: usize) !void {
-    for (stored) |index| {
-        if (index < lead) continue;
-        const at = index - lead;
-        if (at >= session.messages.items.len) continue;
-        try session.compactions.append(session.gpa, std.math.cast(u32, at) orelse continue);
+/// written by hand: one past the end is dropped rather than trusted and the list
+/// is sorted. A migrated file's indices name the messages as they were stored, so
+/// each is shifted by the `lead` lifted out of the front of them.
+fn loadCompactions(session: *Session, stored: []const u32, lead: usize) !void {
+    try session.compactions.appendSlice(session.gpa, stored);
+    std.mem.sort(u32, session.compactions.items, {}, std.sort.asc(u32));
+
+    for (session.compactions.items) |*index| {
+        index.* = std.math.sub(u32, index.*, @intCast(lead)) catch 0;
+        index.* = @min(index.*, @as(u32, @intCast(session.messages.items.len - 1)));
     }
-    const compactions = session.compactions.items;
-    std.mem.sort(u32, compactions, {}, std.sort.asc(u32));
-    var kept: usize = 0;
-    for (compactions) |index| {
-        if (kept > 0 and compactions[kept - 1] == index) continue;
-        compactions[kept] = index;
-        kept += 1;
-    }
-    session.compactions.shrinkRetainingCapacity(kept);
 }
 
 /// Interns the stored tool definitions, so the set is one array and the
@@ -2248,7 +2234,7 @@ test "a compaction survives a save and resume" {
     try std.testing.expectEqualStrings("next", resumed.string(resumed.messages.items[3].content).?);
 }
 
-test "the compaction list is sorted and cleaned when a session is read" {
+test "the compaction list is sorted and clamped when a session is read" {
     const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -2270,14 +2256,9 @@ test "the compaction list is sorted and cleaned when a session is read" {
     var session = try reopen(&tmp, gpa, "odd");
     defer session.deinit();
 
-    // The prompt is lifted out of the conversation, so the indices shift down by
-    // one. One that named the prompt is dropped, one past the end is dropped, the
-    // rest are sorted, and the repeat is collapsed, so the list is the one sorted
-    // copy the rest of the session expects.
     try std.testing.expectEqualStrings("s", session.string(session.system_prompt).?);
-    try std.testing.expectEqualSlices(u32, &.{1}, session.compactions.items);
-    // The latest is therefore the summary, and a request starts there.
-    try std.testing.expectEqual(1, session.sentFrom());
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 1, 2 }, session.compactions.items);
+    try std.testing.expectEqual(2, session.sentFrom());
     try std.testing.expect(session.isCompaction(1));
 }
 
