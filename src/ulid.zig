@@ -51,7 +51,7 @@ pub fn generate(io: std.Io, buf: *[length]u8) void {
     io.random(&random);
     // The epoch is the floor, and the low 48 bits are all an id has room for;
     // a clock before 1970 or after the year 10889 is not worth failing over.
-    const now_ms = std.Io.Clock.now(.real, io).toMilliseconds();
+    const now_ms = std.Io.Clock.real.now(io).toMilliseconds();
     const time_ms: u48 = @truncate(@as(u64, @intCast(@max(now_ms, 0))));
     encode(buf, time_ms, random);
 }

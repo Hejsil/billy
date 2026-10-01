@@ -133,7 +133,7 @@ fn read(self: *Health) !void {
     }) catch return;
     if (stored.value.version > format_version) return;
 
-    const now = std.Io.Clock.now(.real, self.io).toMilliseconds();
+    const now = std.Io.Clock.real.now(self.io).toMilliseconds();
     var read_entries = stored.value.entries.map.iterator();
     while (read_entries.next()) |entry| {
         // A name that cannot be held is left out rather than making the rest of
@@ -381,7 +381,7 @@ test "a wait further off than the cap is brought back to it on reading" {
     var t = try Test.init("{\"version\":1,\"entries\":{\"a\":{\"until_ms\":99999999999999,\"failures\":3}}}");
     defer t.deinit();
 
-    const now = std.Io.Clock.now(.real, std.testing.io).toMilliseconds();
+    const now = std.Io.Clock.real.now(std.testing.io).toMilliseconds();
     try std.testing.expect(t.health.skips("a", now + max_wait_ms - 1000));
     try std.testing.expect(!t.health.skips("a", now + max_wait_ms + 1000));
 }

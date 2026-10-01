@@ -1123,7 +1123,7 @@ pub fn nameFromPrompt(session: *Session, text: []const u8) !bool {
 /// has no prices to cost its tokens at.
 fn rateNow(io: std.Io, config: Config) models.Price {
     const info = config.model_info orelse return .{};
-    return info.priceAt(@intCast(std.Io.Clock.now(.real, io).toSeconds()));
+    return info.priceAt(@intCast(std.Io.Clock.real.now(io).toSeconds()));
 }
 
 /// Sent as the last message of a compaction request, and stored with the summary
