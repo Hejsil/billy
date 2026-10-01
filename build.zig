@@ -17,7 +17,11 @@ pub fn build(b: *std.Build) void {
     mod.addCSourceFiles(.{
         .root = md4c.path("src"),
         .files = &.{ "md4c.c", "md4c-html.c", "entity.c" },
-        .flags = &.{"-DMD4C_USE_UTF8"},
+        // C99, because the library is written in it, so a compiler whose default
+        // is newer or older does not decide whether it builds. UTF-8, because a
+        // reply is UTF-8 and md4c is told which encoding to expect rather than
+        // guessing.
+        .flags = &.{ "-std=c99", "-DMD4C_USE_UTF8" },
     });
 
     const exe = b.addExecutable(.{
