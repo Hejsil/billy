@@ -24,7 +24,7 @@ const std = @import("std");
 const llm = @import("llm.zig");
 const ulid = @import("ulid.zig");
 const xdg = @import("xdg.zig");
-const Mode = @import("mode.zig").Mode;
+const agent = @import("agent.zig");
 
 const Session = @This();
 
@@ -82,7 +82,7 @@ const Stored = struct {
     system_prompt: ?[]const u8 = null,
     /// The mode the session runs in, which fixes its prompt and its tools. A file
     /// saved before modes existed has none, and reads back as general.
-    mode: Mode = .general,
+    mode: agent.Mode = .general,
     /// The conversation, oldest first.
     messages: []const llm.Message = &.{},
     /// Indices into `messages`, sorted, of the summaries a compaction produced.
@@ -263,7 +263,7 @@ title_index: StringIndex = .none,
 
 /// What the session may do and what its prompt says. Kept so a resume keeps the
 /// mode it started in rather than the default.
-mode: Mode = .general,
+mode: agent.Mode = .general,
 
 /// Indices into `messages`, sorted and without repeats, of the summaries a
 /// compaction produced. Keeping them as a list rather than a flag on every
@@ -663,7 +663,7 @@ pub fn setSystemPrompt(session: *Session, system_prompt: []const u8) !void {
 
 /// Records the mode the session runs in. Set once, when the session starts; the
 /// prompt and tools stored with it follow from the mode.
-pub fn setMode(session: *Session, mode: Mode) void {
+pub fn setMode(session: *Session, mode: agent.Mode) void {
     session.mode = mode;
 }
 

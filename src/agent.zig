@@ -11,7 +11,8 @@ const LineEditor = @import("LineEditor.zig");
 const Session = @import("Session.zig");
 const styling = @import("style.zig");
 const term = @import("term.zig");
-const Mode = @import("mode.zig").Mode;
+
+pub const Mode = @import("agent/mode.zig").Mode;
 
 /// A command a prompt can be on its own, which billy runs itself rather than
 /// sending to the model. A command is the whole line, so a prompt that merely

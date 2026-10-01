@@ -7,7 +7,7 @@ const formatting = @import("format.zig");
 const diffing = @import("diff.zig");
 const styling = @import("style.zig");
 const Session = @import("Session.zig");
-const Mode = @import("mode.zig").Mode;
+const agent = @import("agent.zig");
 
 const Tools = @This();
 
@@ -179,7 +179,7 @@ pub fn init(options: Options) !Tools {
 /// spec table's order, with the web tools last when a backend is configured. The
 /// strings are the spec table's own, which are comptime, so this builds nothing;
 /// the session interns and stores them.
-pub fn definitions(tools: *const Tools, mode: Mode) []const Session.Definition {
+pub fn definitions(tools: *const Tools, mode: agent.Mode) []const Session.Definition {
     return switch (mode) {
         .general => if (tools.search != null) &specs_with_web else &specs,
         .chat => if (tools.search != null) &chat_specs_with_web else &chat_specs,
@@ -1227,7 +1227,7 @@ const specs_with_web = specs ++ web_specs;
 
 /// Why the filtered specs are returned by value rather than as a slice: a slice
 /// would point into a comptime local, which a global const may not hold.
-fn allowedCount(comptime source: []const Session.Definition, comptime mode: Mode) usize {
+fn allowedCount(comptime source: []const Session.Definition, comptime mode: agent.Mode) usize {
     var n: usize = 0;
     for (source) |spec| if (mode.allows(spec.name)) {
         n += 1;
@@ -1237,7 +1237,7 @@ fn allowedCount(comptime source: []const Session.Definition, comptime mode: Mode
 
 /// The specs of `source` the chat mode allows, filtered at comptime so the result
 /// is the spec table's own strings and nothing is built at run time.
-fn allowedSpecs(comptime source: []const Session.Definition, comptime mode: Mode) [allowedCount(source, mode)]Session.Definition {
+fn allowedSpecs(comptime source: []const Session.Definition, comptime mode: agent.Mode) [allowedCount(source, mode)]Session.Definition {
     var buffer: [allowedCount(source, mode)]Session.Definition = undefined;
     var n: usize = 0;
     for (source) |spec| {

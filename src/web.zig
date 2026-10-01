@@ -19,8 +19,6 @@ const std = @import("std");
 const agent = @import("agent.zig");
 const html = @import("html.zig");
 const models = @import("models.zig");
-const mode = @import("mode.zig");
-const Mode = mode.Mode;
 const Session = @import("Session.zig");
 const Runner = @import("agent.zig").Runner;
 const Setup = @import("Setup.zig");
@@ -493,7 +491,7 @@ fn writeOpened(out: *std.Io.Writer, header: []const u8, blocks: []const u8, sess
 
 /// The mode a web session starts in, so a new one opens in ask unless the first
 /// prompt says otherwise. The terminal keeps general as its own default.
-const default_mode: mode.Mode = .chat;
+const default_mode: agent.Mode = .chat;
 
 /// What a reply is, so the browser is told how to read it.
 const ContentType = enum {
@@ -597,7 +595,7 @@ test "a parsed prompt is copied, so the body it came from can be freed" {
     @memset(buffer[0..json.len], 'x');
 
     try std.testing.expectEqualStrings("hello", parsed.value.text);
-    try std.testing.expectEqual(Mode.chat, parsed.value.mode.?);
+    try std.testing.expectEqual(agent.Mode.chat, parsed.value.mode.?);
 }
 
 test "the page the browser is given is the one that was written" {
@@ -665,7 +663,7 @@ test "the address to listen on is read from what was asked for" {
 /// whose mode is fixed on the session.
 const Prompt = struct {
     text: []const u8,
-    mode: ?mode.Mode = null,
+    mode: ?agent.Mode = null,
 };
 
 /// Reads the prompt a POST carries, or replies with why it could not and returns
@@ -727,7 +725,7 @@ fn createSession(
 
     // The mode the page chose, or a `/chat`/`/general` command in the prompt,
     // which wins over the choice.
-    const choice = mode.Mode.start(parsed.value.text, parsed.value.mode orelse default_mode);
+    const choice = agent.Mode.start(parsed.value.text, parsed.value.mode orelse default_mode);
     if (choice.text.len == 0)
         return reply(request, .text, "the prompt is empty\n", .bad_request, answered);
     var config = setup.agentConfig(session.cwd(), .plain);
