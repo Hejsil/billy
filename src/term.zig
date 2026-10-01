@@ -646,20 +646,23 @@ fn expectRendered(expected: []const u8, text: []const u8, style: Style) !void {
     try std.testing.expectEqualStrings(expected, out.written());
 }
 
-/// The same, for a terminal that takes escape codes.
+fn expectPlain(expected: []const u8, text: []const u8) !void {
+    try expectRendered(expected, text, .plain);
+}
+
 fn expectAnsi(expected: []const u8, text: []const u8) !void {
     try expectRendered(expected, text, .ansi);
 }
 
 test "a paragraph is written as it stands" {
-    try expectRendered("hello world", "hello world", .plain);
+    try expectPlain("hello world", "hello world");
     // Its own line breaks are kept, not re-wrapped.
-    try expectRendered("one\ntwo", "one\ntwo", .plain);
+    try expectPlain("one\ntwo", "one\ntwo");
 }
 
 test "inline markdown is set in the style of the terminal" {
     // Plain text keeps the text and drops the style, so a pipe to a file reads.
-    try expectRendered("bold and italic and code", "**bold** and *italic* and `code`", .plain);
+    try expectPlain("bold and italic and code", "**bold** and *italic* and `code`");
     // A terminal that takes escape codes shows each as it is meant.
     try expectAnsi(
         "\x1b[1mbold\x1b[0m and \x1b[3mitalic\x1b[0m and \x1b[2mcode\x1b[0m",
@@ -670,27 +673,27 @@ test "inline markdown is set in the style of the terminal" {
 }
 
 test "a heading is its text in bold, with no mark" {
-    try expectRendered("Title", "# Title", .plain);
+    try expectPlain("Title", "# Title");
     try expectAnsi("\x1b[1mTitle\x1b[0m", "## Title");
 }
 
 test "a list is bulleted and indented, a nested list further" {
-    try expectRendered("- one\n- two", "- one\n- two", .plain);
-    try expectRendered("- one\n  - deeper", "- one\n  - deeper", .plain);
+    try expectPlain("- one\n- two", "- one\n- two");
+    try expectPlain("- one\n  - deeper", "- one\n  - deeper");
 }
 
 test "an ordered list keeps its numbers" {
-    try expectRendered("1. one\n2. two", "1. one\n2. two", .plain);
+    try expectPlain("1. one\n2. two", "1. one\n2. two");
     // A list that starts at another number keeps it.
-    try expectRendered("3. three\n4. four", "3. three\n4. four", .plain);
+    try expectPlain("3. three\n4. four", "3. three\n4. four");
 }
 
 test "a task list shows its boxes" {
-    try expectRendered("- [x] done\n- [ ] todo", "- [x] done\n- [ ] todo", .plain);
+    try expectPlain("- [x] done\n- [ ] todo", "- [x] done\n- [ ] todo");
 }
 
 test "a code block is set apart and left as written" {
-    try expectRendered("    let x = 1;\n    x += 1;", "```\nlet x = 1;\nx += 1;\n```", .plain);
+    try expectPlain("    let x = 1;\n    x += 1;", "```\nlet x = 1;\nx += 1;\n```");
     try expectAnsi(
         "\x1b[2m    let x = 1;\x1b[0m",
         "```zig\nlet x = 1;\n```",
@@ -698,17 +701,17 @@ test "a code block is set apart and left as written" {
 }
 
 test "a quote is barred and dim" {
-    try expectRendered("> quoted", "> quoted", .plain);
+    try expectPlain("> quoted", "> quoted");
     try expectAnsi("\x1b[2m> quoted\x1b[0m", "> quoted");
 }
 
 test "a horizontal rule is a line of dashes" {
-    try expectRendered("-" ** 40, "---", .plain);
+    try expectPlain("-" ** 40, "---");
 }
 
 test "a link is clickable where the terminal takes escape codes, else its address is shown" {
     // Plain text has no escape codes, so the address has to be written out.
-    try expectRendered("the spec (https://example.com)", "[the spec](https://example.com)", .plain);
+    try expectPlain("the spec (https://example.com)", "[the spec](https://example.com)");
     // A terminal that takes escape codes gets a hyperlink over the text alone.
     try expectAnsi(
         "\x1b]8;;https://example.com\x1b\\the spec\x1b]8;;\x1b\\",
@@ -717,21 +720,20 @@ test "a link is clickable where the terminal takes escape codes, else its addres
 }
 
 test "an image is shown as its alt text" {
-    try expectRendered("a cat", "![a cat](cat.png)", .plain);
+    try expectPlain("a cat", "![a cat](cat.png)");
     // With no alt text the address stands in, so something is shown.
-    try expectRendered("cat.png", "![](cat.png)", .plain);
+    try expectPlain("cat.png", "![](cat.png)");
 }
 
 test "a table is aligned in columns" {
-    try expectRendered(
+    try expectPlain(
         "name  age\n----  ---\nana   3\nbo    12",
         "| name | age |\n| --- | --- |\n| ana | 3 |\n| bo | 12 |",
-        .plain,
     );
 }
 
 test "a block is set off from the one before it" {
-    try expectRendered("one\n\ntwo", "one\n\ntwo", .plain);
+    try expectPlain("one\n\ntwo", "one\n\ntwo");
     // A heading is followed directly by what it heads, with no blank line.
-    try expectRendered("Title\nthe body", "# Title\nthe body", .plain);
+    try expectPlain("Title\nthe body", "# Title\nthe body");
 }
