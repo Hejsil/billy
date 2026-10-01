@@ -50,8 +50,11 @@ pub const Mode = enum {
     /// prompt with any leading command taken off. `/chat` and `/general` start in
     /// that mode; anything else starts in `default`, which is the frontend's own.
     pub fn start(text: []const u8, default: Mode) Start {
-        if (command(text, chat_command)) |rest| return .{ .mode = .chat, .text = rest };
-        if (command(text, general_command)) |rest| return .{ .mode = .general, .text = rest };
+        const trimmed_text = std.mem.trimStart(u8, text, " \t");
+        if (command(trimmed_text, chat_command)) |rest|
+            return .{ .mode = .chat, .text = rest };
+        if (command(trimmed_text, general_command)) |rest|
+            return .{ .mode = .general, .text = rest };
         return .{ .mode = default, .text = text };
     }
 };
@@ -59,11 +62,12 @@ pub const Mode = enum {
 /// `text` with the command `name` taken off its front, or null when it does not
 /// open with it. A command is a whole word: `/chatty` is not `/chat`.
 fn command(text: []const u8, name: []const u8) ?[]const u8 {
-    const rest = std.mem.trimStart(u8, text, " \t");
-    if (!std.mem.startsWith(u8, rest, name)) return null;
-    const after = rest[name.len..];
-    if (after.len > 0 and after[0] != ' ' and after[0] != '\t' and after[0] != '\n') return null;
-    return std.mem.trimStart(u8, after, " \t\n");
+    if (!std.mem.startsWith(u8, text, name))
+        return null;
+
+    const after = text[name.len..];
+    const res = std.mem.trimStart(u8, after, " \t\n");
+    return if (res.len == 0 or res.len != after.len) res else null;
 }
 
 /// What a first prompt asks for: the mode it names and the prompt itself.
