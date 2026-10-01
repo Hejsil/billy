@@ -63,36 +63,36 @@ pub const Style = enum {
             .ansi => "\x1b[0m",
         };
     }
-};
 
-/// A foreground colour, named by the escape code that selects it. Only the
-/// colours every terminal has are used, so they read as part of the terminal
-/// rather than as a theme of billy's own competing with the one a format script
-/// paints the text in.
-pub const Color = enum(u8) {
-    red = 31,
-    green = 32,
-    yellow = 33,
-    blue = 34,
-    magenta = 35,
-    cyan = 36,
-};
+    /// A foreground colour, named by the escape code that selects it. Only the
+    /// colours every terminal has are used, so they read as part of the terminal
+    /// rather than as a theme of billy's own competing with the one a format script
+    /// paints the text in.
+    pub const Color = enum(u8) {
+        red = 31,
+        green = 32,
+        yellow = 33,
+        blue = 34,
+        magenta = 35,
+        cyan = 36,
+    };
 
-/// The mark a block header opens with: a glyph and the colour it is shown in, so
-/// a block is recognisable from its first character.
-pub const Mark = struct {
-    glyph: []const u8,
-    hue: Color,
-};
+    /// The mark a block header opens with: a glyph and the colour it is shown in, so
+    /// a block is recognisable from its first character.
+    pub const Mark = struct {
+        glyph: []const u8,
+        hue: Color,
 
-/// Prints a block header: `▸ read a.zig`.
-pub fn header(mark: Mark, name: []const u8, target: []const u8, style: Style, out: *std.Io.Writer) !void {
-    try style.color(mark.hue, mark.glyph, out);
-    try out.writeAll(" ");
-    try style.bold(name, out);
-    if (target.len > 0) {
-        try out.writeAll(" ");
-        try style.dim(target, out);
-    }
-    try out.writeAll("\n");
-}
+        /// Prints a block header: `▸ read a.zig`.
+        pub fn header(mark: Mark, name: []const u8, target: []const u8, style: Style, out: *std.Io.Writer) !void {
+            try style.color(mark.hue, mark.glyph, out);
+            try out.writeAll(" ");
+            try style.bold(name, out);
+            if (target.len > 0) {
+                try out.writeAll(" ");
+                try style.dim(target, out);
+            }
+            try out.writeAll("\n");
+        }
+    };
+};

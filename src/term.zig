@@ -15,9 +15,8 @@
 
 const std = @import("std");
 const md = @import("md.zig");
-const styling = @import("style.zig");
 
-const Style = styling.Style;
+pub const Style = @import("term/style.zig").Style;
 
 /// Deepest a list nests before its indent stops growing, so a malformed document
 /// cannot walk `list` off its end.

@@ -9,7 +9,6 @@ const Mock = @import("Mock.zig");
 const search = @import("search.zig");
 const LineEditor = @import("LineEditor.zig");
 const Session = @import("Session.zig");
-const styling = @import("style.zig");
 const term = @import("term.zig");
 
 pub const Mode = @import("agent/mode.zig").Mode;
@@ -86,7 +85,7 @@ pub const Display = struct {
     formats: Tools.Formats = .{},
     /// How billy decorates the lines it prints itself, such as a block header.
     /// Plain everywhere the terminal does not take escape codes.
-    style: styling.Style = .plain,
+    style: term.Style = .plain,
 };
 
 /// One unit of what a run shows: the pieces a conversation is made of, each
@@ -343,11 +342,11 @@ const prompt = "> ";
 /// frontends show a block in: the terminal colours them and the web gives them
 /// classes, but a prompt is a prompt in either.
 pub const marks = struct {
-    pub const prompt = styling.Mark{ .glyph = "»", .hue = .blue };
-    pub const answer = styling.Mark{ .glyph = "◆", .hue = .green };
+    pub const prompt = term.Style.Mark{ .glyph = "»", .hue = .blue };
+    pub const answer = term.Style.Mark{ .glyph = "◆", .hue = .green };
     /// The line a compaction shows as, standing in for the prompt that asked for
     /// it and the summary it produced.
-    pub const compacted = styling.Mark{ .glyph = "⊟", .hue = .yellow };
+    pub const compacted = term.Style.Mark{ .glyph = "⊟", .hue = .yellow };
 };
 
 /// Writes the header line shown above the input prompt: the session id, the
@@ -877,7 +876,7 @@ fn blocksIn(session: *const Session, messages: []const Session.Message, index: u
 /// Prints how many blocks a trimmed transcript left out, dimmed, so a resume does
 /// not read as the whole session. It is the count a short block gives of the
 /// lines it cut, standing where the blocks it names would have been.
-fn printElided(count: usize, style: styling.Style, out: *std.Io.Writer) !void {
+fn printElided(count: usize, style: term.Style, out: *std.Io.Writer) !void {
     try out.print("{s}… {d} earlier blocks{s}\n", .{ style.on("2"), count, style.off() });
 }
 
@@ -1232,9 +1231,9 @@ fn summarize(
 /// that compacts shows the event rather than the two messages. It is headed like
 /// every other block, with its own mark, and opens with the blank line that
 /// separates it from the block before it.
-fn printCompacted(out: *std.Io.Writer, style: styling.Style) !void {
+fn printCompacted(out: *std.Io.Writer, style: term.Style) !void {
     try out.writeAll("\n");
-    try styling.header(marks.compacted, "compacted", "", style, out);
+    try marks.compacted.header("compacted", "", style, out);
     try out.flush();
 }
 
@@ -1246,7 +1245,7 @@ fn printCompacted(out: *std.Io.Writer, style: styling.Style) !void {
 /// The blank line keeps the prompt from reading as the label of the answer or
 /// the tool block that follows it, which begin on the very next row otherwise.
 fn printPrompt(gpa: std.mem.Allocator, out: *std.Io.Writer, text: []const u8, display: Display) !void {
-    try styling.header(marks.prompt, "prompt", "", display.style, out);
+    try marks.prompt.header("prompt", "", display.style, out);
     try term.write(gpa, text, display.style, out);
     try out.writeAll("\n\n");
 }
@@ -1254,7 +1253,7 @@ fn printPrompt(gpa: std.mem.Allocator, out: *std.Io.Writer, text: []const u8, di
 /// Prints a reply under its own header, laid out as markdown. Only the display
 /// changes; the session and the model keep the text itself.
 fn printAnswer(gpa: std.mem.Allocator, out: *std.Io.Writer, content: ?[]const u8, display: Display) !void {
-    try styling.header(marks.answer, "answer", "", display.style, out);
+    try marks.answer.header("answer", "", display.style, out);
     const text = content orelse "";
     if (text.len == 0) {
         try display.style.dim("(empty reply)", out);
@@ -1272,7 +1271,7 @@ fn printAnswer(gpa: std.mem.Allocator, out: *std.Io.Writer, content: ?[]const u8
 fn expectTranscript(
     expected: []const u8,
     messages: []const llm.Message,
-    style: styling.Style,
+    style: term.Style,
 ) !void {
     const gpa = std.testing.allocator;
 
