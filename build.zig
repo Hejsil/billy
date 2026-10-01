@@ -31,17 +31,24 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // Dropping unreachable sections keeps the markdown library's unused code out
+    // of the binary, and it is also what lets a build that links libc work here
+    // at all: this system's `crt1.o` carries an `.sframe` section whose
+    // relocations the linker cannot resolve, and something has to remove it.
+    exe.link_gc_sections = true;
     b.installArtifact(exe);
 
     const mod_tests = b.addTest(.{
         .root_module = mod,
         .filters = filters,
     });
+    mod_tests.link_gc_sections = true;
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
+    exe_tests.link_gc_sections = true;
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     const test_step = b.step("test", "Run the tests");
