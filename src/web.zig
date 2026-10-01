@@ -668,9 +668,7 @@ const Prompt = struct {
 
 /// Reads the prompt a POST carries, or replies with why it could not and returns
 /// null, so the caller has nothing more to do.
-fn readPrompt(setup: *Setup, request: *std.http.Server.Request, answered: *bool) !?std.json.Parsed(Prompt) {
-    const gpa = setup.gpa;
-
+fn readPrompt(gpa: std.mem.Allocator, request: *std.http.Server.Request, answered: *bool) !?std.json.Parsed(Prompt) {
     // The prompt is read first, so a request with nothing usable in it is
     // refused before a session is taken or made.
     var body_buffer: [4096]u8 = undefined;
@@ -713,7 +711,7 @@ fn createSession(
     answered: *bool,
 ) !void {
     const gpa = setup.gpa;
-    const parsed = (try readPrompt(setup, request, answered)) orelse return;
+    const parsed = (try readPrompt(setup.gpa, request, answered)) orelse return;
     defer parsed.deinit();
 
     // A fresh session with a new id and no file: the first message writes it.
@@ -747,7 +745,7 @@ fn askSession(
     answered: *bool,
 ) !void {
     const gpa = setup.gpa;
-    const parsed = (try readPrompt(setup, request, answered)) orelse return;
+    const parsed = (try readPrompt(setup.gpa, request, answered)) orelse return;
     defer parsed.deinit();
     if (parsed.value.text.len == 0)
         return reply(request, .text, "the prompt is empty\n", .bad_request, answered);
