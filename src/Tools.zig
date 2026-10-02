@@ -2018,34 +2018,25 @@ test "a replacement matched exactly is not re-indented" {
     );
 }
 
-/// A tool set over `dir` for the definition tests, with a search backend when
-/// `with_search` is set.
-fn definitionsToolSet(
-    dir: std.Io.Dir,
-    gpa: std.mem.Allocator,
-    http: *std.http.Client,
-    with_search: bool,
-) !Tools {
+fn testTools(with_search: bool) !Tools {
     return Tools.init(.{
         .io = std.testing.io,
-        .dir = dir,
-        .gpa = gpa,
+        .gpa = std.testing.allocator,
+        .dir = .cwd(),
         .bash_timeout_s = 120,
         .search = if (with_search) .{
             .backends = &.{.{ .provider = .tavily, .api_key = "key" }},
             .max_results = 3,
         } else null,
-        .http = http,
+
+        // Not used by tests
+        .http = undefined,
     });
 }
 
 test "the definitions cover every tool the loop dispatches" {
     const gpa = std.testing.allocator;
-    var log: std.Io.Writer.Allocating = .init(gpa);
-    defer log.deinit();
-    var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
-    defer http.deinit();
-    var tool_set = try definitionsToolSet(std.Io.Dir.cwd(), gpa, &http, false);
+    var tool_set = try testTools(false);
 
     // The names are exactly the tools the loop can dispatch, in the order the
     // model receives them, so it is never offered one that does not run.
@@ -2064,15 +2055,9 @@ test "the definitions cover every tool the loop dispatches" {
 }
 
 test "the web tools are offered only when a backend is configured" {
-    const gpa = std.testing.allocator;
-    var log: std.Io.Writer.Allocating = .init(gpa);
-    defer log.deinit();
-    var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
-    defer http.deinit();
-
     // Without a backend neither web tool is offered at all, and the tools every
     // session has come first so the set only grows.
-    var plain = try definitionsToolSet(std.Io.Dir.cwd(), gpa, &http, false);
+    var plain = try testTools(false);
     const without = plain.definitions(.general);
     try std.testing.expectEqual(specs.len, without.len);
     for (without) |definition| {
@@ -2082,7 +2067,7 @@ test "the web tools are offered only when a backend is configured" {
 
     // With one they are appended, so a session that gains them keeps the tools it
     // had.
-    var searched = try definitionsToolSet(std.Io.Dir.cwd(), gpa, &http, true);
+    var searched = try testTools(true);
     const with = searched.definitions(.general);
     try std.testing.expectEqual(specs.len + web_specs.len, with.len);
     try std.testing.expectEqualStrings("web_search", with[with.len - 2].name);
@@ -2097,6 +2082,7 @@ test "the tools work in the directory they are given, wherever billy runs" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+
     // A project directory that is not the one the tests run in, which is the
     // case a resumed session is in: it was started somewhere else.
     try tmp.dir.createDirPath(std.testing.io, "project");
