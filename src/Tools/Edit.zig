@@ -30,7 +30,8 @@ pub fn run(edit: Edit, gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, out:
                 .sub_path = edit.path,
                 .data = applied.text.items,
             }) catch |err| return out.print("error: cannot write {s}: {s}", .{ edit.path, @errorName(err) });
-            try out.print("error: replaced {d} occurrence(s) in {s}", .{ applied.count, edit.path });
+
+            try out.print("replaced {d} occurrence(s) in {s}", .{ applied.count, edit.path });
         },
     }
 }
