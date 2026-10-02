@@ -280,7 +280,7 @@ pub fn agentConfig(setup: *Setup, cwd: []const u8, style: Terminal.Style) agent.
         // is set; and the block headers are decorated for `style`. Only the
         // display changes: the command that runs, the file that is written, the
         // session and the model keep the text as it was written. A reply and a
-        // prompt are markdown, laid out by billy's own renderer (`term.zig`).
+        // prompt are markdown, laid out by billy's own renderer.
         .display = .{
             .formats = .{
                 .bash = if (settings.tools.bash.format) |script| .{

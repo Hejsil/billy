@@ -3,10 +3,10 @@
 ///! theirs.
 const std = @import("std");
 const agent = @import("agent.zig");
-const term = @import("term.zig");
 const Tools = @import("Tools.zig");
 
 pub const Style = @import("Terminal/style.zig").Style;
+pub const Markdown = @import("Terminal/Markdown.zig");
 
 const Terminal = @This();
 
@@ -74,7 +74,7 @@ fn selfOf(context: *anyopaque) *Terminal {
 /// the tool block that follows it, which begin on the very next row otherwise.
 fn printPrompt(gpa: std.mem.Allocator, out: *std.Io.Writer, text: []const u8, display: agent.Display) !void {
     try marks.prompt.header("prompt", "", display.style, out);
-    try term.write(gpa, text, display.style, out);
+    try Markdown.write(gpa, text, display.style, out);
     try out.writeAll("\n\n");
 }
 
@@ -86,7 +86,7 @@ fn printAnswer(gpa: std.mem.Allocator, out: *std.Io.Writer, content: ?[]const u8
     if (text.len == 0) {
         try display.style.dim("(empty reply)", out);
     } else {
-        try term.write(gpa, text, display.style, out);
+        try Markdown.write(gpa, text, display.style, out);
     }
     try out.writeAll("\n");
     try out.flush();

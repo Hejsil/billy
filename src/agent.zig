@@ -9,7 +9,6 @@ const Mock = @import("Mock.zig");
 const search = @import("search.zig");
 const LineEditor = @import("LineEditor.zig");
 const Session = @import("Session.zig");
-const term = @import("term.zig");
 const Terminal = @import("Terminal.zig");
 
 pub const Mode = @import("agent/mode.zig").Mode;

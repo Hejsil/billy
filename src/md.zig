@@ -1,9 +1,4 @@
 //! The md4c binding: billy's whole contact with the C markdown library.
-//!
-//! md4c reads the markdown; `html.zig` and `term.zig` drive it through the parser
-//! callbacks and write the HTML and the terminal text. This module only names the
-//! library, the dialect billy reads, and how a document is handed to it, so that
-//! what is C-shaped stays here and what is shaped for a frontend stays there.
 
 const std = @import("std");
 
