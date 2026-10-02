@@ -10,6 +10,7 @@ const Session = @import("Session.zig");
 const agent = @import("agent.zig");
 
 const Edit = @import("Tools/Edit.zig");
+const web = @import("Tools/web.zig");
 
 const Tools = @This();
 
@@ -47,7 +48,7 @@ pub const Call = union(enum) {
     write: Write,
     edit: Edit,
     bash: Bash,
-    web_search: WebSearch,
+    web_search: web.Search,
     web_fetch: WebFetch,
     /// A call naming a tool this harness does not implement.
     unknown: []const u8,
@@ -74,10 +75,6 @@ pub const Call = union(enum) {
         /// it is for rather than only what it ran. Null when the model gave none,
         /// which is every stored call from before the tool asked for one.
         description: ?[]const u8 = null,
-    };
-
-    pub const WebSearch = struct {
-        query: []const u8,
     };
 
     pub const WebFetch = struct {
@@ -311,7 +308,10 @@ fn dispatch(tools: *Tools, call: Call, out: *std.Io.Writer) !void {
         .write => |args| try tools.write(args, out),
         .edit => |edit| try edit.run(tools.gpa, tools.io, tools.dir, out),
         .bash => |args| try tools.bash(args, out),
-        .web_search => |args| try tools.webSearch(args, out),
+        .web_search => |s| {
+            const client = &(tools.search orelse return fail(out, "web search is not configured", .{}));
+            try s.run(tools.gpa, client, out);
+        },
         .web_fetch => |args| try tools.webFetch(args, out),
         .unknown => |name| try fail(out, "unknown tool '{s}'", .{name}),
         .malformed => |bad| try fail(
@@ -406,29 +406,6 @@ fn bash(tools: *Tools, args: Call.Bash, out: *std.Io.Writer) !void {
     }
 }
 
-/// Runs one web search and writes its results as text. No backend is configured
-/// only when a resumed session carries the tool from a run that had one; the
-/// model is told so rather than the call failing outright.
-fn webSearch(tools: *Tools, args: Call.WebSearch, out: *std.Io.Writer) !void {
-    const client = if (tools.search) |*client| client else return fail(out, "web search is not configured", .{});
-
-    // The search builds its answer in an arena of its own, which is dropped once
-    // the text has been written on.
-    var arena_state = std.heap.ArenaAllocator.init(tools.gpa);
-    defer arena_state.deinit();
-    const text = client.search(arena_state.allocator(), args.query) catch |err| switch (err) {
-        // Every backend is set aside after failing, which is what the user can
-        // fix: one backend is a single point of failure.
-        error.AllBackendsSetAside => return fail(
-            out,
-            "every search backend is set aside after failing; add another to tools.web_search.providers, or wait",
-            .{},
-        ),
-        else => return fail(out, "search failed: {s}", .{@errorName(err)}),
-    };
-    try out.writeAll(text);
-}
-
 /// Fetches one url and writes its content as text. A page is extracted by the
 /// backend; `raw` reads the url directly, for an API or a file. Like a search, a
 /// fetch is offered only when a backend is configured, which is what the client
@@ -495,7 +472,7 @@ pub fn parseCallNamed(arena: std.mem.Allocator, name: []const u8, arguments: []c
             return .{ .malformed = .{ .name = name, .reason = reason } } };
     }
     if (std.mem.eql(u8, name, "web_search")) {
-        return .{ .web_search = fromJson(Call.WebSearch, arena, arguments) catch |reason|
+        return .{ .web_search = fromJson(web.Search, arena, arguments) catch |reason|
             return .{ .malformed = .{ .name = name, .reason = reason } } };
     }
     if (std.mem.eql(u8, name, "web_fetch")) {
