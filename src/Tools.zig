@@ -8,6 +8,7 @@ const diffing = @import("diff.zig");
 const Terminal = @import("Terminal.zig");
 const Session = @import("Session.zig");
 const agent = @import("agent.zig");
+const Bash = @import("Tools/Bash.zig");
 const Edit = @import("Tools/Edit.zig");
 const Read = @import("Tools/Read.zig");
 const Write = @import("Tools/Write.zig");
@@ -35,8 +36,6 @@ pub const Formats = struct {
 /// Longest result handed back to the model, so one command cannot flood the
 /// conversation.
 const max_result_len = 30_000;
-/// Longest output captured from one command.
-const max_command_output = 1 << 20;
 /// Lines of a result shown before the rest is summarized. The model still gets
 /// the whole result; only the display is cut short.
 const max_block_lines = 5;
@@ -55,15 +54,6 @@ pub const Call = union(enum) {
     unknown: []const u8,
     /// A known tool whose arguments could not be read; `name` is still known.
     malformed: Malformed,
-
-    pub const Bash = struct {
-        command: []const u8,
-        /// A short, one-line description of what the command does, written by the
-        /// model. It is shown in the call's header, so a collapsed call says what
-        /// it is for rather than only what it ran. Null when the model gave none,
-        /// which is every stored call from before the tool asked for one.
-        description: ?[]const u8 = null,
-    };
 
     pub const Malformed = struct {
         name: []const u8,
@@ -287,67 +277,21 @@ fn dispatch(tools: *Tools, call: Call, out: *std.Io.Writer) !void {
         .edit => |edit| try edit.run(tools.gpa, tools.io, tools.dir, out),
         .read => |read| try read.run(tools.gpa, tools.io, tools.dir, out),
         .write => |write| try write.run(tools.io, tools.dir, out),
-        .bash => |args| try tools.bash(args, out),
+        .bash => |bash| {
+            const timeout_s = std.math.cast(i64, tools.bash_timeout_s) orelse std.math.maxInt(i64);
+            const timeout = std.Io.Duration.fromSeconds(timeout_s);
+            try bash.run(tools.gpa, tools.io, tools.dir, timeout, out);
+        },
         inline .web_search, .web_fetch => |w| {
-            const client = &(tools.search orelse return fail(out, "web search is not configured", .{}));
+            const client = &(tools.search orelse return out.writeAll("error: web search is not configured"));
             try w.run(tools.gpa, client, out);
         },
-        .unknown => |name| try fail(out, "unknown tool '{s}'", .{name}),
-        .malformed => |bad| try fail(
-            out,
-            "invalid arguments for {s}: {s}",
+        .unknown => |name| try out.print("error: unknown tool '{s}'", .{name}),
+        .malformed => |bad| try out.print(
+            "error: invalid arguments for {s}: {s}",
             .{ bad.name, @errorName(bad.reason) },
         ),
     }
-}
-
-fn bash(tools: *Tools, args: Call.Bash, out: *std.Io.Writer) !void {
-    // The count the configuration holds is turned into the signed seconds
-    // the clock takes. A value past what it can express is absurd but must
-    // not overflow the cast, so it is clamped to the longest duration, which
-    // is no limit in practice.
-    const timeout_s = std.math.cast(i64, tools.bash_timeout_s) orelse std.math.maxInt(i64);
-    const result = std.process.run(tools.gpa, tools.io, .{
-        .argv = &.{ "bash", "-c", args.command },
-        // The command runs where the session's tools do, so a resumed session
-        // runs it in the directory the session was started in.
-        .cwd = .{ .dir = tools.dir },
-        .stdout_limit = .limited(max_command_output),
-        .stderr_limit = .limited(max_command_output),
-        // A command that outlives the configured limit is killed, so a
-        // runaway command cannot hang the agent forever.
-        .timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(timeout_s) } },
-    }) catch |err| switch (err) {
-        error.StreamTooLong => return fail(
-            out,
-            "command produced more than {d} bytes of output",
-            .{max_command_output},
-        ),
-        error.Timeout => return fail(
-            out,
-            "command did not finish within {d}s and was killed",
-            .{tools.bash_timeout_s},
-        ),
-        else => return fail(out, "cannot run command: {s}", .{@errorName(err)}),
-    };
-    defer tools.gpa.free(result.stdout);
-    defer tools.gpa.free(result.stderr);
-
-    try out.print("exit code: {d}\n", .{formatting.exitCode(result.term)});
-    if (result.stdout.len == 0 and result.stderr.len == 0) {
-        try out.writeAll("(no output)\n");
-    }
-    try out.writeAll(result.stdout);
-    if (result.stderr.len > 0) {
-        if (result.stdout.len > 0) try out.writeAll("\n");
-        try out.print("stderr:\n{s}", .{result.stderr});
-    }
-}
-
-/// Writes a failure to `out` as the model is given it, so that it can react to
-/// it. A call that could not run still has a result, and this is its shape.
-fn fail(out: *std.Io.Writer, comptime format: []const u8, args: anytype) !void {
-    try out.print("error: " ++ format, args);
 }
 
 /// Runs one call the way the agent does -- parse it, then run it -- writing the
@@ -391,7 +335,7 @@ pub fn parseCallNamed(arena: std.mem.Allocator, name: []const u8, arguments: []c
             return .{ .malformed = .{ .name = name, .reason = reason } } };
     }
     if (std.mem.eql(u8, name, "bash")) {
-        return .{ .bash = fromJson(Call.Bash, arena, arguments) catch |reason|
+        return .{ .bash = fromJson(Bash, arena, arguments) catch |reason|
             return .{ .malformed = .{ .name = name, .reason = reason } } };
     }
     if (std.mem.eql(u8, name, "web_search")) {
