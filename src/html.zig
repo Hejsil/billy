@@ -1066,8 +1066,8 @@ fn toolResult(call: Tools.Call, result: []const u8, out: *std.Io.Writer) !void {
 /// caller's, freed before this returns.
 pub fn block(gpa: std.mem.Allocator, b: agent.Block, out: *std.Io.Writer) !void {
     switch (b) {
-        .prompt => |text| try titled(gpa, agent.marks.prompt.glyph, "prompt", text, out),
-        .answer => |text| try titled(gpa, agent.marks.answer.glyph, "answer", text, out),
+        .prompt => |text| try titled(gpa, "»", "prompt", text, out),
+        .answer => |text| try titled(gpa, "◆", "answer", text, out),
         // A tool call is one `<details>`, whose summary is the head and whose
         // body is everything the call did. Each of the two blocks is a *whole*
         // element: the `tool_begin` one a collapsed call with an empty body, and
@@ -1107,7 +1107,7 @@ pub fn block(gpa: std.mem.Allocator, b: agent.Block, out: *std.Io.Writer) !void 
         // A compaction stands in for the messages it replaced. What it holds is
         // the ask and the summary, which a page could show; for now it is the
         // line the terminal shows it as.
-        .compacted => try element("div", "compacted", agent.marks.compacted.glyph ++ " compacted", out),
+        .compacted => try element("div", "compacted", "⊟ compacted", out),
         .notice => |text| try element("div", "notice", text, out),
         .elided => |count| try out.print("<div class=\"elided\">… {d} earlier blocks</div>\n", .{count}),
     }
