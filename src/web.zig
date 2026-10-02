@@ -17,6 +17,8 @@
 
 const std = @import("std");
 const agent = @import("agent.zig");
+const Config = @import("Config.zig");
+const Health = @import("Health.zig");
 const html = @import("html.zig");
 const models = @import("models.zig");
 const Session = @import("Session.zig");
@@ -937,3 +939,347 @@ const Stream = struct {
         try self.body.flush();
     }
 };
+
+/// A `Setup` over a temporary directory, for a test that drives a route.
+///
+/// The real one reads the environment, the configuration file and the
+/// credentials; a route needs none of that, only somewhere to keep sessions and
+/// a model to name. What it does not read is left empty, and nothing in the
+/// routes reaches for it.
+const TestServer = struct {
+    setup: Setup,
+    tmp: std.testing.TmpDir,
+    /// The configuration the setup points at, freed with it.
+    settings: Config,
+    /// The environment the setup reads, which a route asks for `HOME`. It is
+    /// held by pointer and allocated, so the address the setup was given stays
+    /// the map's when this value is moved out of `init`.
+    environ: *std.process.Environ.Map,
+    /// Which search backends are set aside, so the search settings the setup
+    /// carries point at a table that is really there.
+    health: Health,
+    /// What the server knows beyond the session files, and the client its routes
+    /// borrow, which outlive every request made through this.
+    registry: Registry,
+    http: std.http.Client,
+
+    fn init() !TestServer {
+        const gpa = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+
+        const sessions = try tmp.dir.createDirPathOpen(std.testing.io, "sessions", .{});
+        const settings = Config.init(gpa);
+        const environ = try gpa.create(std.process.Environ.Map);
+        errdefer gpa.destroy(environ);
+        environ.* = .init(gpa);
+        errdefer environ.deinit();
+        try environ.put("HOME", "/home/tester");
+        const health = try Health.load(std.testing.io, gpa, tmp.dir);
+        errdefer health.deinit();
+        return .{
+            .tmp = tmp,
+            .settings = settings,
+            .environ = environ,
+            .health = health,
+            .registry = .{ .io = std.testing.io, .gpa = gpa },
+            .http = .{ .allocator = gpa, .io = std.testing.io },
+            .setup = .{
+                .io = std.testing.io,
+                .gpa = gpa,
+                .environ = environ,
+                .settings = settings,
+                .sessions = sessions,
+                .data_dir = tmp.dir,
+                .config_dir = tmp.dir,
+                .cwd = ".",
+                .api_key = "k",
+                .base_url = "https://api.deepseek.com",
+                .url = "https://api.deepseek.com/chat/completions",
+                .model = "m",
+                .search = null,
+                .health = health,
+            },
+        };
+    }
+
+    fn deinit(server: *TestServer) void {
+        server.http.deinit();
+        server.registry.deinit();
+        server.health.deinit();
+        server.setup.sessions.close(std.testing.io);
+        server.settings.deinit();
+        server.environ.deinit();
+        std.testing.allocator.destroy(server.environ);
+        server.tmp.cleanup();
+    }
+
+    /// Answers `method path` with `body`, through the real `route`.
+    fn exchange(server: *TestServer, method: std.http.Method, path: []const u8, body: ?[]const u8) !Exchange {
+        return Exchange.run(&server.setup, &server.registry, &server.http, method, path, body);
+    }
+
+    /// A session holding one prompt and its reply, written to disk and named as
+    /// `title` when there is one, so a route has something to serve. Its id is
+    /// returned, owned by the caller.
+    fn session(server: *TestServer, title: ?[]const u8) ![]const u8 {
+        var opened = try Session.open(std.testing.io, server.setup.sessions, std.testing.allocator, null, ".");
+        defer opened.deinit();
+        if (title) |name| try opened.setTitle(name);
+        try opened.append(.{ .role = "user", .content = "hello" });
+        try opened.save();
+        return std.testing.allocator.dupe(u8, opened.id());
+    }
+};
+
+/// The path a session's route is asked for, owned by the caller.
+fn sessionPath(id: []const u8, suffix: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(std.testing.allocator, "/api/sessions/{s}{s}", .{ id, suffix });
+}
+
+/// One request through the real `route`, answered into `out`.
+///
+/// The request is written as HTTP and read back by a real `std.http.Server`, so
+/// what is tested is the dispatcher and the handlers as they run, not a stand-in
+/// for them: the target, the method and the body all take the path they take in
+/// a served connection. Nothing is allocated for the answer's own buffers, so a
+/// test sees the bytes the socket would have carried.
+const Exchange = struct {
+    /// What the connection would have written: the status line, the headers and
+    /// the body.
+    written: std.Io.Writer.Allocating,
+    /// Whether a reply had begun, as `handle` tracks it.
+    answered: bool = false,
+
+    /// Answers `method path` with `body`, exactly as the server would.
+    fn run(
+        setup: *Setup,
+        registry: *Registry,
+        http: *std.http.Client,
+        method: std.http.Method,
+        path: []const u8,
+        body: ?[]const u8,
+    ) !Exchange {
+        const gpa = std.testing.allocator;
+        var exchange: Exchange = .{ .written = .init(gpa) };
+        errdefer exchange.written.deinit();
+
+        const request_text = if (body) |payload|
+            try std.fmt.allocPrint(gpa, "{s} {s} HTTP/1.1\r\nhost: billy\r\ncontent-type: application/json\r\n" ++
+                "content-length: {d}\r\n\r\n{s}", .{ @tagName(method), path, payload.len, payload })
+        else
+            try std.fmt.allocPrint(gpa, "{s} {s} HTTP/1.1\r\nhost: billy\r\n\r\n", .{ @tagName(method), path });
+        defer gpa.free(request_text);
+
+        var in_buffer: [4096]u8 = undefined;
+        if (request_text.len > in_buffer.len) return error.RequestTooLong;
+        @memcpy(in_buffer[0..request_text.len], request_text);
+        var reader = std.Io.Reader.fixed(in_buffer[0..request_text.len]);
+
+        // Room for the largest answer a route writes, which is the page itself.
+        var out_buffer: [128 * 1024]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&out_buffer);
+
+        var server: std.http.Server = .init(&reader, &writer);
+        var request = try server.receiveHead();
+        try route(setup, registry, http, &request, &exchange.answered);
+        try exchange.written.writer.writeAll(writer.buffered());
+        return exchange;
+    }
+
+    fn deinit(exchange: *Exchange) void {
+        exchange.written.deinit();
+    }
+
+    /// What the answer began with, such as `200 OK`, or the method and target
+    /// when the answer is the one `route` writes for a request it does not know.
+    fn statusLine(exchange: *Exchange) []const u8 {
+        const text = exchange.written.written();
+        const end = std.mem.indexOf(u8, text, "\r\n") orelse text.len;
+        return text[0..end];
+    }
+
+    fn contains(exchange: *Exchange, needle: []const u8) bool {
+        return std.mem.indexOf(u8, exchange.written.written(), needle) != null;
+    }
+};
+
+test "a route answers a request it does not know with a 404" {
+    var server = try TestServer.init();
+    defer server.deinit();
+
+    var exchange = try server.exchange(.GET, "/nope", null);
+    defer exchange.deinit();
+
+    try std.testing.expectEqualStrings("HTTP/1.1 404 Not Found", exchange.statusLine());
+    try std.testing.expect(exchange.contains("not found"));
+}
+
+test "the page is served at the root, byte for byte" {
+    var server = try TestServer.init();
+    defer server.deinit();
+
+    var exchange = try server.exchange(.GET, "/", null);
+    defer exchange.deinit();
+
+    try std.testing.expectEqualStrings("HTTP/1.1 200 OK", exchange.statusLine());
+    // The answer is the embedded page and nothing else, so what is served is
+    // the file `index.html` holds rather than something built to look like it.
+    try std.testing.expect(exchange.contains(page));
+}
+
+test "the session list is read from disk, newest first" {
+    var server = try TestServer.init();
+    defer server.deinit();
+
+    // Nothing on disk is an empty list rather than a failure, since a fresh
+    // billy has no sessions at all.
+    var empty = try server.exchange(.GET, "/api/sessions", null);
+    defer empty.deinit();
+    try std.testing.expectEqualStrings("HTTP/1.1 200 OK", empty.statusLine());
+    try std.testing.expect(empty.contains("{\"sessions\":[]}"));
+
+    // A session written to disk is listed by its id and title.
+    const id = try server.session("a named session");
+    defer std.testing.allocator.free(id);
+
+    var listed = try server.exchange(.GET, "/api/sessions", null);
+    defer listed.deinit();
+    try std.testing.expectEqualStrings("HTTP/1.1 200 OK", listed.statusLine());
+    try std.testing.expect(listed.contains(id));
+    try std.testing.expect(listed.contains("a named session"));
+}
+
+test "one session is opened as the page the frontend reads" {
+    var server = try TestServer.init();
+    defer server.deinit();
+
+    const id = try server.session(null);
+    defer std.testing.allocator.free(id);
+    const path = try sessionPath(id, "");
+    defer std.testing.allocator.free(path);
+
+    var opened = try server.exchange(.GET, path, null);
+    defer opened.deinit();
+    try std.testing.expectEqualStrings("HTTP/1.1 200 OK", opened.statusLine());
+    // The three things the page reads: the header, the blocks, and the mode.
+    try std.testing.expect(opened.contains("\"header\":"));
+    try std.testing.expect(opened.contains("\"blocks\":"));
+    try std.testing.expect(opened.contains("\"mode\":"));
+    // The conversation is in the blocks, as the page shows it.
+    try std.testing.expect(opened.contains("hello"));
+}
+
+test "an id with no session is a 404, and one that is not an id is a 400" {
+    var server = try TestServer.init();
+    defer server.deinit();
+
+    // An id of the right shape with no file behind it.
+    var missing = try server.exchange(.GET, "/api/sessions/01M3AAAAAAAAAAAAAAAAAAAAAA", null);
+    defer missing.deinit();
+    try std.testing.expectEqualStrings("HTTP/1.1 404 Not Found", missing.statusLine());
+
+    // Something that could never be an id is refused as a bad request rather
+    // than looked for, so it cannot be turned into a path.
+    var malformed = try server.exchange(.GET, "/api/sessions/..%2f..%2fetc", null);
+    defer malformed.deinit();
+    try std.testing.expectEqualStrings("HTTP/1.1 400 Bad Request", malformed.statusLine());
+}
+
+test "a session is renamed, and the name is on disk" {
+    var server = try TestServer.init();
+    defer server.deinit();
+
+    const id = try server.session(null);
+    defer std.testing.allocator.free(id);
+    const path = try sessionPath(id, "");
+    defer std.testing.allocator.free(path);
+
+    var renamed = try server.exchange(.PATCH, path, "{\"title\":\"renamed by the test\"}");
+    defer renamed.deinit();
+    try std.testing.expectEqualStrings("HTTP/1.1 200 OK", renamed.statusLine());
+
+    // The new name is on disk, not only in the answer.
+    var reread = try Session.open(std.testing.io, server.setup.sessions, std.testing.allocator, id, ".");
+    defer reread.deinit();
+    try std.testing.expectEqualStrings("renamed by the test", reread.title().?);
+}
+
+test "a rename that says nothing usable is refused" {
+    var server = try TestServer.init();
+    defer server.deinit();
+
+    const id = try server.session(null);
+    defer std.testing.allocator.free(id);
+    const path = try sessionPath(id, "");
+    defer std.testing.allocator.free(path);
+
+    // Whitespace is not a title: a session named " " would read as one that was
+    // never named, which is what the list falls back to the id for.
+    var blank = try server.exchange(.PATCH, path, "{\"title\":\"   \"}");
+    defer blank.deinit();
+    try std.testing.expectEqualStrings("HTTP/1.1 400 Bad Request", blank.statusLine());
+
+    // Body that is not JSON at all.
+    var not_json = try server.exchange(.PATCH, path, "not json");
+    defer not_json.deinit();
+    try std.testing.expectEqualStrings("HTTP/1.1 400 Bad Request", not_json.statusLine());
+
+    // And the session is left unnamed rather than holding either of them.
+    var reread = try Session.open(std.testing.io, server.setup.sessions, std.testing.allocator, id, ".");
+    defer reread.deinit();
+    try std.testing.expect(reread.title() == null);
+}
+
+test "a session is deleted, and deleting it again is a 404" {
+    var server = try TestServer.init();
+    defer server.deinit();
+
+    const id = try server.session(null);
+    defer std.testing.allocator.free(id);
+    const path = try sessionPath(id, "");
+    defer std.testing.allocator.free(path);
+
+    var removed = try server.exchange(.DELETE, path, null);
+    defer removed.deinit();
+    try std.testing.expectEqualStrings("HTTP/1.1 200 OK", removed.statusLine());
+
+    // Gone from disk, so nothing can be opened by that id again.
+    try std.testing.expectError(error.SessionNotFound, Session.open(
+        std.testing.io,
+        server.setup.sessions,
+        std.testing.allocator,
+        id,
+        ".",
+    ));
+
+    // A second delete finds nothing to remove, which is a 404 rather than a
+    // failure: the session is gone either way.
+    var again = try server.exchange(.DELETE, path, null);
+    defer again.deinit();
+    try std.testing.expectEqualStrings("HTTP/1.1 404 Not Found", again.statusLine());
+}
+
+test "a prompt is refused while the session is busy, and one that asks nothing" {
+    var server = try TestServer.init();
+    defer server.deinit();
+
+    const id = try server.session(null);
+    defer std.testing.allocator.free(id);
+    const path = try sessionPath(id, "/message");
+    defer std.testing.allocator.free(path);
+
+    // An empty prompt is refused before anything is opened or taken, so a
+    // request that asks nothing cannot start a turn.
+    var empty = try server.exchange(.POST, path, "{\"text\":\"\"}");
+    defer empty.deinit();
+    try std.testing.expectEqualStrings("HTTP/1.1 400 Bad Request", empty.statusLine());
+
+    // A session a turn is running for answers 409 rather than running a second
+    // one over the top of it. The claim stands in for the turn here.
+    try std.testing.expect(try server.registry.claim(id));
+    defer server.registry.release(id);
+    var busy = try server.exchange(.POST, path, "{\"text\":\"do something\"}");
+    defer busy.deinit();
+    try std.testing.expectEqualStrings("HTTP/1.1 409 Conflict", busy.statusLine());
+}
