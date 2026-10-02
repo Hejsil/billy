@@ -86,7 +86,7 @@ pub const Display = struct {
     formats: Tools.Formats = .{},
     /// How billy decorates the lines it prints itself, such as a block header.
     /// Plain everywhere the terminal does not take escape codes.
-    style: term.Style = .plain,
+    style: Terminal.Style = .plain,
 };
 
 /// One unit of what a run shows: the pieces a conversation is made of, each
@@ -1154,7 +1154,7 @@ fn summarize(
 fn expectTranscript(
     expected: []const u8,
     messages: []const llm.Message,
-    style: term.Style,
+    style: Terminal.Style,
 ) !void {
     const gpa = std.testing.allocator;
 

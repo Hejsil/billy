@@ -9,7 +9,7 @@
 //! and the model keep the text as it was written.
 
 const std = @import("std");
-const term = @import("term.zig");
+const Terminal = @import("Terminal.zig");
 
 /// Context lines kept on each side of the change. A model often hands over the
 /// whole block it matched; only the lines nearest the change are worth showing.
@@ -120,7 +120,7 @@ pub fn render(gpa: std.mem.Allocator, diff: []const Line) ![]const u8 {
 /// green, the context dim, and each line opened with the mark of its kind. The
 /// marks carry the meaning where the colour does not, such as a pipe or a
 /// colour-blind terminal.
-pub fn print(diff: []const Line, style: term.Style, out: *std.Io.Writer) !void {
+pub fn print(diff: []const Line, style: Terminal.Style, out: *std.Io.Writer) !void {
     for (diff) |line| {
         switch (line.kind) {
             .context => {
@@ -137,7 +137,7 @@ pub fn print(diff: []const Line, style: term.Style, out: *std.Io.Writer) !void {
 
 /// Writes one line as its mark and its text in `hue`, so a removed line reads
 /// `-what it was` and an added line `+what it is`.
-fn markedLine(kind: Kind, text: []const u8, hue: term.Style.Color, style: term.Style, out: *std.Io.Writer) !void {
+fn markedLine(kind: Kind, text: []const u8, hue: Terminal.Style.Color, style: Terminal.Style, out: *std.Io.Writer) !void {
     try style.color(hue, &.{kind.mark()}, out);
     try style.color(hue, text, out);
 }

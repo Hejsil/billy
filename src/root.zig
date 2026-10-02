@@ -15,6 +15,7 @@ pub const search = @import("search.zig");
 pub const Setup = @import("Setup.zig");
 pub const Session = @import("Session.zig");
 pub const term = @import("term.zig");
+pub const Terminal = @import("Terminal.zig");
 pub const Tools = @import("Tools.zig");
 pub const web = @import("web.zig");
 pub const ulid = @import("ulid.zig");

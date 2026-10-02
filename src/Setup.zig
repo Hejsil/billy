@@ -16,7 +16,7 @@ const Health = @import("Health.zig");
 const models = @import("models.zig");
 const Search = @import("search.zig");
 const Session = @import("Session.zig");
-const term = @import("term.zig");
+const Terminal = @import("Terminal.zig");
 
 const Setup = @This();
 
@@ -250,7 +250,7 @@ fn searchConfig(
 ///
 /// Nothing is allocated here: every string is one the setup already holds, so
 /// asking for this once a turn costs nothing that would have to be freed.
-pub fn agentConfig(setup: *Setup, cwd: []const u8, style: term.Style) agent.Config {
+pub fn agentConfig(setup: *Setup, cwd: []const u8, style: Terminal.Style) agent.Config {
     const settings = &setup.settings;
     return .{
         .api_key = setup.api_key,

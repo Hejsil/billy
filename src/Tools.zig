@@ -5,7 +5,7 @@ const llm = @import("llm.zig");
 const Search = @import("search.zig");
 const formatting = @import("format.zig");
 const diffing = @import("diff.zig");
-const term = @import("term.zig");
+const Terminal = @import("Terminal.zig");
 const Session = @import("Session.zig");
 const agent = @import("agent.zig");
 
@@ -114,7 +114,7 @@ formats: Formats,
 bash_timeout_s: usize,
 /// How the lines billy prints itself are decorated. Shared with the
 /// transcript, so a replayed session looks like the run it continues.
-style: term.Style,
+style: Terminal.Style,
 /// The web search and fetch client, or null when no backend is configured. A
 /// null leaves `web_search` and `web_fetch` out of the tool set billy offers, so
 /// the model is never given a tool that could not run.
@@ -137,7 +137,7 @@ pub const Options = struct {
     /// worth catching at the call site rather than papering over with 120.
     bash_timeout_s: usize,
     /// How the lines billy prints itself are decorated.
-    style: term.Style = .plain,
+    style: Terminal.Style = .plain,
     /// The backend the configuration asked for, with its key resolved, or null
     /// to leave web search out. A null also leaves `web_search` out of the
     /// tool set billy offers, so the model is never given a tool that could
@@ -797,7 +797,7 @@ pub fn describe(
     call: Call,
     result: []const u8,
     formats: Formats,
-    style: term.Style,
+    style: Terminal.Style,
     out: *std.Io.Writer,
 ) !void {
     try printHead(scratch, call, formats, style, out);
@@ -809,15 +809,15 @@ pub fn describe(
 /// rather than in front of every row of output, which the terminal wraps on its
 /// own and cannot be marked without folding it here.
 const marks = struct {
-    const read = term.Style.Mark{ .glyph = "▸", .hue = .blue };
-    const write = term.Style.Mark{ .glyph = "◂", .hue = .green };
-    const edit = term.Style.Mark{ .glyph = "✎", .hue = .yellow };
-    const bash = term.Style.Mark{ .glyph = "❯", .hue = .cyan };
-    const search = term.Style.Mark{ .glyph = "⌕", .hue = .magenta };
-    const fetch = term.Style.Mark{ .glyph = "⇣", .hue = .magenta };
+    const read = Terminal.Style.Mark{ .glyph = "▸", .hue = .blue };
+    const write = Terminal.Style.Mark{ .glyph = "◂", .hue = .green };
+    const edit = Terminal.Style.Mark{ .glyph = "✎", .hue = .yellow };
+    const bash = Terminal.Style.Mark{ .glyph = "❯", .hue = .cyan };
+    const search = Terminal.Style.Mark{ .glyph = "⌕", .hue = .magenta };
+    const fetch = Terminal.Style.Mark{ .glyph = "⇣", .hue = .magenta };
     /// A call that could not be named: a tool billy does not implement, or
     /// arguments that could not be read.
-    const unknown = term.Style.Mark{ .glyph = "?", .hue = .red };
+    const unknown = Terminal.Style.Mark{ .glyph = "?", .hue = .red };
 };
 
 /// How a call is headed: the glyph its tool is marked with, the name of the tool
@@ -828,7 +828,7 @@ pub const Heading = struct {
     /// The glyph the tool is marked with.
     glyph: []const u8,
     /// The colour the terminal shows the glyph in. The web has its own.
-    hue: term.Style.Color,
+    hue: Terminal.Style.Color,
     /// The name of the tool the call names.
     name: []const u8,
     /// What the call acts on, such as a read's path or a search's query, or
@@ -858,7 +858,7 @@ pub const Heading = struct {
 
     /// The heading of a call to the tool `mark` stands for: the mark's glyph, the
     /// tool's name, and what the call acts on.
-    fn marked(mark: term.Style.Mark, name: []const u8, target: []const u8) Heading {
+    fn marked(mark: Terminal.Style.Mark, name: []const u8, target: []const u8) Heading {
         return .{ .glyph = mark.glyph, .hue = mark.hue, .name = name, .target = target };
     }
 };
@@ -876,9 +876,9 @@ pub fn headerLine(text: []const u8) []const u8 {
 /// bash command is laid out by the bash formatter, so it reads the way it runs;
 /// an edit is shown as the diff of the strings it works on; and a search shows
 /// the query it ran.
-pub fn printHead(scratch: std.mem.Allocator, call: Call, formats: Formats, style: term.Style, out: *std.Io.Writer) !void {
+pub fn printHead(scratch: std.mem.Allocator, call: Call, formats: Formats, style: Terminal.Style, out: *std.Io.Writer) !void {
     const head = Heading.of(call);
-    const mark = term.Style.Mark{ .glyph = head.glyph, .hue = head.hue };
+    const mark = Terminal.Style.Mark{ .glyph = head.glyph, .hue = head.hue };
     try mark.header(head.name, head.target, style, out);
     // What a call shows under its header: the change it means to make, or the
     // command it runs. Every other call is its header alone.
@@ -901,7 +901,7 @@ fn printDiff(
     old: []const u8,
     new: []const u8,
     format: Format,
-    style: term.Style,
+    style: Terminal.Style,
     out: *std.Io.Writer,
 ) !void {
     const diff = try diffing.lines(scratch, old, new);
@@ -950,17 +950,17 @@ pub const exit_marks = struct {
 const Ink = union(enum) {
     plain,
     dim,
-    hue: term.Style.Color,
+    hue: Terminal.Style.Color,
 };
 
 /// Prints a label such as `▾ stdout` in bold, so it reads as the heading of the
 /// lines under it rather than as the first of them.
-fn printLabel(name: []const u8, style: term.Style, out: *std.Io.Writer) !void {
+fn printLabel(name: []const u8, style: Terminal.Style, out: *std.Io.Writer) !void {
     try out.print("{s}{s} {s}{s}\n", .{ style.on("1"), label_mark, name, style.off() });
 }
 
 /// Prints `text` in the way `ink` asks for.
-fn printInk(text: []const u8, ink: Ink, style: term.Style, out: *std.Io.Writer) !void {
+fn printInk(text: []const u8, ink: Ink, style: Terminal.Style, out: *std.Io.Writer) !void {
     switch (ink) {
         .plain => try out.writeAll(text),
         .dim => try style.dim(text, out),
@@ -982,7 +982,7 @@ fn printScript(command: []const u8, format: Format, out: *std.Io.Writer) !void {
 /// it put in the file; an edit shows nothing, since its result would only repeat
 /// the change shown above it. Anything that failed shows why instead, whatever
 /// it was asked to do.
-pub fn printResult(call: Call, result: []const u8, style: term.Style, out: *std.Io.Writer) !void {
+pub fn printResult(call: Call, result: []const u8, style: Terminal.Style, out: *std.Io.Writer) !void {
     // A call that failed reports why, whatever it was asked to do. The whole
     // result is billy's own message, so it is shown the way billy shows a
     // failure.
@@ -1015,7 +1015,7 @@ pub fn printResult(call: Call, result: []const u8, style: term.Style, out: *std.
 ///
 /// The status and the split are read back from the result, which is what billy
 /// stored and handed the model, so a replayed session shows the same block.
-fn printBash(result: []const u8, style: term.Style, out: *std.Io.Writer) !void {
+fn printBash(result: []const u8, style: Terminal.Style, out: *std.Io.Writer) !void {
     const parts = splitBash(result) orelse {
         // A result that is not one billy wrote is shown as it is, so a session
         // saved before the status was written still shows everything.
@@ -1038,7 +1038,7 @@ fn printBash(result: []const u8, style: term.Style, out: *std.Io.Writer) !void {
 /// in green when the command succeeded, `✗ exit 1` and the rest in red when it
 /// did not. The stored line reads `exit code: N` for the model; only the line
 /// the user sees is marked and shortened.
-fn printExit(status: []const u8, style: term.Style, out: *std.Io.Writer) !void {
+fn printExit(status: []const u8, style: Terminal.Style, out: *std.Io.Writer) !void {
     const exit = parseExit(status);
     const mark = if (exit.ok) exit_marks.ok else exit_marks.failed;
     var buffer: [64]u8 = undefined;
@@ -1127,7 +1127,7 @@ fn splitBash(result: []const u8) ?BashResult {
 /// count of the rest is printed in place of them, so the block stays short
 /// without hiding that there was more. Every line is printed in `ink`, which is
 /// dim for a tool's output and a colour for billy's own message.
-fn printTruncated(text: []const u8, ink: Ink, style: term.Style, out: *std.Io.Writer) !void {
+fn printTruncated(text: []const u8, ink: Ink, style: Terminal.Style, out: *std.Io.Writer) !void {
     const body = std.mem.trimEnd(u8, text, "\n");
     if (body.len == 0) return;
 
@@ -1865,7 +1865,7 @@ test "parseCall splits known, unknown and malformed calls" {
 /// escape codes -- so a test that wants a colour or a formatter says only that.
 const Shown = struct {
     formats: Formats = .{},
-    style: term.Style = .plain,
+    style: Terminal.Style = .plain,
 };
 
 /// Renders a call named `name` with `arguments` and the `result` it produced,

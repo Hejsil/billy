@@ -6,6 +6,8 @@ const agent = @import("agent.zig");
 const term = @import("term.zig");
 const Tools = @import("Tools.zig");
 
+pub const Style = @import("Terminal/style.zig").Style;
+
 const Terminal = @This();
 
 out: *std.Io.Writer,
@@ -95,7 +97,7 @@ fn printAnswer(gpa: std.mem.Allocator, out: *std.Io.Writer, content: ?[]const u8
 /// that compacts shows the event rather than the two messages. It is headed like
 /// every other block, with its own mark, and opens with the blank line that
 /// separates it from the block before it.
-fn printCompacted(out: *std.Io.Writer, style: term.Style) !void {
+fn printCompacted(out: *std.Io.Writer, style: Style) !void {
     try out.writeAll("\n");
     try marks.compacted.header("compacted", "", style, out);
     try out.flush();
@@ -104,7 +106,7 @@ fn printCompacted(out: *std.Io.Writer, style: term.Style) !void {
 /// Prints how many blocks a trimmed transcript left out, dimmed, so a resume does
 /// not read as the whole session. It is the count a short block gives of the
 /// lines it cut, standing where the blocks it names would have been.
-fn printElided(count: usize, style: term.Style, out: *std.Io.Writer) !void {
+fn printElided(count: usize, style: Style, out: *std.Io.Writer) !void {
     try out.print("{s}… {d} earlier blocks{s}\n", .{ style.on("2"), count, style.off() });
 }
 
@@ -114,11 +116,11 @@ fn printElided(count: usize, style: term.Style, out: *std.Io.Writer) !void {
 /// frontends show a block in: the terminal colours them and the web gives them
 /// classes, but a prompt is a prompt in either.
 pub const marks = struct {
-    pub const prompt = term.Style.Mark{ .glyph = "»", .hue = .blue };
-    pub const answer = term.Style.Mark{ .glyph = "◆", .hue = .green };
+    pub const prompt = Style.Mark{ .glyph = "»", .hue = .blue };
+    pub const answer = Style.Mark{ .glyph = "◆", .hue = .green };
     /// The line a compaction shows as, standing in for the prompt that asked for
     /// it and the summary it produced.
-    pub const compacted = term.Style.Mark{ .glyph = "⊟", .hue = .yellow };
+    pub const compacted = Style.Mark{ .glyph = "⊟", .hue = .yellow };
 };
 
 test "a prompt is headed by the same block live and replayed" {

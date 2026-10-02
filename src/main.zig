@@ -250,7 +250,7 @@ fn runSession(
 
     // The terminal lays its blocks out for the terminal it is on, which the
     // escape codes of a pipe or a redirection would only be noise in.
-    const config = setup.agentConfig(session.cwd(), billy.term.Style.detect(io, .stdout()));
+    const config = setup.agentConfig(session.cwd(), billy.Terminal.Style.detect(io, .stdout()));
 
     if (resume_id != null) {
         // Replay the conversation as a transcript, so the context does not

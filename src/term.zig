@@ -15,8 +15,7 @@
 
 const std = @import("std");
 const md = @import("md.zig");
-
-pub const Style = @import("term/style.zig").Style;
+const Terminal = @import("Terminal.zig");
 
 /// Deepest a list nests before its indent stops growing, so a malformed document
 /// cannot walk `list` off its end.
@@ -33,7 +32,7 @@ const max_columns = 32;
 /// Writes `text`, read as markdown, as the terminal shows it. `style` decides
 /// whether bold, colour and links are written as escape codes or left out, which
 /// is what makes a pipe to a file read as plain structured text.
-pub fn write(gpa: std.mem.Allocator, text: []const u8, style: Style, out: *std.Io.Writer) !void {
+pub fn write(gpa: std.mem.Allocator, text: []const u8, style: Terminal.Style, out: *std.Io.Writer) !void {
     var render = Markdown{ .gpa = gpa, .out = out, .style = style };
     defer render.deinit();
     var parser = Markdown.parser();
@@ -50,7 +49,7 @@ pub fn write(gpa: std.mem.Allocator, text: []const u8, style: Style, out: *std.I
 const Markdown = struct {
     gpa: std.mem.Allocator,
     out: *std.Io.Writer,
-    style: Style,
+    style: Terminal.Style,
     /// The first failure, kept here because a callback returns a number, not an
     /// error.
     err: ?anyerror = null,
@@ -639,7 +638,7 @@ const Markdown = struct {
 
 /// Renders `text` and compares it to `expected`, so a test reads as the text a
 /// terminal shows rather than as the buffer around it.
-fn expectRendered(expected: []const u8, text: []const u8, style: Style) !void {
+fn expectRendered(expected: []const u8, text: []const u8, style: Terminal.Style) !void {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try write(std.testing.allocator, text, style, &out.writer);
