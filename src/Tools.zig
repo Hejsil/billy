@@ -8,9 +8,9 @@ const diffing = @import("diff.zig");
 const Terminal = @import("Terminal.zig");
 const Session = @import("Session.zig");
 const agent = @import("agent.zig");
-
 const Edit = @import("Tools/Edit.zig");
 const Read = @import("Tools/Read.zig");
+const Write = @import("Tools/Write.zig");
 const web = @import("Tools/web.zig");
 
 const Tools = @This();
@@ -55,11 +55,6 @@ pub const Call = union(enum) {
     unknown: []const u8,
     /// A known tool whose arguments could not be read; `name` is still known.
     malformed: Malformed,
-
-    pub const Write = struct {
-        path: []const u8,
-        content: []const u8,
-    };
 
     pub const Bash = struct {
         command: []const u8,
@@ -289,9 +284,9 @@ const Limited = struct {
 /// run -- to `out`, in the shape the model is given it.
 fn dispatch(tools: *Tools, call: Call, out: *std.Io.Writer) !void {
     switch (call) {
-        .read => |read| try read.run(tools.gpa, tools.io, tools.dir, out),
-        .write => |args| try tools.write(args, out),
         .edit => |edit| try edit.run(tools.gpa, tools.io, tools.dir, out),
+        .read => |read| try read.run(tools.gpa, tools.io, tools.dir, out),
+        .write => |write| try write.run(tools.io, tools.dir, out),
         .bash => |args| try tools.bash(args, out),
         inline .web_search, .web_fetch => |w| {
             const client = &(tools.search orelse return fail(out, "web search is not configured", .{}));
@@ -304,16 +299,6 @@ fn dispatch(tools: *Tools, call: Call, out: *std.Io.Writer) !void {
             .{ bad.name, @errorName(bad.reason) },
         ),
     }
-}
-
-fn write(tools: *Tools, args: Call.Write, out: *std.Io.Writer) !void {
-    if (std.fs.path.dirname(args.path)) |parent| {
-        tools.dir.createDirPath(tools.io, parent) catch |err|
-            return fail(out, "cannot create {s}: {s}", .{ parent, @errorName(err) });
-    }
-    tools.dir.writeFile(tools.io, .{ .sub_path = args.path, .data = args.content }) catch |err|
-        return fail(out, "cannot write {s}: {s}", .{ args.path, @errorName(err) });
-    try out.print("wrote {d} bytes to {s}", .{ args.content.len, args.path });
 }
 
 fn bash(tools: *Tools, args: Call.Bash, out: *std.Io.Writer) !void {
@@ -398,7 +383,7 @@ pub fn parseCallNamed(arena: std.mem.Allocator, name: []const u8, arguments: []c
             return .{ .malformed = .{ .name = name, .reason = reason } } };
     }
     if (std.mem.eql(u8, name, "write")) {
-        return .{ .write = fromJson(Call.Write, arena, arguments) catch |reason|
+        return .{ .write = fromJson(Write, arena, arguments) catch |reason|
             return .{ .malformed = .{ .name = name, .reason = reason } } };
     }
     if (std.mem.eql(u8, name, "edit")) {
