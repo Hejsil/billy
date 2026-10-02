@@ -1,4 +1,5 @@
 const std = @import("std");
+const Tools = @import("../Tools.zig");
 const format = @import("../format.zig");
 
 const Bash = @This();
@@ -32,15 +33,17 @@ pub fn run(
         // runaway command cannot hang the agent forever.
         .timeout = .{ .duration = .{ .clock = .awake, .raw = timeout } },
     }) catch |err| switch (err) {
-        error.StreamTooLong => return out.print(
-            "error: command produced more than {d} bytes of output",
+        error.StreamTooLong => return Tools.fail(
+            out,
+            "command produced more than {d} bytes of output",
             .{max_command_output},
         ),
-        error.Timeout => return out.print(
-            "error: command did not finish within {d}s and was killed",
+        error.Timeout => return Tools.fail(
+            out,
+            "command did not finish within {d}s and was killed",
             .{timeout.toSeconds()},
         ),
-        else => return out.print("error: cannot run command: {s}", .{@errorName(err)}),
+        else => return Tools.fail(out, "cannot run command: {s}", .{@errorName(err)}),
     };
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);

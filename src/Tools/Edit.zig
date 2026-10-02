@@ -1,4 +1,5 @@
 const std = @import("std");
+const Tools = @import("../Tools.zig");
 
 const Edit = @This();
 
@@ -9,19 +10,20 @@ replace_all: bool = false,
 
 pub fn run(edit: Edit, gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, out: *std.Io.Writer) !void {
     if (edit.old_string.len == 0)
-        return out.writeAll("error: old_string must not be empty");
+        return Tools.fail(out, "old_string must not be empty", .{});
 
     const contents = dir.readFileAlloc(io, edit.path, gpa, .limited(16 << 20)) catch |err|
-        return out.print("error: cannot read {s}: {s}", .{ edit.path, @errorName(err) });
+        return Tools.fail(out, "cannot read {s}: {s}", .{ edit.path, @errorName(err) });
     defer gpa.free(contents);
 
     const amount: Amount = if (edit.replace_all) .all else .one;
     var change = try replace(gpa, contents, edit.old_string, edit.new_string, amount);
 
     switch (change) {
-        .not_found => return out.print("error: old_string not found in {s}", .{edit.path}),
-        .ambiguous => |count| return out.print(
-            "error: old_string appears {d} times in {s}; add context or pass replace_all",
+        .not_found => return Tools.fail(out, "old_string not found in {s}", .{edit.path}),
+        .ambiguous => |count| return Tools.fail(
+            out,
+            "old_string appears {d} times in {s}; add context or pass replace_all",
             .{ count, edit.path },
         ),
         .applied => |*applied| {
@@ -29,7 +31,7 @@ pub fn run(edit: Edit, gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, out:
             dir.writeFile(io, .{
                 .sub_path = edit.path,
                 .data = applied.text.items,
-            }) catch |err| return out.print("error: cannot write {s}: {s}", .{ edit.path, @errorName(err) });
+            }) catch |err| return Tools.fail(out, "cannot write {s}: {s}", .{ edit.path, @errorName(err) });
 
             try out.print("replaced {d} occurrence(s) in {s}", .{ applied.count, edit.path });
         },

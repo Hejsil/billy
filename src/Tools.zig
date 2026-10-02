@@ -270,6 +270,15 @@ const Limited = struct {
     }
 };
 
+/// Writes the reason a call could not run, which is how a failed call is told
+/// from one that answered: every failure begins with `error: `, and a result is
+/// read for it both by the terminal and by the page (see `printResult` and
+/// `html.block`). A tool that fails through this writes only what went wrong,
+/// and the mark that makes it a failure is added here rather than by each tool.
+pub fn fail(out: *std.Io.Writer, comptime format: []const u8, args: anytype) !void {
+    try out.print("error: " ++ format, args);
+}
+
 /// Runs a parsed call, writing the result of it -- or the reason it could not
 /// run -- to `out`, in the shape the model is given it.
 fn dispatch(tools: *Tools, call: Call, out: *std.Io.Writer) !void {
@@ -283,12 +292,13 @@ fn dispatch(tools: *Tools, call: Call, out: *std.Io.Writer) !void {
             try bash.run(tools.gpa, tools.io, tools.dir, timeout, out);
         },
         inline .web_search, .web_fetch => |w| {
-            const client = &(tools.search orelse return out.writeAll("error: web search is not configured"));
+            const client = &(tools.search orelse return fail(out, "web search is not configured", .{}));
             try w.run(tools.gpa, client, out);
         },
-        .unknown => |name| try out.print("error: unknown tool '{s}'", .{name}),
-        .malformed => |bad| try out.print(
-            "error: invalid arguments for {s}: {s}",
+        .unknown => |name| try fail(out, "unknown tool '{s}'", .{name}),
+        .malformed => |bad| try fail(
+            out,
+            "invalid arguments for {s}: {s}",
             .{ bad.name, @errorName(bad.reason) },
         ),
     }
@@ -1492,6 +1502,48 @@ fn testTools(with_search: bool) !Tools {
         // Not used by tests
         .http = undefined,
     });
+}
+
+test "a failure is written the way a reader knows it is one" {
+    // Every tool that fails goes through `fail`, so what it writes begins with
+    // the mark both readers branch on: the terminal colours it as a failure and
+    // the page draws it as one. A tool that wrote its own message without that
+    // mark would read as a call that answered.
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    try fail(&out.writer, "cannot do {s}", .{"the thing"});
+    try std.testing.expectEqualStrings("error: cannot do the thing", out.written());
+    try std.testing.expect(std.mem.startsWith(u8, out.written(), "error: "));
+}
+
+test "a fetch that fails reaches the reader as a failure" {
+    // The mark is not decoration: `printResult` and `html.block` both tell a
+    // failed call from one that answered by looking for it, so a fetch that
+    // failed without it would be shown as a call that succeeded and said
+    // "fetch failed: ...".
+    //
+    // The url is empty, which the tool refuses before it reaches a backend, so
+    // this says what a reader is given without a request being made.
+    const gpa = std.testing.allocator;
+    var result: std.Io.Writer.Allocating = .init(gpa);
+    defer result.deinit();
+
+    const call = parse(gpa, .{ .id = "1", .function = .{
+        .name = "web_fetch",
+        .arguments = "{\"url\":\"\"}",
+    } });
+    var tool_set = try testTools(true);
+    try tool_set.run(call, &result.writer);
+    try std.testing.expectEqualStrings("error: no url to fetch", result.written());
+
+    // And the reader is told it failed, rather than reading the text as an
+    // answer the call gave.
+    var shown: std.Io.Writer.Allocating = .init(gpa);
+    defer shown.deinit();
+    try printResult(call, result.written(), .ansi, &shown.writer);
+    try std.testing.expect(std.mem.indexOf(u8, shown.written(), "output") != null);
 }
 
 test "the definitions cover every tool the loop dispatches" {

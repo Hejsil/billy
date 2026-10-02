@@ -1,5 +1,6 @@
 const std = @import("std");
 const search = @import("../../search.zig");
+const Tools = @import("../../Tools.zig");
 
 const Search = @This();
 
@@ -17,9 +18,12 @@ pub fn run(s: Search, gpa: std.mem.Allocator, client: *search.Client, out: *std.
     const text = client.search(arena_state.allocator(), s.query) catch |err| switch (err) {
         // Every backend is set aside after failing, which is what the user can
         // fix: one backend is a single point of failure.
-        error.AllBackendsSetAside => return out.writeAll("error: every search backend is set " ++
-            "aside after failing; add another to tools.web_search.providers, or wait"),
-        else => return out.print("error: search failed: {s}", .{@errorName(err)}),
+        error.AllBackendsSetAside => return Tools.fail(
+            out,
+            "every search backend is set aside after failing; add another to tools.web_search.providers, or wait",
+            .{},
+        ),
+        else => return Tools.fail(out, "search failed: {s}", .{@errorName(err)}),
     };
     try out.writeAll(text);
 }
