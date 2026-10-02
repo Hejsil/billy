@@ -10,6 +10,7 @@ const Session = @import("Session.zig");
 const agent = @import("agent.zig");
 
 const Edit = @import("Tools/Edit.zig");
+const Read = @import("Tools/Read.zig");
 const web = @import("Tools/web.zig");
 
 const Tools = @This();
@@ -54,14 +55,6 @@ pub const Call = union(enum) {
     unknown: []const u8,
     /// A known tool whose arguments could not be read; `name` is still known.
     malformed: Malformed,
-
-    pub const Read = struct {
-        path: []const u8,
-        /// First line to read, 1-based.
-        offset: ?usize = null,
-        /// Maximum number of lines.
-        limit: ?usize = null,
-    };
 
     pub const Write = struct {
         path: []const u8,
@@ -296,7 +289,7 @@ const Limited = struct {
 /// run -- to `out`, in the shape the model is given it.
 fn dispatch(tools: *Tools, call: Call, out: *std.Io.Writer) !void {
     switch (call) {
-        .read => |args| try tools.read(args, out),
+        .read => |read| try read.run(tools.gpa, tools.io, tools.dir, out),
         .write => |args| try tools.write(args, out),
         .edit => |edit| try edit.run(tools.gpa, tools.io, tools.dir, out),
         .bash => |args| try tools.bash(args, out),
@@ -311,37 +304,6 @@ fn dispatch(tools: *Tools, call: Call, out: *std.Io.Writer) !void {
             .{ bad.name, @errorName(bad.reason) },
         ),
     }
-}
-
-fn read(tools: *Tools, args: Call.Read, out: *std.Io.Writer) !void {
-    const contents = tools.dir.readFileAlloc(
-        tools.io,
-        args.path,
-        tools.gpa,
-        .limited(16 << 20),
-    ) catch |err| return fail(out, "cannot read {s}: {s}", .{ args.path, @errorName(err) });
-    defer tools.gpa.free(contents);
-
-    // A trailing newline would otherwise read as a final empty line.
-    const text = std.mem.trimEnd(u8, contents, "\n");
-    if (text.len == 0) return out.writeAll("(empty file)");
-
-    const first = args.offset orelse 1;
-    const limit = args.limit orelse 2000;
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    var number: usize = 0;
-    var shown: usize = 0;
-    while (lines.next()) |line| {
-        number += 1;
-        if (number < first) continue;
-        if (shown == limit) break;
-        shown += 1;
-        try out.print("{d:>6}\t{s}\n", .{ number, line });
-    }
-    if (shown == 0) {
-        return out.print("offset {d} is past the end; {d} lines", .{ first, number });
-    }
-    if (shown == limit) try out.print("… {d} more lines\n", .{number - first + 1 - shown});
 }
 
 fn write(tools: *Tools, args: Call.Write, out: *std.Io.Writer) !void {
@@ -432,7 +394,7 @@ pub fn parse(arena: std.mem.Allocator, call: llm.ToolCall) Call {
 /// that replaying one does not have to build the `llm.ToolCall` it came from.
 pub fn parseCallNamed(arena: std.mem.Allocator, name: []const u8, arguments: []const u8) Call {
     if (std.mem.eql(u8, name, "read")) {
-        return .{ .read = fromJson(Call.Read, arena, arguments) catch |reason|
+        return .{ .read = fromJson(Read, arena, arguments) catch |reason|
             return .{ .malformed = .{ .name = name, .reason = reason } } };
     }
     if (std.mem.eql(u8, name, "write")) {
