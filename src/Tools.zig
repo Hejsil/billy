@@ -49,7 +49,7 @@ pub const Call = union(enum) {
     edit: Edit,
     bash: Bash,
     web_search: web.Search,
-    web_fetch: WebFetch,
+    web_fetch: web.Fetch,
     /// A call naming a tool this harness does not implement.
     unknown: []const u8,
     /// A known tool whose arguments could not be read; `name` is still known.
@@ -75,14 +75,6 @@ pub const Call = union(enum) {
         /// it is for rather than only what it ran. Null when the model gave none,
         /// which is every stored call from before the tool asked for one.
         description: ?[]const u8 = null,
-    };
-
-    pub const WebFetch = struct {
-        url: []const u8,
-        /// Read the url directly instead of extracting a page, for an address
-        /// whose bytes are wanted as they are, such as a JSON API. Extraction
-        /// escapes its text as markdown, which would mangle it.
-        raw: bool = false,
     };
 
     pub const Malformed = struct {
@@ -308,11 +300,10 @@ fn dispatch(tools: *Tools, call: Call, out: *std.Io.Writer) !void {
         .write => |args| try tools.write(args, out),
         .edit => |edit| try edit.run(tools.gpa, tools.io, tools.dir, out),
         .bash => |args| try tools.bash(args, out),
-        .web_search => |s| {
+        inline .web_search, .web_fetch => |w| {
             const client = &(tools.search orelse return fail(out, "web search is not configured", .{}));
-            try s.run(tools.gpa, client, out);
+            try w.run(tools.gpa, client, out);
         },
-        .web_fetch => |args| try tools.webFetch(args, out),
         .unknown => |name| try fail(out, "unknown tool '{s}'", .{name}),
         .malformed => |bad| try fail(
             out,
@@ -406,21 +397,6 @@ fn bash(tools: *Tools, args: Call.Bash, out: *std.Io.Writer) !void {
     }
 }
 
-/// Fetches one url and writes its content as text. A page is extracted by the
-/// backend; `raw` reads the url directly, for an API or a file. Like a search, a
-/// fetch is offered only when a backend is configured, which is what the client
-/// carries.
-fn webFetch(tools: *Tools, args: Call.WebFetch, out: *std.Io.Writer) !void {
-    if (args.url.len == 0) return fail(out, "no url to fetch", .{});
-    const client = if (tools.search) |*client| client else return fail(out, "web fetch is not configured", .{});
-
-    var arena_state = std.heap.ArenaAllocator.init(tools.gpa);
-    defer arena_state.deinit();
-    const text = client.extract(arena_state.allocator(), args.url, args.raw) catch |err|
-        return fail(out, "fetch failed: {s}", .{@errorName(err)});
-    try out.writeAll(text);
-}
-
 /// Writes a failure to `out` as the model is given it, so that it can react to
 /// it. A call that could not run still has a result, and this is its shape.
 fn fail(out: *std.Io.Writer, comptime format: []const u8, args: anytype) !void {
@@ -476,7 +452,7 @@ pub fn parseCallNamed(arena: std.mem.Allocator, name: []const u8, arguments: []c
             return .{ .malformed = .{ .name = name, .reason = reason } } };
     }
     if (std.mem.eql(u8, name, "web_fetch")) {
-        return .{ .web_fetch = fromJson(Call.WebFetch, arena, arguments) catch |reason|
+        return .{ .web_fetch = fromJson(web.Fetch, arena, arguments) catch |reason|
             return .{ .malformed = .{ .name = name, .reason = reason } } };
     }
     return .{ .unknown = name };
