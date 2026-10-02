@@ -237,7 +237,7 @@ fn runSession(
         setup.cwd,
     ) catch |err| switch (err) {
         error.SessionNotFound => {
-            std.log.err("no session '{s}' in {s}", .{ resume_id.?, setup.sessions_path });
+            std.log.err("no session '{s}'", .{resume_id.?});
             return err;
         },
         error.InvalidSessionId => {

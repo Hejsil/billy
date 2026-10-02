@@ -1084,10 +1084,9 @@ fn usableName(text: []const u8) bool {
     return !std.mem.allEqual(u8, text, '.');
 }
 
-/// The ids of the sessions in the directory at `path`, the one most recently
-/// written to first, each with its title. Only files that could be a session are
-/// listed. The ids and titles are `gpa`'s, and the caller frees each and then the
-/// list.
+/// The ids of the sessions in the directory `dir`, the one most recently written
+/// to first, each with its title. Only files that could be a session are listed.
+/// The ids and titles are `gpa`'s, and the caller frees each and then the list.
 ///
 /// The order is the time each file was last written, asked of the filesystem
 /// rather than read out of the id: an id carries the time it was *made*, and one
@@ -1097,10 +1096,11 @@ fn usableName(text: []const u8) bool {
 /// in the handle it was opened on, so two listings sharing one would read over
 /// each other; the server asks from several connections at once, and this is what
 /// makes each of those impossible to get wrong.
-pub fn list(io: std.Io, path: []const u8, gpa: std.mem.Allocator) ![]Named {
-    var dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
-    defer dir.close(io);
-    return listIn(dir, io, gpa);
+pub fn list(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator) ![]Named {
+    var iter_dir = try dir.openDir(io, ".", .{ .iterate = true });
+    defer iter_dir.close(io);
+
+    return listIn(iter_dir, io, gpa);
 }
 
 /// One session as a listing shows it: the id that names it, and its title, which

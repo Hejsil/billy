@@ -391,7 +391,7 @@ fn listSessions(setup: *Setup, request: *std.http.Server.Request, answered: *boo
     // What is on disk. Each id and title is its own allocation, freed once the
     // reply is built from them. The listing opens the directory itself, so a
     // listing here and one on another connection do not read over each other.
-    const stored = try Session.list(setup.io, setup.sessions_path, gpa);
+    const stored = try Session.list(setup.io, setup.sessions, gpa);
     defer {
         for (stored) |named| {
             gpa.free(named.id);

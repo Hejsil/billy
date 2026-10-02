@@ -31,8 +31,6 @@ environ: *const std.process.Environ.Map,
 settings: Config,
 /// Directory handle holding the session files.
 sessions: std.Io.Dir,
-/// The path of the sessions directory, for a message that has to name it.
-sessions_path: []const u8,
 /// The directories billy's own files were found in, held so they stay open for
 /// as long as the credentials file might be written.
 data_dir: std.Io.Dir,
@@ -169,7 +167,6 @@ pub fn open(init: std.process.Init, out: *std.Io.Writer) !Setup {
         .environ = environ,
         .settings = settings.config,
         .sessions = sessions,
-        .sessions_path = sessions_path,
         .data_dir = data_dir,
         .config_dir = config_dir,
         .cwd = cwd,
