@@ -8,7 +8,7 @@
 //! resume resends the exact request of the run it continues and hits the prompt
 //! cache. They are refreshed when the conversation is compacted, which is the
 //! one time replacing the front of a request costs no cache that was not already
-//! being thrown away; see `agent.Runner.refreshLead`.
+//! being thrown away; see `Agent.refresh`.
 //!
 //! A session also carries a title, a short name for it that a frontend lists it
 //! by. It is written first in the file, so a listing reads it without reading the
@@ -24,7 +24,7 @@ const std = @import("std");
 const llm = @import("llm.zig");
 const ulid = @import("ulid.zig");
 const xdg = @import("xdg.zig");
-const agent = @import("agent.zig");
+const agent = @import("Agent.zig");
 
 const Session = @This();
 

@@ -1,6 +1,8 @@
 //! The agent loop: read a request from the user, ask the model, run the tools
 //! it asks for, and repeat until it answers with text.
 
+pub const Agent = @This();
+
 const std = @import("std");
 const llm = @import("llm.zig");
 const models = @import("models.zig");
@@ -11,7 +13,7 @@ const LineEditor = @import("LineEditor.zig");
 const Session = @import("Session.zig");
 const Terminal = @import("Terminal.zig");
 
-pub const Mode = @import("agent/mode.zig").Mode;
+pub const Mode = @import("Agent/mode.zig").Mode;
 
 /// A command a prompt can be on its own, which billy runs itself rather than
 /// sending to the model. A command is the whole line, so a prompt that merely
@@ -45,7 +47,7 @@ pub const Config = struct {
     /// Directory holding the user's own instructions file, read into every
     /// session's prompt ahead of the project's; null in a test, or when there is
     /// no such file. Borrowed from the setup, which owns it and outlives the
-    /// runner, so nothing here closes it.
+    /// agent, so nothing here closes it.
     user_instructions_dir: ?std.Io.Dir = null,
     /// What is known about the provider and model: the context window and the
     /// prices. Null for a model billy does not know, in which case the header
@@ -389,172 +391,204 @@ pub fn displayPath(out: *std.Io.Writer, cwd: []const u8, home: ?[]const u8) !voi
 ///
 /// The HTTP client is the run's own, borrowed by pointer, so every request of
 /// every session shares its connections and the certificates it scanned once.
-pub const Runner = struct {
+io: std.Io,
+gpa: std.mem.Allocator,
+config: Config,
+/// The directory the session works in. For a resumed session it is the one
+/// the session was started in, wherever billy runs from now.
+work_dir: std.Io.Dir,
+/// The tools, working in `work_dir`.
+tool_set: Tools,
+/// The model client, sending the conversation to `config.url`.
+client: llm.Client,
+
+/// Opens a session for asking things, working in `cwd` and sharing `http`.
+pub fn init(
     io: std.Io,
     gpa: std.mem.Allocator,
     config: Config,
-    /// The directory the session works in. For a resumed session it is the one
-    /// the session was started in, wherever billy runs from now.
-    work_dir: std.Io.Dir,
-    /// The tools, working in `work_dir`.
-    tool_set: Tools,
-    /// The model client, sending the conversation to `config.url`.
-    client: llm.Client,
+    cwd: []const u8,
+    http: *std.http.Client,
+) !Agent {
+    var work_dir = std.Io.Dir.openDirAbsolute(io, cwd, .{}) catch |err| {
+        std.log.err("cannot work in {s}: {s}", .{ cwd, @errorName(err) });
+        return err;
+    };
+    errdefer work_dir.close(io);
 
-    /// Opens a session for asking things, working in `cwd` and sharing `http`.
-    pub fn init(
-        io: std.Io,
-        gpa: std.mem.Allocator,
-        config: Config,
-        cwd: []const u8,
-        http: *std.http.Client,
-    ) !Runner {
-        var work_dir = std.Io.Dir.openDirAbsolute(io, cwd, .{}) catch |err| {
-            std.log.err("cannot work in {s}: {s}", .{ cwd, @errorName(err) });
-            return err;
-        };
-        errdefer work_dir.close(io);
+    const tool_set = try Tools.init(.{
+        .io = io,
+        .dir = work_dir,
+        .gpa = gpa,
+        .formats = config.display.formats,
+        .bash_timeout_s = config.bash_timeout_s,
+        .style = config.display.style,
+        .search = config.search,
+        .http = http,
+    });
 
-        const tool_set = try Tools.init(.{
-            .io = io,
-            .dir = work_dir,
+    return .{
+        .io = io,
+        .gpa = gpa,
+        .config = config,
+        .work_dir = work_dir,
+        .tool_set = tool_set,
+        .client = .{
             .gpa = gpa,
-            .formats = config.display.formats,
-            .bash_timeout_s = config.bash_timeout_s,
-            .style = config.display.style,
-            .search = config.search,
+            .io = io,
+            .api_key = config.api_key,
+            .url = config.url,
+            .model = config.model,
             .http = http,
-        });
+            .reasoning = config.reasoning,
+        },
+    };
+}
 
-        return .{
-            .io = io,
-            .gpa = gpa,
-            .config = config,
-            .work_dir = work_dir,
-            .tool_set = tool_set,
-            .client = .{
-                .gpa = gpa,
-                .io = io,
-                .api_key = config.api_key,
-                .url = config.url,
-                .model = config.model,
-                .http = http,
-                .reasoning = config.reasoning,
-            },
-        };
+pub fn deinit(agent: *Agent) void {
+    agent.work_dir.close(agent.io);
+}
+
+/// Gives `session` the system prompt and the tools it runs with, if it has
+/// none of its own.
+///
+/// The prompt and the tools are stored with the session and reused on a
+/// resume, so the request sent then matches the earlier run byte for byte and
+/// hits the prompt cache. Both are therefore set only on a session that has
+/// neither, so a new session gets the current ones while a resumed one keeps
+/// what it was saved with. The user's instructions are read from the
+/// configuration directory and the project's from the session's directory,
+/// and both are part of the prompt, so they are sent with every request.
+pub fn prepare(agent: *Agent, session: *Session) !void {
+    // A session with a conversation keeps the mode and prompt it was saved
+    // with, so its request matches the earlier run; a new one takes the mode
+    // the frontend chose, which its first prompt may have named with
+    // `/chat`. Either way the agent's mode matches the session's, so the
+    // tool set it offers and the guard it runs are the session's own.
+    if (session.messages.items.len > 0) {
+        agent.config.mode = session.mode;
+    } else {
+        session.setMode(agent.config.mode);
+        const prompt_text = try leadPrompt(
+            agent.io,
+            agent.gpa,
+            agent.work_dir,
+            agent.config.user_instructions_dir,
+            agent.config.mode,
+        );
+        defer agent.gpa.free(prompt_text);
+        // A mode with no prompt of its own sends no system message, so the
+        // request is the conversation alone.
+        if (prompt_text.len > 0) try session.setSystemPrompt(prompt_text);
     }
+    try session.ensureTools(agent.tool_set.definitions(agent.config.mode));
+}
 
-    pub fn deinit(runner: *Runner) void {
-        runner.work_dir.close(runner.io);
-    }
-
-    /// Gives `session` the system prompt and the tools it runs with, if it has
-    /// none of its own.
-    ///
-    /// The prompt and the tools are stored with the session and reused on a
-    /// resume, so the request sent then matches the earlier run byte for byte and
-    /// hits the prompt cache. Both are therefore set only on a session that has
-    /// neither, so a new session gets the current ones while a resumed one keeps
-    /// what it was saved with. The user's instructions are read from the
-    /// configuration directory and the project's from the session's directory,
-    /// and both are part of the prompt, so they are sent with every request.
-    pub fn prepare(runner: *Runner, session: *Session) !void {
-        // A session with a conversation keeps the mode and prompt it was saved
-        // with, so its request matches the earlier run; a new one takes the mode
-        // the frontend chose, which its first prompt may have named with
-        // `/chat`. Either way the runner's mode matches the session's, so the
-        // tool set it offers and the guard it runs are the session's own.
-        if (session.messages.items.len > 0) {
-            runner.config.mode = session.mode;
-        } else {
-            session.setMode(runner.config.mode);
-            const prompt_text = try leadPrompt(
-                runner.io,
-                runner.gpa,
-                runner.work_dir,
-                runner.config.user_instructions_dir,
-                runner.config.mode,
-            );
-            defer runner.gpa.free(prompt_text);
-            // A mode with no prompt of its own sends no system message, so the
-            // request is the conversation alone.
-            if (prompt_text.len > 0) try session.setSystemPrompt(prompt_text);
-        }
-        try session.ensureTools(runner.tool_set.definitions(runner.config.mode));
-    }
-
-    /// Compacts the conversation if it has outgrown the context window, so that
-    /// a long session goes on rather than failing on an overlong request. When it
-    /// compacts, the session's prompt and tools are refreshed, so the next
-    /// request carries the current ones (see `refreshLead`).
-    ///
-    /// A frontend calls this before it adds a prompt and, on a terminal, before
-    /// it shows the header, so the prompt is not folded into the summary it
-    /// triggers and the header reports the smaller conversation. A failure is
-    /// not fatal: the conversation is left as it is and the request goes out with
-    /// it, which is what would have happened without compaction at all.
-    pub fn compactIfNeeded(runner: *Runner, emitter: Emitter, session: *Session) void {
-        const compacted = maybeCompact(runner.io, &runner.client, emitter, runner.config, session) catch |err| {
-            std.log.warn("compaction failed: {s}", .{@errorName(err)});
-            return;
-        };
-        if (compacted) runner.refresh(session);
-    }
-
-    /// Compacts the conversation now, whatever it has grown to, because the user
-    /// asked with `/compact` rather than because a request would not fit. Says
-    /// whether it compacted anything: a conversation with nothing new since the
-    /// last compaction has nothing to fold in, and neither has one that has not
-    /// been asked anything. A failure is logged and reads as nothing compacted.
-    pub fn compact(runner: *Runner, emitter: Emitter, session: *Session) bool {
-        const compacted = fold(runner.io, &runner.client, emitter, runner.config, session) catch |err| {
-            std.log.warn("compaction failed: {s}", .{@errorName(err)});
-            return false;
-        };
-        if (compacted) runner.refresh(session);
-        return compacted;
-    }
-
-    /// Re-reads the prompt and the tools into the session, so a session that has
-    /// been running a while picks up a changed prompt, instruction files or tool
-    /// set. A compaction is the one moment replacing the front of a request costs
-    /// no cache that was not already being thrown away.
-    fn refresh(runner: *Runner, session: *Session) void {
-        refreshLead(
-            runner.io,
-            runner.gpa,
-            runner.work_dir,
-            runner.config.user_instructions_dir,
-            runner.config.mode,
-            runner.tool_set.definitions(runner.config.mode),
-            session,
-        ) catch |err| std.log.warn("could not refresh the prompt and tools: {s}", .{@errorName(err)});
-    }
-
-    /// Asks `session` one thing and shows how the answer is reached: the prompt,
-    /// the tool calls it makes, and the reply. This is what one prompt of a
-    /// session is, whether it was typed at a terminal or sent from a page.
-    ///
-    /// On the first turn the session is given a title: first one derived from
-    /// what was asked, so it is named at once, and then, when the model is asked
-    /// for titles, one it writes, which replaces the first.
-    pub fn ask(runner: *Runner, emitter: Emitter, session: *Session, text: []const u8) !void {
-        // The first turn is the session's first message; the system prompt is
-        // kept apart from the conversation, so a session that has been asked
-        // nothing has none.
-        const first_turn = session.messages.items.len == 0;
-        _ = try nameFromPrompt(session, text);
-
-        try session.append(.{ .role = "user", .content = text });
-        try emitter.show(.{ .prompt = text });
-        try turn(runner.io, &runner.client, &runner.tool_set, emitter, runner.config, session);
-
-        if (first_turn and runner.config.title) {
-            titleSession(runner.io, &runner.client, runner.config, session) catch |err|
-                std.log.warn("could not title the session: {s}", .{@errorName(err)});
-        }
-    }
+/// What asking `agent` to start a session with a first prompt came to.
+pub const Started = union(enum) {
+    /// What to ask. The prompt with any mode command taken off it, which is the
+    /// text the turn carries.
+    prompt: []const u8,
+    /// The prompt named only a mode, so there is nothing to ask yet: the session
+    /// is set up for that mode and waits for the next prompt.
+    mode_only,
+    /// The session has been asked something before, so this prompt is not its
+    /// first and the mode it runs in is the one it was saved with.
+    asked_before,
 };
+
+/// Settles the mode a session runs in from its first prompt, and gives a new
+/// session the system prompt and tools it needs before its first request.
+///
+/// This is the one place the "first prompt" rules live, so both frontends get
+/// them the same way: `/chat` and `/general` name the mode and the rest of the
+/// line is what is asked; a prompt naming only a mode sets the session up and
+/// asks nothing; and anything else is the mode `default`, which is each
+/// frontend's own (see `Mode.start`).
+///
+/// A session that has been asked before keeps what it was saved with, so this
+/// only reports that its prompt is not the first.
+pub fn start(agent: *Agent, session: *Session, text: []const u8, default: Mode) !Started {
+    if (session.messages.items.len > 0) return .asked_before;
+
+    const choice = Mode.start(text, default);
+    agent.config.mode = choice.mode;
+    try agent.prepare(session);
+    if (choice.text.len == 0) return .mode_only;
+    return .{ .prompt = choice.text };
+}
+
+/// Compacts the conversation if it has outgrown the context window, so that
+/// a long session goes on rather than failing on an overlong request. When it
+/// compacts, the session's prompt and tools are refreshed, so the next
+/// request carries the current ones (see `refreshLead`).
+///
+/// A frontend calls this before it adds a prompt and, on a terminal, before
+/// it shows the header, so the prompt is not folded into the summary it
+/// triggers and the header reports the smaller conversation. A failure is
+/// not fatal: the conversation is left as it is and the request goes out with
+/// it, which is what would have happened without compaction at all.
+pub fn compactIfNeeded(agent: *Agent, emitter: Emitter, session: *Session) void {
+    const compacted = maybeCompact(agent.io, &agent.client, emitter, agent.config, session) catch |err| {
+        std.log.warn("compaction failed: {s}", .{@errorName(err)});
+        return;
+    };
+    if (compacted) agent.refresh(session);
+}
+
+/// Compacts the conversation now, whatever it has grown to, because the user
+/// asked with `/compact` rather than because a request would not fit. Says
+/// whether it compacted anything: a conversation with nothing new since the
+/// last compaction has nothing to fold in, and neither has one that has not
+/// been asked anything. A failure is logged and reads as nothing compacted.
+pub fn compact(agent: *Agent, emitter: Emitter, session: *Session) bool {
+    const compacted = fold(agent.io, &agent.client, emitter, agent.config, session) catch |err| {
+        std.log.warn("compaction failed: {s}", .{@errorName(err)});
+        return false;
+    };
+    if (compacted) agent.refresh(session);
+    return compacted;
+}
+
+/// Re-reads the prompt and the tools into the session, so a session that has
+/// been running a while picks up a changed prompt, instruction files or tool
+/// set. A compaction is the one moment replacing the front of a request costs
+/// no cache that was not already being thrown away.
+fn refresh(agent: *Agent, session: *Session) void {
+    refreshLead(
+        agent.io,
+        agent.gpa,
+        agent.work_dir,
+        agent.config.user_instructions_dir,
+        agent.config.mode,
+        agent.tool_set.definitions(agent.config.mode),
+        session,
+    ) catch |err| std.log.warn("could not refresh the prompt and tools: {s}", .{@errorName(err)});
+}
+
+/// Asks `session` one thing and shows how the answer is reached: the prompt,
+/// the tool calls it makes, and the reply. This is what one prompt of a
+/// session is, whether it was typed at a terminal or sent from a page.
+///
+/// On the first turn the session is given a title: first one derived from
+/// what was asked, so it is named at once, and then, when the model is asked
+/// for titles, one it writes, which replaces the first.
+pub fn ask(agent: *Agent, emitter: Emitter, session: *Session, text: []const u8) !void {
+    // The first turn is the session's first message; the system prompt is
+    // kept apart from the conversation, so a session that has been asked
+    // nothing has none.
+    const first_turn = session.messages.items.len == 0;
+    _ = try nameFromPrompt(session, text);
+
+    try session.append(.{ .role = "user", .content = text });
+    try emitter.show(.{ .prompt = text });
+    try turn(agent.io, &agent.client, &agent.tool_set, emitter, agent.config, session);
+
+    if (first_turn and agent.config.title) {
+        titleSession(agent.io, &agent.client, agent.config, session) catch |err|
+            std.log.warn("could not title the session: {s}", .{@errorName(err)});
+    }
+}
 
 pub fn run(
     io: std.Io,
@@ -569,12 +603,12 @@ pub fn run(
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
 
-    var runner = try Runner.init(io, gpa, config, session.cwd(), &http);
-    defer runner.deinit();
+    var agent = try Agent.init(io, gpa, config, session.cwd(), &http);
+    defer agent.deinit();
     // A resumed session keeps the prompt and tools it was saved with, so it is
-    // prepared here; a new one gets them when its first prompt names the mode.
-    var started = session.messages.items.len > 0;
-    if (started) try runner.prepare(session);
+    // prepared here; a new one gets them from its first prompt, through `start`.
+    const resumed = session.messages.items.len > 0;
+    if (resumed) try agent.prepare(session);
 
     // The editor holds the lines it returns and its history in an arena of its
     // own, over `gpa`, so the run need not keep an allocator for them.
@@ -597,39 +631,35 @@ pub fn run(
         // summary lands where the history it stands in for ended. It runs before
         // the header is built, so the header then reports the smaller
         // conversation.
-        runner.compactIfNeeded(emitter, session);
+        agent.compactIfNeeded(emitter, session);
         header.clearRetainingCapacity();
-        // The header is built from the runner's config, so the mode it shows is
+        // The header is built from the agent's config, so the mode it shows is
         // the one the session is running in, which the first prompt may have set.
-        try sessionHeader(&header.writer, runner.config, session.id(), session.context_tokens, session.cost);
+        try sessionHeader(&header.writer, agent.config, session.id(), session.context_tokens, session.cost);
         const line = (try editor.readLine(header.written(), prompt)) orelse break;
         if (line.len == 0) continue;
         // A command billy runs itself rather than sending to the model.
         if (Command.of(line)) |cmd| {
             switch (cmd) {
                 .compact => {
-                    if (!started or !runner.compact(emitter, session))
+                    // A session that has been asked nothing has nothing to fold
+                    // in, so the command says so rather than compacting nothing.
+                    if (!resumed or !agent.compact(emitter, session))
                         try emitter.show(.{ .notice = "nothing to compact" });
                 },
             }
             try out.flush();
             continue;
         }
-        // The first prompt of a new session sets its mode: `/chat` opens the
-        // chat mode, and anything else the general one. The lead is prepared from
-        // the mode before the first request, so nothing is sent before it is
-        // known.
-        var text = line;
-        if (!started) {
-            const choice = Mode.start(line, .general);
-            runner.config.mode = choice.mode;
-            text = choice.text;
-            started = true;
-            try runner.prepare(session);
-            // A first prompt that was only `/chat` names the mode and asks
-            // nothing, so the turn waits for the next prompt.
-            if (text.len == 0) continue;
-        }
+        // The first prompt of a new session sets its mode and gives it the
+        // prompt and tools to send, which the agent settles the same way
+        // whatever frontend asked. A prompt that named only a mode asks nothing,
+        // so the turn waits for the next one.
+        const text = switch (try agent.start(session, line, .general)) {
+            .prompt => |text| text,
+            .asked_before => line,
+            .mode_only => continue,
+        };
         // The line editor has erased the prompt it was typed behind, so the
         // prompt is written out now as the block a replay shows: the `> ` belongs
         // to the input, not to what was said. Flushed before the request, which
@@ -637,7 +667,7 @@ pub fn run(
         //
         // A failed request must not end the session: report it and take the next
         // request from the user.
-        runner.ask(emitter, session, text) catch |err|
+        agent.ask(emitter, session, text) catch |err|
             std.log.err("request failed: {s}", .{@errorName(err)});
         try out.flush();
     }
@@ -1112,8 +1142,8 @@ fn fold(
     // Nothing has been added since the last compaction, so there is nothing new
     // to fold in: compacting again would only summarize the summary, and would
     // do so on every request.
-    const start = session.sentFrom();
-    if (session.messages.items.len - start <= 1) return false;
+    const sent_from = session.sentFrom();
+    if (session.messages.items.len - sent_from <= 1) return false;
 
     const summary = try summarize(io, client, config, session) orelse return false;
     defer client.gpa.free(summary);
@@ -2145,14 +2175,14 @@ test "prepare gives a fresh session the user's instructions from the configurati
     defer http.deinit();
     var config = testConfig("m", "/work", null);
     config.user_instructions_dir = config_dir.dir;
-    // `Runner.init` opens the directory it works in, so it has to be one that
+    // `Agent.init` opens the directory it works in, so it has to be one that
     // exists; the session's recorded directory is separate.
     const work_dir = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(work_dir);
-    var runner = try Runner.init(io, gpa, config, work_dir, &http);
-    defer runner.deinit();
+    var agent = try Agent.init(io, gpa, config, work_dir, &http);
+    defer agent.deinit();
 
-    try runner.prepare(&session);
+    try agent.prepare(&session);
 
     // The prompt the session runs with carries the user's instructions, so the
     // configuration directory is read for every session and not only a project.
@@ -2182,10 +2212,10 @@ test "prepare gives a chat session no prompt and only the tools it allows" {
     config.user_instructions_dir = config_dir.dir;
     const work_dir = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(work_dir);
-    var runner = try Runner.init(io, gpa, config, work_dir, &http);
-    defer runner.deinit();
+    var agent = try Agent.init(io, gpa, config, work_dir, &http);
+    defer agent.deinit();
 
-    try runner.prepare(&session);
+    try agent.prepare(&session);
 
     // The mode is recorded, no system prompt is set at all (a chat request is the
     // conversation alone, so the instructions never reach it), and the tools
@@ -2193,10 +2223,96 @@ test "prepare gives a chat session no prompt and only the tools it allows" {
     try std.testing.expectEqual(Mode.chat, session.mode);
     try std.testing.expect(!session.hasSystemPrompt());
 
-    const defs = runner.tool_set.definitions(.chat);
+    const defs = agent.tool_set.definitions(.chat);
     try std.testing.expectEqual(@as(usize, 1), defs.len);
     try std.testing.expectEqualStrings("read", defs[0].name);
     try std.testing.expectEqual(defs.len, session.tools.len);
+}
+
+test "a first prompt names the mode and says what to ask" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+    const work_dir = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(work_dir);
+
+    // A prompt that names no mode runs in the one the frontend asked for, and is
+    // asked as it was typed.
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    var agent = try Agent.init(io, gpa, testConfig("m", "/work", null), work_dir, &http);
+    defer agent.deinit();
+
+    const plain = try agent.start(&session, "do the thing", .general);
+    try std.testing.expectEqualStrings("do the thing", plain.prompt);
+    try std.testing.expectEqual(Mode.general, agent.config.mode);
+    // The session was prepared, so it now carries the tools it will offer.
+    try std.testing.expect(session.tools.len > 0);
+
+    // A first prompt may name the mode itself, which wins over what the frontend
+    // asked for, and the rest of the line is what is asked.
+    var named = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer named.deinit();
+    const chat = try agent.start(&named, "/chat what is a hash map?", .general);
+    try std.testing.expectEqualStrings("what is a hash map?", chat.prompt);
+    try std.testing.expectEqual(Mode.chat, agent.config.mode);
+    try std.testing.expectEqual(Mode.chat, named.mode);
+}
+
+test "a first prompt that names only a mode asks nothing" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+    const work_dir = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(work_dir);
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    var agent = try Agent.init(io, gpa, testConfig("m", "/work", null), work_dir, &http);
+    defer agent.deinit();
+
+    // `/chat` on its own opens that mode: the session is set up and ready, and
+    // there is nothing to send to the model yet.
+    const started = try agent.start(&session, "/chat", .general);
+    try std.testing.expectEqual(Started.mode_only, started);
+    try std.testing.expectEqual(Mode.chat, session.mode);
+    // Set up anyway, so the next prompt is asked without being looked at again.
+    try std.testing.expect(session.tools.len > 0);
+}
+
+test "a prompt after the first leaves the session as it was set up" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+    const work_dir = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(work_dir);
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    var agent = try Agent.init(io, gpa, testConfig("m", "/work", null), work_dir, &http);
+    defer agent.deinit();
+
+    _ = try agent.start(&session, "the first thing", .general);
+    try session.append(.{ .role = "assistant", .content = "done" });
+
+    // A session that has been asked something is not started again: its mode is
+    // the one it was saved with, and a mode command in a later prompt is part of
+    // what is asked rather than a command, since only the first prompt can name
+    // one.
+    const later = try agent.start(&session, "/chat is this a command?", .general);
+    try std.testing.expectEqual(Started.asked_before, later);
 }
 
 test "the terminal shows a tool call the way a replay does" {
@@ -2410,20 +2526,20 @@ test "the first turn names the session, and the naming is not part of it" {
     defer http.deinit();
     var config = testConfig("m", "/work", null);
     config.title = true;
-    // The runner builds the model client from the config, so the config carries
+    // The agent builds the model client from the config, so the config carries
     // the address of the mock.
     config.url = mock.url;
-    // `Runner.init` opens the directory it works in, so it has to be one that
+    // `Agent.init` opens the directory it works in, so it has to be one that
     // exists; the session's recorded directory is separate and stays "/work".
     const work_dir = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(work_dir);
-    var runner = try Runner.init(io, gpa, config, work_dir, &http);
-    defer runner.deinit();
+    var agent = try Agent.init(io, gpa, config, work_dir, &http);
+    defer agent.deinit();
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var terminal = testTerminal(&out.writer, .{});
-    try runner.ask(terminal.emitter(), &session, "the flaky test keeps failing, please fix it");
+    try agent.ask(terminal.emitter(), &session, "the flaky test keeps failing, please fix it");
 
     try mock.group.await(io);
     if (mock.err) |err| return err;

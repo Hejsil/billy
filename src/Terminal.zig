@@ -2,7 +2,7 @@
 ///! reply's markdown laid out by the format script, and the tools laid out by
 ///! theirs.
 const std = @import("std");
-const agent = @import("agent.zig");
+const agent = @import("Agent.zig");
 const Tools = @import("Tools.zig");
 
 pub const Style = @import("Terminal/style.zig").Style;

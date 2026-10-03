@@ -16,13 +16,12 @@
 //! something else is asked for, and why the help says so.
 
 const std = @import("std");
-const agent = @import("agent.zig");
+const agent = @import("Agent.zig");
 const Config = @import("Config.zig");
 const Health = @import("Health.zig");
 const html = @import("html.zig");
 const models = @import("models.zig");
 const Session = @import("Session.zig");
-const Runner = @import("agent.zig").Runner;
 const Setup = @import("Setup.zig");
 
 /// The port billy serves on when nothing else is asked for.
@@ -724,7 +723,9 @@ fn createSession(
     defer registry.release(session.id());
 
     // The mode the page chose, or a `/chat`/`/general` command in the prompt,
-    // which wins over the choice.
+    // which wins over the choice. It is settled here rather than by the agent so
+    // that a prompt naming only a mode -- which asks nothing -- is answered with
+    // a status, which a stream that has already begun cannot carry.
     const choice = agent.Mode.start(parsed.value.text, parsed.value.mode orelse default_mode);
     if (choice.text.len == 0)
         return reply(request, .text, "the prompt is empty\n", .bad_request, answered);
@@ -788,9 +789,11 @@ fn serveTurn(
     announce_id: ?[]const u8,
 ) !void {
     const gpa = setup.gpa;
-    var runner = try Runner.init(setup.io, gpa, config, session.cwd(), http);
-    defer runner.deinit();
-    try runner.prepare(session);
+    var agent_ = try agent.Agent.init(setup.io, gpa, config, session.cwd(), http);
+    defer agent_.deinit();
+    // The session is prepared from the mode the caller settled, which is the
+    // session's own once it has been asked something.
+    try agent_.prepare(session);
 
     // The head of the reply goes out before the run starts, so the page can read
     // the stream while the model is working. From here on a failure is part of
@@ -814,7 +817,7 @@ fn serveTurn(
     // page with no new session to show.
     if (agent.Command.of(text)) |cmd| {
         switch (cmd) {
-            .compact => if (!runner.compact(emitter, session)) try stream.fail("nothing to compact"),
+            .compact => if (!agent_.compact(emitter, session)) try stream.fail("nothing to compact"),
         }
         try sendHeader(setup, gpa, session, &stream);
         try stream.done();
@@ -832,8 +835,8 @@ fn serveTurn(
         if (session.title()) |title| try stream.send("title", TitleEvent{ .title = title });
     }
 
-    runner.compactIfNeeded(emitter, session);
-    runner.ask(emitter, session, text) catch |err| {
+    agent_.compactIfNeeded(emitter, session);
+    agent_.ask(emitter, session, text) catch |err| {
         std.log.err("a request failed: {s}", .{@errorName(err)});
         try stream.fail(@errorName(err));
     };

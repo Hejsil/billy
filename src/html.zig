@@ -13,7 +13,7 @@
 //! it ran and what it produced.
 
 const std = @import("std");
-const agent = @import("agent.zig");
+const agent = @import("Agent.zig");
 const diffing = @import("diff.zig");
 const md = @import("md.zig");
 const models = @import("models.zig");

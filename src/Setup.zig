@@ -8,7 +8,7 @@
 //! left to the caller, which builds the agent configuration from this.
 
 const std = @import("std");
-const agent = @import("agent.zig");
+const agent = @import("Agent.zig");
 const llm = @import("llm.zig");
 const Config = @import("Config.zig");
 const credentials = @import("credentials.zig");

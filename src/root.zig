@@ -1,6 +1,6 @@
 //! By convention, root.zig is the root source file when making a package.
 
-pub const agent = @import("agent.zig");
+pub const agent = @import("Agent.zig");
 pub const Config = @import("Config.zig");
 pub const credentials = @import("credentials.zig");
 pub const diff = @import("diff.zig");
