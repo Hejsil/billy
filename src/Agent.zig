@@ -18,7 +18,10 @@ pub const Mode = @import("Agent/mode.zig").Mode;
 /// A command a prompt can be on its own, which billy runs itself rather than
 /// sending to the model. A command is the whole line, so a prompt that merely
 /// starts with one is still a prompt.
-pub const Command = enum {
+///
+/// Private: a frontend hands the agent what was typed and is told what came of
+/// it, so which commands there are and what they do is the agent's own business.
+const Command = enum {
     /// Fold the conversation into a summary now, whatever its size.
     compact,
 
@@ -497,6 +500,57 @@ pub const Started = union(enum) {
     asked_before,
 };
 
+/// What a line typed into a session came to.
+pub const Waiting = union(enum) {
+    /// The line is asked of the model, with any mode command taken off it.
+    ask: []const u8,
+    /// The line named a mode and nothing else, so the session is set up for it
+    /// and there is nothing to ask yet.
+    ready,
+    /// The line was a command, which the agent has already run. Everything it
+    /// had to say has gone out through the emitter.
+    ran,
+};
+
+/// Takes a line typed into `session` and does what it asks for, except asking
+/// the model, which is left to `ask`.
+///
+/// This is the whole of what a frontend has to know about a line: a command is
+/// run here and reported through the emitter, the first prompt settles the mode
+/// and gives the session its prompt and tools, and anything else comes back as
+/// the text to ask. Compaction is the agent's own business, so neither frontend
+/// names it, calls it, or words what it says when there is nothing to fold.
+pub fn take(agent: *Agent, emitter: Emitter, session: *Session, line: []const u8, default: Mode) !Waiting {
+    // A command comes first: it is run rather than asked, and the session is not
+    // touched by it beyond what the command does.
+    if (Command.of(line)) |cmd| {
+        switch (cmd) {
+            .compact => {
+                // A session that has been asked nothing has nothing to fold in,
+                // and neither has one with nothing new since the last compaction.
+                if (!agent.compact(emitter, session))
+                    try emitter.show(.{ .notice = "nothing to compact" });
+            },
+        }
+        return .ran;
+    }
+
+    // The conversation is compacted before a request that would carry it, so a
+    // long session goes on rather than failing on an overlong request. It is
+    // done here, before the prompt is added, so the prompt is not folded into
+    // the summary it triggers.
+    agent.compactIfNeeded(emitter, session);
+
+    const started = try agent.start(session, line, default);
+    return switch (started) {
+        .prompt => |text| .{ .ask = text },
+        .mode_only => .ready,
+        // A session that has been asked something keeps the mode it was saved
+        // with, so the line is asked as it was typed.
+        .asked_before => .{ .ask = line },
+    };
+}
+
 /// Settles the mode a session runs in from its first prompt, and gives a new
 /// session the system prompt and tools it needs before its first request.
 ///
@@ -528,7 +582,7 @@ pub fn start(agent: *Agent, session: *Session, text: []const u8, default: Mode) 
 /// triggers and the header reports the smaller conversation. A failure is
 /// not fatal: the conversation is left as it is and the request goes out with
 /// it, which is what would have happened without compaction at all.
-pub fn compactIfNeeded(agent: *Agent, emitter: Emitter, session: *Session) void {
+fn compactIfNeeded(agent: *Agent, emitter: Emitter, session: *Session) void {
     const compacted = maybeCompact(agent.io, &agent.client, emitter, agent.config, session) catch |err| {
         std.log.warn("compaction failed: {s}", .{@errorName(err)});
         return;
@@ -541,7 +595,7 @@ pub fn compactIfNeeded(agent: *Agent, emitter: Emitter, session: *Session) void 
 /// whether it compacted anything: a conversation with nothing new since the
 /// last compaction has nothing to fold in, and neither has one that has not
 /// been asked anything. A failure is logged and reads as nothing compacted.
-pub fn compact(agent: *Agent, emitter: Emitter, session: *Session) bool {
+fn compact(agent: *Agent, emitter: Emitter, session: *Session) bool {
     const compacted = fold(agent.io, &agent.client, emitter, agent.config, session) catch |err| {
         std.log.warn("compaction failed: {s}", .{@errorName(err)});
         return false;
@@ -626,39 +680,23 @@ pub fn run(
     var header: std.Io.Writer.Allocating = .init(gpa);
     defer header.deinit();
     while (true) {
-        // The conversation is compacted here, between prompts: the turn before
-        // has finished and the one about to be typed has not started, so the
-        // summary lands where the history it stands in for ended. It runs before
-        // the header is built, so the header then reports the smaller
-        // conversation.
-        agent.compactIfNeeded(emitter, session);
         header.clearRetainingCapacity();
         // The header is built from the agent's config, so the mode it shows is
         // the one the session is running in, which the first prompt may have set.
         try sessionHeader(&header.writer, agent.config, session.id(), session.context_tokens, session.cost);
         const line = (try editor.readLine(header.written(), prompt)) orelse break;
         if (line.len == 0) continue;
-        // A command billy runs itself rather than sending to the model.
-        if (Command.of(line)) |cmd| {
-            switch (cmd) {
-                .compact => {
-                    // A session that has been asked nothing has nothing to fold
-                    // in, so the command says so rather than compacting nothing.
-                    if (!resumed or !agent.compact(emitter, session))
-                        try emitter.show(.{ .notice = "nothing to compact" });
-                },
-            }
+        // What the line came to is the agent's to decide: a command is run and
+        // reported through the emitter, a first prompt settles the mode, and
+        // anything else is what is asked.
+        const waiting = try agent.take(emitter, session, line, .general);
+        if (waiting == .ran) {
             try out.flush();
             continue;
         }
-        // The first prompt of a new session sets its mode and gives it the
-        // prompt and tools to send, which the agent settles the same way
-        // whatever frontend asked. A prompt that named only a mode asks nothing,
-        // so the turn waits for the next one.
-        const text = switch (try agent.start(session, line, .general)) {
-            .prompt => |text| text,
-            .asked_before => line,
-            .mode_only => continue,
+        const text = switch (waiting) {
+            .ask => |text| text,
+            else => continue,
         };
         // The line editor has erased the prompt it was typed behind, so the
         // prompt is written out now as the block a replay shows: the `> ` belongs

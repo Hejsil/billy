@@ -811,14 +811,16 @@ fn serveTurn(
     var stream = Stream{ .body = &body_writer, .gpa = gpa };
     const emitter = stream.emitter();
 
-    // A `/compact` command folds the conversation into a summary and stops,
-    // rather than being sent to the model. It comes before the session is
-    // announced, so a `/compact` on a session that has nothing to fold leaves the
-    // page with no new session to show.
-    if (agent.Command.of(text)) |cmd| {
-        switch (cmd) {
-            .compact => if (!agent_.compact(emitter, session)) try stream.fail("nothing to compact"),
-        }
+    // The line is given to the agent before the session is announced, because a
+    // command is answered without the session being started at all: a `/compact`
+    // on a page with a session that has nothing to fold must leave the page with
+    // no new session to show. Anything that is not a command is a turn, and the
+    // page is told the session's id first so it can add it to the list.
+    // The line as it was typed, with the mode the caller settled: a mode command
+    // was already taken off the text by `createSession`, so `take` sees none and
+    // the mode stands. A session that has been asked something keeps its own.
+    const waiting = try agent_.take(emitter, session, text, config.mode);
+    if (waiting == .ran) {
         try sendHeader(setup, gpa, session, &stream);
         try stream.done();
         return;
@@ -835,7 +837,14 @@ fn serveTurn(
         if (session.title()) |title| try stream.send("title", TitleEvent{ .title = title });
     }
 
-    agent_.compactIfNeeded(emitter, session);
+    // A line that named only a mode asks nothing, so there is no turn to run and
+    // the session is already set up for the mode it named.
+    if (waiting == .ready) {
+        try sendHeader(setup, gpa, session, &stream);
+        try stream.done();
+        return;
+    }
+
     agent_.ask(emitter, session, text) catch |err| {
         std.log.err("a request failed: {s}", .{@errorName(err)});
         try stream.fail(@errorName(err));
