@@ -69,7 +69,7 @@ pub fn isId(text: []const u8) bool {
 test "an id carries the time it was made and sorts by it" {
     var earlier: [length]u8 = undefined;
     var later: [length]u8 = undefined;
-    const none = [_]u8{0} ** 10;
+    const none: [10]u8 = @splat(0);
 
     encode(&earlier, 1_700_000_000_000, none);
     encode(&later, 1_700_000_001_000, none);
@@ -102,8 +102,9 @@ test "two ids made in the same millisecond differ, and sort by their random part
     var second: [length]u8 = undefined;
     const time_ms: u48 = 1_700_000_000_000;
 
-    encode(&first, time_ms, [_]u8{0} ** 10);
-    encode(&second, time_ms, [_]u8{0} ** 9 ++ [_]u8{1});
+    encode(&first, time_ms, @splat(0));
+    const nine_zeros: [9]u8 = @splat(0);
+    encode(&second, time_ms, nine_zeros ++ [_]u8{1});
 
     try std.testing.expect(!std.mem.eql(u8, &first, &second));
     try std.testing.expect(std.mem.order(u8, &first, &second) == .lt);
@@ -113,7 +114,7 @@ test "two ids made in the same millisecond differ, and sort by their random part
 
 test "isId tells an id from a name and from a shorter or longer string" {
     var buf: [length]u8 = undefined;
-    encode(&buf, 1, [_]u8{0} ** 10);
+    encode(&buf, 1, @splat(0));
     try std.testing.expect(isId(&buf));
 
     try std.testing.expect(!isId("20260924-104612"));

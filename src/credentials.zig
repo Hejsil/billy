@@ -25,7 +25,7 @@ const format_version = 1;
 const max_credentials_bytes = 1 << 20;
 /// The mode the file is written with. A key is a secret, so the file is kept to
 /// the owner, unlike the configuration, which holds no secret.
-const secret_mode: std.Io.File.Permissions = @enumFromInt(0o600);
+const secret_mode: std.Io.File.Permissions = @fromBackingInt(@intCast(0o600));
 
 /// A service billy needs a credential for.
 pub const Service = enum {

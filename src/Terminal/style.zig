@@ -33,7 +33,7 @@ pub const Style = enum {
     pub fn color(style: Style, hue: Color, text: []const u8, out: *std.Io.Writer) !void {
         switch (style) {
             .plain => try out.writeAll(text),
-            .ansi => try out.print("\x1b[{d}m{s}\x1b[0m", .{ @intFromEnum(hue), text }),
+            .ansi => try out.print("\x1b[{d}m{s}\x1b[0m", .{ @backingInt(hue), text }),
         }
     }
 
@@ -42,7 +42,7 @@ pub const Style = enum {
     pub fn boldColor(style: Style, hue: Color, text: []const u8, out: *std.Io.Writer) !void {
         switch (style) {
             .plain => try out.writeAll(text),
-            .ansi => try out.print("\x1b[1;{d}m{s}\x1b[0m", .{ @intFromEnum(hue), text }),
+            .ansi => try out.print("\x1b[1;{d}m{s}\x1b[0m", .{ @backingInt(hue), text }),
         }
     }
 

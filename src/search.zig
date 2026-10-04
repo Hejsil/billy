@@ -421,7 +421,7 @@ pub const Client = struct {
 
         var req = try client.http.request(method, try std.Uri.parse(location), .{
             // A redirect is followed, so an endpoint that moved still answers.
-            .redirect_behavior = @enumFromInt(3),
+            .redirect_behavior = @fromBackingInt(@intCast(3)),
             .headers = .{
                 .content_type = if (payload != null) .{ .override = "application/json" } else .default,
             },
@@ -452,7 +452,7 @@ pub const Client = struct {
             // A backend failing is a warning rather than an error: with more
             // than one backend the caller tries the next, and the failure is
             // reported to the model as the result of the call.
-            std.log.warn("{s}: HTTP {d}", .{ what, @intFromEnum(response.head.status) });
+            std.log.warn("{s}: HTTP {d}", .{ what, @backingInt(response.head.status) });
             const discarded = response.reader(&.{});
             _ = discarded.discardRemaining() catch {};
             return null;

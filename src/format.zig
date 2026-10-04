@@ -175,7 +175,7 @@ fn writeSide(io: std.Io, dir: std.Io.Dir, data: []const u8, kind: []const u8, bu
 pub fn exitCode(term: std.process.Child.Term) u8 {
     return switch (term) {
         .exited => |code| code,
-        .signal => |signal| @intCast(128 + @as(u32, @intFromEnum(signal))),
+        .signal => |signal| @intCast(128 + @as(u32, @backingInt(signal))),
         .stopped => 128,
         .unknown => 255,
     };

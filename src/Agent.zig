@@ -1812,14 +1812,15 @@ test "a large instructions file is streamed whole" {
     // chunks, and the newline at the end is kept as written.
     var file_text: std.Io.Writer.Allocating = .init(gpa);
     defer file_text.deinit();
-    try file_text.writer.writeAll("x" ** 5000);
+    const long_text: [5000]u8 = @splat('x');
+    try file_text.writer.writeAll(&long_text);
     try file_text.writer.writeAll("\n");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = file_text.written() });
 
     var expected: std.Io.Writer.Allocating = .init(gpa);
     defer expected.deinit();
     try expected.writer.writeAll("\n\nThe project's instructions follow, read from AGENTS.md.\n\n");
-    try expected.writer.writeAll("x" ** 5000);
+    try expected.writer.writeAll(&long_text);
     try expected.writer.writeAll("\n");
 
     try expectInstructions(expected.written(), projectInstructions, tmp.dir);
@@ -2614,7 +2615,8 @@ test "a title is cut to one clean line, or dropped when there is none" {
     try std.testing.expect((try cleanTitle(gpa, "   \n  ")) == null);
 
     // A long title is kept whole: there is no limit.
-    const long = (try cleanTitle(gpa, "x" ** 200)).?;
+    const too_long: [200]u8 = @splat('x');
+    const long = (try cleanTitle(gpa, &too_long)).?;
     defer gpa.free(long);
     try std.testing.expectEqual(@as(usize, 200), long.len);
 

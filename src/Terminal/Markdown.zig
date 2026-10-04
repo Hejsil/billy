@@ -26,7 +26,7 @@ const max_list_depth = 16;
 /// text around it.
 const code_indent = "    ";
 /// The line a horizontal rule is drawn with.
-const rule = "-" ** 40;
+const rule: [40]u8 = @splat('-');
 /// Most columns a table is read for, so a broken one cannot walk an array off its
 /// end.
 const max_columns = 32;
@@ -244,7 +244,7 @@ fn openBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque
         md.c.MD_BLOCK_LI => return self.openItem(@ptrCast(@alignCast(detail.?))),
         md.c.MD_BLOCK_HR => {
             if (!self.beginBlock(false)) return false;
-            if (!self.put(rule)) return false;
+            if (!self.put(&rule)) return false;
         },
         md.c.MD_BLOCK_H => {
             if (!self.beginBlock(true)) return false;
@@ -703,7 +703,7 @@ test "a quote is barred and dim" {
 }
 
 test "a horizontal rule is a line of dashes" {
-    try expectPlain("-" ** 40, "---");
+    try expectPlain(&rule, "---");
 }
 
 test "a link is clickable where the terminal takes escape codes, else its address is shown" {

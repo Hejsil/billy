@@ -347,14 +347,14 @@ fn interpret(gpa: std.mem.Allocator, answer: Answer) !Completion {
     // The client logs what the server said as context; the error it returns is
     // what the caller reports, so the failure is not announced twice.
     if (answer.status.class() != .success) {
-        std.log.warn("HTTP {d}: {s}", .{ @intFromEnum(answer.status), answer.body });
+        std.log.warn("HTTP {d}: {s}", .{ @backingInt(answer.status), answer.body });
         return error.HttpStatus;
     }
     const parsed = std.json.parseFromSlice(Response, gpa, answer.body, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     }) catch |err| {
-        std.log.warn("HTTP {d}: {s}", .{ @intFromEnum(answer.status), answer.body });
+        std.log.warn("HTTP {d}: {s}", .{ @backingInt(answer.status), answer.body });
         return err;
     };
     errdefer parsed.deinit();
@@ -364,7 +364,7 @@ fn interpret(gpa: std.mem.Allocator, answer: Answer) !Completion {
         return error.ApiError;
     }
     if (parsed.value.choices.len == 0) {
-        std.log.warn("HTTP {d} without choices: {s}", .{ @intFromEnum(answer.status), answer.body });
+        std.log.warn("HTTP {d} without choices: {s}", .{ @backingInt(answer.status), answer.body });
         return error.NoChoices;
     }
     // A provider that omits usage leaves the totals at zero, so the session

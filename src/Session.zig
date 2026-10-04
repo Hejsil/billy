@@ -230,11 +230,11 @@ gpa: std.mem.Allocator,
 /// zero-filled, so what is written ends in NUL and the id is a NUL-terminated
 /// string with no length kept beside it. A generated id is a ULID; a resume
 /// takes one from the command line.
-id_buf: [max_id_len]u8 = [_]u8{0} ** max_id_len,
+id_buf: [max_id_len]u8 = @splat(0),
 
 /// The id with the file extension: the name of the session file, in a fixed
 /// buffer beside the id and zero-filled past the name for the same reason.
-name_buf: [max_id_len + extension.len]u8 = [_]u8{0} ** (max_id_len + extension.len),
+name_buf: [max_id_len + extension.len]u8 = @splat(0),
 
 /// All string data, one NUL-terminated copy per distinct string. Two equal
 /// strings share an index, so a conversation that repeats its roles, its tool
@@ -972,7 +972,7 @@ fn internString(session: *Session, text: ?[]const u8) !StringIndex {
     const start: u32 = @intCast(session.strings.items.len);
     try session.strings.print(session.gpa, "{f}", .{std.unicode.fmtUtf8(value)});
     try session.strings.append(session.gpa, 0);
-    const candidate: StringIndex = @enumFromInt(start);
+    const candidate: StringIndex = @fromBackingInt(@intCast(start));
 
     const context = Interned{ .session = session };
     const entry = try session.interned.getOrPutContext(session.gpa, candidate, context);
@@ -989,7 +989,7 @@ fn string(session: *const Session, index: StringIndex) ?[]const u8 {
 
 fn stringPtr(session: *const Session, index: StringIndex) ?[*:0]const u8 {
     if (index == .none) return null;
-    const start = @intFromEnum(index);
+    const start = @backingInt(index);
     return session.strings.items[start .. session.strings.items.len - 1 :0].ptr;
 }
 
@@ -1557,9 +1557,9 @@ test "the sessions in a directory are listed by when they were written" {
     // order below is none of these: it is the time each file was written, which
     // is what makes the listing newest-first whatever the ids are.
     var older_buf: [max_id_len]u8 = undefined;
-    ulid.encode(older_buf[0..ulid.length], 1_700_000_000_000, [_]u8{0} ** 10);
+    ulid.encode(older_buf[0..ulid.length], 1_700_000_000_000, @splat(0));
     var newer_buf: [max_id_len]u8 = undefined;
-    ulid.encode(newer_buf[0..ulid.length], 1_700_000_001_000, [_]u8{0} ** 10);
+    ulid.encode(newer_buf[0..ulid.length], 1_700_000_001_000, @splat(0));
 
     const oldest = older_buf[0..ulid.length];
     const newest_id = newer_buf[0..ulid.length];
@@ -1598,7 +1598,7 @@ test "the ordering keeps each id with the time it was written at" {
     var buffers: [count][max_id_len]u8 = undefined;
     for (0..count) |i| {
         const made = buffers[i][0..ulid.length];
-        ulid.encode(made, 1_700_000_000_000 + @as(u48, @intCast(i)), [_]u8{0} ** 10);
+        ulid.encode(made, 1_700_000_000_000 + @as(u48, @intCast(i)), @splat(0));
         try writeSessionAt(&tmp, gpa, made, @intCast(1_000 + (count - 1 - i) * 1_000));
     }
 
@@ -1620,9 +1620,9 @@ test "sessions written at the same moment are ordered by their ids" {
     const gpa = std.testing.allocator;
 
     var older_buf: [max_id_len]u8 = undefined;
-    ulid.encode(older_buf[0..ulid.length], 1_700_000_000_000, [_]u8{0} ** 10);
+    ulid.encode(older_buf[0..ulid.length], 1_700_000_000_000, @splat(0));
     var newer_buf: [max_id_len]u8 = undefined;
-    ulid.encode(newer_buf[0..ulid.length], 1_700_000_001_000, [_]u8{0} ** 10);
+    ulid.encode(newer_buf[0..ulid.length], 1_700_000_001_000, @splat(0));
 
     // The same write time on both, so the newer id comes first and the order does
     // not depend on how the directory happened to be read.
@@ -1655,11 +1655,11 @@ test "a listing carries each session's title" {
     // One session named with a long title, one with a short title, and one that
     // has not been named. The long one is longer than the first read buffer, so
     // it is read back only because the reader grows.
-    const long_title = "a long title " ** 199 ++ "ends here";
+    const long_title: [title_read_buffer_len + 1]u8 = @splat('y');
     try std.testing.expect(long_title.len > title_read_buffer_len);
     var long = try newSession(&tmp, gpa);
     defer long.deinit();
-    try long.setTitle(long_title);
+    try long.setTitle(&long_title);
     try long.append(.{ .role = "user", .content = "hi" });
 
     var titled = try newSession(&tmp, gpa);
@@ -1679,7 +1679,7 @@ test "a listing carries each session's title" {
     // has none.
     for (listed) |entry| {
         if (std.mem.eql(u8, entry.id, long.id())) {
-            try std.testing.expectEqualStrings(long_title, entry.title);
+            try std.testing.expectEqualStrings(&long_title, entry.title);
         } else if (std.mem.eql(u8, entry.id, titled.id())) {
             try std.testing.expectEqualStrings("Fix the parser", entry.title);
         } else {
@@ -1702,9 +1702,14 @@ test "a title is trimmed and cut to the most a title may be when it is set" {
     try std.testing.expectEqualStrings("Fix the parser", session.title().?);
 
     // A title of any length is kept whole: there is no limit.
-    const long = "\u{20AC}" ** 500;
-    try session.setTitle(long);
-    try std.testing.expectEqualStrings(long, session.title().?);
+    // The euro sign is three bytes in UTF-8, so this is not one byte repeated.
+    const many_euros = comptime blk: {
+        var out: [3 * 500]u8 = undefined;
+        for (0..500) |i| @memcpy(out[i * 3 ..][0..3], "\u{20AC}");
+        break :blk out;
+    };
+    try session.setTitle(&many_euros);
+    try std.testing.expectEqualStrings(&many_euros, session.title().?);
 }
 
 test "the title is read from the front of a session file, unescaped" {
@@ -1731,7 +1736,8 @@ test "the title is read from the front of a session file, unescaped" {
     try std.testing.expect((try titleOf(gpa, "not json at all")) == null);
 
     // A title of any length is read, however long: there is no limit.
-    try expectTitle(gpa, "y" ** 4096, "{\"version\":3,\"title\":\"" ++ ("y" ** 4096) ++ "\"}");
+    const long_title: [4096]u8 = @splat('y');
+    try expectTitle(gpa, &long_title, "{\"version\":3,\"title\":\"" ++ &long_title ++ "\"}");
 }
 
 /// Reads the title out of `front`, which stands in for the start of a session
@@ -1766,9 +1772,9 @@ test "setCheckedId rejects names that could escape the session directory" {
     try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, "a b"));
     // A name that does not fit, with room for its NUL, is refused rather than
     // cut short: the longest that fits is one byte less than the buffer.
-    try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, "x" ** (max_id_len + 1)));
-    try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, "x" ** max_id_len));
-    _ = try setCheckedId(&buf, "x" ** (max_id_len - 1));
+    try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, &@as([max_id_len + 1]u8, @splat('x'))));
+    try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, &@as([max_id_len]u8, @splat('x'))));
+    _ = try setCheckedId(&buf, &@as([max_id_len - 1]u8, @splat('x')));
 }
 
 test "defaultDir is the sessions directory under the data directory" {

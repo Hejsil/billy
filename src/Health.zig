@@ -211,7 +211,7 @@ fn add(self: *Health, name: []const u8) !*Wait {
     const entry = self.entries.getOrPutAssumeCapacityAdapted(name, names);
     // The name was not there, since it was looked for above.
     std.debug.assert(!entry.found_existing);
-    entry.key_ptr.* = @enumFromInt(start);
+    entry.key_ptr.* = @fromBackingInt(@intCast(start));
     entry.value_ptr.* = .{};
     return entry.value_ptr;
 }
@@ -219,7 +219,7 @@ fn add(self: *Health, name: []const u8) !*Wait {
 /// The text of the name at `offset`: from there to the NUL that ends it, which
 /// every name in the pool carries.
 fn nameText(self: *const Health, offset: Name) []const u8 {
-    const start = @intFromEnum(offset);
+    const start = @backingInt(offset);
     return std.mem.span(self.strings.items[start .. self.strings.items.len - 1 :0].ptr);
 }
 

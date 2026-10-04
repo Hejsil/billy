@@ -2,11 +2,15 @@
     .name = .billy,
     .version = "0.0.0",
     .fingerprint = 0xc2a2b4ce8410c683, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .md4c = .{
             .url = "https://github.com/mity/md4c/archive/refs/tags/v0.6.0.tar.gz",
             .hash = "N-V-__8AAEVDEgAtMuYZhXcl61grSDsy5AEXDjgWT0yKUDNs",
+        },
+        .translate_c = .{
+            .url = "git+https://codeberg.org/ziglang/translate-c?ref=2.0.0#0da7a16c3235b935b82421646076e0657cda21f6",
+            .hash = "translate_c-2.0.0-Q_BUWltOBwA0229IE8wwSxxGzOxyRso3hvcb1nN8oJX_",
         },
     },
     .paths = .{

@@ -142,9 +142,10 @@ const Stored = struct {
     /// share, by name. The configuration keeps its own arena, which the file does
     /// not hold.
     fn toConfig(stored: Stored, config: *Config) void {
-        inline for (std.meta.fields(Stored)) |field| {
-            if (comptime @hasField(Config, field.name)) {
-                @field(config, field.name) = @field(stored, field.name);
+        const fields = @typeInfo(Stored).@"struct".field_names;
+        inline for (fields) |name| {
+            if (comptime @hasField(Config, name)) {
+                @field(config, name) = @field(stored, name);
             }
         }
     }
@@ -192,9 +193,10 @@ pub fn deinit(config: *Config) void {
 /// has no field in the configuration.
 fn toStored(config: *const Config) Stored {
     var stored: Stored = .{};
-    inline for (std.meta.fields(Stored)) |field| {
-        if (comptime @hasField(Config, field.name)) {
-            @field(stored, field.name) = @field(config, field.name);
+    const fields = @typeInfo(Stored).@"struct".field_names;
+    inline for (fields) |name| {
+        if (comptime @hasField(Config, name)) {
+            @field(stored, name) = @field(config, name);
         }
     }
     return stored;
@@ -252,16 +254,16 @@ pub fn save(config: *const Config, io: std.Io, dir: std.Io.Dir) !void {
 // a setting, so one added without the other is a mistake worth stopping over.
 // The version belongs to the file alone, and the arena to the configuration.
 comptime {
-    for (std.meta.fields(Config)) |field| {
-        if (std.mem.eql(u8, field.name, "arena_state")) continue;
-        if (!@hasField(Stored, field.name)) {
-            @compileError("Config." ++ field.name ++ " would not be saved: add it to Stored as well");
+    for (@typeInfo(Config).@"struct".field_names) |name| {
+        if (std.mem.eql(u8, name, "arena_state")) continue;
+        if (!@hasField(Stored, name)) {
+            @compileError("Config." ++ name ++ " would not be saved: add it to Stored as well");
         }
     }
-    for (std.meta.fields(Stored)) |field| {
-        if (std.mem.eql(u8, field.name, "version")) continue;
-        if (!@hasField(Config, field.name)) {
-            @compileError("Stored." ++ field.name ++ " has no field in Config: add one so it is read back");
+    for (@typeInfo(Stored).@"struct".field_names) |name| {
+        if (std.mem.eql(u8, name, "version")) continue;
+        if (!@hasField(Config, name)) {
+            @compileError("Stored." ++ name ++ " has no field in Config: add one so it is read back");
         }
     }
 }
@@ -302,17 +304,18 @@ fn setPath(
     const segment = nextSegment(path);
     if (segment.head.len == 0) return error.UnknownOption;
 
-    inline for (std.meta.fields(T)) |field| {
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_names, info.field_types) |name, Field| {
         // The version is the file's own, not a setting a path names.
-        if (comptime !std.mem.eql(u8, field.name, "version") and isSettable(field.type)) {
-            if (std.mem.eql(u8, field.name, segment.head)) {
+        if (comptime !std.mem.eql(u8, name, "version") and isSettable(Field)) {
+            if (std.mem.eql(u8, name, segment.head)) {
                 if (segment.rest.len == 0) {
-                    if (comptime @typeInfo(field.type) == .@"struct") return error.NotASection;
-                    @field(target, field.name) = try parseValue(field.type, arena, value);
+                    if (comptime @typeInfo(Field) == .@"struct") return error.NotASection;
+                    @field(target, name) = try parseValue(Field, arena, value);
                     return;
                 }
-                if (comptime @typeInfo(field.type) == .@"struct") {
-                    return setPath(field.type, &@field(target, field.name), segment.rest, arena, value);
+                if (comptime @typeInfo(Field) == .@"struct") {
+                    return setPath(Field, &@field(target, name), segment.rest, arena, value);
                 }
                 return error.NotASection;
             }

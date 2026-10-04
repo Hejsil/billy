@@ -674,8 +674,8 @@ fn enterRaw(ed: *LineEditor) !std.posix.termios {
     raw.lflag.IEXTEN = false;
     raw.iflag.ICRNL = false;
     raw.iflag.IXON = false;
-    raw.cc[@intFromEnum(std.posix.V.MIN)] = 0;
-    raw.cc[@intFromEnum(std.posix.V.TIME)] = 1;
+    raw.cc[@backingInt(std.posix.V.MIN)] = 0;
+    raw.cc[@backingInt(std.posix.V.TIME)] = 1;
     try std.posix.tcsetattr(fd, .NOW, raw);
     return saved;
 }
@@ -1118,8 +1118,8 @@ test "a line wider than the terminal folds into several rows" {
     try std.testing.expectEqual(2, rowAt(line, 10, 26).index);
 
     // A row that fills the width exactly does not open another one.
-    try std.testing.expectEqual(2, rowCount("z" ** 20, 10));
-    try std.testing.expectEqual(1, rowAt("z" ** 20, 10, 20).index);
+    try std.testing.expectEqual(2, rowCount(&@as([20]u8, @splat('z')), 10));
+    try std.testing.expectEqual(1, rowAt(&@as([20]u8, @splat('z')), 10, 20).index);
 }
 
 test "folding repeats within every source row" {

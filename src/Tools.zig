@@ -1755,7 +1755,7 @@ test "a result longer than the cap is cut and says what it lost" {
     defer tmp.cleanup();
 
     // Far more than the cap, so the cut is plainly not the whole file.
-    const line = "x" ** 99 ++ "\n";
+    const line = @as([99]u8, @splat('x')) ++ "\n";
     var big: std.ArrayList(u8) = .empty;
     defer big.deinit(gpa);
     for (0..1000) |_| try big.appendSlice(gpa, line);

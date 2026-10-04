@@ -1,4 +1,5 @@
 const std = @import("std");
+const Translator = @import("translate_c").Translator;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -7,13 +8,29 @@ pub fn build(b: *std.Build) void {
 
     const md4c = b.dependency("md4c", .{});
 
+    // The md4c binding is translated from its headers at build time, since
+    // `@cImport` was removed in Zig 0.17 and translate-c is now a package of its
+    // own. The header billy translates is one file that includes the three md4c
+    // headers it needs, which is what the translator takes as its input.
+    const translate_c = b.dependency("translate_c", .{});
+    const md4c_zig: Translator = .init(translate_c, .{
+        .name = "md4c",
+        .c_source_file = b.path("src/md4c_binding.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    md4c_zig.addIncludePath(md4c.path("src"));
+    // A reply is UTF-8, and md4c is told which encoding to expect rather than
+    // guessing at it.
+    md4c_zig.defineCMacro("MD4C_USE_UTF8", null);
+
     const mod = b.addModule("billy", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    mod.addIncludePath(md4c.path("src"));
+    mod.addImport("md4c", md4c_zig.mod);
     mod.addCSourceFiles(.{
         .root = md4c.path("src"),
         .files = &.{ "md4c.c", "md4c-html.c", "entity.c" },
@@ -60,7 +77,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
 
     const fmt = b.addFmt(.{
-        .paths = &.{ "src", "build.zig", "build.zig.zon" },
+        .paths = &.{ b.path("src"), b.path("build.zig"), b.path("build.zig.zon") },
         .check = true,
     });
     const fmt_step = b.step("fmt", "Check that every source file is formatted");

@@ -2,15 +2,7 @@
 
 const std = @import("std");
 
-/// md4c, its entity table, and its own HTML renderer. The table is needed
-/// because a link address is decoded before it is trusted: a `javascript:`
-/// scheme can be spelled with entities, and the decoded address is the one the
-/// browser will follow. The HTML renderer is only for the oracle test below.
-pub const c = @cImport({
-    @cInclude("md4c.h");
-    @cInclude("entity.h");
-    @cInclude("md4c-html.h");
-});
+pub const c = @import("md4c");
 
 /// The dialect billy reads, on top of plain CommonMark: the GitHub extensions a
 /// model reaches for -- tables, strikethrough, task lists, links written as bare
