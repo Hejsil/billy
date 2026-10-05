@@ -19,9 +19,6 @@ const app_dir = "billy";
 /// Name of the configuration file inside that directory.
 pub const file_name = "config.json";
 
-/// Longest configuration file read back, so a damaged file cannot exhaust memory.
-const max_config_bytes = 1 << 20;
-
 /// What `open` found, including whether the file had to be written.
 pub const Opened = struct {
     config: Config,
@@ -211,21 +208,25 @@ fn toStored(config: *const Config) Stored {
 pub fn open(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator) !Opened {
     var config = Config.init(gpa);
     errdefer config.deinit();
+
     const arena = config.arena_state.allocator();
 
-    const text = dir.readFileAlloc(io, file_name, arena, .limited(max_config_bytes)) catch |err| switch (err) {
+    const text = dir.readFileAlloc(io, file_name, arena, .unlimited) catch |err| switch (err) {
         error.FileNotFound => {
             try config.save(io, dir);
             return .{ .config = config, .created = true };
         },
         else => return err,
     };
+
     const stored = std.json.parseFromSliceLeaky(Stored, arena, text, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     }) catch return error.CorruptConfig;
+
     try stored.validate();
     stored.toConfig(&config);
+
     return .{ .config = config, .created = false };
 }
 
@@ -281,7 +282,9 @@ comptime {
 /// stored. Strings are kept in the configuration's own arena.
 pub fn set(config: *Config, path: []const u8, value: []const u8) !void {
     var stored = config.toStored();
+
     try setPath(Stored, &stored, path, config.arena_state.allocator(), value);
+
     // A value that would make the configuration one the next read refuses, such
     // as a zero timeout, is a value this setting does not take.
     stored.validate() catch |err| switch (err) {
@@ -641,7 +644,7 @@ test "the file is indented, so it can be read and edited by hand" {
     config.max_turns = 3;
     try config.save(std.testing.io, tmp.dir);
 
-    const text = try tmp.dir.readFileAlloc(std.testing.io, file_name, gpa, .limited(max_config_bytes));
+    const text = try tmp.dir.readFileAlloc(std.testing.io, file_name, gpa, .unlimited);
     defer gpa.free(text);
     try std.testing.expectEqualStrings(
         \\{
