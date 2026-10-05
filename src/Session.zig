@@ -728,7 +728,7 @@ pub fn recordCost(session: *Session, usage: llm.Usage, cost: f64) void {
     session.cost += cost;
 }
 
-pub fn save(session: *Session) !void {
+pub fn save(session: *const Session) !void {
     var atomic = try session.dir.createFileAtomic(session.io, session.name(), .{
         .replace = true,
     });
@@ -737,8 +737,14 @@ pub fn save(session: *Session) !void {
     var file_buf: [std.heap.page_size_min]u8 = undefined;
     var file_writer = atomic.file.writer(session.io, &file_buf);
 
+    try session.write(&file_writer.interface);
+    try file_writer.end();
+    try atomic.replace(session.io);
+}
+
+pub fn write(session: *const Session, writer: *std.Io.Writer) !void {
     var json: std.json.Stringify = .{
-        .writer = &file_writer.interface,
+        .writer = writer,
         .options = .{ .emit_null_optional_fields = false },
     };
 
@@ -785,9 +791,6 @@ pub fn save(session: *Session) !void {
     try json.write(session.cwd());
 
     try json.endObject();
-
-    try file_writer.end();
-    try atomic.replace(session.io);
 }
 
 /// Reads an existing session's file into `session`.
