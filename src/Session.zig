@@ -40,9 +40,6 @@ const extension = ".json";
 /// and is written from the front, so there is always a byte left to end the id.
 const max_id_len = 64;
 
-/// Longest session file read back, so a damaged file cannot exhaust memory.
-const max_session_bytes = 64 << 20;
-
 /// The result given a tool call a kill left open. It restores a conversation the
 /// API will take, and tells the model the call did not finish so it can try
 /// again.
@@ -803,7 +800,7 @@ fn load(session: *Session) !void {
         session.io,
         session.name(),
         arena,
-        .limited(max_session_bytes),
+        .unlimited,
     ) catch |err| switch (err) {
         error.FileNotFound => return error.SessionNotFound,
         else => return err,
@@ -811,6 +808,7 @@ fn load(session: *Session) !void {
 
     const stored = std.json.parseFromSliceLeaky(Stored, arena, text, .{
         .ignore_unknown_fields = true,
+        .allocate = .alloc_if_needed,
     }) catch return error.CorruptSession;
 
     if (stored.version > Stored.default.version)
