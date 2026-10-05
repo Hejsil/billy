@@ -12,7 +12,7 @@ pub fn run(edit: Edit, gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, out:
     if (edit.old_string.len == 0)
         return Tools.fail(out, "old_string must not be empty", .{});
 
-    const contents = dir.readFileAlloc(io, edit.path, gpa, .limited(16 << 20)) catch |err|
+    const contents = dir.readFileAlloc(io, edit.path, gpa, .unlimited) catch |err|
         return Tools.fail(out, "cannot read {s}: {s}", .{ edit.path, @errorName(err) });
     defer gpa.free(contents);
 
