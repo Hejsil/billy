@@ -11,9 +11,6 @@
 
 const std = @import("std");
 
-/// Room above the text when the laid-out text is read back, so a formatter that
-/// runs away cannot exhaust memory.
-const slack = 1 << 20;
 /// The most arguments a block passes to its format script, which is the two sides
 /// of a diff. `bash` and `-c` and the script itself come before them.
 const max_args = 2;
@@ -89,10 +86,7 @@ fn run(format: Format, text: []const u8, args: []const []const u8, out: *std.Io.
 
     var out_buffer: [4096]u8 = undefined;
     var reader: std.Io.File.Reader = .init(child.stdout.?, formatter.io, &out_buffer);
-    const written = reader.interface.allocRemaining(
-        formatter.gpa,
-        .limited(text.len +| slack),
-    ) catch return false;
+    const written = reader.interface.allocRemaining(formatter.gpa, .unlimited) catch return false;
     defer formatter.gpa.free(written);
 
     // A formatter that failed, or left nothing behind, is one the text should
@@ -202,7 +196,7 @@ test "each side is written to its own fresh file" {
     try std.testing.expect(!std.mem.eql(u8, first, second));
 
     // Each file holds what it was given.
-    const contents = try dir.readFileAlloc(std.testing.io, std.fs.path.basename(first), gpa, .limited(64));
+    const contents = try dir.readFileAlloc(std.testing.io, std.fs.path.basename(first), gpa, .unlimited);
     defer gpa.free(contents);
     try std.testing.expectEqualStrings("one", contents);
 }
