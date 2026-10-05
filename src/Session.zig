@@ -25,6 +25,7 @@ const llm = @import("llm.zig");
 const ulid = @import("ulid.zig");
 const xdg = @import("xdg.zig");
 const agent = @import("Agent.zig");
+const Pool = @import("Pool.zig");
 
 const Session = @This();
 
@@ -105,29 +106,7 @@ const Stored = struct {
     const default = Stored{};
 };
 
-const StringIndex = enum(u32) {
-    none = std.math.maxInt(u32),
-    _,
-};
-
-/// Equality and hashing for interned strings. A string is named by its index
-/// into the pool rather than by a pointer, so that growing the pool cannot
-/// invalidate a key, and the pool itself stays the only copy of the text.
-const Interned = struct {
-    session: *const Session,
-
-    pub fn hash(context: Interned, index: StringIndex) u64 {
-        return std.hash.Wyhash.hash(0, context.session.string(index) orelse "");
-    }
-
-    pub fn eql(context: Interned, a: StringIndex, b: StringIndex) bool {
-        return std.mem.eql(
-            u8,
-            context.session.string(a) orelse "",
-            context.session.string(b) orelse "",
-        );
-    }
-};
+const StringIndex = Pool.Index;
 
 const ToolCallIndex = struct {
     start: u32,
@@ -153,11 +132,11 @@ const ToolCall = struct {
 
     fn resolve(tool_call: ToolCall, session: *const Session) llm.ToolCall {
         return .{
-            .id = session.string(tool_call.id) orelse "",
-            .type = session.string(tool_call.type) orelse "",
+            .id = session.pool.get(tool_call.id) orelse "",
+            .type = session.pool.get(tool_call.type) orelse "",
             .function = .{
-                .name = session.string(tool_call.function.name) orelse "",
-                .arguments = session.string(tool_call.function.arguments) orelse "",
+                .name = session.pool.get(tool_call.function.name) orelse "",
+                .arguments = session.pool.get(tool_call.function.arguments) orelse "",
             },
         };
     }
@@ -185,10 +164,10 @@ pub const Message = struct {
             calls = resolved;
         }
         return .{
-            .role = session.string(message.role) orelse "",
-            .content = session.string(message.content),
-            .tool_call_id = session.string(message.tool_call_id),
-            .reasoning_content = session.string(message.reasoning),
+            .role = session.pool.get(message.role) orelse "",
+            .content = session.pool.get(message.content),
+            .tool_call_id = session.pool.get(message.tool_call_id),
+            .reasoning_content = session.pool.get(message.reasoning),
             .tool_calls = calls,
         };
     }
@@ -236,11 +215,7 @@ name_buf: [max_id_len + extension.len]u8 = @splat(0),
 /// All string data, one NUL-terminated copy per distinct string. Two equal
 /// strings share an index, so a conversation that repeats its roles, its tool
 /// names and what a repeated call returned pays for each of them once.
-strings: std.ArrayList(u8) = .empty,
-
-/// The strings the pool holds, so that one already there is not appended again.
-/// Keyed by index rather than by pointer, since the pool moves as it grows.
-interned: std.HashMapUnmanaged(StringIndex, void, Interned, std.hash_map.default_max_load_percentage) = .empty,
+pool: Pool = .{},
 
 tool_calls: std.ArrayList(ToolCall) = .empty,
 
@@ -341,13 +316,12 @@ fn named(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: ?[]const
 
     // The session owns its directory rather than pointing into the caller's
     // memory, which it may outlive.
-    session.interned_cwd = try session.internString(arg_cwd);
+    session.interned_cwd = try session.pool.intern(session.gpa, arg_cwd);
     return session;
 }
 
 pub fn deinit(session: *Session) void {
-    session.strings.deinit(session.gpa);
-    session.interned.deinit(session.gpa);
+    session.pool.deinit(session.gpa);
     session.tool_calls.deinit(session.gpa);
     session.messages.deinit(session.gpa);
     session.compactions.deinit(session.gpa);
@@ -366,7 +340,7 @@ pub fn name(session: *const Session) []const u8 {
 }
 
 pub fn cwd(session: *const Session) []const u8 {
-    return session.string(session.interned_cwd) orelse "";
+    return session.pool.get(session.interned_cwd) orelse "";
 }
 
 /// The conversation as a completion request carries it: the `messages` array of
@@ -392,7 +366,7 @@ pub const Conversation = struct {
         try json.beginArray();
         // The system prompt leads every request, and is the one message that is
         // not part of the conversation.
-        if (session.string(session.system_prompt)) |prompt| {
+        if (session.pool.get(session.system_prompt)) |prompt| {
             try json.beginObject();
             try json.objectField("role");
             try json.write("system");
@@ -424,9 +398,9 @@ pub const Conversation = struct {
 fn writeMessage(session: *const Session, json: anytype, message: Message) !void {
     try json.beginObject();
     try json.objectField("role");
-    try json.write(session.string(message.role) orelse "");
+    try json.write(session.pool.get(message.role) orelse "");
 
-    if (session.string(message.content)) |content| {
+    if (session.pool.get(message.content)) |content| {
         try json.objectField("content");
         try json.write(content);
     }
@@ -439,7 +413,7 @@ fn writeMessage(session: *const Session, json: anytype, message: Message) !void 
         try json.endArray();
     }
 
-    if (session.string(message.tool_call_id)) |tool_call_id| {
+    if (session.pool.get(message.tool_call_id)) |tool_call_id| {
         try json.objectField("tool_call_id");
         try json.write(tool_call_id);
     }
@@ -448,7 +422,7 @@ fn writeMessage(session: *const Session, json: anytype, message: Message) !void 
     // context on the next request has it to send. Written last, after every
     // other field, so a message that carries none is byte for byte the message
     // it was before this field existed and a cached prefix still matches.
-    if (session.string(message.reasoning)) |reasoning| {
+    if (session.pool.get(message.reasoning)) |reasoning| {
         try json.objectField("reasoning_content");
         try json.write(reasoning);
     }
@@ -496,19 +470,19 @@ pub fn hasSystemPrompt(session: *const Session) bool {
 /// The system prompt sent at the front of every request, or null when the
 /// session has none.
 pub fn systemPrompt(session: *const Session) ?[]const u8 {
-    return session.string(session.system_prompt);
+    return session.pool.get(session.system_prompt);
 }
 
 /// The session's title, a short name for it, or null when it has none.
 pub fn title(session: *const Session) ?[]const u8 {
-    return session.string(session.title_index);
+    return session.pool.get(session.title_index);
 }
 
 /// Names the session, replacing any title it had. The whitespace around it is
 /// trimmed and the title itself is kept as written. It is held in the pool and
 /// reaches the file with the next save.
 pub fn setTitle(session: *Session, text: []const u8) !void {
-    session.title_index = try session.internString(std.mem.trim(u8, text, " \t\r\n"));
+    session.title_index = try session.pool.intern(session.gpa, std.mem.trim(u8, text, " \t\r\n"));
 }
 
 /// A tool call as the transcript reads it: the id that names the result which
@@ -523,12 +497,12 @@ pub const Call = struct {
 
 /// The role of a message, read from where it is stored.
 pub fn roleOf(session: *const Session, message: Message) []const u8 {
-    return session.string(message.role) orelse "";
+    return session.pool.get(message.role) orelse "";
 }
 
 /// The content of a message, or null when it has none.
 pub fn contentOf(session: *const Session, message: Message) ?[]const u8 {
-    return session.string(message.content);
+    return session.pool.get(message.content);
 }
 
 /// How many tool calls a message asked for.
@@ -540,9 +514,9 @@ pub fn callCount(session: *const Session, message: Message) usize {
 pub fn callAt(session: *const Session, message: Message, index: usize) Call {
     const call = message.tool_calls.resolve(session)[index];
     return .{
-        .id = session.string(call.id) orelse "",
-        .name = session.string(call.function.name) orelse "",
-        .arguments = session.string(call.function.arguments) orelse "",
+        .id = session.pool.get(call.id) orelse "",
+        .name = session.pool.get(call.function.name) orelse "",
+        .arguments = session.pool.get(call.function.arguments) orelse "",
     };
 }
 
@@ -557,9 +531,9 @@ pub fn toolResult(session: *const Session, from: usize, call: []const u8) []cons
     const messages = session.messages.items;
     if (from >= messages.len) return "";
     for (messages[from..]) |message| {
-        if (!std.mem.eql(u8, session.string(message.role) orelse "", "tool")) continue;
-        const call_id = session.string(message.tool_call_id) orelse continue;
-        if (std.mem.eql(u8, call_id, call)) return session.string(message.content) orelse "";
+        if (!std.mem.eql(u8, session.pool.get(message.role) orelse "", "tool")) continue;
+        const call_id = session.pool.get(message.tool_call_id) orelse continue;
+        if (std.mem.eql(u8, call_id, call)) return session.pool.get(message.content) orelse "";
     }
     return "";
 }
@@ -577,7 +551,7 @@ pub fn resolvedMessages(session: *const Session, allocator: std.mem.Allocator) !
     const lead: usize = if (session.hasSystemPrompt()) 1 else 0;
     const messages = try allocator.alloc(llm.Message, lead + session.messages.items.len);
     var out: usize = 0;
-    if (session.string(session.system_prompt)) |prompt| {
+    if (session.pool.get(session.system_prompt)) |prompt| {
         messages[0] = .{ .role = "system", .content = prompt };
         out = 1;
     }
@@ -625,20 +599,20 @@ fn appendMessage(session: *Session, message: llm.Message) !void {
 
     for (tool_calls) |tool_call| {
         try session.tool_calls.append(session.gpa, .{
-            .id = try session.internString(tool_call.id),
-            .type = try session.internString(tool_call.type),
+            .id = try session.pool.intern(session.gpa, tool_call.id),
+            .type = try session.pool.intern(session.gpa, tool_call.type),
             .function = .{
-                .name = try session.internString(tool_call.function.name),
-                .arguments = try session.internString(tool_call.function.arguments),
+                .name = try session.pool.intern(session.gpa, tool_call.function.name),
+                .arguments = try session.pool.intern(session.gpa, tool_call.function.arguments),
             },
         });
     }
 
     try session.messages.append(session.gpa, .{
-        .role = try session.internString(message.role),
-        .content = try session.internString(message.content),
-        .tool_call_id = try session.internString(message.tool_call_id),
-        .reasoning = try session.internString(message.reasoning_content),
+        .role = try session.pool.intern(session.gpa, message.role),
+        .content = try session.pool.intern(session.gpa, message.content),
+        .tool_call_id = try session.pool.intern(session.gpa, message.tool_call_id),
+        .reasoning = try session.pool.intern(session.gpa, message.reasoning_content),
         .tool_calls = interned_tool_calls,
     });
 }
@@ -651,7 +625,7 @@ fn appendMessage(session: *Session, message: llm.Message) !void {
 /// saved with and hits its prompt cache. The prompt is held in the pool and
 /// reaches the file with the next save, like the tools.
 pub fn setSystemPrompt(session: *Session, system_prompt: []const u8) !void {
-    session.system_prompt = try session.internString(system_prompt);
+    session.system_prompt = try session.pool.intern(session.gpa, system_prompt);
 }
 
 /// Records the mode the session runs in. Set once, when the session starts; the
@@ -682,9 +656,9 @@ pub fn setTools(session: *Session, definitions: []const Definition) !void {
     errdefer session.gpa.free(tools);
     for (definitions, tools) |definition, *tool| {
         tool.* = .{
-            .name = try session.internString(definition.name),
-            .description = try session.internString(definition.description),
-            .parameters = try session.internString(definition.parameters),
+            .name = try session.pool.intern(session.gpa, definition.name),
+            .description = try session.pool.intern(session.gpa, definition.description),
+            .parameters = try session.pool.intern(session.gpa, definition.parameters),
         };
     }
     session.gpa.free(session.tools);
@@ -750,12 +724,12 @@ pub fn write(session: *const Session, writer: *std.Io.Writer) !void {
     try json.objectField("version");
     try json.write(Stored.default.version);
 
-    if (session.string(session.title_index)) |stored_title| {
+    if (session.pool.get(session.title_index)) |stored_title| {
         try json.objectField("title");
         try json.write(stored_title);
     }
 
-    if (session.string(session.system_prompt)) |prompt| {
+    if (session.pool.get(session.system_prompt)) |prompt| {
         try json.objectField("system_prompt");
         try json.write(prompt);
     }
@@ -827,7 +801,7 @@ fn load(session: *Session) !void {
     session.context_tokens = stored.context_tokens;
     session.cost = stored.cost;
     if (stored.cwd) |stored_cwd|
-        session.interned_cwd = try session.internString(stored_cwd);
+        session.interned_cwd = try session.pool.intern(session.gpa, stored_cwd);
 }
 
 fn loadPromptAndMessages(
@@ -877,8 +851,8 @@ fn loadTools(session: *Session, stored: []const StoredTool) !void {
     const tools = try session.gpa.alloc(Tool, stored.len);
     for (stored, tools) |stored_tool, *tool| {
         tool.* = .{
-            .name = try session.internString(stored_tool.function.name),
-            .description = try session.internString(stored_tool.function.description),
+            .name = try session.pool.intern(session.gpa, stored_tool.function.name),
+            .description = try session.pool.intern(session.gpa, stored_tool.function.description),
             .parameters = try session.internParameters(stored_tool.function.parameters),
         };
     }
@@ -921,8 +895,8 @@ fn repairTail(session: *Session) !void {
     while (k < calls) : (k += 1) {
         const call_id = session.messages.items[tail].tool_calls.resolve(session)[k].id;
         const result: Message = .{
-            .role = try session.internString("tool"),
-            .content = try session.internString(interrupted_result),
+            .role = try session.pool.intern(session.gpa, "tool"),
+            .content = try session.pool.intern(session.gpa, interrupted_result),
             .tool_call_id = call_id,
         };
         try session.messages.insert(session.gpa, at + (k - answered), result);
@@ -950,46 +924,6 @@ fn lastCall(session: *const Session) ?usize {
     return null;
 }
 
-/// Interns `text` into the pool and returns its index, or `.none` for null.
-///
-/// The pool holds text, and text is what a request and the session file carry
-/// as a JSON string. A tool's output, what the user typed and a file read back
-/// are arbitrary bytes, though, and Zig writes a byte slice that is not valid
-/// UTF-8 as an array of numbers, which the API rejects. The text is therefore
-/// written through `fmtUtf8`, which passes well-formed text through unchanged
-/// and repairs anything ill-formed, so every string the pool holds, and
-/// everything written from it, is text a request and a session file can carry.
-fn internString(session: *Session, text: ?[]const u8) !StringIndex {
-    const value = text orelse return .none;
-
-    // The candidate is put in the pool before it is looked up, since a key has
-    // to name a string the pool already holds. A duplicate is rolled back as
-    // soon as the lookup finds the copy that was there already. The text is
-    // written straight into the pool, so nothing else is allocated for it.
-    const start: u32 = @intCast(session.strings.items.len);
-    try session.strings.print(session.gpa, "{f}", .{std.unicode.fmtUtf8(value)});
-    try session.strings.append(session.gpa, 0);
-    const candidate: StringIndex = @fromBackingInt(@intCast(start));
-
-    const context = Interned{ .session = session };
-    const entry = try session.interned.getOrPutContext(session.gpa, candidate, context);
-    if (!entry.found_existing) return candidate;
-
-    session.strings.shrinkRetainingCapacity(start);
-    return entry.key_ptr.*;
-}
-
-fn string(session: *const Session, index: StringIndex) ?[]const u8 {
-    const ptr = session.stringPtr(index) orelse return null;
-    return std.mem.span(ptr);
-}
-
-fn stringPtr(session: *const Session, index: StringIndex) ?[*:0]const u8 {
-    if (index == .none) return null;
-    const start = @backingInt(index);
-    return session.strings.items[start .. session.strings.items.len - 1 :0].ptr;
-}
-
 /// The directory billy keeps its own files in: `$XDG_DATA_HOME/billy`, or
 /// `$HOME/.local/share/billy` when that is unset, as the XDG base directory
 /// specification prescribes. The credentials live in the directory itself, and
@@ -1013,11 +947,11 @@ pub fn defaultDir(gpa: std.mem.Allocator, environ: *const std.process.Environ.Ma
 /// is what the request is sent.
 fn internParameters(session: *Session, value: std.json.Value) !StringIndex {
     switch (value) {
-        .string => |text| return session.internString(text),
+        .string => |text| return session.pool.intern(session.gpa, text),
         else => {
             const text = try std.json.Stringify.valueAlloc(session.gpa, value, .{});
             defer session.gpa.free(text);
-            return session.internString(text);
+            return session.pool.intern(session.gpa, text);
         },
     }
 }
@@ -1040,12 +974,12 @@ pub const ToolSet = struct {
             try json.objectField("function");
             try json.beginObject();
             try json.objectField("name");
-            try json.write(session.string(tool.name) orelse "");
+            try json.write(session.pool.get(tool.name) orelse "");
             try json.objectField("description");
-            try json.write(session.string(tool.description) orelse "");
+            try json.write(session.pool.get(tool.description) orelse "");
             try json.objectField("parameters");
             // The schema is written as the JSON it is, not as a quoted string.
-            try json.print("{s}", .{session.string(tool.parameters) orelse "{}"});
+            try json.print("{s}", .{session.pool.get(tool.parameters) orelse "{}"});
             try json.endObject();
             try json.endObject();
         }
@@ -1500,7 +1434,7 @@ test "a new session is written out by its first message" {
     // The prompt is its own field, apart from the conversation, which is the
     // message alone.
     try std.testing.expect(resumed.hasSystemPrompt());
-    try std.testing.expectEqualStrings("be terse", resumed.string(resumed.system_prompt).?);
+    try std.testing.expectEqualStrings("be terse", resumed.pool.get(resumed.system_prompt).?);
     try std.testing.expectEqual(1, resumed.messages.items.len);
     try std.testing.expectEqualStrings("user", resumed.roleOf(resumed.messages.items[0]));
     try std.testing.expectEqualStrings("hello", resumed.contentOf(resumed.messages.items[0]).?);
@@ -2131,7 +2065,7 @@ test "an equal string is interned once and shared" {
     // Each distinct string once, in the order it was first seen.
     try std.testing.expectEqualStrings(
         "/work\x00user\x00hello\x00assistant\x00call_1\x00function\x00read\x00{}\x00[]\x00",
-        session.strings.items,
+        session.pool.strings.items,
     );
     // The two equal contents, and the repeated parts of the two tool calls,
     // name the one copy of each.
@@ -2162,14 +2096,14 @@ test "a version 2 file's system prompt is lifted into its own field" {
 
     // The prompt comes back as its own field and is no longer a message, so the
     // conversation is the user message alone.
-    try std.testing.expectEqualStrings("old prompt", resumed.string(resumed.system_prompt).?);
+    try std.testing.expectEqualStrings("old prompt", resumed.pool.get(resumed.system_prompt).?);
     try std.testing.expectEqual(1, resumed.messages.items.len);
     try std.testing.expectEqualStrings("user", resumed.roleOf(resumed.messages.items[0]));
     try std.testing.expectEqualStrings("hi", resumed.contentOf(resumed.messages.items[0]).?);
 
     // A resume keeps it rather than taking a newer one.
     try resumed.ensureSystemPrompt("new prompt");
-    try std.testing.expectEqualStrings("old prompt", resumed.string(resumed.system_prompt).?);
+    try std.testing.expectEqualStrings("old prompt", resumed.pool.get(resumed.system_prompt).?);
 }
 
 test "a compaction is appended and a request starts at its summary" {
@@ -2229,11 +2163,11 @@ test "a compaction survives a save and resume" {
     defer resumed.deinit();
 
     // Everything comes back, and the request still starts at the summary.
-    try std.testing.expectEqualStrings("be terse", resumed.string(resumed.system_prompt).?);
+    try std.testing.expectEqualStrings("be terse", resumed.pool.get(resumed.system_prompt).?);
     try std.testing.expectEqual(4, resumed.messages.items.len);
     try std.testing.expectEqual(2, resumed.sentFrom());
-    try std.testing.expectEqualStrings("the summary", resumed.string(resumed.messages.items[2].content).?);
-    try std.testing.expectEqualStrings("next", resumed.string(resumed.messages.items[3].content).?);
+    try std.testing.expectEqualStrings("the summary", resumed.pool.get(resumed.messages.items[2].content).?);
+    try std.testing.expectEqualStrings("next", resumed.pool.get(resumed.messages.items[3].content).?);
 }
 
 test "the compaction list is sorted and clamped when a session is read" {
@@ -2258,7 +2192,7 @@ test "the compaction list is sorted and clamped when a session is read" {
     var session = try reopen(&tmp, gpa, "odd");
     defer session.deinit();
 
-    try std.testing.expectEqualStrings("s", session.string(session.system_prompt).?);
+    try std.testing.expectEqualStrings("s", session.pool.get(session.system_prompt).?);
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 1, 2 }, session.compactions.items);
     try std.testing.expectEqual(2, session.sentFrom());
     try std.testing.expect(session.isCompaction(1));
@@ -2300,18 +2234,18 @@ test "the system prompt is kept apart from the conversation and is not replaced"
     // field, sent at the front of every request.
     try session.setSystemPrompt("current prompt");
     try std.testing.expect(session.hasSystemPrompt());
-    try std.testing.expectEqualStrings("current prompt", session.string(session.system_prompt).?);
+    try std.testing.expectEqualStrings("current prompt", session.pool.get(session.system_prompt).?);
     try std.testing.expectEqual(0, session.messages.items.len);
 
     // A session that already has one keeps it, which is what a resume relies on.
     try session.append(.{ .role = "user", .content = "hi" });
     try session.ensureSystemPrompt("a different prompt");
-    try std.testing.expectEqualStrings("current prompt", session.string(session.system_prompt).?);
+    try std.testing.expectEqualStrings("current prompt", session.pool.get(session.system_prompt).?);
     try std.testing.expectEqual(1, session.messages.items.len);
 
     // Setting it outright replaces it, which is what a compaction does.
     try session.setSystemPrompt("a different prompt");
-    try std.testing.expectEqualStrings("a different prompt", session.string(session.system_prompt).?);
+    try std.testing.expectEqualStrings("a different prompt", session.pool.get(session.system_prompt).?);
 }
 
 test "the tools are written out with the schema as the JSON it is" {
@@ -2361,7 +2295,7 @@ test "ensureTools stores the tools and only sets them once" {
     defer session.deinit();
     try session.ensureTools(&tools);
     try std.testing.expectEqual(1, session.tools.len);
-    try std.testing.expectEqualStrings("read", session.string(session.tools[0].name).?);
+    try std.testing.expectEqualStrings("read", session.pool.get(session.tools[0].name).?);
 
     // The tools are held in memory until the session's first message, which is
     // what writes the session out.
@@ -2375,8 +2309,8 @@ test "ensureTools stores the tools and only sets them once" {
     var resumed = try reopen(&tmp, gpa, session.id());
     defer resumed.deinit();
     try std.testing.expectEqual(1, resumed.tools.len);
-    try std.testing.expectEqualStrings("read", resumed.string(resumed.tools[0].name).?);
-    try std.testing.expectEqualStrings("Read a file.", resumed.string(resumed.tools[0].description).?);
+    try std.testing.expectEqualStrings("read", resumed.pool.get(resumed.tools[0].name).?);
+    try std.testing.expectEqualStrings("Read a file.", resumed.pool.get(resumed.tools[0].description).?);
 
     // A session that already has tools keeps them, rather than taking a new set.
     const replaced = [_]Definition{.{
@@ -2388,7 +2322,7 @@ test "ensureTools stores the tools and only sets them once" {
     defer reopened.deinit();
     try reopened.ensureTools(&replaced);
     try std.testing.expectEqual(1, reopened.tools.len);
-    try std.testing.expectEqualStrings("read", reopened.string(reopened.tools[0].name).?);
+    try std.testing.expectEqualStrings("read", reopened.pool.get(reopened.tools[0].name).?);
 }
 
 test "a session saved without tools loads with none" {
@@ -2491,7 +2425,7 @@ test "a new session does not reuse an id whose file exists" {
     var resumed = try reopen(&tmp, gpa, first.id());
     defer resumed.deinit();
 
-    try std.testing.expectEqualStrings("keep me", resumed.string(resumed.messages.items[0].content).?);
+    try std.testing.expectEqualStrings("keep me", resumed.pool.get(resumed.messages.items[0].content).?);
 }
 
 test "the working directory is stored and restored on resume" {
