@@ -2035,7 +2035,7 @@ test "a message a session read back with bytes that are not UTF-8 is repaired" {
     // Saving it back writes the content as a string, so the bytes are gone for
     // good and the file is one a later resume reads as text.
     try session.save();
-    const text = try tmp.dir.readFileAlloc(std.testing.io, "bytes.json", gpa, .limited(1 << 16));
+    const text = try tmp.dir.readFileAlloc(std.testing.io, "bytes.json", gpa, .unlimited);
     defer gpa.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "[97,255,98]") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\"content\":\"a\u{FFFD}b\"") != null);
