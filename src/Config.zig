@@ -221,7 +221,7 @@ pub fn open(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator) !Opened {
 
     const stored = std.json.parseFromSliceLeaky(Stored, arena, text, .{
         .ignore_unknown_fields = true,
-        .allocate = .alloc_always,
+        .allocate = .alloc_if_needed,
     }) catch return error.CorruptConfig;
 
     try stored.validate();
@@ -240,13 +240,13 @@ pub fn open(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator) !Opened {
 pub fn save(config: *const Config, io: std.Io, dir: std.Io.Dir) !void {
     var atomic = try dir.createFileAtomic(io, file_name, .{ .replace = true });
     defer atomic.deinit(io);
-    var buffer: [4096]u8 = undefined;
-    var file: std.Io.File.Writer = .init(atomic.file, io, &buffer);
-    try std.json.Stringify.value(
-        config.toStored(),
-        .{ .whitespace = .indent_2 },
-        &file.interface,
-    );
+
+    var buf: [std.heap.page_size_min]u8 = undefined;
+    var file = atomic.file.writer(io, &buf);
+
+    const stored = config.toStored();
+    try std.json.Stringify.value(stored, .{ .whitespace = .indent_2 }, &file.interface);
+
     try file.flush();
     try atomic.replace(io);
 }
