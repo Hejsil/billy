@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const llm = @import("llm.zig");
-const Search = @import("search.zig");
+const Health = @import("Health.zig");
 const formatting = @import("format.zig");
 const diffing = @import("diff.zig");
 const Terminal = @import("Terminal.zig");
@@ -12,7 +12,7 @@ const Bash = @import("Tools/Bash.zig");
 const Edit = @import("Tools/Edit.zig");
 const Read = @import("Tools/Read.zig");
 const Write = @import("Tools/Write.zig");
-const web = @import("Tools/web.zig");
+pub const web = @import("Tools/web.zig");
 
 const Tools = @This();
 
@@ -77,10 +77,20 @@ bash_timeout_s: usize,
 /// How the lines billy prints itself are decorated. Shared with the
 /// transcript, so a replayed session looks like the run it continues.
 style: Terminal.Style,
-/// The web search and fetch client, or null when no backend is configured. A
-/// null leaves `web_search` and `web_fetch` out of the tool set billy offers, so
-/// the model is never given a tool that could not run.
-search: ?Search.Client,
+/// The search backends the configuration named, with their keys resolved, or
+/// null to leave `web_search` out of the tool set billy offers, so the model is
+/// never given a tool that could not run.
+search: ?web.Search.Config,
+/// The fetch backends, on the same terms. A set with no backend leaves
+/// `web_fetch` out.
+fetch: ?web.Fetch.Config,
+/// The run's one HTTP client, borrowed by a web tool when one is configured, so
+/// a search or a fetch shares connections and scanned certificates with the
+/// model requests.
+http: *std.http.Client,
+/// The waits of every backend, so one that just failed is skipped. Null runs
+/// without them, which is what a test wants.
+health: ?*Health,
 
 /// What a tool set is built from, gathered into one so the constructor reads
 /// as what each value is rather than as a run of positional arguments, which
@@ -104,11 +114,14 @@ pub const Options = struct {
     /// to leave web search out. A null also leaves `web_search` out of the
     /// tool set billy offers, so the model is never given a tool that could
     /// not run.
-    search: ?Search.Config = null,
-    /// The run's one HTTP client, borrowed by the search backend when one is
-    /// configured, so a search shares connections and scanned certificates
-    /// with the model requests.
+    search: ?web.Search.Config = null,
+    /// The fetch backends the configuration asked for, with their keys resolved,
+    /// or null to leave `web_fetch` out.
+    fetch: ?web.Fetch.Config = null,
+    /// The run's one HTTP client, borrowed by a web tool when one is configured.
     http: *std.http.Client,
+    /// The waits of every backend, so one that just failed is skipped.
+    health: ?*Health = null,
 };
 
 pub fn init(options: Options) !Tools {
@@ -119,15 +132,17 @@ pub fn init(options: Options) !Tools {
         .formats = options.formats,
         .bash_timeout_s = options.bash_timeout_s,
         .style = options.style,
-        .search = if (options.search) |config| .{
-            .io = options.io,
-            .gpa = options.gpa,
-            .backends = config.backends,
-            .max_results = config.max_results,
-            .health = config.health,
-            .http = options.http,
-        } else null,
+        .search = options.search,
+        .fetch = options.fetch,
+        .http = options.http,
+        .health = options.health,
     };
+}
+
+/// Whether any web tool is offered: a search backend or a fetch backend, each
+/// with its own set, so a configuration may have one without the other.
+pub fn hasWeb(tools: *const Tools) bool {
+    return tools.search != null or tools.fetch != null;
 }
 
 /// The definitions a session should be given: the tools the mode allows, in the
@@ -136,8 +151,8 @@ pub fn init(options: Options) !Tools {
 /// the session interns and stores them.
 pub fn definitions(tools: *const Tools, mode: agent.Mode) []const Session.Definition {
     return switch (mode) {
-        .general => if (tools.search != null) &specs_with_web else &specs,
-        .chat => if (tools.search != null) &chat_specs_with_web else &chat_specs,
+        .general => if (tools.hasWeb()) &specs_with_web else &specs,
+        .chat => if (tools.hasWeb()) &chat_specs_with_web else &chat_specs,
     };
 }
 
@@ -291,10 +306,20 @@ fn dispatch(tools: *Tools, call: Call, out: *std.Io.Writer) !void {
             const timeout = std.Io.Duration.fromSeconds(timeout_s);
             try bash.run(tools.gpa, tools.io, tools.dir, timeout, out);
         },
-        inline .web_search, .web_fetch => |w| {
-            const client = &(tools.search orelse return fail(out, "web search is not configured", .{}));
-            try w.run(tools.gpa, client, out);
-        },
+        .web_search => |search| try search.run(
+            tools.gpa,
+            tools.http,
+            tools.search,
+            tools.health,
+            out,
+        ),
+        .web_fetch => |fetch| try fetch.run(
+            tools.gpa,
+            tools.http,
+            tools.fetch,
+            tools.health,
+            out,
+        ),
         .unknown => |name| try fail(out, "unknown tool '{s}'", .{name}),
         .malformed => |bad| try fail(
             out,
@@ -1499,7 +1524,9 @@ fn testTools(with_search: bool) !Tools {
             .max_results = 3,
         } else null,
 
-        // Not used by tests
+        // A web tool that actually makes a request needs a live client; the
+        // tests here only exercise the ones that refuse before any request, so
+        // this is never reached.
         .http = undefined,
     });
 }
@@ -1567,8 +1594,8 @@ test "the definitions cover every tool the loop dispatches" {
 }
 
 test "the web tools are offered only when a backend is configured" {
-    // Without a backend neither web tool is offered at all, and the tools every
-    // session has come first so the set only grows.
+    // With nothing configured neither web tool is offered at all, and the tools
+    // every session has come first so the set only grows.
     var plain = try testTools(false);
     const without = plain.definitions(.general);
     try std.testing.expectEqual(specs.len, without.len);
@@ -1577,8 +1604,9 @@ test "the web tools are offered only when a backend is configured" {
         try std.testing.expect(!std.mem.eql(u8, definition.name, "web_fetch"));
     }
 
-    // With one they are appended, so a session that gains them keeps the tools it
-    // had.
+    // With one backend, both tools are appended -- a search is offered with the
+    // fetch that reads what it found -- so a session that gains them keeps the
+    // tools it had.
     var searched = try testTools(true);
     const with = searched.definitions(.general);
     try std.testing.expectEqual(specs.len + web_specs.len, with.len);

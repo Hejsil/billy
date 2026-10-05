@@ -1001,6 +1001,7 @@ const TestServer = struct {
                 .url = "https://api.deepseek.com/chat/completions",
                 .model = "m",
                 .search = null,
+                .fetch = null,
                 .health = health,
             },
         };

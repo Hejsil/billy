@@ -14,7 +14,7 @@ const Config = @import("Config.zig");
 const credentials = @import("credentials.zig");
 const Health = @import("Health.zig");
 const models = @import("models.zig");
-const Search = @import("search.zig");
+const tools = @import("Tools.zig");
 const Session = @import("Session.zig");
 const Terminal = @import("Terminal.zig");
 
@@ -51,7 +51,9 @@ url: []const u8,
 model: []const u8,
 /// Web search, when the configuration names a backend and its key is set. Null
 /// leaves `web_search` out of the tools the model is offered.
-search: ?Search.Config,
+search: ?tools.web.Search.Config,
+/// Web fetch, on the same terms, with its own backends.
+fetch: ?tools.web.Fetch.Config,
 /// Which search backends are worth trying, so one that just failed is set aside
 /// until the wait it was given is over. Held here rather than built per turn, so
 /// a backend stays set aside across turns and the web server's many connections
@@ -140,22 +142,39 @@ pub fn open(init: std.process.Init, out: *std.Io.Writer) !Setup {
     };
     errdefer sessions.close(io);
 
-    var blame: Search.Provider = .tavily;
-    const search_config = searchConfig(arena, &store, environ, settings.config, &blame) catch |err| {
+    // Each tool reports the backend at fault on its own, since the two sets are
+    // configured apart from each other.
+    var search_blame: tools.web.Search.Provider = .tavily;
+    const search_config = searchConfig(arena, &store, environ, settings.config, &search_blame) catch |err| {
         switch (err) {
             error.MissingApiKey => {
                 // The backend is named, so a service is one of the ones reached
                 // with a key.
-                const service = credentials.searchService(blame).?;
+                const service = credentials.searchService(search_blame).?;
                 std.log.err(
                     "run `billy login {s}`, or set {s} to use {s}, or clear tools.web_search in the configuration",
-                    .{ service.name(), service.variable(), @tagName(blame) },
+                    .{ service.name(), service.variable(), @tagName(search_blame) },
                 );
             },
             error.MissingSearchUrl => std.log.err(
                 "set tools.web_search.searxng.url to your SearXNG instance, or clear tools.web_search in the configuration",
                 .{},
             ),
+            else => {},
+        }
+        return err;
+    };
+
+    var fetch_blame: tools.web.Fetch.Provider = .tavily;
+    const fetch_config = fetchConfig(arena, &store, environ, settings.config, &fetch_blame) catch |err| {
+        switch (err) {
+            error.MissingApiKey => {
+                const service = credentials.fetchService(fetch_blame).?;
+                std.log.err(
+                    "run `billy login {s}`, or set {s} to use {s}, or clear tools.web_fetch in the configuration",
+                    .{ service.name(), service.variable(), @tagName(fetch_blame) },
+                );
+            },
             else => {},
         }
         return err;
@@ -175,7 +194,8 @@ pub fn open(init: std.process.Init, out: *std.Io.Writer) !Setup {
         .url = url,
         .model = model,
         .search = search_config,
-        // The waits search backends were last given, read from disk.
+        .fetch = fetch_config,
+        // The waits web backends were last given, read from disk.
         .health = try Health.load(io, init.gpa, data_dir),
     };
 }
@@ -200,6 +220,34 @@ fn reasoningOf(setting: []const u8) llm.Reasoning {
     return .{ .effort = setting };
 }
 
+/// The web fetch settings for a configuration that names a backend, or null when
+/// it names none. `raw` needs no key, so a configuration that holds only it
+/// fetches without a service.
+fn fetchConfig(
+    arena: std.mem.Allocator,
+    store: *const credentials.Store,
+    environ: *const std.process.Environ.Map,
+    settings: Config,
+    blame: *tools.web.Fetch.Provider,
+) !?tools.web.Fetch.Config {
+    const web = settings.tools.web_fetch;
+    if (web.providers.len == 0) return null;
+
+    const backends = try arena.alloc(tools.web.Fetch.Backend, web.providers.len);
+    for (web.providers, backends) |provider, *backend| {
+        blame.* = provider;
+        const service = credentials.fetchService(provider);
+        backend.* = .{
+            .provider = provider,
+            .api_key = if (service) |one|
+                credentials.credential(store, environ, one) orelse return error.MissingApiKey
+            else
+                "",
+        };
+    }
+    return .{ .backends = backends };
+}
+
 /// The web search settings for a configuration that names a backend, or null
 /// when it names none. A backend named without its key is an error rather than a
 /// silent "no search": the configuration asked for the tool, and leaving it out
@@ -209,15 +257,15 @@ fn searchConfig(
     store: *const credentials.Store,
     environ: *const std.process.Environ.Map,
     settings: Config,
-    blame: *Search.Provider,
-) !?Search.Config {
+    blame: *tools.web.Search.Provider,
+) !?tools.web.Search.Config {
     const web = settings.tools.web_search;
     if (web.providers.len == 0) return null;
 
     // Each backend resolves its own key, or, for the one that is self-hosted,
     // needs the instance named instead. What went wrong is left to the caller to
     // report, which is what `blame` is for, so this only says which it was.
-    const backends = try arena.alloc(Search.Backend, web.providers.len);
+    const backends = try arena.alloc(tools.web.Search.Backend, web.providers.len);
     for (web.providers, backends) |provider, *backend| {
         blame.* = provider;
         const service = credentials.searchService(provider);
@@ -293,14 +341,13 @@ pub fn agentConfig(setup: *Setup, cwd: []const u8, style: Terminal.Style) agent.
             },
             .style = style,
         },
-        // Web search is offered only when the configuration names a backend and
-        // its key is set; the tool is left out of the request otherwise. The
-        // waits travel with it, so a backend that just failed is skipped.
-        .search = if (setup.search) |search| .{
-            .backends = search.backends,
-            .max_results = search.max_results,
-            .health = &setup.health,
-        } else null,
+        // A web tool is offered only when the configuration names a backend for
+        // it and its key is set; the tool is left out of the request otherwise.
+        // The waits travel with the run, so a backend that just failed is
+        // skipped.
+        .search = setup.search,
+        .fetch = setup.fetch,
+        .health = &setup.health,
     };
 }
 
@@ -314,7 +361,7 @@ test "each backend resolves its own key, and SearXNG its instance" {
     var environ: std.process.Environ.Map = .init(gpa);
     defer environ.deinit();
     const store: credentials.Store = .{};
-    var blame: Search.Provider = .tavily;
+    var blame: tools.web.Search.Provider = .tavily;
 
     // Nothing named is no search at all.
     var off = Config.init(gpa);
@@ -327,7 +374,7 @@ test "each backend resolves its own key, and SearXNG its instance" {
     defer naming.deinit();
     naming.tools.web_search.providers = &.{.tavily};
     try std.testing.expectError(error.MissingApiKey, searchConfig(arena, &store, &environ, naming, &blame));
-    try std.testing.expectEqual(Search.Provider.tavily, blame);
+    try std.testing.expectEqual(tools.web.Search.Provider.tavily, blame);
 
     // SearXNG needs no key, but needs the instance named.
     var searx = Config.init(gpa);
@@ -339,7 +386,7 @@ test "each backend resolves its own key, and SearXNG its instance" {
     searx.tools.web_search.searxng.url = "https://searx.example.org";
     const config = (try searchConfig(arena, &store, &environ, searx, &blame)).?;
     try std.testing.expectEqual(@as(usize, 1), config.backends.len);
-    try std.testing.expectEqual(Search.Provider.searxng, config.backends[0].provider);
+    try std.testing.expectEqual(tools.web.Search.Provider.searxng, config.backends[0].provider);
     try std.testing.expectEqualStrings("", config.backends[0].api_key);
     try std.testing.expectEqualStrings("https://searx.example.org", config.backends[0].endpoint.?);
 }

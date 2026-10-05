@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const models = @import("models.zig");
-const search = @import("search.zig");
+const Tools = @import("Tools.zig");
 
 /// Name of the file the credentials are kept in, in the billy data directory.
 pub const file_name = "credentials.json";
@@ -82,13 +82,23 @@ pub fn modelService(provider: models.Provider) Service {
 }
 
 /// The service holding the key for the search backend `provider`.
-pub fn searchService(provider: search.Provider) ?Service {
+pub fn searchService(provider: Tools.web.Search.Provider) ?Service {
     return switch (provider) {
         .tavily => .tavily,
         .exa => .exa,
         .brave => .brave,
         // SearXNG is self-hosted and needs no key.
         .searxng => null,
+    };
+}
+
+/// The service holding the key for the fetch backend `provider`. `raw` reads the
+/// url itself and asks no service, so it has none.
+pub fn fetchService(provider: Tools.web.Fetch.Provider) ?Service {
+    return switch (provider) {
+        .tavily => .tavily,
+        .exa => .exa,
+        .raw => null,
     };
 }
 

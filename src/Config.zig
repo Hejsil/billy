@@ -8,7 +8,7 @@
 //! newer billy does not break an older one.
 
 const std = @import("std");
-const search = @import("search.zig");
+const toolset = @import("Tools.zig");
 const xdg = @import("xdg.zig");
 
 const Config = @This();
@@ -31,6 +31,20 @@ pub const Tools = struct {
     bash: Bash = .{},
     edit: Edit = .{},
     web_search: WebSearch = .{},
+    web_fetch: WebFetch = .{},
+};
+
+/// Settings for the web fetch tool.
+pub const WebFetch = struct {
+    /// The backends to read a url with, in the order they are tried: the first
+    /// that reads it is used. Empty leaves `web_fetch` out of the tools the
+    /// model is offered. `raw` is the url itself, read directly, which is what a
+    /// call asking for the bytes as they are uses; a fresh configuration holds
+    /// only that, so fetching works without a service to extract a page.
+    ///
+    /// The key a backend needs is read from the credential `billy login` stored
+    /// for it, or from its environment variable when none is stored.
+    providers: []const toolset.web.Fetch.Provider = &.{.raw},
 };
 
 /// Settings for the web search tool.
@@ -39,13 +53,13 @@ pub const WebSearch = struct {
     /// answers is used, so a backend that is down or rate-limited falls through
     /// to the next. Empty leaves web search out of the tools the model is
     /// offered, which is the default: a fresh configuration has no key to search
-    /// with. The names are the variants of `search.Provider`, and one billy does
+    /// with. The names are the variants of `Search.Provider`, and one billy does
     /// not know makes the file corrupt rather than reading as "no search".
     ///
     /// The key a backend needs is read from the credential `billy login` stored
     /// for it, or from its environment variable when none is stored, and never
     /// from this file, which is written to disk in the clear.
-    providers: []const search.Provider = &.{},
+    providers: []const toolset.web.Search.Provider = &.{},
     /// Results asked for per query. The backend may return fewer, and billy caps
     /// it.
     max_results: usize = 5,
@@ -588,7 +602,7 @@ test "open reads a self-hosted backend's instance from the file" {
     var opened = try openFrom(&tmp, "{\"tools\":{\"web_search\":{" ++
         "\"providers\":[\"searxng\"],\"searxng\":{\"url\":\"https://searx.example.org\"}}}}");
     defer opened.config.deinit();
-    try std.testing.expectEqual(search.Provider.searxng, opened.config.tools.web_search.providers[0]);
+    try std.testing.expectEqual(toolset.web.Search.Provider.searxng, opened.config.tools.web_search.providers[0]);
     try std.testing.expectEqualStrings("https://searx.example.org", opened.config.tools.web_search.searxng.url.?);
 
     var known = try openFrom(&tmp, "{\"tools\":{\"web_search\":{\"providers\":[\"exa\"]}}}");
@@ -605,7 +619,7 @@ test "open reads the web search backends and result count from the file" {
     var opened = try openFrom(&tmp, "{\"tools\":{\"web_search\":{" ++
         "\"providers\":[\"tavily\",\"brave\"],\"max_results\":3}}}");
     defer opened.config.deinit();
-    try std.testing.expectEqualSlices(search.Provider, &.{ .tavily, .brave }, opened.config.tools.web_search.providers);
+    try std.testing.expectEqualSlices(toolset.web.Search.Provider, &.{ .tavily, .brave }, opened.config.tools.web_search.providers);
     try std.testing.expectEqual(3, opened.config.tools.web_search.max_results);
 
     // The defaults leave it off, and the count ready for a backend to be named.
@@ -668,6 +682,11 @@ test "the file is indented, so it can be read and edited by hand" {
         \\      "searxng": {
         \\        "url": null
         \\      }
+        \\    },
+        \\    "web_fetch": {
+        \\      "providers": [
+        \\        "raw"
+        \\      ]
         \\    }
         \\  }
         \\}
@@ -687,7 +706,7 @@ test "save round-trips a configured search backend" {
 
     var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
     defer opened.config.deinit();
-    try std.testing.expectEqual(search.Provider.tavily, opened.config.tools.web_search.providers[0]);
+    try std.testing.expectEqual(toolset.web.Search.Provider.tavily, opened.config.tools.web_search.providers[0]);
     try std.testing.expectEqual(4, opened.config.tools.web_search.max_results);
 }
 

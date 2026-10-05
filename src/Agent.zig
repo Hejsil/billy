@@ -8,7 +8,7 @@ const llm = @import("llm.zig");
 const models = @import("models.zig");
 const Tools = @import("Tools.zig");
 const Mock = @import("Mock.zig");
-const search = @import("search.zig");
+const Health = @import("Health.zig");
 const LineEditor = @import("LineEditor.zig");
 const Session = @import("Session.zig");
 const Terminal = @import("Terminal.zig");
@@ -74,7 +74,11 @@ pub const Config = struct {
     display: Display = .{},
     /// Web search, when the configuration names a backend and its key is set.
     /// Null leaves `web_search` out of the tools the model is offered.
-    search: ?search.Config = null,
+    search: ?Tools.web.Search.Config = null,
+    /// Web fetch, on the same terms, with its own backends.
+    fetch: ?Tools.web.Fetch.Config = null,
+    /// The waits of every web backend, so one that just failed is skipped.
+    health: ?*Health = null,
 };
 
 /// How billy lays out and decorates what it shows: the formatter scripts for a
@@ -427,7 +431,9 @@ pub fn init(
         .bash_timeout_s = config.bash_timeout_s,
         .style = config.display.style,
         .search = config.search,
+        .fetch = config.fetch,
         .http = http,
+        .health = config.health,
     });
 
     return .{
