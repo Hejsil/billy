@@ -28,8 +28,6 @@ const base_wait_ms: i64 = 30 * 1000;
 pub const file_name = "health.json";
 /// Layout of that file, bumped when its shape changes.
 const format_version = 1;
-/// Longest file read back, so a damaged one cannot exhaust memory.
-const max_file_bytes = 1 << 16;
 
 /// One backend's wait: what the file holds under a backend's name, and what the
 /// table holds for it.
@@ -127,7 +125,7 @@ fn read(self: *Health) !void {
     // No file is the ordinary case of a first run, and a file that cannot be
     // read or understood is one left by something else: neither is worth
     // reporting, since the waits are only advice.
-    const stored_text = self.dir.readFileAlloc(self.io, file_name, arena, .limited(max_file_bytes)) catch return;
+    const stored_text = self.dir.readFileAlloc(self.io, file_name, arena, .unlimited) catch return;
     const stored = std.json.parseFromSlice(Stored, arena, stored_text, .{
         .ignore_unknown_fields = true,
     }) catch return;
