@@ -265,11 +265,7 @@ title_index: StringIndex = .none,
 /// mode it started in rather than the default.
 mode: agent.Mode = .general,
 
-/// Indices into `messages`, sorted and without repeats, of the summaries a
-/// compaction produced. Keeping them as a list rather than a flag on every
-/// message costs four bytes per compaction instead of a byte on every message,
-/// and is what a request and a transcript read to know where the conversation
-/// now starts.
+/// Indices into `messages` of the summaries a compaction produced
 compactions: std.ArrayList(u32) = .empty,
 
 /// The tool definitions sent with every request. Stored in the session so a
