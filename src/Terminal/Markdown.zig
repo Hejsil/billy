@@ -15,7 +15,8 @@
 
 const std = @import("std");
 const md = @import("../md.zig");
-const Terminal = @import("../Terminal.zig");
+const md4c = @import("../md4c.zig");
+const Style = @import("style.zig").Style;
 
 const Markdown = @This();
 
@@ -33,7 +34,7 @@ const max_columns = 32;
 
 gpa: std.mem.Allocator,
 out: *std.Io.Writer,
-style: Terminal.Style,
+style: Style,
 /// The first failure, kept here because a callback returns a number, not an
 /// error.
 err: ?anyerror = null,
@@ -99,30 +100,16 @@ const Row = struct {
 /// Writes `text`, read as markdown, as the terminal shows it. `style` decides
 /// whether bold, colour and links are written as escape codes or left out, which
 /// is what makes a pipe to a file read as plain structured text.
-pub fn write(gpa: std.mem.Allocator, text: []const u8, style: Terminal.Style, out: *std.Io.Writer) !void {
+pub fn write(gpa: std.mem.Allocator, text: []const u8, style: Style, out: *std.Io.Writer) !void {
     var render = Markdown{ .gpa = gpa, .out = out, .style = style };
     defer render.deinit();
 
-    var p = Markdown.parser();
+    var p = md4c.parser(Markdown);
     try md.parse(text, &p, &render);
 
     // A callback cannot return an error, so a failed write is kept on the
     // renderer and reported here, once md4c has stopped.
     if (render.err) |err| return err;
-}
-
-fn parser() md.c.MD_PARSER {
-    return .{
-        .abi_version = 0,
-        .flags = md.flags,
-        .enter_block = enterBlock,
-        .leave_block = leaveBlock,
-        .enter_span = enterSpan,
-        .leave_span = leaveSpan,
-        .text = writeText,
-        .debug_log = null,
-        .syntax = null,
-    };
 }
 
 fn deinit(self: *Markdown) void {
@@ -227,7 +214,7 @@ fn endBlock(self: *Markdown) void {
 
 // ---- blocks ----
 
-fn openBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
+pub fn openBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
     switch (block_type) {
         md.c.MD_BLOCK_DOC => {},
         md.c.MD_BLOCK_QUOTE => {
@@ -277,7 +264,7 @@ fn openBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque
     return true;
 }
 
-fn closeBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
+pub fn closeBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
     _ = detail;
     switch (block_type) {
         md.c.MD_BLOCK_DOC => {},
@@ -477,7 +464,7 @@ fn freeTable(self: *Markdown) void {
 
 // ---- spans ----
 
-fn openSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) bool {
+pub fn openSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) bool {
     if (span_type == md.c.MD_SPAN_IMG) {
         const img: *const md.c.MD_SPAN_IMG_DETAIL = @ptrCast(@alignCast(detail.?));
         self.image_url = attribute(img.src);
@@ -498,7 +485,7 @@ fn openSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) b
     };
 }
 
-fn closeSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) bool {
+pub fn closeSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) bool {
     _ = detail;
     if (span_type == md.c.MD_SPAN_IMG) return self.closeImg();
     if (self.table) return true;
@@ -558,7 +545,7 @@ fn closeImg(self: *Markdown) bool {
 
 // ---- text ----
 
-fn writeRun(self: *Markdown, text_type: md.c.MD_TEXTTYPE, text: []const u8) bool {
+pub fn writeRun(self: *Markdown, text_type: md.c.MD_TEXTTYPE, text: []const u8) bool {
     // Inside an image label every run is the alt text, gathered for the close.
     if (self.image_depth > 0) {
         self.image_label.appendSlice(self.gpa, text) catch return self.fail();
@@ -609,34 +596,9 @@ fn attribute(value: md.c.MD_ATTRIBUTE) []const u8 {
     return value.text[0..value.size];
 }
 
-fn enterBlock(block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
-    const self: *Markdown = @ptrCast(@alignCast(userdata.?));
-    return @intFromBool(!self.openBlock(block_type, detail));
-}
-
-fn leaveBlock(block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
-    const self: *Markdown = @ptrCast(@alignCast(userdata.?));
-    return @intFromBool(!self.closeBlock(block_type, detail));
-}
-
-fn enterSpan(span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
-    const self: *Markdown = @ptrCast(@alignCast(userdata.?));
-    return @intFromBool(!self.openSpan(span_type, detail));
-}
-
-fn leaveSpan(span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
-    const self: *Markdown = @ptrCast(@alignCast(userdata.?));
-    return @intFromBool(!self.closeSpan(span_type, detail));
-}
-
-fn writeText(text_type: md.c.MD_TEXTTYPE, text: [*c]const md.c.MD_CHAR, size: md.c.MD_SIZE, userdata: ?*anyopaque) callconv(.c) c_int {
-    const self: *Markdown = @ptrCast(@alignCast(userdata.?));
-    return @intFromBool(!self.writeRun(text_type, text[0..size]));
-}
-
 /// Renders `text` and compares it to `expected`, so a test reads as the text a
 /// terminal shows rather than as the buffer around it.
-fn expectRendered(expected: []const u8, text: []const u8, style: Terminal.Style) !void {
+fn expectRendered(expected: []const u8, text: []const u8, style: Style) !void {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try write(std.testing.allocator, text, style, &out.writer);

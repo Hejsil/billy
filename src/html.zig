@@ -16,6 +16,7 @@ const std = @import("std");
 const agent = @import("Agent.zig");
 const diffing = @import("diff.zig");
 const md = @import("md.zig");
+const md4c = @import("md4c.zig");
 const models = @import("models.zig");
 const favicons = @import("web/favicons.zig");
 const Session = @import("Session.zig");
@@ -89,7 +90,7 @@ const Escaping = struct {
 /// and a reply must not be able to make one that runs code.
 pub fn markdown(gpa: std.mem.Allocator, text: []const u8, out: *std.Io.Writer) !void {
     var render = Markdown{ .gpa = gpa, .out = out };
-    var parser = Markdown.parser();
+    var parser = md4c.parser(Markdown);
     try md.parse(text, &parser, &render);
     // A callback cannot return an error, so a failed write is kept on the
     // renderer and reported here, once md4c has stopped.
@@ -112,22 +113,6 @@ const Markdown = struct {
     /// How deep inside an image label this is. The text of a label is an
     /// attribute, so no tags are written there and a line break becomes a space.
     image_depth: usize = 0,
-
-    /// The callbacks md4c reads the document with. None of them take any state
-    /// of their own but the renderer `md4c` passes back as `userdata`.
-    fn parser() md.c.MD_PARSER {
-        return .{
-            .abi_version = 0,
-            .flags = md.flags,
-            .enter_block = enterBlock,
-            .leave_block = leaveBlock,
-            .enter_span = enterSpan,
-            .leave_span = leaveSpan,
-            .text = writeText,
-            .debug_log = null,
-            .syntax = null,
-        };
-    }
 
     /// Writes `text` on, keeping the failure if there is one. Returns whether the
     /// write worked, so a callback can stop the parse: md4c stops at the first
@@ -161,7 +146,7 @@ const Markdown = struct {
 
     // ---- blocks ----
 
-    fn openBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
+    pub fn openBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
         switch (block_type) {
             md.c.MD_BLOCK_DOC => {},
             md.c.MD_BLOCK_QUOTE => return self.put("<blockquote>\n"),
@@ -189,7 +174,7 @@ const Markdown = struct {
         return true;
     }
 
-    fn closeBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
+    pub fn closeBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
         switch (block_type) {
             md.c.MD_BLOCK_DOC => {},
             md.c.MD_BLOCK_QUOTE => return self.put("</blockquote>\n"),
@@ -257,7 +242,7 @@ const Markdown = struct {
 
     // ---- spans ----
 
-    fn openSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) bool {
+    pub fn openSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) bool {
         const inside_image = self.image_depth > 0;
         if (span_type == md.c.MD_SPAN_IMG) self.image_depth += 1;
         // Inside an image label only the text matters: it is the alt text, and a
@@ -281,7 +266,7 @@ const Markdown = struct {
         return true;
     }
 
-    fn closeSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) bool {
+    pub fn closeSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) bool {
         if (span_type == md.c.MD_SPAN_IMG) self.image_depth -= 1;
         if (self.image_depth > 0) return true;
 
@@ -330,7 +315,7 @@ const Markdown = struct {
 
     // ---- text ----
 
-    fn writeRun(self: *Markdown, text_type: md.c.MD_TEXTTYPE, text: []const u8) bool {
+    pub fn writeRun(self: *Markdown, text_type: md.c.MD_TEXTTYPE, text: []const u8) bool {
         switch (text_type) {
             // A NULL is replaced the way CommonMark says, rather than written.
             md.c.MD_TEXT_NULLCHAR => return self.put("\u{FFFD}"),
@@ -450,31 +435,6 @@ fn schemeOf(url: []const u8, buffer: []u8) []const u8 {
 /// Writes the HTML for one block, span or run of text, driving md4c. Each
 /// callback is C, so it returns a number: zero to carry on, non-zero to stop the
 /// parse, which is how a failed write stops it.
-fn enterBlock(block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
-    const self: *Markdown = @ptrCast(@alignCast(userdata.?));
-    return @intFromBool(!self.openBlock(block_type, detail));
-}
-
-fn leaveBlock(block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
-    const self: *Markdown = @ptrCast(@alignCast(userdata.?));
-    return @intFromBool(!self.closeBlock(block_type, detail));
-}
-
-fn enterSpan(span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
-    const self: *Markdown = @ptrCast(@alignCast(userdata.?));
-    return @intFromBool(!self.openSpan(span_type, detail));
-}
-
-fn leaveSpan(span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
-    const self: *Markdown = @ptrCast(@alignCast(userdata.?));
-    return @intFromBool(!self.closeSpan(span_type, detail));
-}
-
-fn writeText(text_type: md.c.MD_TEXTTYPE, text: [*c]const md.c.MD_CHAR, size: md.c.MD_SIZE, userdata: ?*anyopaque) callconv(.c) c_int {
-    const self: *Markdown = @ptrCast(@alignCast(userdata.?));
-    return @intFromBool(!self.writeRun(text_type, text[0..size]));
-}
-
 pub fn diff(lines: []const diffing.Line, out: *std.Io.Writer) !void {
     try out.writeAll("<pre class=\"diff\">");
     for (lines) |line| {
