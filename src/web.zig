@@ -240,55 +240,42 @@ fn route(
     const target = request.head.target;
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
 
-    if (request.head.method == .GET) {
-        if (std.mem.eql(u8, path, "/")) {
+    if (std.mem.eql(u8, path, "/")) switch (request.head.method) {
+        .GET => {
             answered.* = true;
             return request.respond(page, .{
                 .status = .ok,
                 .extra_headers = &.{ContentType.html.header()},
                 .keep_alive = false,
             });
-        }
-        if (std.mem.eql(u8, path, "/api/sessions")) return listSessions(setup, request, answered);
-        if (std.mem.startsWith(u8, path, "/api/sessions/")) {
-            const rest = path["/api/sessions/".len..];
-            // `{id}/message` is a prompt, which is a POST; everything under the
-            // id otherwise is the session itself.
-            if (std.mem.endsWith(u8, rest, "/message")) {
-                return reply(request, .text, "method not allowed\n", .method_not_allowed, answered);
-            }
-            return openSession(setup, request, rest, answered);
-        }
-    }
-    if (request.head.method == .POST) {
-        if (std.mem.eql(u8, path, "/api/sessions")) return createSession(setup, registry, http, request, answered);
-        const prefix = "/api/sessions/";
-        if (std.mem.startsWith(u8, path, prefix)) {
-            const rest = path[prefix.len..];
-            if (std.mem.endsWith(u8, rest, "/message")) {
-                const id = rest[0 .. rest.len - "/message".len];
-                return askSession(setup, registry, http, request, id, answered);
-            }
-        }
-    }
+        },
+        else => return replyNotAllowed(request, answered),
+    };
 
-    if (request.head.method == .PATCH) {
-        const prefix = "/api/sessions/";
-        if (std.mem.startsWith(u8, path, prefix)) {
-            const rest = path[prefix.len..];
-            if (rest.len > 0 and !std.mem.endsWith(u8, rest, "/message")) {
-                return renameSession(setup, registry, request, rest, answered);
-            }
-        }
-    }
-    if (request.head.method == .DELETE) {
-        const prefix = "/api/sessions/";
-        if (std.mem.startsWith(u8, path, prefix)) {
-            const rest = path[prefix.len..];
-            if (!std.mem.endsWith(u8, rest, "/message") and rest.len > 0) {
-                return deleteSession(setup, registry, request, rest, answered);
-            }
-        }
+    if (std.mem.eql(u8, path, "/api/sessions")) switch (request.head.method) {
+        .GET => return listSessions(setup, request, answered),
+        .POST => return createSession(setup, registry, http, request, answered),
+        else => return replyNotAllowed(request, answered),
+    };
+
+    const sessions_prefix = "/api/sessions/";
+    if (std.mem.startsWith(u8, path, sessions_prefix)) {
+        const id_end = std.mem.findScalarPos(u8, path, sessions_prefix.len, '/') orelse path.len;
+        const id = path[sessions_prefix.len..id_end];
+
+        // /api/sessions/{id}/message
+        if (std.mem.eql(u8, path[id_end..], "/message")) switch (request.head.method) {
+            .POST => return askSession(setup, registry, http, request, id, answered),
+            else => return replyNotAllowed(request, answered),
+        };
+
+        // /api/sessions/message
+        if (path.len == id_end) switch (request.head.method) {
+            .GET => return openSession(setup, request, id, answered),
+            .PATCH => return renameSession(setup, registry, request, id, answered),
+            .DELETE => return deleteSession(setup, registry, request, id, answered),
+            else => return replyNotAllowed(request, answered),
+        };
     }
 
     answered.* = true;
@@ -529,6 +516,10 @@ fn reply(
         .extra_headers = &.{content_type.header()},
         .keep_alive = false,
     });
+}
+
+fn replyNotAllowed(request: *std.http.Server.Request, answered: *bool) !void {
+    return reply(request, .text, "method not allowed\n", .method_not_allowed, answered);
 }
 
 test "a session is taken for a turn, and refused while one runs" {
