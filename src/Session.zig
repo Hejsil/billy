@@ -942,6 +942,27 @@ pub fn defaultDir(gpa: std.mem.Allocator, environ: *const std.process.Environ.Ma
     return std.fs.path.join(gpa, &.{ data_dir, sessions_dir });
 }
 
+/// The data directory, made if it is not there yet. Building the path and making
+/// it is one intention, so the two error reports are written here rather than at
+/// every caller that needs the directory.
+pub fn openDataDir(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+) !std.Io.Dir {
+    return xdg.openDirBuilt(io, dataDir(gpa, environ), "billy's files");
+}
+
+/// The sessions directory, made if it is not there yet, on the same terms as
+/// `openDataDir`.
+pub fn openDefaultDir(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+) !std.Io.Dir {
+    return xdg.openDirBuilt(io, defaultDir(gpa, environ), "sessions");
+}
+
 /// The arguments schema of a tool as JSON text: already text when a file holds
 /// it so, and written back out when an older file holds the parsed object, which
 /// is what the request is sent.

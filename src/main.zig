@@ -192,14 +192,8 @@ fn runLogin(init: std.process.Init, out: *std.Io.Writer, service: ?[]const u8) !
     const arena = init.arena.allocator();
     const environ = init.environ_map;
 
-    const data_dir = billy.Session.dataDir(arena, environ) catch |err| {
-        std.log.err("cannot find where to store billy's files: {s}", .{@errorName(err)});
-        return err;
-    };
-    var data_dir_handle = std.Io.Dir.cwd().createDirPathOpen(io, data_dir, .{}) catch |err| {
-        std.log.err("cannot use {s} for billy's files: {s}", .{ data_dir, @errorName(err) });
-        return err;
-    };
+    const data_dir = try billy.Session.dataDir(arena, environ);
+    var data_dir_handle = try billy.Session.openDataDir(io, arena, environ);
     defer data_dir_handle.close(io);
 
     var credentials = billy.credentials.load(io, data_dir_handle, arena) catch |err| {

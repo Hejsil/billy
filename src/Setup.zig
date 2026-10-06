@@ -74,14 +74,8 @@ pub fn open(init: std.process.Init, out: *std.Io.Writer) !Setup {
     // directory itself, and the sessions in a subdirectory of it. The credentials
     // are not kept with the configuration, which is meant to be shared between
     // machines, and a key is not.
-    const data_dir_path = Session.dataDir(arena, environ) catch |err| {
-        std.log.err("cannot find where to store billy's files: {s}", .{@errorName(err)});
-        return err;
-    };
-    var data_dir = std.Io.Dir.cwd().createDirPathOpen(io, data_dir_path, .{}) catch |err| {
-        std.log.err("cannot use {s} for billy's files: {s}", .{ data_dir_path, @errorName(err) });
-        return err;
-    };
+    const data_dir_path = try Session.dataDir(arena, environ);
+    var data_dir = try Session.openDataDir(io, arena, environ);
     errdefer data_dir.close(io);
 
     const store = credentials.load(io, data_dir, arena) catch |err| {
@@ -89,14 +83,8 @@ pub fn open(init: std.process.Init, out: *std.Io.Writer) !Setup {
         return err;
     };
 
-    const config_dir_path = Config.defaultDir(arena, environ) catch |err| {
-        std.log.err("cannot find where to store the configuration: {s}", .{@errorName(err)});
-        return err;
-    };
-    var config_dir = std.Io.Dir.cwd().createDirPathOpen(io, config_dir_path, .{}) catch |err| {
-        std.log.err("cannot use {s} for the configuration: {s}", .{ config_dir_path, @errorName(err) });
-        return err;
-    };
+    const config_dir_path = try Config.defaultDir(arena, environ);
+    var config_dir = try Config.openDefaultDir(io, arena, environ);
     errdefer config_dir.close(io);
 
     // The configuration owns an arena of its own for the strings it reads, so it
@@ -132,14 +120,7 @@ pub fn open(init: std.process.Init, out: *std.Io.Writer) !Setup {
 
     // The sessions live in a subdirectory of billy's data directory, apart from
     // the credentials stored in the directory itself.
-    const sessions_path = Session.defaultDir(arena, environ) catch |err| {
-        std.log.err("cannot find where to store sessions: {s}", .{@errorName(err)});
-        return err;
-    };
-    var sessions = std.Io.Dir.cwd().createDirPathOpen(io, sessions_path, .{}) catch |err| {
-        std.log.err("cannot use {s} for sessions: {s}", .{ sessions_path, @errorName(err) });
-        return err;
-    };
+    var sessions = try Session.openDefaultDir(io, arena, environ);
     errdefer sessions.close(io);
 
     // Each tool reports the backend at fault on its own, since the two sets are

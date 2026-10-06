@@ -414,14 +414,8 @@ pub fn run(
     path: []const u8,
     value: []const u8,
 ) !void {
-    const dir_path = defaultDir(arena, environ) catch |err| {
-        std.log.err("cannot find where to store the configuration: {s}", .{@errorName(err)});
-        return err;
-    };
-    var dir = std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{}) catch |err| {
-        std.log.err("cannot use {s} for the configuration: {s}", .{ dir_path, @errorName(err) });
-        return err;
-    };
+    const dir_path = try defaultDir(arena, environ);
+    var dir = try openDefaultDir(io, arena, environ);
     defer dir.close(io);
 
     var opened = open(io, dir, gpa) catch |err| {
@@ -461,6 +455,17 @@ pub fn run(
 /// specification prescribes.
 pub fn defaultDir(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
     return xdg.dir(gpa, environ, "XDG_CONFIG_HOME", &.{".config"});
+}
+
+/// The configuration directory, made if it is not there yet. Building the path
+/// and making it is one intention, so the two error reports are written here
+/// rather than at every caller that needs the directory.
+pub fn openDefaultDir(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+) !std.Io.Dir {
+    return xdg.openDirBuilt(io, defaultDir(gpa, environ), "the configuration");
 }
 
 test "defaultDir is billy's directory under the configuration base" {
