@@ -70,94 +70,33 @@ pub fn open(init: std.process.Init, out: *std.Io.Writer) !Setup {
     const arena = init.arena.allocator();
     const environ = init.environ_map;
 
-    // billy's own files live under the data directory: the credentials in the
-    // directory itself, and the sessions in a subdirectory of it. The credentials
-    // are not kept with the configuration, which is meant to be shared between
-    // machines, and a key is not.
-    const data_dir_path = try Session.dataDir(arena, environ);
-    var data_dir = try Session.openDataDir(io, arena, environ);
-    errdefer data_dir.close(io);
+    // What billy reads its own files through, and the credentials those files
+    // hold. Every one of these is reported where it failed rather than here, so
+    // the report can name what the user has to fix.
+    var files = try openFiles(io, arena, environ);
+    errdefer files.deinit(io);
 
-    const store = credentials.load(io, data_dir, arena) catch |err| {
-        std.log.err("cannot read the credentials in {s}: {s}", .{ data_dir_path, @errorName(err) });
-        return err;
-    };
-
-    const config_dir_path = try Config.defaultDir(arena, environ);
-    var config_dir = try Config.openDefaultDir(io, arena, environ);
-    errdefer config_dir.close(io);
-
-    // The configuration owns an arena of its own for the strings it reads, so it
-    // is freed when the run is over rather than with the process arena.
-    var settings = Config.open(io, config_dir, init.gpa) catch |err| {
-        std.log.err("cannot read the configuration in {s}: {s}", .{ config_dir_path, @errorName(err) });
+    var settings = openSettings(init, files.config_dir, files.config_dir_path, out) catch |err| {
+        std.log.err("cannot read the configuration in {s}: {s}", .{
+            files.config_dir_path, @errorName(err),
+        });
         return err;
     };
     errdefer settings.config.deinit();
-    if (settings.created) {
-        try out.print("wrote the default configuration to {s}\n", .{
-            try std.fs.path.join(arena, &.{ config_dir_path, Config.file_name }),
-        });
-    }
 
-    const base_url = environ.get("BILLY_BASE_URL") orelse "https://api.deepseek.com";
-    const model = environ.get("BILLY_MODEL") orelse "deepseek-flash";
-    // The endpoint URL is built once, here, and lives with the process. The web
-    // server asks for the agent configuration once per turn, so building it
-    // there would leak one allocation per turn into the process arena.
-    const url = try std.fmt.allocPrint(arena, "{s}/chat/completions", .{
-        std.mem.trimEnd(u8, base_url, "/"),
-    });
-    const api_key = credentials.modelKey(&store, environ, base_url) orelse {
-        std.log.err("run `billy login deepseek`, or set DEEPSEEK_API_KEY to your API key", .{});
-        return error.MissingApiKey;
-    };
+    const endpoint = try openEndpoint(arena, environ, &files.store);
 
-    const cwd = std.process.currentPathAlloc(io, arena) catch |err| {
-        std.log.err("cannot find the working directory: {s}", .{@errorName(err)});
+    // Which backend each set is built from, remembered so the report of a
+    // failure can name it: only the builder knows which provider it was on.
+    var search_failed: tools.web.Search.Provider = .tavily;
+    const search_config = searchConfig(arena, &files.store, environ, settings.config, &search_failed) catch |err| {
+        reportSearchFailure(err, search_failed);
         return err;
     };
 
-    // The sessions live in a subdirectory of billy's data directory, apart from
-    // the credentials stored in the directory itself.
-    var sessions = try Session.openDefaultDir(io, arena, environ);
-    errdefer sessions.close(io);
-
-    // Each tool reports the backend at fault on its own, since the two sets are
-    // configured apart from each other.
-    var search_blame: tools.web.Search.Provider = .tavily;
-    const search_config = searchConfig(arena, &store, environ, settings.config, &search_blame) catch |err| {
-        switch (err) {
-            error.MissingApiKey => {
-                // The backend is named, so a service is one of the ones reached
-                // with a key.
-                const service = credentials.searchService(search_blame).?;
-                std.log.err(
-                    "run `billy login {s}`, or set {s} to use {s}, or clear tools.web_search in the configuration",
-                    .{ service.name(), service.variable(), @tagName(search_blame) },
-                );
-            },
-            error.MissingSearchUrl => std.log.err(
-                "set tools.web_search.searxng.url to your SearXNG instance, or clear tools.web_search in the configuration",
-                .{},
-            ),
-            else => {},
-        }
-        return err;
-    };
-
-    var fetch_blame: tools.web.Fetch.Provider = .tavily;
-    const fetch_config = fetchConfig(arena, &store, environ, settings.config, &fetch_blame) catch |err| {
-        switch (err) {
-            error.MissingApiKey => {
-                const service = credentials.fetchService(fetch_blame).?;
-                std.log.err(
-                    "run `billy login {s}`, or set {s} to use {s}, or clear tools.web_fetch in the configuration",
-                    .{ service.name(), service.variable(), @tagName(fetch_blame) },
-                );
-            },
-            else => {},
-        }
+    var fetch_failed: tools.web.Fetch.Provider = .raw;
+    const fetch_config = fetchConfig(arena, &files.store, environ, settings.config, &fetch_failed) catch |err| {
+        reportFetchFailure(err, fetch_failed);
         return err;
     };
 
@@ -166,20 +105,146 @@ pub fn open(init: std.process.Init, out: *std.Io.Writer) !Setup {
         .gpa = init.gpa,
         .environ = environ,
         .settings = settings.config,
-        .sessions = sessions,
-        .data_dir = data_dir,
-        .config_dir = config_dir,
-        .cwd = cwd,
-        .api_key = api_key,
-        .base_url = base_url,
-        .url = url,
-        .model = model,
+        .sessions = files.sessions,
+        .data_dir = files.data_dir,
+        .config_dir = files.config_dir,
+        .cwd = files.cwd,
+        .api_key = endpoint.api_key,
+        .base_url = endpoint.base_url,
+        .url = endpoint.url,
+        .model = endpoint.model,
         .search = search_config,
         .fetch = fetch_config,
         // The waits web backends were last given, read from disk.
-        .health = try Health.load(io, init.gpa, data_dir),
+        .health = try Health.load(io, init.gpa, files.data_dir),
     };
 }
+
+/// The directories billy keeps its own files in, the credentials stored among
+/// them, and the directory the run was started in. Read in one place because
+/// they are found the same way and freed together.
+const Files = struct {
+    /// The directory the credentials file is under, and the store read out of
+    /// it. The store's keys are owned by the arena `open` runs in.
+    ///
+    /// The paths are kept beside the handles because a report names the file that
+    /// could not be read, and a handle has no name to give.
+    data_dir: std.Io.Dir,
+    data_dir_path: []const u8,
+    store: credentials.Store,
+    /// The directory the configuration file is under.
+    config_dir: std.Io.Dir,
+    config_dir_path: []const u8,
+    /// The directory holding the session files.
+    sessions: std.Io.Dir,
+    /// Where billy was started, so a new session records it.
+    cwd: []const u8,
+
+    fn deinit(files: *Files, io: std.Io) void {
+        files.sessions.close(io);
+        files.config_dir.close(io);
+        files.data_dir.close(io);
+    }
+};
+
+/// Opens billy's own directories, reading the credentials stored in the data
+/// directory, and finds the working directory the run was started in.
+///
+/// billy's own files live under the data directory: the credentials in the
+/// directory itself, and the sessions in a subdirectory of it. The credentials
+/// are not kept with the configuration, which is meant to be shared between
+/// machines, and a key is not.
+fn openFiles(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+) !Files {
+    var data_dir = try Session.openDataDir(io, arena, environ);
+    errdefer data_dir.close(io);
+
+    var config_dir = try Config.openDefaultDir(io, arena, environ);
+    errdefer config_dir.close(io);
+
+    var sessions = try Session.openDefaultDir(io, arena, environ);
+    errdefer sessions.close(io);
+
+    const data_dir_path = try Session.dataDir(arena, environ);
+    const store = credentials.load(io, data_dir, arena) catch |err| {
+        std.log.err("cannot read the credentials in {s}: {s}", .{ data_dir_path, @errorName(err) });
+        return err;
+    };
+
+    const cwd = std.process.currentPathAlloc(io, arena) catch |err| {
+        std.log.err("cannot find the working directory: {s}", .{@errorName(err)});
+        return err;
+    };
+
+    return .{
+        .data_dir = data_dir,
+        .data_dir_path = data_dir_path,
+        .store = store,
+        .config_dir = config_dir,
+        .config_dir_path = try Config.defaultDir(arena, environ),
+        .sessions = sessions,
+        .cwd = cwd,
+    };
+}
+
+/// The configuration, written with its defaults when the file is missing, which
+/// is reported on `out`: it is the one thing here the user is told about.
+///
+/// The configuration owns an arena of its own for the strings it reads, so it is
+/// freed when the run is over rather than with the process arena.
+fn openSettings(
+    init: std.process.Init,
+    config_dir: std.Io.Dir,
+    config_dir_path: []const u8,
+    out: *std.Io.Writer,
+) !Config.Opened {
+    var settings = try Config.open(init.io, config_dir, init.gpa);
+    errdefer settings.config.deinit();
+
+    if (settings.created) {
+        try out.print("wrote the default configuration to {s}\n", .{
+            try std.fs.path.join(init.arena.allocator(), &.{ config_dir_path, Config.file_name }),
+        });
+    }
+    return settings;
+}
+
+/// The model endpoint billy talks to, and the key it is asked with. The URL is
+/// built once, here, and lives with the process: the web server asks for the
+/// agent configuration once per turn, so building it there would leak one
+/// allocation per turn into the process arena.
+fn openEndpoint(
+    arena: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    store: *const credentials.Store,
+) !Endpoint {
+    const base_url = environ.get("BILLY_BASE_URL") orelse "https://api.deepseek.com";
+    const api_key = credentials.modelKey(store, environ, base_url) orelse {
+        std.log.err("run `billy login deepseek`, or set DEEPSEEK_API_KEY to your API key", .{});
+        return error.MissingApiKey;
+    };
+
+    return .{
+        .base_url = base_url,
+        .api_key = api_key,
+        .url = try std.fmt.allocPrint(arena, "{s}/chat/completions", .{
+            std.mem.trimEnd(u8, base_url, "/"),
+        }),
+        .model = environ.get("BILLY_MODEL") orelse "deepseek-flash",
+    };
+}
+
+/// Where billy talks to the model, and as which model.
+const Endpoint = struct {
+    base_url: []const u8,
+    api_key: []const u8,
+    /// The full URL of the chat completions endpoint, built from `base_url`.
+    url: []const u8,
+    model: []const u8,
+};
 
 pub fn deinit(setup: *Setup) void {
     setup.health.deinit();
@@ -201,6 +266,50 @@ fn reasoningOf(setting: []const u8) llm.Reasoning {
     return .{ .effort = setting };
 }
 
+/// The web search settings for a configuration that names a backend, or null
+/// when it names none. A backend named without its key is an error rather than a
+/// silent "no search": the configuration asked for the tool, and leaving it out
+/// without a word would look like a bug.
+///
+/// The report of what went wrong is written here rather than by the caller, so
+/// naming the backend that is at fault does not need an out-parameter: only this
+/// function knows which provider it was on.
+fn searchConfig(
+    arena: std.mem.Allocator,
+    store: *const credentials.Store,
+    environ: *const std.process.Environ.Map,
+    settings: Config,
+    failed: *tools.web.Search.Provider,
+) !?tools.web.Search.Config {
+    const web_settings = settings.tools.web_search;
+    if (web_settings.providers.len == 0) return null;
+
+    // Each backend resolves its own key, or, for the one that is self-hosted,
+    // needs the instance named instead.
+    const backends = try arena.alloc(tools.web.Search.Backend, web_settings.providers.len);
+    for (web_settings.providers, backends) |provider, *backend| {
+        failed.* = provider;
+        const service = credentials.searchService(provider);
+        backend.* = .{
+            .provider = provider,
+            .api_key = if (service) |one|
+                credentials.credential(store, environ, one) orelse
+                    return error.MissingApiKey
+            else blk: {
+                // A backend billy knows the address of needs only its key; one it
+                // does not, SearXNG, needs the instance named.
+                const url = web_settings.searxng.url orelse
+                    return error.MissingSearchUrl;
+                if (url.len == 0) return error.MissingSearchUrl;
+                break :blk "";
+            },
+            // Only a self-hosted backend is reached somewhere billy does not know.
+            .endpoint = if (service == null) web_settings.searxng.url else null,
+        };
+    }
+    return .{ .backends = backends, .max_results = web_settings.max_results };
+}
+
 /// The web fetch settings for a configuration that names a backend, or null when
 /// it names none. `raw` needs no key, so a configuration that holds only it
 /// fetches without a service.
@@ -209,19 +318,20 @@ fn fetchConfig(
     store: *const credentials.Store,
     environ: *const std.process.Environ.Map,
     settings: Config,
-    blame: *tools.web.Fetch.Provider,
+    failed: *tools.web.Fetch.Provider,
 ) !?tools.web.Fetch.Config {
-    const web = settings.tools.web_fetch;
-    if (web.providers.len == 0) return null;
+    const web_settings = settings.tools.web_fetch;
+    if (web_settings.providers.len == 0) return null;
 
-    const backends = try arena.alloc(tools.web.Fetch.Backend, web.providers.len);
-    for (web.providers, backends) |provider, *backend| {
-        blame.* = provider;
+    const backends = try arena.alloc(tools.web.Fetch.Backend, web_settings.providers.len);
+    for (web_settings.providers, backends) |provider, *backend| {
+        failed.* = provider;
         const service = credentials.fetchService(provider);
         backend.* = .{
             .provider = provider,
             .api_key = if (service) |one|
-                credentials.credential(store, environ, one) orelse return error.MissingApiKey
+                credentials.credential(store, environ, one) orelse
+                    return error.MissingApiKey
             else
                 "",
         };
@@ -229,42 +339,44 @@ fn fetchConfig(
     return .{ .backends = backends };
 }
 
-/// The web search settings for a configuration that names a backend, or null
-/// when it names none. A backend named without its key is an error rather than a
-/// silent "no search": the configuration asked for the tool, and leaving it out
-/// without a word would look like a bug.
-fn searchConfig(
-    arena: std.mem.Allocator,
-    store: *const credentials.Store,
-    environ: *const std.process.Environ.Map,
-    settings: Config,
-    blame: *tools.web.Search.Provider,
-) !?tools.web.Search.Config {
-    const web = settings.tools.web_search;
-    if (web.providers.len == 0) return null;
-
-    // Each backend resolves its own key, or, for the one that is self-hosted,
-    // needs the instance named instead. What went wrong is left to the caller to
-    // report, which is what `blame` is for, so this only says which it was.
-    const backends = try arena.alloc(tools.web.Search.Backend, web.providers.len);
-    for (web.providers, backends) |provider, *backend| {
-        blame.* = provider;
-        const service = credentials.searchService(provider);
-        backend.* = .{
-            .provider = provider,
-            .api_key = if (service) |one|
-                credentials.credential(store, environ, one) orelse return error.MissingApiKey
-            else blk: {
-                // A backend billy knows the address of needs only its key; one it
-                // does not, SearXNG, needs the instance named.
-                if (web.searxng.url == null or web.searxng.url.?.len == 0) return error.MissingSearchUrl;
-                break :blk "";
-            },
-            // Only a self-hosted backend is reached somewhere billy does not know.
-            .endpoint = if (service == null) web.searxng.url else null,
-        };
+/// Tells the user what to fix about the search backend that could not be built:
+/// the login that stores its key, the variable the same key can come from, or the
+/// instance a self-hosted backend needs named.
+///
+/// A failure here is one the configuration asked for -- it named the backend --
+/// so leaving the tool out quietly would look like a bug rather than a choice.
+fn reportSearchFailure(err: anyerror, provider: tools.web.Search.Provider) void {
+    switch (err) {
+        error.MissingApiKey => {
+            // A backend reached with a key is one of the services, since the one
+            // billy hosts itself is reached without one.
+            const service = credentials.searchService(provider).?;
+            std.log.err(
+                "run `billy login {s}`, or set {s} to use {s}, or clear tools.web_search in the configuration",
+                .{ service.name(), service.variable(), @tagName(provider) },
+            );
+        },
+        error.MissingSearchUrl => std.log.err(
+            "set tools.web_search.{s}.url to your {s} instance, or clear tools.web_search in the configuration",
+            .{ @tagName(provider), @tagName(provider) },
+        ),
+        else => {},
     }
-    return .{ .backends = backends, .max_results = web.max_results };
+}
+
+/// Tells the user what to fix about the fetch backend that could not be built,
+/// on the same terms as `reportSearchFailure`.
+fn reportFetchFailure(err: anyerror, provider: tools.web.Fetch.Provider) void {
+    switch (err) {
+        error.MissingApiKey => {
+            const service = credentials.fetchService(provider).?;
+            std.log.err(
+                "run `billy login {s}`, or set {s} to use {s}, or clear tools.web_fetch in the configuration",
+                .{ service.name(), service.variable(), @tagName(provider) },
+            );
+        },
+        else => {},
+    }
 }
 
 /// The agent configuration for a session working in `cwd`, with its blocks
@@ -342,34 +454,69 @@ test "each backend resolves its own key, and SearXNG its instance" {
     var environ: std.process.Environ.Map = .init(gpa);
     defer environ.deinit();
     const store: credentials.Store = .{};
-    var blame: tools.web.Search.Provider = .tavily;
 
     // Nothing named is no search at all.
     var off = Config.init(gpa);
     defer off.deinit();
-    try std.testing.expect((try searchConfig(arena, &store, &environ, off, &blame)) == null);
+    var failed: tools.web.Search.Provider = .tavily;
+    try std.testing.expect((try searchConfig(arena, &store, &environ, off, &failed)) == null);
 
     // A backend billy knows is asked for a key, and one that is not set is an
-    // error rather than a silent "no search". The backend at fault is reported.
+    // error rather than a silent "no search".
     var naming = Config.init(gpa);
     defer naming.deinit();
     naming.tools.web_search.providers = &.{.tavily};
-    try std.testing.expectError(error.MissingApiKey, searchConfig(arena, &store, &environ, naming, &blame));
-    try std.testing.expectEqual(tools.web.Search.Provider.tavily, blame);
+    try std.testing.expectError(error.MissingApiKey, searchConfig(arena, &store, &environ, naming, &failed));
+    // The backend at fault is the one the report names.
+    try std.testing.expectEqual(tools.web.Search.Provider.tavily, failed);
 
     // SearXNG needs no key, but needs the instance named.
     var searx = Config.init(gpa);
     defer searx.deinit();
     searx.tools.web_search.providers = &.{.searxng};
-    try std.testing.expectError(error.MissingSearchUrl, searchConfig(arena, &store, &environ, searx, &blame));
+    try std.testing.expectError(error.MissingSearchUrl, searchConfig(arena, &store, &environ, searx, &failed));
 
     // Every named backend becomes a backend to try, in the order named.
     searx.tools.web_search.searxng.url = "https://searx.example.org";
-    const config = (try searchConfig(arena, &store, &environ, searx, &blame)).?;
+    const config = (try searchConfig(arena, &store, &environ, searx, &failed)).?;
     try std.testing.expectEqual(@as(usize, 1), config.backends.len);
     try std.testing.expectEqual(tools.web.Search.Provider.searxng, config.backends[0].provider);
     try std.testing.expectEqualStrings("", config.backends[0].api_key);
     try std.testing.expectEqualStrings("https://searx.example.org", config.backends[0].endpoint.?);
+}
+
+test "a fetch backend is asked for its key, and raw for none" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    const store: credentials.Store = .{};
+
+    // The default holds only `raw`, which asks no service, so it resolves with
+    // no key stored at all.
+    var raw = Config.init(gpa);
+    defer raw.deinit();
+    var failed: tools.web.Fetch.Provider = .raw;
+    const config = (try fetchConfig(arena, &store, &environ, raw, &failed)).?;
+    try std.testing.expectEqual(@as(usize, 1), config.backends.len);
+    try std.testing.expectEqual(tools.web.Fetch.Provider.raw, config.backends[0].provider);
+    try std.testing.expectEqualStrings("", config.backends[0].api_key);
+
+    // A service needs its key, on the same terms as a search backend.
+    var naming = Config.init(gpa);
+    defer naming.deinit();
+    naming.tools.web_fetch.providers = &.{.tavily};
+    try std.testing.expectError(error.MissingApiKey, fetchConfig(arena, &store, &environ, naming, &failed));
+    try std.testing.expectEqual(tools.web.Fetch.Provider.tavily, failed);
+
+    // A set with nothing in it leaves `web_fetch` out of the request.
+    var none = Config.init(gpa);
+    defer none.deinit();
+    none.tools.web_fetch.providers = &.{};
+    try std.testing.expect((try fetchConfig(arena, &store, &environ, none, &failed)) == null);
 }
 
 test "the reasoning setting names what billy asks of the model's thinking" {
