@@ -19,10 +19,10 @@ const search = @import("search.zig");
 
 /// Name of the file the credentials are kept in, in the billy data directory.
 pub const file_name = "credentials.json";
+
 /// Layout of the credentials file, bumped when its shape changes.
 const format_version = 1;
-/// Longest credentials file read back, so a damaged file cannot exhaust memory.
-const max_credentials_bytes = 1 << 20;
+
 /// The mode the file is written with. A key is a secret, so the file is kept to
 /// the owner, unlike the configuration, which holds no secret.
 const secret_mode: std.Io.File.Permissions = @fromBackingInt(@intCast(0o600));
@@ -166,7 +166,7 @@ const Stored = struct {
 /// Reads the stored credentials from `dir`. A missing file is an empty store,
 /// which is what a user who has never logged in has.
 pub fn load(io: std.Io, dir: std.Io.Dir, arena: std.mem.Allocator) !Store {
-    const text = dir.readFileAlloc(io, file_name, arena, .limited(max_credentials_bytes)) catch |err| switch (err) {
+    const text = dir.readFileAlloc(io, file_name, arena, .unlimited) catch |err| switch (err) {
         error.FileNotFound => return .{},
         else => return err,
     };
@@ -426,7 +426,7 @@ test "the file holds a field per service that has a key, and nothing else" {
     try store.put(allocator, .tavily, "tvly-secret");
     try save(&store, std.testing.io, tmp.dir);
 
-    const text = try tmp.dir.readFileAlloc(std.testing.io, file_name, allocator, .limited(max_credentials_bytes));
+    const text = try tmp.dir.readFileAlloc(std.testing.io, file_name, allocator, .unlimited);
     // The service is a field named after it; a service with no key is left out
     // rather than written as null. The file is indented, so it is readable by
     // the user it belongs to.
