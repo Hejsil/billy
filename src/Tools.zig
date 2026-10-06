@@ -160,14 +160,12 @@ pub fn definitions(tools: *const Tools, mode: agent.Mode) []const Session.Defini
 /// a mode without showing the call.
 pub fn callName(call: Call) []const u8 {
     return switch (call) {
-        .read => "read",
-        .write => "write",
-        .edit => "edit",
-        .bash => "bash",
-        .web_search => "web_search",
-        .web_fetch => "web_fetch",
+        // The two a call carries its own name in: one never named a tool, and the
+        // other is the name whose arguments could not be parsed.
         .unknown => |name| name,
         .malformed => |bad| bad.name,
+        // Every other tag is the tool's own name, so it is not written twice.
+        inline else => |_, tag| @tagName(tag),
     };
 }
 
@@ -357,29 +355,18 @@ pub fn parse(arena: std.mem.Allocator, call: llm.ToolCall) Call {
 /// is the pair a session stores. This is what a transcript reads a call with, so
 /// that replaying one does not have to build the `llm.ToolCall` it came from.
 pub fn parseCallNamed(arena: std.mem.Allocator, name: []const u8, arguments: []const u8) Call {
-    if (std.mem.eql(u8, name, "read")) {
-        return .{ .read = fromJson(Read, arena, arguments) catch |reason|
-            return .{ .malformed = .{ .name = name, .reason = reason } } };
-    }
-    if (std.mem.eql(u8, name, "write")) {
-        return .{ .write = fromJson(Write, arena, arguments) catch |reason|
-            return .{ .malformed = .{ .name = name, .reason = reason } } };
-    }
-    if (std.mem.eql(u8, name, "edit")) {
-        return .{ .edit = fromJson(Edit, arena, arguments) catch |reason|
-            return .{ .malformed = .{ .name = name, .reason = reason } } };
-    }
-    if (std.mem.eql(u8, name, "bash")) {
-        return .{ .bash = fromJson(Bash, arena, arguments) catch |reason|
-            return .{ .malformed = .{ .name = name, .reason = reason } } };
-    }
-    if (std.mem.eql(u8, name, "web_search")) {
-        return .{ .web_search = fromJson(web.Search, arena, arguments) catch |reason|
-            return .{ .malformed = .{ .name = name, .reason = reason } } };
-    }
-    if (std.mem.eql(u8, name, "web_fetch")) {
-        return .{ .web_fetch = fromJson(web.Fetch, arena, arguments) catch |reason|
-            return .{ .malformed = .{ .name = name, .reason = reason } } };
+    // The tools a call can name, by the tag they parse into. The tag is the name
+    // a model uses, so the two are not written side by side: a tool whose
+    // arguments do not fit becomes `malformed` rather than failing the call, so a
+    // caller can still name what it could not run.
+    const fields = @typeInfo(Call).@"union".field_types;
+    inline for (.{ Call.read, Call.write, Call.edit, Call.bash, Call.web_search, Call.web_fetch }) |tag| {
+        if (std.mem.eql(u8, name, @tagName(tag))) {
+            const payload = fields[@backingInt(tag)];
+            const parsed = fromJson(payload, arena, arguments) catch |reason|
+                return .{ .malformed = .{ .name = name, .reason = reason } };
+            return @unionInit(Call, @tagName(tag), parsed);
+        }
     }
     return .{ .unknown = name };
 }
