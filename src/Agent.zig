@@ -589,7 +589,7 @@ pub fn start(agent: *Agent, session: *Session, text: []const u8, default: Mode) 
 /// not fatal: the conversation is left as it is and the request goes out with
 /// it, which is what would have happened without compaction at all.
 fn compactIfNeeded(agent: *Agent, emitter: Emitter, session: *Session) void {
-    const compacted = maybeCompact(agent.io, &agent.client, emitter, agent.config, session) catch |err| {
+    const compacted = agent.maybeCompact(emitter, session) catch |err| {
         std.log.warn("compaction failed: {s}", .{@errorName(err)});
         return;
     };
@@ -602,7 +602,7 @@ fn compactIfNeeded(agent: *Agent, emitter: Emitter, session: *Session) void {
 /// last compaction has nothing to fold in, and neither has one that has not
 /// been asked anything. A failure is logged and reads as nothing compacted.
 fn compact(agent: *Agent, emitter: Emitter, session: *Session) bool {
-    const compacted = fold(agent.io, &agent.client, emitter, agent.config, session) catch |err| {
+    const compacted = agent.fold(emitter, session) catch |err| {
         std.log.warn("compaction failed: {s}", .{@errorName(err)});
         return false;
     };
@@ -614,16 +614,14 @@ fn compact(agent: *Agent, emitter: Emitter, session: *Session) bool {
 /// been running a while picks up a changed prompt, instruction files or tool
 /// set. A compaction is the one moment replacing the front of a request costs
 /// no cache that was not already being thrown away.
+///
+/// A refresh that fails is not the turn's: the session keeps the prompt and
+/// tools it had, which are the ones its last request was sent with, and the
+/// run goes on.
 fn refresh(agent: *Agent, session: *Session) void {
-    refreshLead(
-        agent.io,
-        agent.gpa,
-        agent.work_dir,
-        agent.config.user_instructions_dir,
-        agent.config.mode,
-        agent.tool_set.definitions(agent.config.mode),
-        session,
-    ) catch |err| std.log.warn("could not refresh the prompt and tools: {s}", .{@errorName(err)});
+    const mode = agent.config.mode;
+    refreshLead(agent, mode, agent.tool_set.definitions(mode), session) catch |err|
+        std.log.warn("could not refresh the prompt and tools: {s}", .{@errorName(err)});
 }
 
 /// Asks `session` one thing and shows how the answer is reached: the prompt,
@@ -642,10 +640,10 @@ pub fn ask(agent: *Agent, emitter: Emitter, session: *Session, text: []const u8)
 
     try session.append(.{ .role = "user", .content = text });
     try emitter.show(.{ .prompt = text });
-    try turn(agent.io, &agent.client, &agent.tool_set, emitter, agent.config, session);
+    try turn(agent, emitter, session);
 
     if (first_turn and agent.config.title) {
-        titleSession(agent.io, &agent.client, agent.config, session) catch |err|
+        titleSession(agent, session) catch |err|
             std.log.warn("could not title the session: {s}", .{@errorName(err)});
     }
 }
@@ -876,21 +874,14 @@ fn blocksIn(session: *const Session, messages: []const Session.Message, index: u
 
 /// Runs the model until it replies with text instead of tool calls, showing what
 /// happens as blocks as it goes.
-fn turn(
-    io: std.Io,
-    client: *llm.Client,
-    tool_set: *Tools,
-    emitter: Emitter,
-    config: Config,
-    session: *Session,
-) !void {
+fn turn(agent: *Agent, emitter: Emitter, session: *Session) !void {
     // Holds the parsed call of each tool call the model asks for, which is read
     // until that call has been run and shown. Reset per call, so a turn that
     // makes many calls holds only the one it is on.
-    var scratch_state = std.heap.ArenaAllocator.init(tool_set.gpa);
+    var scratch_state = std.heap.ArenaAllocator.init(agent.tool_set.gpa);
     defer scratch_state.deinit();
 
-    var remaining: usize = config.max_turns;
+    var remaining: usize = agent.config.max_turns;
     // A compaction that failed is not tried again within the same turn, so a
     // provider that will not summarize cannot turn every request of a long turn
     // into a second failed one. The next turn tries afresh.
@@ -903,15 +894,12 @@ fn turn(
         // compaction refreshes the prompt and tools before the next request, so
         // the turn picks up the current ones.
         if (!compact_failed) {
-            const compacted = maybeCompact(io, client, emitter, config, session) catch |err| blk: {
+            const compacted = agent.maybeCompact(emitter, session) catch |err| blk: {
                 std.log.warn("compaction failed: {s}", .{@errorName(err)});
                 compact_failed = true;
                 break :blk false;
             };
-            if (compacted) {
-                refreshLead(io, tool_set.gpa, tool_set.dir, config.user_instructions_dir, config.mode, tool_set.definitions(config.mode), session) catch |err|
-                    std.log.warn("could not refresh the prompt and tools: {s}", .{@errorName(err)});
-            }
+            if (compacted) refresh(agent, session);
         }
 
         // The completion owns its parsed reply, and each tool result lives in the
@@ -919,14 +907,14 @@ fn turn(
         // conversation is written straight onto the connection out of the pool,
         // the reply is freed when the turn ends, and the session interns what it
         // keeps.
-        const completion = try client.complete(client.gpa, session.conversation(&.{}), session.toolSet());
+        const completion = try agent.client.complete(agent.gpa, session.conversation(&.{}), session.toolSet());
         defer completion.deinit();
 
         // The totals are recorded first, so the save inside `append` stores them
         // along with the message. Each request is priced as it is made, at the
         // rates in effect then, so a session running through a rate change is
         // billed for what it actually cost.
-        session.recordUsage(completion.usage, costOf(rateNow(io, config), completion.usage));
+        session.recordUsage(completion.usage, costOf(agent.rateNow(), completion.usage));
         try session.append(completion.message);
 
         const message = completion.message;
@@ -934,13 +922,13 @@ fn turn(
         // No calls means the model answered, which ends the turn.
         if (calls.len == 0) return emitter.show(.{ .answer = message.content orelse "" });
 
-        try runCalls(tool_set, emitter, &scratch_state, session, config.mode, calls);
+        try runCalls(&agent.tool_set, emitter, &scratch_state, session, agent.config.mode, calls);
     }
     var buffer: [96]u8 = undefined;
     const stopped = std.fmt.bufPrint(
         &buffer,
         "stopped after {d} turns without a final answer",
-        .{config.max_turns},
+        .{agent.config.max_turns},
     ) catch "stopped without a final answer";
     try emitter.show(.{ .notice = stopped });
 }
@@ -1024,16 +1012,19 @@ fn leadPrompt(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir, user_dir: ?st
 /// so the only shared prefix left to lose is the prompt and the tools
 /// themselves.
 fn refreshLead(
-    io: std.Io,
-    gpa: std.mem.Allocator,
-    dir: std.Io.Dir,
-    user_dir: ?std.Io.Dir,
+    agent: *const Agent,
     mode: Mode,
     definitions: []const Session.Definition,
     session: *Session,
 ) !void {
-    const prompt_text = try leadPrompt(io, gpa, dir, user_dir, mode);
-    defer gpa.free(prompt_text);
+    const prompt_text = try leadPrompt(
+        agent.io,
+        agent.gpa,
+        agent.tool_set.dir,
+        agent.config.user_instructions_dir,
+        mode,
+    );
+    defer agent.gpa.free(prompt_text);
     if (prompt_text.len > 0) try session.setSystemPrompt(prompt_text);
     try session.setTools(definitions);
     try session.save();
@@ -1060,20 +1051,15 @@ const title_prompt =
 /// request shares the conversation's cache. A model that answers with nothing
 /// usable leaves the session as it is, so the title it already has (the one
 /// derived from the first prompt) stands.
-fn titleSession(
-    io: std.Io,
-    client: *llm.Client,
-    config: Config,
-    session: *Session,
-) !void {
+fn titleSession(agent: *Agent, session: *Session) !void {
     const extra = [_]llm.Message{.{ .role = "user", .content = title_prompt }};
-    const completion = try client.complete(client.gpa, session.conversation(&extra), session.toolSet());
+    const completion = try agent.client.complete(agent.gpa, session.conversation(&extra), session.toolSet());
     defer completion.deinit();
-    session.recordCost(completion.usage, costOf(rateNow(io, config), completion.usage));
+    session.recordCost(completion.usage, costOf(agent.rateNow(), completion.usage));
 
     const raw = completion.message.content orelse return;
-    const title = try cleanTitle(client.gpa, raw) orelse return;
-    defer client.gpa.free(title);
+    const title = try cleanTitle(agent.gpa, raw) orelse return;
+    defer agent.gpa.free(title);
     try session.setTitle(title);
     try session.save();
 }
@@ -1115,9 +1101,9 @@ pub fn nameFromPrompt(session: *Session, text: []const u8) !bool {
 
 /// The rates in effect right now. Zero for a model billy does not know, which
 /// has no prices to cost its tokens at.
-fn rateNow(io: std.Io, config: Config) models.Price {
-    const info = config.model_info orelse return .{};
-    return info.priceAt(@intCast(std.Io.Clock.real.now(io).toSeconds()));
+fn rateNow(agent: *const Agent) models.Price {
+    const info = agent.config.model_info orelse return .{};
+    return info.priceAt(@intCast(std.Io.Clock.real.now(agent.io).toSeconds()));
 }
 
 /// Sent as the last message of a compaction request, and stored with the summary
@@ -1136,10 +1122,10 @@ const compact_prompt =
 /// The number of tokens the conversation may reach before it is compacted. Zero
 /// when compaction is off, or when the model's window is unknown and there is
 /// then no threshold to measure a conversation against.
-fn compactThreshold(config: Config) usize {
-    if (config.compact_at == 0) return 0;
-    const info = config.model_info orelse return 0;
-    return info.context_window * config.compact_at / 100;
+fn compactThreshold(agent: *const Agent) usize {
+    if (agent.config.compact_at == 0) return 0;
+    const info = agent.config.model_info orelse return 0;
+    return info.context_window * agent.config.compact_at / 100;
 }
 
 /// Compacts the conversation into a summary when it has filled the context
@@ -1149,20 +1135,14 @@ fn compactThreshold(config: Config) usize {
 /// This is the automatic compaction, which waits for the threshold; a caller
 /// that wants the conversation folded now, whatever it has grown to, asks for
 /// `compact` instead.
-fn maybeCompact(
-    io: std.Io,
-    client: *llm.Client,
-    emitter: Emitter,
-    config: Config,
-    session: *Session,
-) !bool {
+fn maybeCompact(agent: *Agent, emitter: Emitter, session: *Session) !bool {
     // Nothing is compacted for a model whose window is unknown, since there is
     // then no threshold to measure the conversation against; and a conversation
     // that has not reached it is left alone for the next request to fold, if it
     // ever does.
-    const threshold = compactThreshold(config);
+    const threshold = agent.compactThreshold();
     if (threshold == 0 or session.context_tokens < threshold) return false;
-    return fold(io, client, emitter, config, session);
+    return agent.fold(emitter, session);
 }
 
 /// Compacts the conversation into a summary now, whatever it has grown to, and
@@ -1176,21 +1156,15 @@ fn maybeCompact(
 /// which is what would have happened without compaction at all. The caller
 /// refreshes the session's prompt and tools when it did compact, which is why
 /// the answer is reported rather than swallowed.
-fn fold(
-    io: std.Io,
-    client: *llm.Client,
-    emitter: Emitter,
-    config: Config,
-    session: *Session,
-) !bool {
+fn fold(agent: *Agent, emitter: Emitter, session: *Session) !bool {
     // Nothing has been added since the last compaction, so there is nothing new
     // to fold in: compacting again would only summarize the summary, and would
     // do so on every request.
     const sent_from = session.sentFrom();
     if (session.messages.items.len - sent_from <= 1) return false;
 
-    const summary = try summarize(io, client, config, session) orelse return false;
-    defer client.gpa.free(summary);
+    const summary = try agent.summarize(session) orelse return false;
+    defer agent.gpa.free(summary);
 
     // The conversation a request now carries is the summary and little else, so
     // its size is not known until the next request reports one. Clearing the
@@ -1212,25 +1186,20 @@ fn fold(
 /// the compacting prompt after it. The request cost real tokens, so it is billed
 /// like any other, but it must not move the context gauge: the conversation it
 /// was sent is about to be replaced by something far smaller.
-fn summarize(
-    io: std.Io,
-    client: *llm.Client,
-    config: Config,
-    session: *Session,
-) !?[]const u8 {
+fn summarize(agent: *Agent, session: *Session) !?[]const u8 {
     // The conversation the model has been given, with the compacting prompt as
     // the message after it: the same request a turn would send, with one more
     // message on the end, so the model reads exactly what happened. Nothing is
     // added to the session: the prompt is written straight out of the local
     // array and is gone when this returns.
     const extra = [_]llm.Message{.{ .role = "user", .content = compact_prompt }};
-    const completion = try client.complete(client.gpa, session.conversation(&extra), session.toolSet());
+    const completion = try agent.client.complete(agent.gpa, session.conversation(&extra), session.toolSet());
     defer completion.deinit();
-    session.recordCost(completion.usage, costOf(rateNow(io, config), completion.usage));
+    session.recordCost(completion.usage, costOf(agent.rateNow(), completion.usage));
 
     const content = completion.message.content orelse return null;
     if (content.len == 0) return null;
-    return try client.gpa.dupe(u8, content);
+    return try agent.gpa.dupe(u8, content);
 }
 
 /// Prints `messages` the way a resumed session replays them, from a session
@@ -1495,6 +1464,35 @@ test "printTranscript rebuilds an edit's diff from the stored call" {
 
 /// A config with no model metadata, so the header is just the model and the
 /// directory. Tests that need a gauge fill `model_info` in.
+/// An agent for a test, working in a directory that exists.
+///
+/// The HTTP client is borrowed by the agent and by the tools that make requests,
+/// so a test that makes one passes the client it points at a mock; a test that
+/// only drives the loop passes null, and the client it is given is never read.
+/// That is what keeps the setup of an unused client out of every test: the field
+/// is a pointer, so a null is only a null until a web tool is called.
+fn testAgent(io: std.Io, gpa: std.mem.Allocator, config: Config, http: ?*std.http.Client) !Agent {
+    const work_dir = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(work_dir);
+    return testAgentIn(io, gpa, config, work_dir, http);
+}
+
+/// An agent for a test working in `work_dir`, which is where the project's
+/// instructions are looked for. A test that cares which directory that is names
+/// one; the rest work in the directory the tests run from.
+fn testAgentIn(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    config: Config,
+    work_dir: []const u8,
+    http: ?*std.http.Client,
+) !Agent {
+    if (http) |client| return Agent.init(io, gpa, config, work_dir, client);
+
+    var unused: std.http.Client = undefined;
+    return Agent.init(io, gpa, config, work_dir, &unused);
+}
+
 fn testConfig(model: []const u8, cwd: []const u8, home: ?[]const u8) Config {
     return .{
         .api_key = "k",
@@ -1913,12 +1911,16 @@ test "sameDir tells a directory from its parent and root from itself" {
 }
 
 test "the compaction threshold is the configured share of the window, or off" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
     // A model without a known window has nothing to measure a conversation
     // against, so there is no threshold even with compaction on.
-    try std.testing.expectEqual(0, compactThreshold(testConfig("m", "/work", null)));
+    var agent = try testAgent(io, gpa, testConfig("m", "/work", null), null);
+    defer agent.deinit();
+    try std.testing.expectEqual(0, agent.compactThreshold());
 
-    var config = testConfig("m", "/work", null);
-    config.model_info = .{
+    agent.config.model_info = .{
         .provider = .deepseek,
         .model = "m",
         .context_window = 1000,
@@ -1926,17 +1928,17 @@ test "the compaction threshold is the configured share of the window, or off" {
     };
 
     // The default is a share of the window, not the whole of it.
-    try std.testing.expectEqual(800, compactThreshold(config));
+    try std.testing.expectEqual(800, agent.compactThreshold());
 
     // Zero turns it off.
-    config.compact_at = 0;
-    try std.testing.expectEqual(0, compactThreshold(config));
+    agent.config.compact_at = 0;
+    try std.testing.expectEqual(0, agent.compactThreshold());
 
     // Any share the file names, whether or not it divides the window evenly.
-    config.compact_at = 50;
-    try std.testing.expectEqual(500, compactThreshold(config));
-    config.compact_at = 33;
-    try std.testing.expectEqual(330, compactThreshold(config));
+    agent.config.compact_at = 50;
+    try std.testing.expectEqual(500, agent.compactThreshold());
+    agent.config.compact_at = 33;
+    try std.testing.expectEqual(330, agent.compactThreshold());
 }
 
 test "maybeCompact folds the conversation once it has filled the window" {
@@ -1979,19 +1981,16 @@ test "maybeCompact folds the conversation once it has filled the window" {
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
-    var client: llm.Client = .{
-        .gpa = gpa,
-        .io = io,
-        .api_key = "k",
-        .url = mock.url,
-        .model = "m",
-        .http = &http,
-    };
+    config.url = mock.url;
+    config.api_key = "k";
+
+    var agent = try testAgent(io, gpa, config, &http);
+    defer agent.deinit();
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var terminal = testTerminal(&out.writer, .{});
-    try std.testing.expect(try maybeCompact(io, &client, terminal.emitter(), config, &session));
+    try std.testing.expect(try agent.maybeCompact(terminal.emitter(), &session));
 
     try mock.group.await(io);
     if (mock.err) |err| return err;
@@ -2040,7 +2039,13 @@ test "maybeCompact does nothing below the threshold, off, or with nothing new" {
     var config = testConfig("m", "/work", null);
     config.model_info = .{ .provider = .deepseek, .model = "m", .context_window = 1000, .price = .{} };
 
-    // There is no client: the function must return before it reaches for one.
+    // Nothing is listening on this address, so a request made where the function
+    // should have returned first would fail the test rather than pass it.
+    config.url = "http://127.0.0.1:1/chat/completions";
+
+    var agent = try testAgent(io, gpa, config, null);
+    defer agent.deinit();
+
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var terminal = testTerminal(&out.writer, .{});
@@ -2048,15 +2053,15 @@ test "maybeCompact does nothing below the threshold, off, or with nothing new" {
 
     // Below the threshold.
     session.context_tokens = 100;
-    try std.testing.expect(!try maybeCompact(io, undefined, emitter, config, &session));
+    try std.testing.expect(!try agent.maybeCompact(emitter, &session));
     // Turned off.
     session.context_tokens = 999;
-    config.compact_at = 0;
-    try std.testing.expect(!try maybeCompact(io, undefined, emitter, config, &session));
+    agent.config.compact_at = 0;
+    try std.testing.expect(!try agent.maybeCompact(emitter, &session));
     // A model with no known window has no threshold to measure against.
-    config.compact_at = 80;
-    config.model_info = null;
-    try std.testing.expect(!try maybeCompact(io, undefined, emitter, config, &session));
+    agent.config.compact_at = 80;
+    agent.config.model_info = null;
+    try std.testing.expect(!try agent.maybeCompact(emitter, &session));
 
     // Nothing was added, and nothing was printed.
     try std.testing.expectEqual(1, session.messages.items.len);
@@ -2090,14 +2095,18 @@ test "a compaction asked for now folds the conversation in whatever its size" {
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
-    var client: llm.Client = .{ .gpa = gpa, .io = io, .api_key = "k", .url = mock.url, .model = "m", .http = &http };
+    config.url = mock.url;
+    config.api_key = "k";
+
+    var agent = try testAgent(io, gpa, config, &http);
+    defer agent.deinit();
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var terminal = testTerminal(&out.writer, .{});
     // Asked for now, so the threshold and the setting are ignored: the
     // conversation is folded whatever size it has grown to.
-    try std.testing.expect(try fold(io, &client, terminal.emitter(), config, &session));
+    try std.testing.expect(try agent.fold(terminal.emitter(), &session));
     try mock.group.await(io);
     if (mock.err) |err| return err;
 
@@ -2108,7 +2117,7 @@ test "a compaction asked for now folds the conversation in whatever its size" {
     // Asking again does nothing: the summary is the last message, so there is
     // nothing new to fold in, and a request would only re-summarize it.
     out.clearRetainingCapacity();
-    try std.testing.expect(!try fold(io, &client, terminal.emitter(), config, &session));
+    try std.testing.expect(!try agent.fold(terminal.emitter(), &session));
     try std.testing.expectEqualStrings("", out.written());
 }
 
@@ -2141,10 +2150,16 @@ test "maybeCompact does not compact a summary that stands alone" {
     // Over the threshold, but the last message is the summary itself, so there is
     // nothing new to fold in and a request would only re-summarize it.
     session.context_tokens = 999;
+    // Nothing is listening there, so a request made where this should have
+    // returned first would fail the test.
+    config.url = "http://127.0.0.1:1/chat/completions";
+    var agent = try testAgent(io, gpa, config, null);
+    defer agent.deinit();
+
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var terminal = testTerminal(&out.writer, .{});
-    try std.testing.expect(!try maybeCompact(io, undefined, terminal.emitter(), config, &session));
+    try std.testing.expect(!try agent.maybeCompact(terminal.emitter(), &session));
 
     try std.testing.expectEqual(2, session.messages.items.len);
     try std.testing.expectEqualStrings("", out.written());
@@ -2177,7 +2192,18 @@ test "refreshLead replaces the prompt, the project instructions and the tools" {
     try session.setSystemPrompt("OLD PROMPT");
     try session.setTools(&old_tools);
 
-    try refreshLead(io, gpa, tmp.dir, null, .general, &new_tools, &session);
+    // The lead is read out of the directory the agent works in, which is where
+    // the project's instructions are looked for: the session's own directory,
+    // which is the temporary one holding them.
+    // The lead is read out of the directory the agent works in, which is where
+    // the project's instructions are looked for: the temporary directory holding
+    // them. No client is given, since this reads no model.
+    const work_dir = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(work_dir);
+    var agent = try testAgentIn(io, gpa, testConfig("m", "/work", null), work_dir, null);
+    defer agent.deinit();
+
+    try refreshLead(&agent, .general, &new_tools, &session);
 
     // The prompt is the current one: billy's own text with the project's
     // instructions after it, and none of the old prompt left.
@@ -2216,15 +2242,11 @@ test "prepare gives a fresh session the user's instructions from the configurati
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
     var config = testConfig("m", "/work", null);
     config.user_instructions_dir = config_dir.dir;
     // `Agent.init` opens the directory it works in, so it has to be one that
     // exists; the session's recorded directory is separate.
-    const work_dir = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(work_dir);
-    var agent = try Agent.init(io, gpa, config, work_dir, &http);
+    var agent = try testAgent(io, gpa, config, null);
     defer agent.deinit();
 
     try agent.prepare(&session);
@@ -2250,14 +2272,10 @@ test "prepare gives a chat session no prompt and only the tools it allows" {
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
     var config = testConfig("m", "/work", null);
     config.mode = .chat;
     config.user_instructions_dir = config_dir.dir;
-    const work_dir = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(work_dir);
-    var agent = try Agent.init(io, gpa, config, work_dir, &http);
+    var agent = try testAgent(io, gpa, config, null);
     defer agent.deinit();
 
     try agent.prepare(&session);
@@ -2280,16 +2298,11 @@ test "a first prompt names the mode and says what to ask" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
-    const work_dir = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(work_dir);
-
     // A prompt that names no mode runs in the one the frontend asked for, and is
     // asked as it was typed.
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
-    var agent = try Agent.init(io, gpa, testConfig("m", "/work", null), work_dir, &http);
+    var agent = try testAgent(io, gpa, testConfig("m", "/work", null), null);
     defer agent.deinit();
 
     const plain = try agent.start(&session, "do the thing", .general);
@@ -2314,14 +2327,9 @@ test "a first prompt that names only a mode asks nothing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
-    const work_dir = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(work_dir);
-
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
-    var agent = try Agent.init(io, gpa, testConfig("m", "/work", null), work_dir, &http);
+    var agent = try testAgent(io, gpa, testConfig("m", "/work", null), null);
     defer agent.deinit();
 
     // `/chat` on its own opens that mode: the session is set up and ready, and
@@ -2339,14 +2347,9 @@ test "a prompt after the first leaves the session as it was set up" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
-    const work_dir = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(work_dir);
-
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
-    var agent = try Agent.init(io, gpa, testConfig("m", "/work", null), work_dir, &http);
+    var agent = try testAgent(io, gpa, testConfig("m", "/work", null), null);
     defer agent.deinit();
 
     _ = try agent.start(&session, "the first thing", .general);
@@ -2498,24 +2501,15 @@ test "a turn shows the tool it runs and then the answer" {
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
-    var client: llm.Client = .{
-        .gpa = gpa,
-        .io = io,
-        .api_key = "k",
-        .url = mock.url,
-        .model = "m",
-        .http = &http,
-    };
-    var tool_set = try Tools.init(.{
-        .io = io,
-        .dir = std.Io.Dir.cwd(),
-        .gpa = gpa,
-        .bash_timeout_s = 120,
-        .http = &http,
-    });
+
+    var config = testConfig("m", "/work", null);
+    config.url = mock.url;
+    config.api_key = "k";
+    var agent = try testAgent(io, gpa, config, &http);
+    defer agent.deinit();
 
     var recorder = Recorder{ .gpa = arena_state.allocator() };
-    try turn(io, &client, &tool_set, recorder.emitter(), testConfig("m", "/work", null), &session);
+    try turn(&agent, recorder.emitter(), &session);
 
     try mock.group.await(io);
     if (mock.err) |err| return err;
@@ -2567,8 +2561,6 @@ test "the first turn names the session, and the naming is not part of it" {
     defer mock.deinit();
     try mock.serve();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
     var config = testConfig("m", "/work", null);
     config.title = true;
     // The agent builds the model client from the config, so the config carries
@@ -2576,9 +2568,9 @@ test "the first turn names the session, and the naming is not part of it" {
     config.url = mock.url;
     // `Agent.init` opens the directory it works in, so it has to be one that
     // exists; the session's recorded directory is separate and stays "/work".
-    const work_dir = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(work_dir);
-    var agent = try Agent.init(io, gpa, config, work_dir, &http);
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+    var agent = try testAgent(io, gpa, config, &http);
     defer agent.deinit();
 
     var out: std.Io.Writer.Allocating = .init(gpa);
