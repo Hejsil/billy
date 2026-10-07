@@ -3,7 +3,7 @@
 const std = @import("std");
 const transport = @import("../../web.zig");
 const outcome = @import("../Outcome.zig");
-const results = @import("../Results.zig");
+const Search = @import("../Search.zig");
 const Mock = @import("../../../Mock.zig");
 
 /// One Tavily search, posted to `endpoint`, which is the provider's own or a
@@ -20,7 +20,7 @@ pub fn search(
 ) !outcome.Value {
     const body = try std.json.Stringify.valueAlloc(gpa, Request{
         .query = query,
-        .max_results = @min(max_results, results.result_limit),
+        .max_results = @min(max_results, Search.Result.result_limit),
     }, .{ .emit_null_optional_fields = false });
     defer gpa.free(body);
 
@@ -43,10 +43,10 @@ pub fn search(
     };
     defer parsed.deinit();
 
-    const mapped = try results.mapped(gpa, parsed.value.results, "content");
+    const mapped = try Search.Result.mapped(gpa, parsed.value.results, "content");
     defer gpa.free(mapped);
 
-    return .{ .text = try results.renderAlloc(gpa, mapped) };
+    return .{ .text = try Search.Result.renderAlloc(gpa, mapped) };
 }
 
 /// One Tavily extraction. The url's text is the backend's; a url the backend

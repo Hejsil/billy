@@ -5,7 +5,7 @@
 const std = @import("std");
 const escape = @import("../html.zig").escape;
 const models = @import("../models.zig");
-const results = @import("../Tools/web/Results.zig");
+const Search = @import("../Tools/web/Search.zig");
 
 /// Writes the favicons of a web search: one small round bubble per result,
 /// holding the source's own favicon and opening its url. They sit in the
@@ -17,7 +17,7 @@ const results = @import("../Tools/web/Results.zig");
 /// that is not a list of results, such as a search that matched nothing.
 pub fn write(result: []const u8, out: *std.Io.Writer) !void {
     var origin_buffer: [256]u8 = undefined;
-    var found = results.parseResults(result);
+    var found = Search.Result.parseResults(result);
     while (found.next()) |one| {
         const origin = originOf(one.url, &origin_buffer) orelse continue;
         try bubble(one, origin, out);
@@ -28,7 +28,7 @@ pub fn write(result: []const u8, out: *std.Io.Writer) !void {
 /// cropping to it, with the source's first letter behind it so a site that has no
 /// favicon still reads as a small bubble rather than a broken image. The host is
 /// the bubble's tooltip, and the whole bubble opens the result.
-fn bubble(found: results.Result, origin: []const u8, out: *std.Io.Writer) !void {
+fn bubble(found: Search.Result, origin: []const u8, out: *std.Io.Writer) !void {
     const host = models.hostOf(found.url) orelse return;
     try out.writeAll("<a class=\"fav\" href=\"");
     try escape(found.url, out);

@@ -6,11 +6,12 @@ const Health = @import("../../Health.zig");
 const tools = @import("../../Tools.zig");
 const Mock = @import("../../Mock.zig");
 const outcome = @import("Outcome.zig");
-const results = @import("Results.zig");
 const brave = @import("provider/brave.zig");
 const exa = @import("provider/exa.zig");
 const searxng = @import("provider/searxng.zig");
 const tavily = @import("provider/tavily.zig");
+
+pub const Result = @import("Search/Result.zig");
 
 const Search = @This();
 

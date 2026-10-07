@@ -3,7 +3,7 @@
 const std = @import("std");
 const transport = @import("../../web.zig");
 const outcome = @import("../Outcome.zig");
-const results = @import("../Results.zig");
+const Search = @import("../Search.zig");
 const Mock = @import("../../../Mock.zig");
 
 /// One Brave search, sent as a GET with the query in the url. Brave wants its
@@ -37,10 +37,10 @@ pub fn search(
     };
     defer parsed.deinit();
 
-    const mapped = try results.mapped(gpa, parsed.value.web.results, "description");
+    const mapped = try Search.Result.mapped(gpa, parsed.value.web.results, "description");
     defer gpa.free(mapped);
 
-    return .{ .text = try results.renderAlloc(gpa, mapped) };
+    return .{ .text = try Search.Result.renderAlloc(gpa, mapped) };
 }
 
 /// Brave's own address.

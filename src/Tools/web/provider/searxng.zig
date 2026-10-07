@@ -3,7 +3,7 @@
 const std = @import("std");
 const transport = @import("../../web.zig");
 const outcome = @import("../Outcome.zig");
-const results = @import("../Results.zig");
+const Search = @import("../Search.zig");
 const Mock = @import("../../../Mock.zig");
 
 /// One SearXNG search, sent as a GET to the instance the configuration names.
@@ -41,10 +41,10 @@ pub fn search(
     // The instance is the configuration's, so only it knows the address; there
     // is no default to fall back on.
     const capped = parsed.value.results[0..@min(parsed.value.results.len, max_results)];
-    const mapped = try results.mapped(gpa, capped, "content");
+    const mapped = try Search.Result.mapped(gpa, capped, "content");
     defer gpa.free(mapped);
 
-    return .{ .text = try results.renderAlloc(gpa, mapped) };
+    return .{ .text = try Search.Result.renderAlloc(gpa, mapped) };
 }
 
 /// The part of a SearXNG response billy uses, which is the same from every engine

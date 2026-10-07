@@ -3,13 +3,11 @@
 
 const std = @import("std");
 
-/// One search result as the model reads it: the shape `render` writes and
-/// `parseResults` reads back. Every backend's own results are mapped into it.
-pub const Result = struct {
-    title: []const u8 = "",
-    url: []const u8 = "",
-    snippet: []const u8 = "",
-};
+const Result = @This();
+
+title: []const u8 = "",
+url: []const u8 = "",
+snippet: []const u8 = "",
 
 /// Most results a backend is asked for, whatever the configuration says, so one
 /// query cannot be turned into a wall of text.

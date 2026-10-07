@@ -3,7 +3,7 @@
 const std = @import("std");
 const transport = @import("../../web.zig");
 const outcome = @import("../Outcome.zig");
-const results = @import("../Results.zig");
+const Search = @import("../Search.zig");
 const Mock = @import("../../../Mock.zig");
 
 /// One Exa search, posted to `endpoint`. Exa would return the whole page of each
@@ -19,8 +19,8 @@ pub fn search(
 ) !outcome.Value {
     const body = try std.json.Stringify.valueAlloc(gpa, Request{
         .query = query,
-        .numResults = @min(max_results, results.result_limit),
-        .contents = .{ .text = .{ .maxCharacters = results.snippet_len } },
+        .numResults = @min(max_results, Search.Result.result_limit),
+        .contents = .{ .text = .{ .maxCharacters = Search.Result.snippet_len } },
     }, .{ .emit_null_optional_fields = false });
     defer gpa.free(body);
 
@@ -40,10 +40,10 @@ pub fn search(
     };
     defer parsed.deinit();
 
-    const mapped = try results.mapped(gpa, parsed.value.results, "text");
+    const mapped = try Search.Result.mapped(gpa, parsed.value.results, "text");
     defer gpa.free(mapped);
 
-    return .{ .text = try results.renderAlloc(gpa, mapped) };
+    return .{ .text = try Search.Result.renderAlloc(gpa, mapped) };
 }
 
 /// One Exa contents call, posted to `endpoint`. A url the backend could not read
