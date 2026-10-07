@@ -82,59 +82,50 @@ fn writeField(out: *std.Io.Writer, text: []const u8) !void {
 /// something wrong.
 /// Reads a list of results back, one at a time.
 pub const Reader = struct {
-    rest: []const u8,
+    lines: std.mem.SplitIterator(u8, .scalar),
 
     pub fn next(self: *Reader) ?Result {
-        while (self.rest.len > 0) {
-            const line = takeLine(&self.rest);
-            const marker = markerLen(line) orelse continue;
-            const title = std.mem.trimEnd(u8, line[marker..], " \t\r");
-            // The url line is always written; the snippet only when there is
-            // one, which the next line being a field tells.
-            const url = self.field() orelse "";
-            const snippet = self.field() orelse "";
-            return .{ .title = title, .url = url, .snippet = snippet };
+        while (self.lines.next()) |title| {
+            const marker = markerLen(title) orelse continue;
+            const url = self.nextIndented(marker) orelse continue;
+            const snippet = self.nextIndented(marker) orelse "";
+
+            return .{
+                .title = std.mem.trim(u8, title[marker..], " \t\r"),
+                .url = std.mem.trim(u8, url, " \t\r"),
+                .snippet = std.mem.trim(u8, snippet, " \t\r"),
+            };
         }
+
         return null;
     }
 
-    /// The next field, trimmed, consumed; null when the next line is blank or a
-    /// heading, which is where this result ends.
-    fn field(self: *Reader) ?[]const u8 {
-        var ahead = self.rest;
-        const line = takeLine(&ahead);
-        if (markerLen(line) != null) return null;
-        const value = std.mem.trim(u8, line, " \t\r");
-        if (value.len == 0) return null;
-        self.rest = ahead;
-        return value;
+    fn nextIndented(self: *Reader, indentation: usize) ?[]const u8 {
+        const rest = self.lines.rest();
+        const trimmed = std.mem.trimStart(u8, rest, " ");
+
+        const trimmed_indentation = rest.len - trimmed.len;
+        if (trimmed_indentation < indentation)
+            return null;
+
+        self.lines.index = (self.lines.index orelse 0) + trimmed_indentation;
+        return self.lines.next();
+    }
+
+    fn markerLen(line: []const u8) ?usize {
+        for (line, 0..) |c, i| switch (c) {
+            '0'...'9' => continue,
+            '.' => return i + 1,
+            else => return null,
+        };
+
+        return null;
     }
 };
 
 /// Reads the results out of `text`, which is the text `render` wrote.
 pub fn parse(text: []const u8) Reader {
-    return .{ .rest = text };
-}
-
-/// The next line of `text`, advancing it past the newline that ends it. The last
-/// line of a text without a newline is the whole of what is left.
-fn takeLine(text: *[]const u8) []const u8 {
-    const end = std.mem.indexOfScalar(u8, text.*, '\n') orelse text.*.len;
-    const line = text.*[0..end];
-    text.* = if (end < text.*.len) text.*[end + 1 ..] else text.*[text.*.len..];
-    return line;
-}
-
-/// The length of the `N. ` heading at the start of `line`, or null when the line
-/// is not one. Only a heading reaches the margin, so this is what tells a result
-/// from the text under it.
-fn markerLen(line: []const u8) ?usize {
-    var i: usize = 0;
-    while (i < line.len and std.ascii.isDigit(line[i])) i += 1;
-    if (i == 0 or i >= line.len or line[i] != '.') return null;
-    i += 1;
-    if (i < line.len and line[i] == ' ') i += 1;
-    return i;
+    return .{ .lines = std.mem.splitScalar(u8, text, '\n') };
 }
 
 test "results are formatted as a numbered list of title, url and snippet" {
@@ -178,13 +169,17 @@ test "the list reads back as the results it was built from" {
     defer gpa.free(text);
 
     var parsed = parse(text);
-    for (results) |expected| {
-        const found = parsed.next() orelse return error.TestUnexpectedResult;
-        try std.testing.expectEqualStrings(expected.title, found.title);
-        try std.testing.expectEqualStrings(expected.url, found.url);
-        try std.testing.expectEqualStrings(expected.snippet, found.snippet);
-    }
-    try std.testing.expect(parsed.next() == null);
+
+    var parsed_list = std.ArrayList(Result).empty;
+    defer parsed_list.deinit(gpa);
+
+    while (parsed.next()) |result|
+        try parsed_list.append(gpa, result);
+
+    const parsed_text = try renderAlloc(gpa, parsed_list.items);
+    defer gpa.free(parsed_text);
+
+    try std.testing.expectEqualStrings(text, parsed_text);
 }
 
 test "a field with a newline in it does not read as another result" {
