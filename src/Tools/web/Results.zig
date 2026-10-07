@@ -29,29 +29,31 @@ pub const snippet_len = 500;
 /// reach the margin, since every field carries the indent and every newline in
 /// one is turned into a space, so a line at the margin is always a heading and a
 /// blank line always falls between two results. See `parseResults`.
-///
-/// `allocator` owns the result and the buffer it is built in, so one allocator
-/// does for the whole thing.
-pub fn render(allocator: std.mem.Allocator, results: []const Result) ![]const u8 {
-    if (results.len == 0) return allocator.dupe(u8, "(no results)");
+pub fn render(results: []const Result, out: *std.Io.Writer) !void {
+    if (results.len == 0)
+        return out.writeAll("(no results)");
 
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
     for (results, 1..) |result, number| {
-        if (number > 1) try out.writer.writeByte('\n');
-        try out.writer.print("{d}. ", .{number});
-        try writeField(&out.writer, result.title);
-        try out.writer.writeByte('\n');
-        try out.writer.writeAll(indent);
-        try writeField(&out.writer, result.url);
-        try out.writer.writeByte('\n');
+        if (number > 1) try out.writeByte('\n');
+        try out.print("{d}. ", .{number});
+        try writeField(out, result.title);
+        try out.writeByte('\n');
+        try out.writeAll(indent);
+        try writeField(out, result.url);
+        try out.writeByte('\n');
         // A result with no snippet is still worth its title and url, so the
         // line is left out rather than written empty.
         if (std.mem.trim(u8, result.snippet, " \t\r\n").len == 0) continue;
-        try out.writer.writeAll(indent);
-        try writeField(&out.writer, result.snippet);
-        try out.writer.writeByte('\n');
+        try out.writeAll(indent);
+        try writeField(out, result.snippet);
+        try out.writeByte('\n');
     }
+}
+
+pub fn renderAlloc(gpa: std.mem.Allocator, results: []const Result) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try render(results, &out.writer);
     return out.toOwnedSlice();
 }
 
@@ -144,8 +146,10 @@ test "results are formatted as a numbered list of title, url and snippet" {
         // A result with no snippet is still worth its title and url.
         .{ .title = "Docs", .url = "https://ziglang.org/documentation" },
     };
-    const text = try render(gpa, &results);
+
+    const text = try renderAlloc(gpa, &results);
     defer gpa.free(text);
+
     try std.testing.expectEqualStrings(
         "1. Zig\n   https://ziglang.org\n   A language.\n\n" ++
             "2. Docs\n   https://ziglang.org/documentation\n",
@@ -156,8 +160,9 @@ test "results are formatted as a numbered list of title, url and snippet" {
 test "a query that matched nothing says so" {
     const gpa = std.testing.allocator;
 
-    const text = try render(gpa, &.{});
+    const text = try renderAlloc(gpa, &.{});
     defer gpa.free(text);
+
     try std.testing.expectEqualStrings("(no results)", text);
 }
 
@@ -169,7 +174,8 @@ test "the list reads back as the results it was built from" {
         .{ .title = "Docs", .url = "https://ziglang.org/documentation" },
         .{ .title = "Blog", .url = "https://ziglang.org/blog", .snippet = "Notes." },
     };
-    const text = try render(gpa, &results);
+
+    const text = try renderAlloc(gpa, &results);
     defer gpa.free(text);
 
     var parsed = parseResults(text);
@@ -192,8 +198,10 @@ test "a field with a newline in it does not read as another result" {
         .url = "https://nodejs.org",
         .snippet = "One line.\n\n3. Also not a result",
     }};
-    const text = try render(gpa, &results);
+
+    const text = try renderAlloc(gpa, &results);
     defer gpa.free(text);
+
     try std.testing.expectEqualStrings(
         "1. Node.js 2. Not a result\n" ++
             "   https://nodejs.org\n" ++

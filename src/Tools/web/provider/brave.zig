@@ -40,7 +40,7 @@ pub fn search(
     const mapped = try results.mapped(gpa, parsed.value.web.results, "description");
     defer gpa.free(mapped);
 
-    return .{ .text = try results.render(gpa, mapped) };
+    return .{ .text = try results.renderAlloc(gpa, mapped) };
 }
 
 /// Brave's own address.

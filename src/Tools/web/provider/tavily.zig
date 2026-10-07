@@ -46,7 +46,7 @@ pub fn search(
     const mapped = try results.mapped(gpa, parsed.value.results, "content");
     defer gpa.free(mapped);
 
-    return .{ .text = try results.render(gpa, mapped) };
+    return .{ .text = try results.renderAlloc(gpa, mapped) };
 }
 
 /// One Tavily extraction. The url's text is the backend's; a url the backend

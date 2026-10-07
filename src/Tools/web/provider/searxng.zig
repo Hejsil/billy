@@ -44,7 +44,7 @@ pub fn search(
     const mapped = try results.mapped(gpa, capped, "content");
     defer gpa.free(mapped);
 
-    return .{ .text = try results.render(gpa, mapped) };
+    return .{ .text = try results.renderAlloc(gpa, mapped) };
 }
 
 /// The part of a SearXNG response billy uses, which is the same from every engine

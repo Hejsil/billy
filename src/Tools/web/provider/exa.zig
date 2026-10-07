@@ -43,7 +43,7 @@ pub fn search(
     const mapped = try results.mapped(gpa, parsed.value.results, "text");
     defer gpa.free(mapped);
 
-    return .{ .text = try results.render(gpa, mapped) };
+    return .{ .text = try results.renderAlloc(gpa, mapped) };
 }
 
 /// One Exa contents call, posted to `endpoint`. A url the backend could not read
