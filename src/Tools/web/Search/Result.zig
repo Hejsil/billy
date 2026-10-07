@@ -128,47 +128,10 @@ pub fn parse(text: []const u8) Reader {
     return .{ .lines = std.mem.splitScalar(u8, text, '\n') };
 }
 
-test "results are formatted as a numbered list of title, url and snippet" {
+fn testTransform(input: []const u8, expected: []const u8) !void {
     const gpa = std.testing.allocator;
 
-    const results = [_]Result{
-        .{ .title = "Zig", .url = "https://ziglang.org", .snippet = "A language." },
-        // A result with no snippet is still worth its title and url.
-        .{ .title = "Docs", .url = "https://ziglang.org/documentation" },
-    };
-
-    const text = try renderAlloc(gpa, &results);
-    defer gpa.free(text);
-
-    try std.testing.expectEqualStrings(
-        "1. Zig\n   https://ziglang.org\n   A language.\n\n" ++
-            "2. Docs\n   https://ziglang.org/documentation\n",
-        text,
-    );
-}
-
-test "a query that matched nothing says so" {
-    const gpa = std.testing.allocator;
-
-    const text = try renderAlloc(gpa, &.{});
-    defer gpa.free(text);
-
-    try std.testing.expectEqualStrings("(no results)", text);
-}
-
-test "the list reads back as the results it was built from" {
-    const gpa = std.testing.allocator;
-
-    const results = [_]Result{
-        .{ .title = "Zig", .url = "https://ziglang.org", .snippet = "A language." },
-        .{ .title = "Docs", .url = "https://ziglang.org/documentation" },
-        .{ .title = "Blog", .url = "https://ziglang.org/blog", .snippet = "Notes." },
-    };
-
-    const text = try renderAlloc(gpa, &results);
-    defer gpa.free(text);
-
-    var parsed = parse(text);
+    var parsed = parse(input);
 
     var parsed_list = std.ArrayList(Result).empty;
     defer parsed_list.deinit(gpa);
@@ -179,7 +142,31 @@ test "the list reads back as the results it was built from" {
     const parsed_text = try renderAlloc(gpa, parsed_list.items);
     defer gpa.free(parsed_text);
 
-    try std.testing.expectEqualStrings(text, parsed_text);
+    try std.testing.expectEqualStrings(expected, parsed_text);
+}
+
+fn testCanonical(input: []const u8) !void {
+    try testTransform(input, input);
+}
+
+test "results are formatted as a numbered list of title, url and snippet" {
+    try testCanonical(
+        \\1. Zig
+        \\   https://ziglang.org
+        \\   A language.
+        \\
+        \\2. Docs
+        \\   https://ziglang.org/documentation
+        \\
+    );
+}
+
+test "a query that matched nothing says so" {
+    try testTransform(
+        \\
+    ,
+        \\(no results)
+    );
 }
 
 test "a field with a newline in it does not read as another result" {
