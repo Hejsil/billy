@@ -33,10 +33,8 @@ pub fn request(
     what: []const u8,
 ) !Answer {
     var req = try http.request(method, try std.Uri.parse(location), .{
-        // A redirect is followed, so an endpoint that moved still answers.
-        .redirect_behavior = @fromBackingInt(@intCast(3)),
         .headers = .{
-            .content_type = if (payload != null) .{ .override = "application/json" } else .default,
+            .content_type = if (payload) |_| .{ .override = "application/json" } else .default,
         },
         .extra_headers = headers,
     });
