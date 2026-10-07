@@ -112,7 +112,7 @@ pub const Reader = struct {
 };
 
 /// Reads the results out of `text`, which is the text `render` wrote.
-pub fn parseResults(text: []const u8) Reader {
+pub fn parse(text: []const u8) Reader {
     return .{ .rest = text };
 }
 
@@ -136,6 +136,7 @@ fn markerLen(line: []const u8) ?usize {
     if (i < line.len and line[i] == ' ') i += 1;
     return i;
 }
+
 test "results are formatted as a numbered list of title, url and snippet" {
     const gpa = std.testing.allocator;
 
@@ -176,7 +177,7 @@ test "the list reads back as the results it was built from" {
     const text = try renderAlloc(gpa, &results);
     defer gpa.free(text);
 
-    var parsed = parseResults(text);
+    var parsed = parse(text);
     for (results) |expected| {
         const found = parsed.next() orelse return error.TestUnexpectedResult;
         try std.testing.expectEqualStrings(expected.title, found.title);
@@ -208,7 +209,7 @@ test "a field with a newline in it does not read as another result" {
     );
 
     // Read back it is one result, with the newlines folded to spaces.
-    var parsed = parseResults(text);
+    var parsed = parse(text);
     const found = parsed.next() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("Node.js 2. Not a result", found.title);
     try std.testing.expectEqualStrings("https://nodejs.org", found.url);
@@ -217,7 +218,7 @@ test "a field with a newline in it does not read as another result" {
 }
 
 test "text that is not a list of results reads back as none" {
-    var parsed = parseResults("(no results)");
+    var parsed = parse("(no results)");
     try std.testing.expect(parsed.next() == null);
 }
 

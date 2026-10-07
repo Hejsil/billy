@@ -17,7 +17,7 @@ const Search = @import("../Tools/web/Search.zig");
 /// that is not a list of results, such as a search that matched nothing.
 pub fn write(result: []const u8, out: *std.Io.Writer) !void {
     var origin_buffer: [256]u8 = undefined;
-    var found = Search.Result.parseResults(result);
+    var found = Search.Result.parse(result);
     while (found.next()) |one| {
         const origin = originOf(one.url, &origin_buffer) orelse continue;
         try bubble(one, origin, out);
