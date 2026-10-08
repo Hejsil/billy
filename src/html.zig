@@ -842,15 +842,21 @@ fn hasStatus(call: Tools.Call) bool {
     };
 }
 
-/// Writes the pill for `status`: grey with an ellipsis while the call runs, the
+/// Writes the pill for `status`: grey with three dots while the call runs, the
 /// colour of the exit and the code once it has one, and grey and empty for a
 /// finished call whose status was never recorded. The element is the same width
 /// in every case, so the description after it starts in the same place on every
-/// row.
+/// row and the row does not move when the call ends.
+///
+/// The dots are three elements of their own rather than an ellipsis character,
+/// since the page is what animates them: each comes and goes in turn, which is
+/// what the page's own stylesheet does with them.
 fn pill(status: Status, out: *std.Io.Writer) !void {
     switch (status) {
-        // No animation: the ellipsis alone says the call has not finished.
-        .running => try out.writeAll("<span class=\"exit running\" title=\"running\">…</span>"),
+        .running => try out.writeAll(
+            "<span class=\"exit running\" title=\"running\">" ++
+                "<span class=\"dots\"><i></i><i></i><i></i></span></span>",
+        ),
         .finished => |maybe_exit| {
             const exit = maybe_exit orelse return out.writeAll(
                 "<span class=\"exit unknown\" title=\"the exit status was not recorded\"></span>",
@@ -1140,22 +1146,23 @@ test "a running call shows a grey pill, and a finished one the status" {
         .arguments = "{\"command\":\"make\",\"description\":\"build it\"}",
     } });
 
-    // The half a stream sends while the command runs: a grey pill with an
-    // ellipsis, where the status will go, and the command it is about to run,
-    // which is the one moment a reader most wants to see it.
+    // The half a stream sends while the command runs: a grey pill holding the
+    // dots the page animates, where the status will go, and the command it is
+    // about to run, which is the one moment a reader most wants to see it.
     try block(gpa, .{ .tool_begin = bash }, &out.writer);
     try std.testing.expectEqualStrings(
         "<details class=\"tool\"><summary class=\"tool-head\">" ++
             "<span class=\"name\">bash</span> <span class=\"target\">build it</span>" ++
             "<span class=\"produced\">" ++
-            "<span class=\"exit running\" title=\"running\">…</span></span></summary>\n" ++
+            "<span class=\"exit running\" title=\"running\">" ++
+            "<span class=\"dots\"><i></i><i></i><i></i></span></span></span></summary>\n" ++
             "<div class=\"tool-body\"><pre class=\"command\">make</pre>\n</div></details>\n",
         out.written(),
     );
     out.clearRetainingCapacity();
 
     // The half sent when the result arrives: the same row with the status in the
-    // pill, so replacing the first with it turns the ellipsis into the status.
+    // pill, so replacing the first with it turns the dots into the status.
     try block(gpa, .{ .tool_end = .{ .call = bash, .result = "exit code: 0\n" } }, &out.writer);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "<span class=\"exit ok\" title=\"exit code 0\">✓ 0</span>") != null);
 
