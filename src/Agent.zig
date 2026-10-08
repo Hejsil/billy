@@ -1,8 +1,5 @@
 //! The agent loop: read a request from the user, ask the model, run the tools
 //! it asks for, and repeat until it answers with text.
-
-pub const Agent = @This();
-
 const std = @import("std");
 const llm = @import("llm.zig");
 const models = @import("models.zig");
@@ -14,6 +11,8 @@ const Session = @import("Session.zig");
 const Terminal = @import("Terminal.zig");
 
 pub const Mode = @import("Agent/mode.zig").Mode;
+
+const Agent = @This();
 
 /// A command a prompt can be on its own, which billy runs itself rather than
 /// sending to the model. A command is the whole line, so a prompt that merely

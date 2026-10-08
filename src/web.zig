@@ -16,7 +16,7 @@
 //! something else is asked for, and why the help says so.
 
 const std = @import("std");
-const agent = @import("Agent.zig");
+const Agent = @import("Agent.zig");
 const Config = @import("Config.zig");
 const Health = @import("Health.zig");
 const html = @import("html.zig");
@@ -207,16 +207,14 @@ fn handle(
     var server: std.http.Server = .init(&reader.interface, &writer.interface);
 
     var request = server.receiveHead() catch return;
-    // Whether a reply has gone out for this request yet. A failure after the
-    // reply has started cannot be reported with a status -- the head is already
-    // sent -- so the flag is what tells the failure path whether a 500 is still
-    // possible.
-    var answered = false;
-    route(setup, registry, http, &request, &answered) catch |err| {
+    // The flag inside tells the failure path below whether a status is still
+    // possible: a reply that has begun has sent its head already.
+    var r = Request{ .setup = setup, .request = &request };
+    route(&r, registry, http) catch |err| {
         std.log.err("cannot answer a request: {s}", .{@errorName(err)});
         // Nothing has been sent, so the browser can be told what happened
         // rather than only watching the connection drop.
-        if (!answered) request.respond("billy: internal error\n", .{
+        if (!r.answered) request.respond("billy: internal error\n", .{
             .status = .internal_server_error,
             .extra_headers = &.{ContentType.text.header()},
             .keep_alive = false,
@@ -224,38 +222,97 @@ fn handle(
     };
 }
 
+/// One request being answered: what every route needs, and the failures they all
+/// share.
+///
+/// A route answers a failure rather than returning one, so the reasons a session
+/// cannot be opened or taken are written once here instead of once per route.
+/// Keeping the reasons together is also what keeps them consistent: a route that
+/// forgot one would answer a different status for the same state.
+const Request = struct {
+    setup: *Setup,
+    request: *std.http.Server.Request,
+    /// Whether a reply for this request has begun. A failure after that cannot be
+    /// reported with a status -- the head is already sent -- so this is what
+    /// tells the caller of `route` whether a 500 is still possible.
+    answered: bool = false,
+
+    /// Opens the session `id`, or answers why it could not be and returns null,
+    /// so the caller has nothing more to do. Which status an id deserves is
+    /// decided here, once, rather than by every route that opens one.
+    fn openSession(r: *Request, id: []const u8) !?Session {
+        return Session.open(r.setup.io, r.setup.sessions, r.setup.gpa, id, r.setup.cwd) catch |err| switch (err) {
+            // An id that could not be a session name is a bad request rather than
+            // a missing session: what was asked for could never exist.
+            error.InvalidSessionId => {
+                try r.reply(.text, "bad session id\n", .bad_request);
+                return null;
+            },
+            error.SessionNotFound => {
+                try r.noSession();
+                return null;
+            },
+            else => return err,
+        };
+    }
+
+    /// Takes the session `id` for a turn, or answers that it is busy and returns
+    /// false. A taken session is released with `Registry.release`, whatever
+    /// happens in between.
+    fn claim(r: *Request, registry: *Registry, id: []const u8) !bool {
+        if (try registry.claim(id)) return true;
+        try r.reply(.text, "the session is busy\n", .conflict);
+        return false;
+    }
+
+    /// Answers that the session named was not found. Written once because it is
+    /// the answer to two different misses: an id nothing was ever handed out, and
+    /// a file that is gone.
+    fn noSession(r: *Request) !void {
+        return r.reply(.text, "no such session\n", .not_found);
+    }
+
+    /// Answers a request with `body`, and ends the connection.
+    fn reply(r: *Request, content_type: ContentType, body: []const u8, status: std.http.Status) !void {
+        r.answered = true;
+        try r.request.respond(body, .{
+            .status = status,
+            .extra_headers = &.{content_type.header()},
+            .keep_alive = false,
+        });
+    }
+
+    fn replyNotAllowed(r: *Request) !void {
+        return r.reply(.text, "method not allowed\n", .method_not_allowed);
+    }
+};
+
 /// The routes there are. Everything else is a 404, so a request billy does not
 /// understand is answered rather than left hanging.
 ///
-/// `answered` is set once a reply for the request has begun, so the caller knows
-/// whether a failure can still be turned into a status.
-fn route(
-    setup: *Setup,
-    registry: *Registry,
-    http: *std.http.Client,
-    request: *std.http.Server.Request,
-    answered: *bool,
-) !void {
+/// The handlers are given one of these, which carries everything a route needs
+/// and answers the failures they all share.
+fn route(r: *Request, registry: *Registry, http: *std.http.Client) !void {
     // The path is the target up to a query, which none of these routes take.
-    const target = request.head.target;
+    const target = r.request.head.target;
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
 
-    if (std.mem.eql(u8, path, "/")) switch (request.head.method) {
+    if (std.mem.eql(u8, path, "/")) switch (r.request.head.method) {
         .GET => {
-            answered.* = true;
-            return request.respond(page, .{
+            r.answered = true;
+            return r.request.respond(page, .{
                 .status = .ok,
                 .extra_headers = &.{ContentType.html.header()},
                 .keep_alive = false,
             });
         },
-        else => return replyNotAllowed(request, answered),
+        else => return r.replyNotAllowed(),
     };
 
-    if (std.mem.eql(u8, path, "/api/sessions")) switch (request.head.method) {
-        .GET => return listSessions(setup, request, answered),
-        .POST => return createSession(setup, registry, http, request, answered),
-        else => return replyNotAllowed(request, answered),
+    if (std.mem.eql(u8, path, "/api/sessions")) switch (r.request.head.method) {
+        .GET => return listSessions(r),
+        .POST => return createSession(r, registry, http),
+        else => return r.replyNotAllowed(),
     };
 
     const sessions_prefix = "/api/sessions/";
@@ -264,26 +321,21 @@ fn route(
         const id = path[sessions_prefix.len..id_end];
 
         // /api/sessions/{id}/message
-        if (std.mem.eql(u8, path[id_end..], "/message")) switch (request.head.method) {
-            .POST => return askSession(setup, registry, http, request, id, answered),
-            else => return replyNotAllowed(request, answered),
+        if (std.mem.eql(u8, path[id_end..], "/message")) switch (r.request.head.method) {
+            .POST => return askSession(r, registry, http, id),
+            else => return r.replyNotAllowed(),
         };
 
-        // /api/sessions/message
-        if (path.len == id_end) switch (request.head.method) {
-            .GET => return openSession(setup, request, id, answered),
-            .PATCH => return renameSession(setup, registry, request, id, answered),
-            .DELETE => return deleteSession(setup, registry, request, id, answered),
-            else => return replyNotAllowed(request, answered),
+        // /api/sessions/{id}
+        if (path.len == id_end) switch (r.request.head.method) {
+            .GET => return openSession(r, id),
+            .PATCH => return renameSession(r, registry, id),
+            .DELETE => return deleteSession(r, registry, id),
+            else => return r.replyNotAllowed(),
         };
     }
 
-    answered.* = true;
-    return request.respond("not found\n", .{
-        .status = .not_found,
-        .extra_headers = &.{ContentType.text.header()},
-        .keep_alive = false,
-    });
+    return r.reply(.text, "not found\n", .not_found);
 }
 
 /// `DELETE /api/sessions/{id}`: removes a session for good. There is no trash,
@@ -292,25 +344,18 @@ fn route(
 /// A session a turn is running for answers 409, since removing it under the turn
 /// would leave the run writing to a file that is gone. An id with no file is a
 /// 404, so deleting one twice says the second was nothing.
-fn deleteSession(
-    setup: *Setup,
-    registry: *Registry,
-    request: *std.http.Server.Request,
-    id: []const u8,
-    answered: *bool,
-) !void {
+fn deleteSession(r: *Request, registry: *Registry, id: []const u8) !void {
     // Taken for the moment it takes to remove, so a turn cannot start against a
     // session that is being removed. Given back whether or not it is removed.
-    if (!try registry.claim(id))
-        return reply(request, .text, "the session is busy\n", .conflict, answered);
+    if (!try r.claim(registry, id)) return;
     defer registry.release(id);
 
-    Session.delete(setup.io, setup.sessions, id) catch |err| switch (err) {
-        error.InvalidSessionId => return reply(request, .text, "bad session id\n", .bad_request, answered),
-        error.SessionNotFound => return reply(request, .text, "no such session\n", .not_found, answered),
+    Session.delete(r.setup.io, r.setup.sessions, id) catch |err| switch (err) {
+        error.InvalidSessionId => return r.reply(.text, "bad session id\n", .bad_request),
+        error.SessionNotFound => return r.noSession(),
         else => return err,
     };
-    return reply(request, .text, "", .ok, answered);
+    return r.reply(.text, "", .ok);
 }
 
 /// The body a rename sends: the session's new name.
@@ -320,44 +365,33 @@ const Rename = struct { title: []const u8 };
 /// way a model's title is (`Session.setTitle`), and written out at once, so the
 /// list shows it. A session a turn is running for answers 409, since renaming it
 /// would race the turn writing the same file.
-fn renameSession(
-    setup: *Setup,
-    registry: *Registry,
-    request: *std.http.Server.Request,
-    id: []const u8,
-    answered: *bool,
-) !void {
-    const gpa = setup.gpa;
+fn renameSession(r: *Request, registry: *Registry, id: []const u8) !void {
+    const gpa = r.setup.gpa;
 
     var body_buffer: [4096]u8 = undefined;
-    const body_reader = request.readerExpectNone(&body_buffer);
+    const body_reader = r.request.readerExpectNone(&body_buffer);
     const body = body_reader.allocRemaining(gpa, .limited(1 << 16)) catch
-        return reply(request, .text, "cannot read the title\n", .bad_request, answered);
+        return r.reply(.text, "cannot read the title\n", .bad_request);
     defer gpa.free(body);
 
     const parsed = std.json.parseFromSlice(Rename, gpa, body, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
-    }) catch return reply(request, .text, "the title is not JSON\n", .bad_request, answered);
+    }) catch return r.reply(.text, "the title is not JSON\n", .bad_request);
     defer parsed.deinit();
     // A title of nothing is refused rather than stored: a session with an empty
     // name reads as one that was never named.
     const title = std.mem.trim(u8, parsed.value.title, " \t\r\n");
-    if (title.len == 0) return reply(request, .text, "the title is empty\n", .bad_request, answered);
+    if (title.len == 0) return r.reply(.text, "the title is empty\n", .bad_request);
 
-    if (!try registry.claim(id))
-        return reply(request, .text, "the session is busy\n", .conflict, answered);
+    if (!try r.claim(registry, id)) return;
     defer registry.release(id);
 
-    var session = Session.open(setup.io, setup.sessions, gpa, id, setup.cwd) catch |err| switch (err) {
-        error.InvalidSessionId => return reply(request, .text, "bad session id\n", .bad_request, answered),
-        error.SessionNotFound => return reply(request, .text, "no such session\n", .not_found, answered),
-        else => return err,
-    };
+    var session = (try r.openSession(id)) orelse return;
     defer session.deinit();
     try session.setTitle(title);
     try session.save();
-    return reply(request, .text, "", .ok, answered);
+    return r.reply(.text, "", .ok);
 }
 
 /// One session as the listing shows it: just its id, which is what names it.
@@ -373,13 +407,13 @@ const Listed = struct {
 const Listing = struct { sessions: []const Listed };
 
 /// `GET /api/sessions`: every session on disk, newest written first.
-fn listSessions(setup: *Setup, request: *std.http.Server.Request, answered: *bool) !void {
-    const gpa = setup.gpa;
+fn listSessions(r: *Request) !void {
+    const gpa = r.setup.gpa;
 
     // What is on disk. Each id and title is its own allocation, freed once the
     // reply is built from them. The listing opens the directory itself, so a
     // listing here and one on another connection do not read over each other.
-    const stored = try Session.list(setup.io, setup.sessions, gpa);
+    const stored = try Session.list(r.setup.io, r.setup.sessions, gpa);
     defer {
         for (stored) |named| {
             gpa.free(named.id);
@@ -395,7 +429,7 @@ fn listSessions(setup: *Setup, request: *std.http.Server.Request, answered: *boo
     var body: std.Io.Writer.Allocating = .init(gpa);
     defer body.deinit();
     try std.json.Stringify.value(Listing{ .sessions = sessions.items }, .{}, &body.writer);
-    return reply(request, .json, body.written(), .ok, answered);
+    return r.reply(.json, body.written(), .ok);
 }
 
 /// One session's page: the header line above a conversation, and the
@@ -413,24 +447,20 @@ const Opened = struct {
 /// A session with no file yet is one that has been started and not asked
 /// anything, which is what a page should show: an empty conversation rather than
 /// a failure. Any other missing id is a 404.
-fn openSession(
-    setup: *Setup,
-    request: *std.http.Server.Request,
-    id: []const u8,
-    answered: *bool,
-) !void {
-    const gpa = setup.gpa;
+fn openSession(r: *Request, id: []const u8) !void {
+    const gpa = r.setup.gpa;
 
     var body: std.Io.Writer.Allocating = .init(gpa);
     defer body.deinit();
-    const opened = writeSession(setup, gpa, id, &body.writer) catch |err| switch (err) {
+    const opened = writeSession(r.setup, gpa, id, &body.writer) catch |err| switch (err) {
         // An id that could not be a session name is a bad request, not a missing
-        // session.
-        error.InvalidSessionId => return reply(request, .text, "bad session id\n", .bad_request, answered),
+        // session. A session with no file is not an error here: it is one that
+        // has been started and not asked anything, which the page shows empty.
+        error.InvalidSessionId => return r.reply(.text, "bad session id\n", .bad_request),
         else => return err,
     };
-    if (!opened) return reply(request, .text, "no such session\n", .not_found, answered);
-    return reply(request, .json, body.written(), .ok, answered);
+    if (!opened) return r.noSession();
+    return r.reply(.json, body.written(), .ok);
 }
 
 /// Writes the JSON a session's page is built from, and says whether the session
@@ -479,7 +509,7 @@ fn writeOpened(out: *std.Io.Writer, header: []const u8, blocks: []const u8, sess
 
 /// The mode a web session starts in, so a new one opens in ask unless the first
 /// prompt says otherwise. The terminal keeps general as its own default.
-const default_mode: agent.Mode = .chat;
+const default_mode: Agent.Mode = .chat;
 
 /// What a reply is, so the browser is told how to read it.
 const ContentType = enum {
@@ -500,27 +530,6 @@ const ContentType = enum {
         };
     }
 };
-
-/// Answers a request with `body`, and ends the connection. Marks the request
-/// answered, so the caller knows a failure now cannot be reported with a status.
-fn reply(
-    request: *std.http.Server.Request,
-    content_type: ContentType,
-    body: []const u8,
-    status: std.http.Status,
-    answered: *bool,
-) !void {
-    answered.* = true;
-    try request.respond(body, .{
-        .status = status,
-        .extra_headers = &.{content_type.header()},
-        .keep_alive = false,
-    });
-}
-
-fn replyNotAllowed(request: *std.http.Server.Request, answered: *bool) !void {
-    return reply(request, .text, "method not allowed\n", .method_not_allowed, answered);
-}
 
 test "a session is taken for a turn, and refused while one runs" {
     const gpa = std.testing.allocator;
@@ -587,7 +596,7 @@ test "a parsed prompt is copied, so the body it came from can be freed" {
     @memset(buffer[0..json.len], 'x');
 
     try std.testing.expectEqualStrings("hello", parsed.value.text);
-    try std.testing.expectEqual(agent.Mode.chat, parsed.value.mode.?);
+    try std.testing.expectEqual(Agent.Mode.chat, parsed.value.mode.?);
 }
 
 test "the page the browser is given is the one that was written" {
@@ -655,18 +664,19 @@ test "the address to listen on is read from what was asked for" {
 /// whose mode is fixed on the session.
 const Prompt = struct {
     text: []const u8,
-    mode: ?agent.Mode = null,
+    mode: ?Agent.Mode = null,
 };
 
 /// Reads the prompt a POST carries, or replies with why it could not and returns
 /// null, so the caller has nothing more to do.
-fn readPrompt(gpa: std.mem.Allocator, request: *std.http.Server.Request, answered: *bool) !?std.json.Parsed(Prompt) {
+fn readPrompt(r: *Request) !?std.json.Parsed(Prompt) {
+    const gpa = r.setup.gpa;
     // The prompt is read first, so a request with nothing usable in it is
     // refused before a session is taken or made.
     var body_buffer: [4096]u8 = undefined;
-    const body_reader = request.readerExpectNone(&body_buffer);
+    const body_reader = r.request.readerExpectNone(&body_buffer);
     const body = body_reader.allocRemaining(gpa, .limited(1 << 20)) catch {
-        try reply(request, .text, "cannot read the prompt\n", .bad_request, answered);
+        try r.reply(.text, "cannot read the prompt\n", .bad_request);
         return null;
     };
     defer gpa.free(body);
@@ -674,7 +684,7 @@ fn readPrompt(gpa: std.mem.Allocator, request: *std.http.Server.Request, answere
     // The strings are copied out of `body`, which is freed on the way out, so
     // the value stands on its own.
     return parsePrompt(gpa, body) catch {
-        try reply(request, .text, "the prompt is not JSON\n", .bad_request, answered);
+        try r.reply(.text, "the prompt is not JSON\n", .bad_request);
         return null;
     };
 }
@@ -695,70 +705,51 @@ fn parsePrompt(gpa: std.mem.Allocator, body: []const u8) !std.json.Parsed(Prompt
 /// A new session has no id on the page until it is asked something, so the id it
 /// is given here is the first event of the stream: that is how the page learns it
 /// and adds the session to its list.
-fn createSession(
-    setup: *Setup,
-    registry: *Registry,
-    http: *std.http.Client,
-    request: *std.http.Server.Request,
-    answered: *bool,
-) !void {
-    const gpa = setup.gpa;
-    const parsed = (try readPrompt(setup.gpa, request, answered)) orelse return;
+fn createSession(r: *Request, registry: *Registry, http: *std.http.Client) !void {
+    const gpa = r.setup.gpa;
+    const parsed = (try readPrompt(r)) orelse return;
     defer parsed.deinit();
 
     // A fresh session with a new id and no file: the first message writes it.
-    var session = try Session.open(setup.io, setup.sessions, gpa, null, setup.cwd);
+    var session = try Session.open(r.setup.io, r.setup.sessions, gpa, null, r.setup.cwd);
     defer session.deinit();
-    if (!try registry.claim(session.id()))
-        return reply(request, .text, "the session is busy\n", .conflict, answered);
+    if (!try r.claim(registry, session.id())) return;
     defer registry.release(session.id());
 
     // The mode the page chose, or a `/chat`/`/general` command in the prompt,
     // which wins over the choice. It is settled here rather than by the agent so
     // that a prompt naming only a mode -- which asks nothing -- is answered with
     // a status, which a stream that has already begun cannot carry.
-    const choice = agent.Mode.start(parsed.value.text, parsed.value.mode orelse default_mode);
+    const choice = Agent.Mode.start(parsed.value.text, parsed.value.mode orelse default_mode);
     if (choice.text.len == 0)
-        return reply(request, .text, "the prompt is empty\n", .bad_request, answered);
-    var config = setup.agentConfig(session.cwd(), .plain);
+        return r.reply(.text, "the prompt is empty\n", .bad_request);
+    var config = r.setup.agentConfig(session.cwd(), .plain);
     config.mode = choice.mode;
 
-    try serveTurn(setup, http, request, answered, &session, config, choice.text, session.id());
+    try serveTurn(r, http, &session, config, choice.text, session.id());
 }
 
 /// `POST /api/sessions/{id}/message`: asks the session `text`, answering with the
 /// run as it happens.
 ///
 /// A session a turn is already running for answers 409: one thing at a time.
-fn askSession(
-    setup: *Setup,
-    registry: *Registry,
-    http: *std.http.Client,
-    request: *std.http.Server.Request,
-    id: []const u8,
-    answered: *bool,
-) !void {
-    const gpa = setup.gpa;
-    const parsed = (try readPrompt(setup.gpa, request, answered)) orelse return;
+fn askSession(r: *Request, registry: *Registry, http: *std.http.Client, id: []const u8) !void {
+    const parsed = (try readPrompt(r)) orelse return;
     defer parsed.deinit();
     if (parsed.value.text.len == 0)
-        return reply(request, .text, "the prompt is empty\n", .bad_request, answered);
+        return r.reply(.text, "the prompt is empty\n", .bad_request);
 
     // Taken for the whole turn, and given back however the turn ends.
-    if (!try registry.claim(id))
-        return reply(request, .text, "the session is busy\n", .conflict, answered);
+    if (!try r.claim(registry, id)) return;
     defer registry.release(id);
 
     // The session is opened fresh for this turn and dropped at the end, so it is
     // always what is on disk; a session changed by another billy in between is
     // read rather than overwritten. It runs in the mode stored with it.
-    var session = Session.open(setup.io, setup.sessions, gpa, id, setup.cwd) catch |err| switch (err) {
-        error.SessionNotFound => return reply(request, .text, "no such session\n", .not_found, answered),
-        else => return err,
-    };
+    var session = (try r.openSession(id)) orelse return;
     defer session.deinit();
 
-    try serveTurn(setup, http, request, answered, &session, setup.agentConfig(session.cwd(), .plain), parsed.value.text, null);
+    try serveTurn(r, http, &session, r.setup.agentConfig(session.cwd(), .plain), parsed.value.text, null);
 }
 
 /// Answers one prompt as the run happens: the run's blocks as the events of a
@@ -770,33 +761,31 @@ fn askSession(
 /// as the first event, before anything else; `announce_id` is null for a session
 /// the page already has.
 fn serveTurn(
-    setup: *Setup,
+    r: *Request,
     http: *std.http.Client,
-    request: *std.http.Server.Request,
-    answered: *bool,
     session: *Session,
-    config: agent.Config,
+    config: Agent.Config,
     text: []const u8,
     announce_id: ?[]const u8,
 ) !void {
-    const gpa = setup.gpa;
-    var agent_ = try agent.Agent.init(setup.io, gpa, config, session.cwd(), http);
-    defer agent_.deinit();
+    const gpa = r.setup.gpa;
+    var agent = try Agent.init(r.setup.io, gpa, config, session.cwd(), http);
+    defer agent.deinit();
     // The session is prepared from the mode the caller settled, which is the
     // session's own once it has been asked something.
-    try agent_.prepare(session);
+    try agent.prepare(session);
 
     // The head of the reply goes out before the run starts, so the page can read
     // the stream while the model is working. From here on a failure is part of
     // the stream rather than something the connection can be told with a status.
     var stream_buffer: [4096]u8 = undefined;
-    var body_writer = try request.respondStreaming(&stream_buffer, .{
+    var body_writer = try r.request.respondStreaming(&stream_buffer, .{
         .respond_options = .{
             .extra_headers = &.{ContentType.events.header()},
             .keep_alive = false,
         },
     });
-    answered.* = true;
+    r.answered = true;
     defer body_writer.end() catch {};
 
     var stream = Stream{ .body = &body_writer, .gpa = gpa };
@@ -810,9 +799,9 @@ fn serveTurn(
     // The line as it was typed, with the mode the caller settled: a mode command
     // was already taken off the text by `createSession`, so `take` sees none and
     // the mode stands. A session that has been asked something keeps its own.
-    const waiting = try agent_.take(emitter, session, text, config.mode);
+    const waiting = try agent.take(emitter, session, text, config.mode);
     if (waiting == .ran) {
-        try sendHeader(setup, gpa, session, &stream);
+        try sendHeader(r.setup, gpa, session, &stream);
         try stream.done();
         return;
     }
@@ -824,26 +813,26 @@ fn serveTurn(
     // own title, if it gives one, arrives with the list the page refreshes when
     // the turn ends.
     if (session.messages.items.len == 0) {
-        _ = try agent.nameFromPrompt(session, text);
+        _ = try Agent.nameFromPrompt(session, text);
         if (session.title()) |title| try stream.send("title", TitleEvent{ .title = title });
     }
 
     // A line that named only a mode asks nothing, so there is no turn to run and
     // the session is already set up for the mode it named.
     if (waiting == .ready) {
-        try sendHeader(setup, gpa, session, &stream);
+        try sendHeader(r.setup, gpa, session, &stream);
         try stream.done();
         return;
     }
 
-    agent_.ask(emitter, session, text) catch |err| {
+    agent.ask(emitter, session, text) catch |err| {
         std.log.err("a request failed: {s}", .{@errorName(err)});
         try stream.fail(@errorName(err));
     };
 
     // What the run left the session at, so the page shows the new gauge and
     // cost, and knows the turn is over.
-    try sendHeader(setup, gpa, session, &stream);
+    try sendHeader(r.setup, gpa, session, &stream);
     try stream.done();
 }
 
@@ -887,11 +876,11 @@ const Stream = struct {
     body: *std.http.BodyWriter,
     gpa: std.mem.Allocator,
 
-    fn emitter(self: *Stream) agent.Emitter {
+    fn emitter(self: *Stream) Agent.Emitter {
         return .{ .context = self, .vtable = &.{ .block = show } };
     }
 
-    fn show(context: *anyopaque, b: agent.Block) anyerror!void {
+    fn show(context: *anyopaque, b: Agent.Block) anyerror!void {
         const self: *Stream = @ptrCast(@alignCast(context));
         var rendered: std.Io.Writer.Allocating = .init(self.gpa);
         defer rendered.deinit();
@@ -1086,7 +1075,9 @@ const Exchange = struct {
 
         var server: std.http.Server = .init(&reader, &writer);
         var request = try server.receiveHead();
-        try route(setup, registry, http, &request, &exchange.answered);
+        var r = Request{ .setup = setup, .request = &request };
+        try route(&r, registry, http);
+        exchange.answered = r.answered;
         try exchange.written.writer.writeAll(writer.buffered());
         return exchange;
     }
