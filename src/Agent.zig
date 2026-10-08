@@ -796,8 +796,10 @@ fn emitMessage(
     }
     if (!std.mem.eql(u8, role, "assistant")) return;
 
-    const calls = session.callCount(message);
-    if (calls == 0) return emitter.show(.{ .answer = session.contentOf(message) orelse "" });
+    const calls = message.tool_calls.len;
+    if (calls == 0)
+        return emitter.show(.{ .answer = session.contentOf(message) orelse "" });
+
     for (skip..calls) |i| {
         const call = session.callAt(message, i);
         const parsed = Tools.parseCallNamed(arena, call.name, call.arguments);
@@ -868,7 +870,7 @@ fn blocksIn(session: *const Session, messages: []const Session.Message, index: u
     const role = session.roleOf(messages[index]);
     if (std.mem.eql(u8, role, "user")) return 1;
     if (!std.mem.eql(u8, role, "assistant")) return 0;
-    const calls = session.callCount(messages[index]);
+    const calls = messages[index].tool_calls.len;
     return if (calls == 0) 1 else calls;
 }
 

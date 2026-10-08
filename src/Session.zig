@@ -505,11 +505,6 @@ pub fn contentOf(session: *const Session, message: Message) ?[]const u8 {
     return session.pool.get(message.content);
 }
 
-/// How many tool calls a message asked for.
-pub fn callCount(session: *const Session, message: Message) usize {
-    return message.tool_calls.resolve(session).len;
-}
-
 /// One tool call of a message, by position within it.
 pub fn callAt(session: *const Session, message: Message, index: usize) Call {
     const call = message.tool_calls.resolve(session)[index];
@@ -872,13 +867,15 @@ fn repairTail(session: *Session) !void {
     // conversation with none, or whose last such message is answered in full, is
     // one the earlier run finished.
     const tail = session.lastCall() orelse return;
-    const calls = session.callCount(session.messages.items[tail]);
+    const calls = session.messages.items[tail].tool_calls.len;
 
     // The results that follow the message, which is where they were written.
     var answered: usize = 0;
-    while (answered < calls and tail + 1 + answered < session.messages.items.len and
-        std.mem.eql(u8, session.roleOf(session.messages.items[tail + 1 + answered]), "tool"))
+    for (session.messages.items[tail + 1 ..]) |message| {
+        if (!std.mem.eql(u8, session.roleOf(message), "tool"))
+            break;
         answered += 1;
+    }
     if (answered >= calls) return;
 
     // The calls with no result are answered right after the results the file
@@ -918,7 +915,7 @@ fn lastCall(session: *const Session) ?usize {
     while (i > 0) {
         i -= 1;
         const message = session.messages.items[i];
-        if (std.mem.eql(u8, session.roleOf(message), "assistant") and session.callCount(message) > 0)
+        if (std.mem.eql(u8, session.roleOf(message), "assistant") and message.tool_calls.len > 0)
             return i;
     }
     return null;
@@ -1942,13 +1939,13 @@ test "a stored message reads back as its parts" {
     const user = session.messages.items[0];
     try std.testing.expectEqualStrings("user", session.roleOf(user));
     try std.testing.expectEqualStrings("hello", session.contentOf(user).?);
-    try std.testing.expectEqual(0, session.callCount(user));
+    try std.testing.expectEqual(0, user.tool_calls.len);
 
     // A message with no content reports none, rather than an empty string.
     const assistant = session.messages.items[1];
     try std.testing.expectEqualStrings("assistant", session.roleOf(assistant));
     try std.testing.expect(session.contentOf(assistant) == null);
-    try std.testing.expectEqual(2, session.callCount(assistant));
+    try std.testing.expectEqual(2, assistant.tool_calls.len);
 
     const first = session.callAt(assistant, 0);
     try std.testing.expectEqualStrings("call_1", first.id);
