@@ -76,26 +76,26 @@ pub fn open(init: std.process.Init, out: *std.Io.Writer) !Setup {
     var files = try openFiles(io, arena, environ);
     errdefer files.deinit(io);
 
-    var settings = openSettings(init, files.config_dir, files.config_dir_path, out) catch |err| {
+    var opened = openConfig(init, files.config_dir, files.config_dir_path, out) catch |err| {
         std.log.err("cannot read the configuration in {s}: {s}", .{
             files.config_dir_path, @errorName(err),
         });
         return err;
     };
-    errdefer settings.config.deinit();
+    errdefer opened.config.deinit();
 
     const endpoint = try openEndpoint(arena, environ, &files.store);
 
     // Which backend each set is built from, remembered so the report of a
     // failure can name it: only the builder knows which provider it was on.
     var search_failed: tools.web.Search.Provider = .tavily;
-    const search_config = searchConfig(arena, &files.store, environ, settings.config, &search_failed) catch |err| {
+    const search_config = searchConfig(arena, &files.store, environ, opened.config, &search_failed) catch |err| {
         reportSearchFailure(err, search_failed);
         return err;
     };
 
     var fetch_failed: tools.web.Fetch.Provider = .raw;
-    const fetch_config = fetchConfig(arena, &files.store, environ, settings.config, &fetch_failed) catch |err| {
+    const fetch_config = fetchConfig(arena, &files.store, environ, opened.config, &fetch_failed) catch |err| {
         reportFetchFailure(err, fetch_failed);
         return err;
     };
@@ -104,7 +104,7 @@ pub fn open(init: std.process.Init, out: *std.Io.Writer) !Setup {
         .io = io,
         .gpa = init.gpa,
         .environ = environ,
-        .config = settings.config,
+        .config = opened.config,
         .sessions = files.sessions,
         .data_dir = files.data_dir,
         .config_dir = files.config_dir,
@@ -195,21 +195,21 @@ fn openFiles(
 ///
 /// The configuration owns an arena of its own for the strings it reads, so it is
 /// freed when the run is over rather than with the process arena.
-fn openSettings(
+fn openConfig(
     init: std.process.Init,
     config_dir: std.Io.Dir,
     config_dir_path: []const u8,
     out: *std.Io.Writer,
 ) !Config.Opened {
-    var settings = try Config.open(init.io, config_dir, init.gpa);
-    errdefer settings.config.deinit();
+    var config = try Config.open(init.io, config_dir, init.gpa);
+    errdefer config.config.deinit();
 
-    if (settings.created) {
+    if (config.created) {
         try out.print("wrote the default configuration to {s}\n", .{
             try std.fs.path.join(init.arena.allocator(), &.{ config_dir_path, Config.file_name }),
         });
     }
-    return settings;
+    return config;
 }
 
 /// The model endpoint billy talks to, and the key it is asked with. The URL is

@@ -953,7 +953,7 @@ const TestServer = struct {
     setup: Setup,
     tmp: std.testing.TmpDir,
     /// The configuration the setup points at, freed with it.
-    settings: Config,
+    config: Config,
     /// The environment the setup reads, which a route asks for `HOME`. It is
     /// held by pointer and allocated, so the address the setup was given stays
     /// the map's when this value is moved out of `init`.
@@ -982,7 +982,7 @@ const TestServer = struct {
         errdefer health.deinit();
         return .{
             .tmp = tmp,
-            .settings = config,
+            .config = config,
             .environ = environ,
             .health = health,
             .registry = .{ .io = std.testing.io, .gpa = gpa },
@@ -1012,7 +1012,7 @@ const TestServer = struct {
         server.registry.deinit();
         server.health.deinit();
         server.setup.sessions.close(std.testing.io);
-        server.settings.deinit();
+        server.config.deinit();
         server.environ.deinit();
         std.testing.allocator.destroy(server.environ);
         server.tmp.cleanup();
