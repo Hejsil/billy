@@ -2006,18 +2006,20 @@ test "every string is kept as it was written, and reads back as its own" {
         },
     });
 
-    // Each distinct string once, in the order it was first seen. A role is not
-    // among them: it is the enum, so no copy of "user" or "assistant" is kept.
+    // Every string as it came, in the order it was added, with a role among
+    // them: a role is the enum, so no copy of "user" or "assistant" is kept.
     try std.testing.expectEqualStrings(
-        "/work\x00hello\x00call_1\x00function\x00read\x00{}\x00[]\x00",
+        "/work\x00hello\x00hello\x00call_1\x00function\x00read\x00{}\x00" ++
+            "call_1\x00function\x00read\x00[]\x00",
         session.pool.strings.items,
     );
-    // The two equal contents, and the repeated parts of the two tool calls,
-    // name the one copy of each.
-    try std.testing.expectEqual(session.messages.items[0].content, session.messages.items[1].content);
+    // Two equal contents are two entries in the pool, and each message reads
+    // back the text that was written for it.
+    try std.testing.expectEqualStrings("hello", session.contentOf(session.messages.items[0]).?);
+    try std.testing.expectEqualStrings("hello", session.contentOf(session.messages.items[1]).?);
     const calls = session.messages.items[2].tool_calls.resolve(&session);
-    try std.testing.expectEqual(calls[0].id, calls[1].id);
-    try std.testing.expectEqual(calls[0].function.name, calls[1].function.name);
+    try std.testing.expectEqualStrings("{}", session.pool.get(calls[0].function.arguments).?);
+    try std.testing.expectEqualStrings("[]", session.pool.get(calls[1].function.arguments).?);
 }
 
 test "a version 2 file's system prompt is lifted into its own field" {

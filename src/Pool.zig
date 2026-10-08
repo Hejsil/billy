@@ -1,12 +1,18 @@
-//! The string pool: one copy of every distinct string, named by where it sits
-//! in the pool rather than by a pointer.
+//! The string pool: every string in one arena, named by where it sits rather
+//! than by a pointer.
 //!
-//! Text repeats itself, and a pool pays for each distinct string once. A name is
-//! a small index that survives the pool growing, which a pointer into it would
-//! not.
+//! A name is a small index that survives the pool growing, which a pointer into
+//! it would not, and the whole of a session's text is one allocation that frees
+//! in one step.
+//!
+//! The pool does not look for a string it already holds. It used to, and the
+//! price was a hash over every string: a session whose tool results are tens of
+//! kilobytes each hashed megabytes of text to find that almost none of it
+//! repeated -- nine megabytes to save a few kilobytes of roles and tool names,
+//! which the roles are an enum for now anyway. Text is kept as it comes.
 //!
 //! Everything a pool holds is valid UTF-8. Text that is not is repaired as it is
-//! interned, so anything written from the pool can be carried as a JSON string.
+//! added, so anything written from the pool can be carried as a JSON string.
 
 const std = @import("std");
 
@@ -19,38 +25,14 @@ pub const Index = enum(u32) {
     _,
 };
 
-/// Equality and hashing for interned strings. A string is named by its index
-/// into the pool rather than by a pointer, so that growing the pool cannot
-/// invalidate a key, and the pool itself stays the only copy of the text.
-const Interned = struct {
-    pool: *const Pool,
-
-    pub fn hash(context: Interned, index: Index) u64 {
-        return std.hash.Wyhash.hash(0, context.pool.get(index) orelse "");
-    }
-
-    pub fn eql(context: Interned, a: Index, b: Index) bool {
-        return std.mem.eql(
-            u8,
-            context.pool.get(a) orelse "",
-            context.pool.get(b) orelse "",
-        );
-    }
-};
-
-/// All string data, one NUL-terminated copy per distinct string.
+/// All string data, one NUL-terminated copy per string.
 strings: std.ArrayList(u8) = .empty,
-
-/// The strings the pool holds, so that one already there is not appended again.
-/// Keyed by index rather than by pointer, since the pool moves as it grows.
-index: std.HashMapUnmanaged(Index, void, Interned, std.hash_map.default_max_load_percentage) = .empty,
 
 pub fn deinit(pool: *Pool, gpa: std.mem.Allocator) void {
     pool.strings.deinit(gpa);
-    pool.index.deinit(gpa);
 }
 
-/// Interns `text` into the pool and returns its index, or `.none` for null.
+/// Adds `text` to the pool and returns its index, or `.none` for null.
 ///
 /// Text that is not valid UTF-8 is repaired, since Zig writes a byte slice that
 /// is not as an array of numbers, which JSON rejects. `fmtUtf8` passes
@@ -59,21 +41,11 @@ pub fn deinit(pool: *Pool, gpa: std.mem.Allocator) void {
 pub fn intern(pool: *Pool, gpa: std.mem.Allocator, text: ?[]const u8) !Index {
     const value = text orelse return .none;
 
-    // A key has to name a string the pool already holds, so the candidate is
-    // written into the pool before the lookup and rolled back if the lookup
-    // finds the copy that was there already. The text goes straight into the
-    // pool, so nothing else is allocated for it.
     const start: u32 = @intCast(pool.strings.items.len);
     try pool.strings.print(gpa, "{f}", .{std.unicode.fmtUtf8(value)});
+    errdefer pool.strings.shrinkRetainingCapacity(start);
     try pool.strings.append(gpa, 0);
-    const candidate: Index = @fromBackingInt(start);
-
-    const context = Interned{ .pool = pool };
-    const entry = try pool.index.getOrPutContext(gpa, candidate, context);
-    if (!entry.found_existing) return candidate;
-
-    pool.strings.shrinkRetainingCapacity(start);
-    return entry.key_ptr.*;
+    return @fromBackingInt(start);
 }
 
 /// The string `index` names as a NUL-terminated pointer, or null for `.none`.
@@ -96,21 +68,23 @@ pub fn get(pool: *const Pool, index: Index) ?[]const u8 {
     return std.mem.span(pool.ptr(index) orelse return null);
 }
 
-test "an equal string is interned once and shared" {
+test "each string is kept where it was written, and reads back from there" {
     const gpa = std.testing.allocator;
 
     var pool: Pool = .{};
     defer pool.deinit(gpa);
 
     const first = try pool.intern(gpa, "hello");
-    const second = try pool.intern(gpa, "hello");
-    const other = try pool.intern(gpa, "world");
+    const second = try pool.intern(gpa, "world");
+    // A string already held is added again rather than looked for: the pool
+    // keeps text, it does not remember which text it has.
+    const again = try pool.intern(gpa, "hello");
 
-    try std.testing.expectEqual(first, second);
-    try std.testing.expect(other != first);
-    try std.testing.expectEqualStrings("hello\x00world\x00", pool.strings.items);
+    try std.testing.expect(again != first);
+    try std.testing.expectEqualStrings("hello\x00world\x00hello\x00", pool.strings.items);
     try std.testing.expectEqualStrings("hello", pool.get(first).?);
-    try std.testing.expectEqualStrings("world", pool.get(other).?);
+    try std.testing.expectEqualStrings("world", pool.get(second).?);
+    try std.testing.expectEqualStrings("hello", pool.get(again).?);
 }
 
 test "a null and an absent string name nothing" {
@@ -152,7 +126,6 @@ test "a string read back is the whole string, not the rest of the pool" {
 
     const first = try pool.intern(gpa, "read");
     const second = try pool.intern(gpa, "read a file");
-    try std.testing.expectEqual(first, try pool.intern(gpa, "read"));
 
     // The first string ends at its NUL, not where the second one starts.
     try std.testing.expectEqualStrings("read", pool.get(first).?);
