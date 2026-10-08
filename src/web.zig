@@ -492,7 +492,7 @@ fn writeSession(
 
     var blocks: std.Io.Writer.Allocating = .init(gpa);
     defer blocks.deinit();
-    try html.conversation(gpa, &session, &blocks.writer);
+    try html.conversation(gpa, &session, setup.config.stored.web_blocks, &blocks.writer);
 
     try writeOpened(out, header.written(), blocks.written(), @tagName(session.mode));
     return true;

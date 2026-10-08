@@ -116,6 +116,12 @@ const Stored = struct {
     max_turns: usize = 100,
     /// Blocks to replay on a resume. Zero shows the whole session.
     resume_blocks: usize = 10,
+    /// Blocks of a session the web page shows when it is opened. Zero shows the
+    /// whole session. It is its own setting rather than `resume_blocks` because
+    /// the two are read on different things: a replay fills a terminal's screen,
+    /// while the page is scrolled, so it wants far more of the conversation and
+    /// still far less than all of it.
+    web_blocks: usize = 200,
     /// How full the context window must be, as a whole percentage, before the
     /// conversation is compacted into a summary. Zero turns compaction off.
     compact_at: usize = 80,
@@ -605,6 +611,7 @@ test "the file is indented, so it can be read and edited by hand" {
         \\  "version": 1,
         \\  "max_turns": 3,
         \\  "resume_blocks": 10,
+        \\  "web_blocks": 200,
         \\  "compact_at": 80,
         \\  "title": true,
         \\  "reasoning": "off",

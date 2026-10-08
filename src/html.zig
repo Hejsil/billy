@@ -1384,12 +1384,27 @@ test "the blocks of a run are each rendered as what they are" {
     try std.testing.expectEqualStrings("<div class=\"elided\">… 7 earlier blocks</div>\n", out.written());
 }
 
-/// Writes a whole stored conversation as HTML, oldest block first: what the web
-/// page shows when a session is opened. `gpa` is the run's, for the scratch each
-/// block needs while it is written.
-pub fn conversation(gpa: std.mem.Allocator, session: *const Session, out: *std.Io.Writer) !void {
+/// Writes a stored conversation as HTML, oldest block first: what the web page
+/// shows when a session is opened. `gpa` is the run's, for the scratch each block
+/// needs while it is written.
+///
+/// `blocks` is how much of the conversation to show, counted in blocks the way a
+/// replay counts them: only the last `blocks` are written, with the count of what
+/// was left out in their place. Zero writes the whole conversation.
+///
+/// A session of thousands of blocks is megabytes of HTML and some hundred
+/// thousand elements for the page to build, which a browser does not do without
+/// a pause; the cap is what keeps opening one responsive. What is left out is a
+/// count rather than a link, since reading the rest is what the terminal's own
+/// replay is for.
+pub fn conversation(
+    gpa: std.mem.Allocator,
+    session: *const Session,
+    blocks: usize,
+    out: *std.Io.Writer,
+) !void {
     var page = Page{ .gpa = gpa, .out = out };
-    try agent.walk(gpa, session, 0, page.emitter());
+    try agent.walk(gpa, session, blocks, page.emitter());
 }
 
 /// Shows each block of a conversation as its element. It is the emitter `walk`
@@ -1448,7 +1463,8 @@ test "a whole conversation is rendered, a tool call and a compaction included" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try conversation(gpa, &session, &out.writer);
+    // The whole conversation: this test is about how a block is written.
+    try conversation(gpa, &session, 0, &out.writer);
     const page = out.written();
 
     // The prompt is a block of its own, and its text is laid out as markdown.
