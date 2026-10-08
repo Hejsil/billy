@@ -1084,19 +1084,26 @@ fn listIn(dir: std.Io.Dir, io: std.Io, gpa: std.mem.Allocator) ![]Named {
         // not one to read.
         if (entry.kind != .file) continue;
         const stem = idInName(entry.name) orelse continue;
+
         // A file that cannot be asked about is one to leave out rather than one
         // to fail the listing over.
         const stat = dir.statFile(io, entry.name, .{}) catch continue;
         try written.append(gpa, stat.mtime.toMilliseconds());
+
         // The name is a window into the iterator, which the next entry moves on,
         // so the id is copied out before it can go.
         const owned_id = try gpa.dupe(u8, stem);
         // A failed append leaves the copy unheld, so it is freed on the way out.
         errdefer gpa.free(owned_id);
+
         // The title is read from the front of the file, which keeps a listing
         // cheap however large the conversations are.
-        const stored_title = try readTitle(io, gpa, dir, entry.name);
+        const stored_title = readTitle(io, gpa, dir, entry.name) catch |err| switch (err) {
+            error.SyntaxError => continue,
+            else => return err,
+        };
         errdefer gpa.free(stored_title);
+
         try names.append(gpa, .{ .id = owned_id, .title = stored_title });
     }
 
@@ -1121,23 +1128,9 @@ fn readTitle(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir, file_name: []c
     var file = dir.openFile(io, file_name, .{}) catch return gpa.dupe(u8, "");
     defer file.close(io);
 
-    // The read buffer starts big enough for a normal title and doubles until the
-    // title is found, so a title has no length limit. A session's title is at the
-    // front of the file, so a normal one is read in the first buffer and the
-    // growing only happens for an unusually long title. The reader reads
-    // positionally, so each try starts at the front again.
-    var cap: usize = title_read_buffer_len;
-    while (true) : (cap *= 2) {
-        const buffer = gpa.alloc(u8, cap) catch break;
-        defer gpa.free(buffer);
-        var reader = file.reader(io, buffer);
-        const read = titleFrom(&reader.interface, gpa) catch |err| switch (err) {
-            error.StreamTooLong => continue,
-            else => break,
-        };
-        return read orelse gpa.dupe(u8, "");
-    }
-    return gpa.dupe(u8, "");
+    var reader_buf: [std.heap.page_size_min]u8 = undefined;
+    var reader = file.reader(io, &reader_buf);
+    return (try titleFrom(&reader.interface, gpa)) orelse "";
 }
 
 /// Reads the title out of the front of a session file, or null when it has none.
@@ -1147,76 +1140,31 @@ fn readTitle(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir, file_name: []c
 /// name the session -- one saved before titles, or hand-written -- is recognized
 /// and left alone after a few bytes rather than scanned to its end.
 fn titleFrom(reader: *std.Io.Reader, gpa: std.mem.Allocator) !?[]u8 {
-    // `{"version":` up to the quote that closes the key.
-    const opening = reader.takeDelimiter('"') catch return null;
-    _ = opening orelse return null;
-    const first_key = reader.takeDelimiter('"') catch return null;
-    if (!std.mem.eql(u8, first_key orelse return null, "version")) return null;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    // The version's own value and the quote that opens the next key.
-    const between = reader.takeDelimiter('"') catch return null;
-    _ = between orelse return null;
-    const key = reader.takeDelimiter('"') catch return null;
-    if (!std.mem.eql(u8, key orelse return null, "title")) return null;
+    var j_reader = std.json.Reader.init(gpa, reader);
+    defer j_reader.deinit();
 
-    // The colon and the quote that opens the value; then the value itself.
-    const colon = reader.takeDelimiter('"') catch return null;
-    _ = colon orelse return null;
-    return try takeString(reader, gpa);
-}
+    const object_begin = try j_reader.next();
+    if (object_begin != .object_begin) return null;
 
-/// Reads a JSON string value, undoing its escapes. Null when it runs past the
-/// length a title may be, or the stream ends before a value is read: either way
-/// it is not a title billy wrote.
-///
-/// The value is read a run of bytes at a time, up to the next quote. That quote
-/// closes the string only when it is not escaped, so a run that ends just before
-/// an escaped quote is read on: it stops at the first quote that is not escaped,
-/// which is the one that ends the value.
-fn takeString(reader: *std.Io.Reader, gpa: std.mem.Allocator) !?[]u8 {
-    var raw: std.ArrayList(u8) = .empty;
-    defer raw.deinit(gpa);
-    while (true) {
-        // A value the reader's buffer cannot hold is its own error rather than
-        // "no title", so the caller can read it with a bigger buffer.
-        const run = (reader.takeDelimiter('"') catch |err| switch (err) {
-            error.StreamTooLong => return error.StreamTooLong,
-            error.ReadFailed => return null,
-        }) orelse return null;
-        try raw.appendSlice(gpa, run);
-        if (endsEscaped(raw.items)) {
-            // The run ended on an escaped quote, so that quote is part of the
-            // value and the string goes on.
-            try raw.append(gpa, '"');
-            continue;
-        }
-        return try unescape(gpa, raw.items);
-    }
-}
+    const version_key = try j_reader.nextAlloc(arena, .alloc_always);
+    if (version_key != .allocated_string) return null;
+    if (!std.mem.eql(u8, version_key.allocated_string, "version")) return null;
 
-/// Whether `bytes` ends in an odd number of backslashes, so the byte after it --
-/// the quote a run was read up to -- is escaped rather than ending the string.
-/// Two backslashes are one escaped backslash with nothing escaping the quote
-/// after them, so the count matters, not just the last byte.
-fn endsEscaped(bytes: []const u8) bool {
-    var backslashes: usize = 0;
-    var i = bytes.len;
-    while (i > 0 and bytes[i - 1] == '\\') : (i -= 1) backslashes += 1;
-    return backslashes % 2 == 1;
-}
+    const version_value = try j_reader.nextAlloc(arena, .alloc_always);
+    if (version_value != .allocated_number) return null;
 
-/// A JSON string's contents with its escapes undone: a backslash and the byte
-/// after it stand for that byte. A title is one clean line, so the only escapes
-/// the writer produces are `\"` and `\\`.
-fn unescape(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    var i: usize = 0;
-    while (i < raw.len) : (i += 1) {
-        if (raw[i] == '\\' and i + 1 < raw.len) i += 1;
-        try out.append(gpa, raw[i]);
-    }
-    return out.toOwnedSlice(gpa);
+    const title_key = try j_reader.nextAlloc(arena, .alloc_always);
+    if (title_key != .allocated_string) return null;
+    if (!std.mem.eql(u8, title_key.allocated_string, "title")) return null;
+
+    const title_value = try j_reader.nextAlloc(arena, .alloc_always);
+    if (title_value != .allocated_string) return null;
+
+    return try gpa.dupe(u8, title_value.allocated_string);
 }
 
 /// Orders sessions by when their files were written, newest first, carrying the
@@ -1270,13 +1218,13 @@ fn idInName(file_name: []const u8) ?[]const u8 {
 
 /// A session opened fresh in `tmp`, for a test to build a conversation in. The
 /// caller owns it and frees it with `deinit`.
-fn newSession(tmp: *std.testing.TmpDir, gpa: std.mem.Allocator) !Session {
+fn newTestSession(tmp: *std.testing.TmpDir, gpa: std.mem.Allocator) !Session {
     return Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
 }
 
 /// The session `id` read back from `tmp`, which is what reopening it does. The
 /// caller owns it and frees it with `deinit`.
-fn reopen(tmp: *std.testing.TmpDir, gpa: std.mem.Allocator, session_id: []const u8) !Session {
+fn reopenTestSession(tmp: *std.testing.TmpDir, gpa: std.mem.Allocator, session_id: []const u8) !Session {
     return Session.open(std.testing.io, tmp.dir, gpa, session_id, "/work");
 }
 
@@ -1330,11 +1278,11 @@ fn expectResume(messages: []const llm.Message) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, gpa);
+    var session = try newTestSession(&tmp, gpa);
     defer session.deinit();
     for (messages) |message| try session.append(message);
 
-    var resumed = try reopen(&tmp, gpa, session.id());
+    var resumed = try reopenTestSession(&tmp, gpa, session.id());
     defer resumed.deinit();
     try expectSessionConvo(gpa, &resumed, messages);
 }
@@ -1353,7 +1301,7 @@ test "a new session is given a ULID, and nothing is written yet" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, std.testing.allocator);
+    var session = try newTestSession(&tmp, std.testing.allocator);
     defer session.deinit();
 
     try std.testing.expect(ulid.isId(session.id()));
@@ -1377,7 +1325,7 @@ test "a session can be started for an id that has no file yet" {
 
     // The first message is what writes it, exactly as for a generated id.
     try session.append(.{ .role = "user", .content = "hello" });
-    var resumed = try reopen(&tmp, gpa, "made-by-hand");
+    var resumed = try reopenTestSession(&tmp, gpa, "made-by-hand");
     defer resumed.deinit();
     try std.testing.expectEqual(@as(usize, 1), resumed.messages.items.len);
     try std.testing.expectEqualStrings("hello", resumed.contentOf(resumed.messages.items[0]).?);
@@ -1411,11 +1359,11 @@ test "a session is deleted for good, and only that session" {
     try Session.delete(std.testing.io, tmp.dir, gone_id);
 
     // The one deleted is gone, and cannot be deleted again.
-    try std.testing.expectError(error.SessionNotFound, reopen(&tmp, gpa, gone_id));
+    try std.testing.expectError(error.SessionNotFound, reopenTestSession(&tmp, gpa, gone_id));
     try std.testing.expectError(error.SessionNotFound, Session.delete(std.testing.io, tmp.dir, gone_id));
 
     // The other is untouched.
-    var still = try reopen(&tmp, gpa, kept_id);
+    var still = try reopenTestSession(&tmp, gpa, kept_id);
     defer still.deinit();
     try std.testing.expectEqualStrings("keep me", still.contentOf(still.messages.items[0]).?);
 
@@ -1435,7 +1383,7 @@ test "a new session is written out by its first message" {
         .parameters = "{}",
     }};
 
-    var session = try newSession(&tmp, gpa);
+    var session = try newTestSession(&tmp, gpa);
     defer session.deinit();
 
     // Setting a session up -- its prompt and its tools -- is held in memory, so
@@ -1449,7 +1397,7 @@ test "a new session is written out by its first message" {
     // set up before it lands in the file with it.
     try session.append(.{ .role = "user", .content = "hello" });
 
-    var resumed = try reopen(&tmp, gpa, session.id());
+    var resumed = try reopenTestSession(&tmp, gpa, session.id());
     defer resumed.deinit();
     try std.testing.expectEqual(1, resumed.tools.len);
     // The prompt is its own field, apart from the conversation, which is the
@@ -1609,17 +1557,17 @@ test "a listing carries each session's title" {
     // it is read back only because the reader grows.
     const long_title: [title_read_buffer_len + 1]u8 = @splat('y');
     try std.testing.expect(long_title.len > title_read_buffer_len);
-    var long = try newSession(&tmp, gpa);
+    var long = try newTestSession(&tmp, gpa);
     defer long.deinit();
     try long.setTitle(&long_title);
     try long.append(.{ .role = "user", .content = "hi" });
 
-    var titled = try newSession(&tmp, gpa);
+    var titled = try newTestSession(&tmp, gpa);
     defer titled.deinit();
     try titled.setTitle("Fix the parser");
     try titled.append(.{ .role = "user", .content = "hi" });
 
-    var unnamed = try newSession(&tmp, gpa);
+    var unnamed = try newTestSession(&tmp, gpa);
     defer unnamed.deinit();
     try unnamed.append(.{ .role = "user", .content = "hi" });
 
@@ -1646,7 +1594,7 @@ test "a title is trimmed and cut to the most a title may be when it is set" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var session = try newSession(&tmp, gpa);
+    var session = try newTestSession(&tmp, gpa);
     defer session.deinit();
 
     // The whitespace a paste brings is not part of the title.
@@ -1685,7 +1633,7 @@ test "the title is read from the front of a session file, unescaped" {
     try std.testing.expect((try titleOf(gpa, "{\"version\":3,\"system_prompt\":\"be terse\",\"messages\":[]}")) == null);
     try std.testing.expect((try titleOf(gpa, "{\"version\":3,\"messages\":[]}")) == null);
     // Something that is not a session at all.
-    try std.testing.expect((try titleOf(gpa, "not json at all")) == null);
+    try std.testing.expectError(error.SyntaxError, titleOf(gpa, "not json at all"));
 
     // A title of any length is read, however long: there is no limit.
     const long_title: [4096]u8 = @splat('y');
@@ -1764,7 +1712,7 @@ test "a resume answers a tool call a killed run left open" {
     defer tmp.cleanup();
     const gpa = std.testing.allocator;
 
-    var session = try newSession(&tmp, gpa);
+    var session = try newTestSession(&tmp, gpa);
     defer session.deinit();
 
     // The assistant asked for a tool, and the run was killed before its result
@@ -1778,7 +1726,7 @@ test "a resume answers a tool call a killed run left open" {
     // The call now has an answer, so the request the session builds is one the
     // API takes: the assistant message is followed by the result of its call,
     // and the call did not finish.
-    var resumed = try reopen(&tmp, gpa, session.id());
+    var resumed = try reopenTestSession(&tmp, gpa, session.id());
     defer resumed.deinit();
     try expectSessionConvo(gpa, &resumed, &.{
         .{ .role = "user", .content = "hello" },
@@ -1795,7 +1743,7 @@ test "a resume answers every call a kill left open, in the order made" {
     defer tmp.cleanup();
     const gpa = std.testing.allocator;
 
-    var session = try newSession(&tmp, gpa);
+    var session = try newTestSession(&tmp, gpa);
     defer session.deinit();
 
     try session.append(.{ .role = "user", .content = "go" });
@@ -1810,7 +1758,7 @@ test "a resume answers every call a kill left open, in the order made" {
 
     // The result the file held stays with its call, and the call it lost is
     // answered in the place it was made rather than after the user message.
-    var resumed = try reopen(&tmp, gpa, session.id());
+    var resumed = try reopenTestSession(&tmp, gpa, session.id());
     defer resumed.deinit();
     try expectSessionConvo(gpa, &resumed, &.{
         .{ .role = "user", .content = "go" },
@@ -1830,7 +1778,7 @@ test "a resume leaves a finished conversation alone" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, gpa);
+    var session = try newTestSession(&tmp, gpa);
     defer session.deinit();
 
     // A run that finished leaves every call answered and its compaction in
@@ -1846,7 +1794,7 @@ test "a resume leaves a finished conversation alone" {
     try session.appendCompaction("summarize this", "the summary");
     try session.append(.{ .role = "assistant", .content = "done" });
 
-    var resumed = try reopen(&tmp, gpa, session.id());
+    var resumed = try reopenTestSession(&tmp, gpa, session.id());
     defer resumed.deinit();
 
     try std.testing.expectEqual(session.messages.items.len, resumed.messages.items.len);
@@ -1860,7 +1808,7 @@ test "a repair moves a compaction that sits behind the turn it completes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, gpa);
+    var session = try newTestSession(&tmp, gpa);
     defer session.deinit();
 
     // A file that holds a compaction right behind a call with no result, as one
@@ -1873,7 +1821,7 @@ test "a repair moves a compaction that sits behind the turn it completes" {
     }} });
     try session.appendCompaction("summarize this", "the summary");
 
-    var resumed = try reopen(&tmp, gpa, session.id());
+    var resumed = try reopenTestSession(&tmp, gpa, session.id());
     defer resumed.deinit();
 
     // user, the assistant message, its answer, then the prompt and the summary:
@@ -1890,7 +1838,7 @@ test "a conversation writes the messages a request would have carried" {
     defer tmp.cleanup();
     const gpa = std.testing.allocator;
 
-    var session = try newSession(&tmp, gpa);
+    var session = try newTestSession(&tmp, gpa);
     defer session.deinit();
 
     // A message of every shape: an optional left out, one filled in, and a call
@@ -1926,7 +1874,7 @@ test "an extra message is written after the conversation, and is not part of it"
     defer tmp.cleanup();
     const gpa = std.testing.allocator;
 
-    var session = try newSession(&tmp, gpa);
+    var session = try newTestSession(&tmp, gpa);
     defer session.deinit();
     try session.setSystemPrompt("be terse");
     try session.append(.{ .role = "user", .content = "hello" });
@@ -1950,7 +1898,7 @@ test "a string that is not valid UTF-8 is repaired on the way into the pool" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, gpa);
+    var session = try newTestSession(&tmp, gpa);
     defer session.deinit();
 
     // A command's output and a file read back are arbitrary bytes, so a result
@@ -1982,7 +1930,7 @@ test "a message a session read back with bytes that are not UTF-8 is repaired" {
             "\"content\":[97,255,98],\"tool_call_id\":\"call_1\"}]}",
     });
 
-    var session = try reopen(&tmp, gpa, "bytes");
+    var session = try reopenTestSession(&tmp, gpa, "bytes");
     defer session.deinit();
 
     try std.testing.expectEqualStrings("a\u{FFFD}b", session.contentOf(session.messages.items[0]).?);
@@ -2002,7 +1950,7 @@ test "a stored message reads back as its parts" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, gpa);
+    var session = try newTestSession(&tmp, gpa);
     defer session.deinit();
 
     try session.append(.{ .role = "user", .content = "hello" });
@@ -2040,7 +1988,7 @@ test "a tool result is found only from where the search starts" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, gpa);
+    var session = try newTestSession(&tmp, gpa);
     defer session.deinit();
 
     try session.append(.{ .role = "assistant", .tool_calls = &.{.{
@@ -2068,7 +2016,7 @@ test "an equal string is interned once and shared" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, gpa);
+    var session = try newTestSession(&tmp, gpa);
     defer session.deinit();
 
     try session.append(.{ .role = "user", .content = "hello" });
@@ -2112,7 +2060,7 @@ test "a version 2 file's system prompt is lifted into its own field" {
             "{\"role\":\"user\",\"content\":\"hi\"}]}",
     });
 
-    var resumed = try reopen(&tmp, gpa, "one");
+    var resumed = try reopenTestSession(&tmp, gpa, "one");
     defer resumed.deinit();
 
     // The prompt comes back as its own field and is no longer a message, so the
@@ -2133,7 +2081,7 @@ test "a compaction is appended and a request starts at its summary" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, gpa);
+    var session = try newTestSession(&tmp, gpa);
     defer session.deinit();
 
     try session.setSystemPrompt("be terse");
@@ -2173,14 +2121,14 @@ test "a compaction survives a save and resume" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, gpa);
+    var session = try newTestSession(&tmp, gpa);
     defer session.deinit();
     try session.setSystemPrompt("be terse");
     try session.append(.{ .role = "user", .content = "one" });
     try session.appendCompaction("summarize this", "the summary");
     try session.append(.{ .role = "user", .content = "next" });
 
-    var resumed = try reopen(&tmp, gpa, session.id());
+    var resumed = try reopenTestSession(&tmp, gpa, session.id());
     defer resumed.deinit();
 
     // Everything comes back, and the request still starts at the summary.
@@ -2210,7 +2158,7 @@ test "the compaction list is sorted and clamped when a session is read" {
             "\"compactions\":[2,0,2,99]}",
     });
 
-    var session = try reopen(&tmp, gpa, "odd");
+    var session = try reopenTestSession(&tmp, gpa, "odd");
     defer session.deinit();
 
     try std.testing.expectEqualStrings("s", session.pool.get(session.system_prompt).?);
@@ -2225,7 +2173,7 @@ test "the messages a request carries start at the latest compaction" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, gpa);
+    var session = try newTestSession(&tmp, gpa);
     defer session.deinit();
     try session.setSystemPrompt("s");
     try session.append(.{ .role = "user", .content = "old" });
@@ -2248,7 +2196,7 @@ test "the system prompt is kept apart from the conversation and is not replaced"
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, gpa);
+    var session = try newTestSession(&tmp, gpa);
     defer session.deinit();
 
     // Setting the prompt does not put a message in the conversation: it is its own
@@ -2281,7 +2229,7 @@ test "the tools are written out with the schema as the JSON it is" {
         .parameters = "{\"type\":\"object\",\"required\":[\"path\"]}",
     }};
 
-    var session = try newSession(&tmp, gpa);
+    var session = try newTestSession(&tmp, gpa);
     defer session.deinit();
     try session.ensureTools(&tools);
 
@@ -2312,7 +2260,7 @@ test "ensureTools stores the tools and only sets them once" {
         .parameters = "{}",
     }};
 
-    var session = try newSession(&tmp, gpa);
+    var session = try newTestSession(&tmp, gpa);
     defer session.deinit();
     try session.ensureTools(&tools);
     try std.testing.expectEqual(1, session.tools.len);
@@ -2327,7 +2275,7 @@ test "ensureTools stores the tools and only sets them once" {
     try session.append(.{ .role = "user", .content = "hi" });
 
     // The stored tools survive a save and resume.
-    var resumed = try reopen(&tmp, gpa, session.id());
+    var resumed = try reopenTestSession(&tmp, gpa, session.id());
     defer resumed.deinit();
     try std.testing.expectEqual(1, resumed.tools.len);
     try std.testing.expectEqualStrings("read", resumed.pool.get(resumed.tools[0].name).?);
@@ -2339,7 +2287,7 @@ test "ensureTools stores the tools and only sets them once" {
         .description = "Run a command.",
         .parameters = "{}",
     }};
-    var reopened = try reopen(&tmp, gpa, session.id());
+    var reopened = try reopenTestSession(&tmp, gpa, session.id());
     defer reopened.deinit();
     try reopened.ensureTools(&replaced);
     try std.testing.expectEqual(1, reopened.tools.len);
@@ -2358,7 +2306,7 @@ test "a session saved without tools loads with none" {
         .data = "{\"version\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
     });
 
-    var session = try reopen(&tmp, gpa, "legacy");
+    var session = try reopenTestSession(&tmp, gpa, "legacy");
     defer session.deinit();
     try std.testing.expectEqual(0, session.tools.len);
 }
@@ -2369,7 +2317,7 @@ test "the token totals survive a save and resume" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try newSession(&tmp, gpa);
+    var session = try newTestSession(&tmp, gpa);
     defer session.deinit();
 
     session.recordUsage(.{
@@ -2390,7 +2338,7 @@ test "the token totals survive a save and resume" {
     }, 0.0002);
     try session.append(.{ .role = "assistant", .content = "hello" });
 
-    var resumed = try reopen(&tmp, gpa, session.id());
+    var resumed = try reopenTestSession(&tmp, gpa, session.id());
     defer resumed.deinit();
 
     try std.testing.expectEqual(300, resumed.usage.prompt_tokens);
@@ -2411,19 +2359,19 @@ test "opening an unknown or damaged session is reported" {
 
     try std.testing.expectError(
         error.SessionNotFound,
-        reopen(&tmp, gpa, "nope"),
+        reopenTestSession(&tmp, gpa, "nope"),
     );
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad.json", .data = "{" });
     try std.testing.expectError(
         error.CorruptSession,
-        reopen(&tmp, gpa, "bad"),
+        reopenTestSession(&tmp, gpa, "bad"),
     );
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "future.json", .data = "{\"version\":99}" });
     try std.testing.expectError(
         error.UnsupportedSessionVersion,
-        reopen(&tmp, gpa, "future"),
+        reopenTestSession(&tmp, gpa, "future"),
     );
 }
 
@@ -2433,17 +2381,17 @@ test "a new session does not reuse an id whose file exists" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var first = try newSession(&tmp, gpa);
+    var first = try newTestSession(&tmp, gpa);
     defer first.deinit();
     try first.append(.{ .role = "user", .content = "keep me" });
 
-    var second = try newSession(&tmp, gpa);
+    var second = try newTestSession(&tmp, gpa);
     defer second.deinit();
     try second.append(.{ .role = "user", .content = "and me" });
 
     try std.testing.expect(!std.mem.eql(u8, first.id(), second.id()));
 
-    var resumed = try reopen(&tmp, gpa, first.id());
+    var resumed = try reopenTestSession(&tmp, gpa, first.id());
     defer resumed.deinit();
 
     try std.testing.expectEqualStrings("keep me", resumed.pool.get(resumed.messages.items[0].content).?);
@@ -2504,7 +2452,7 @@ test "a resumed session frees everything it read back" {
     try big.appendSlice(gpa, "]}");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big" ++ extension, .data = big.items });
 
-    var resumed = try reopen(&tmp, gpa, "big");
+    var resumed = try reopenTestSession(&tmp, gpa, "big");
     defer resumed.deinit();
     try std.testing.expectEqual(2000, resumed.messages.items.len);
     try std.testing.expectEqualStrings("/work", resumed.cwd());
@@ -2522,13 +2470,13 @@ test "the id and file name read back from their fixed buffers" {
         .sub_path = "dev" ++ extension,
         .data = "{\"version\":1,\"messages\":[]}",
     });
-    var resumed = try reopen(&tmp, gpa, "dev");
+    var resumed = try reopenTestSession(&tmp, gpa, "dev");
     defer resumed.deinit();
     try std.testing.expectEqualStrings("dev", resumed.id());
     try std.testing.expectEqualStrings("dev" ++ extension, resumed.name());
 
     // A new session gets a generated ULID of its own.
-    var fresh = try newSession(&tmp, gpa);
+    var fresh = try newTestSession(&tmp, gpa);
     defer fresh.deinit();
     try std.testing.expectEqual(ulid.length, fresh.id().len);
     try std.testing.expect(ulid.isId(fresh.id()));
