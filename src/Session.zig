@@ -524,12 +524,15 @@ pub fn callAt(session: *const Session, message: Message, index: usize) Call {
 /// nothing to allocate.
 pub fn toolResult(session: *const Session, from: usize, call: []const u8) []const u8 {
     const messages = session.messages.items;
-    if (from >= messages.len) return "";
+    if (from >= messages.len)
+        return "";
+
     for (messages[from..]) |message| {
-        if (!std.mem.eql(u8, session.pool.get(message.role) orelse "", "tool")) continue;
         const call_id = session.pool.get(message.tool_call_id) orelse continue;
-        if (std.mem.eql(u8, call_id, call)) return session.pool.get(message.content) orelse "";
+        if (std.mem.eql(u8, call_id, call))
+            return session.pool.get(message.content) orelse "";
     }
+
     return "";
 }
 
