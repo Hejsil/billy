@@ -144,7 +144,7 @@ const ToolCall = struct {
 
 /// An llm.Message as stored in a session.
 pub const Message = struct {
-    role: StringIndex,
+    role: llm.Role,
     content: StringIndex = .none,
     tool_call_id: StringIndex = .none,
     /// What the model thought before this message, for a provider that reports
@@ -164,7 +164,7 @@ pub const Message = struct {
             calls = resolved;
         }
         return .{
-            .role = session.pool.get(message.role) orelse "",
+            .role = message.role,
             .content = session.pool.get(message.content),
             .tool_call_id = session.pool.get(message.tool_call_id),
             .reasoning_content = session.pool.get(message.reasoning),
@@ -398,7 +398,8 @@ pub const Conversation = struct {
 fn writeMessage(session: *const Session, json: anytype, message: Message) !void {
     try json.beginObject();
     try json.objectField("role");
-    try json.write(session.pool.get(message.role) orelse "");
+    // The name the API knows the role by, so a file reads as it always did.
+    try json.write(message.role.name());
 
     if (session.pool.get(message.content)) |content| {
         try json.objectField("content");
@@ -495,9 +496,10 @@ pub const Call = struct {
     arguments: []const u8,
 };
 
-/// The role of a message, read from where it is stored.
+/// The role of a message, which is the name the API knows it by.
 pub fn roleOf(session: *const Session, message: Message) []const u8 {
-    return session.pool.get(message.role) orelse "";
+    _ = session;
+    return message.role.name();
 }
 
 /// The content of a message, or null when it has none.
@@ -550,7 +552,7 @@ pub fn resolvedMessages(session: *const Session, allocator: std.mem.Allocator) !
     const messages = try allocator.alloc(llm.Message, lead + session.messages.items.len);
     var out: usize = 0;
     if (session.pool.get(session.system_prompt)) |prompt| {
-        messages[0] = .{ .role = "system", .content = prompt };
+        messages[0] = .{ .role = .system, .content = prompt };
         out = 1;
     }
     for (session.messages.items) |message| {
@@ -579,9 +581,9 @@ pub fn append(session: *Session, message: llm.Message) !void {
 /// to it rather than as something it said. Both are written out together, so the
 /// file is never left holding half of a compaction.
 pub fn appendCompaction(session: *Session, prompt: []const u8, summary: []const u8) !void {
-    try session.appendMessage(.{ .role = "user", .content = prompt });
+    try session.appendMessage(.{ .role = .user, .content = prompt });
     const summary_index: u32 = @intCast(session.messages.items.len);
-    try session.appendMessage(.{ .role = "user", .content = summary });
+    try session.appendMessage(.{ .role = .user, .content = summary });
     try session.compactions.append(session.gpa, summary_index);
     try session.save();
 }
@@ -607,7 +609,7 @@ fn appendMessage(session: *Session, message: llm.Message) !void {
     }
 
     try session.messages.append(session.gpa, .{
-        .role = try session.pool.intern(session.gpa, message.role),
+        .role = message.role,
         .content = try session.pool.intern(session.gpa, message.content),
         .tool_call_id = try session.pool.intern(session.gpa, message.tool_call_id),
         .reasoning = try session.pool.intern(session.gpa, message.reasoning_content),
@@ -816,8 +818,7 @@ fn loadPromptAndMessages(
     if (system_prompt) |prompt| {
         try session.setSystemPrompt(prompt);
     } else {
-        while (lead < messages.len and
-            std.mem.eql(u8, messages[lead].role, "system")) lead += 1;
+        while (lead < messages.len and messages[lead].role == .system) lead += 1;
         if (lead > 0)
             try session.setSystemPrompt(messages[0].content orelse "");
     }
@@ -875,7 +876,7 @@ fn repairTail(session: *Session) !void {
     // The results that follow the message, which is where they were written.
     var answered: usize = 0;
     for (session.messages.items[tail + 1 ..]) |message| {
-        if (!std.mem.eql(u8, session.roleOf(message), "tool"))
+        if (message.role != .tool)
             break;
         answered += 1;
     }
@@ -895,7 +896,7 @@ fn repairTail(session: *Session) !void {
     while (k < calls) : (k += 1) {
         const call_id = session.messages.items[tail].tool_calls.resolve(session)[k].id;
         const result: Message = .{
-            .role = try session.pool.intern(session.gpa, "tool"),
+            .role = .tool,
             .content = try session.pool.intern(session.gpa, interrupted_result),
             .tool_call_id = call_id,
         };
@@ -918,7 +919,7 @@ fn lastCall(session: *const Session) ?usize {
     while (i > 0) {
         i -= 1;
         const message = session.messages.items[i];
-        if (std.mem.eql(u8, session.roleOf(message), "assistant") and message.tool_calls.len > 0)
+        if (message.role == .assistant and message.tool_calls.len > 0)
             return i;
     }
     return null;
@@ -1229,12 +1230,13 @@ fn reopenTestSession(tmp: *std.testing.TmpDir, session_id: []const u8) !Session 
 }
 
 /// Checks two conversations hold the same messages, field for field: the role,
-/// the content, the call a result answers, and every tool call. The strings are
-/// compared by content, since two sessions number their strings differently.
+/// the content, the call a result answers, and every tool call. The text is
+/// compared by content, since two sessions number their strings differently; a
+/// role is the enum itself, so it is compared as one.
 fn expectConvo(expected: []const llm.Message, actual: []const llm.Message) !void {
     try std.testing.expectEqual(expected.len, actual.len);
     for (expected, actual) |want, got| {
-        try std.testing.expectEqualStrings(want.role, got.role);
+        try std.testing.expectEqual(want.role, got.role);
         try std.testing.expectEqualStrings(want.content orelse "", got.content orelse "");
         try std.testing.expectEqualStrings(want.tool_call_id orelse "", got.tool_call_id orelse "");
 
@@ -1323,7 +1325,7 @@ test "a session can be started for an id that has no file yet" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, session.name(), .{}));
 
     // The first message is what writes it, exactly as for a generated id.
-    try session.append(.{ .role = "user", .content = "hello" });
+    try session.append(.{ .role = .user, .content = "hello" });
     var resumed = try reopenTestSession(&tmp, "made-by-hand");
     defer resumed.deinit();
     try std.testing.expectEqual(@as(usize, 1), resumed.messages.items.len);
@@ -1344,13 +1346,13 @@ test "a session is deleted for good, and only that session" {
     // Two sessions, so the delete can be seen to remove one and leave the other.
     var kept = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer kept.deinit();
-    try kept.append(.{ .role = "user", .content = "keep me" });
+    try kept.append(.{ .role = .user, .content = "keep me" });
     const kept_id = try gpa.dupe(u8, kept.id());
     defer gpa.free(kept_id);
 
     var gone = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer gone.deinit();
-    try gone.append(.{ .role = "user", .content = "delete me" });
+    try gone.append(.{ .role = .user, .content = "delete me" });
     const gone_id = try gpa.dupe(u8, gone.id());
     defer gpa.free(gone_id);
 
@@ -1391,7 +1393,7 @@ test "a new session is written out by its first message" {
 
     // The first message is what brings the session into being, and everything
     // set up before it lands in the file with it.
-    try session.append(.{ .role = "user", .content = "hello" });
+    try session.append(.{ .role = .user, .content = "hello" });
 
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
@@ -1553,16 +1555,16 @@ test "a listing carries each session's title" {
     var long = try newTestSession(&tmp);
     defer long.deinit();
     try long.setTitle(&long_title);
-    try long.append(.{ .role = "user", .content = "hi" });
+    try long.append(.{ .role = .user, .content = "hi" });
 
     var titled = try newTestSession(&tmp);
     defer titled.deinit();
     try titled.setTitle("Fix the parser");
-    try titled.append(.{ .role = "user", .content = "hi" });
+    try titled.append(.{ .role = .user, .content = "hi" });
 
     var unnamed = try newTestSession(&tmp);
     defer unnamed.deinit();
-    try unnamed.append(.{ .role = "user", .content = "hi" });
+    try unnamed.append(.{ .role = .user, .content = "hi" });
 
     const listed = try listIn(tmp.dir, std.testing.io, gpa);
     defer freeList(listed, gpa);
@@ -1689,12 +1691,12 @@ test "a session survives a save and resume" {
     // A message of every shape: a prompt, an assistant message that asks for a
     // tool, and the result that answers it.
     try expectResume(&.{
-        .{ .role = "user", .content = "hello" },
-        .{ .role = "assistant", .tool_calls = &.{.{
+        .{ .role = .user, .content = "hello" },
+        .{ .role = .assistant, .tool_calls = &.{.{
             .id = "call_1",
             .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" },
         }} },
-        .{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;\n" },
+        .{ .role = .tool, .tool_call_id = "call_1", .content = "1\tconst x = 1;\n" },
     });
 }
 
@@ -1707,8 +1709,8 @@ test "a resume answers a tool call a killed run left open" {
 
     // The assistant asked for a tool, and the run was killed before its result
     // was written, so the session ends on the call with no message answering it.
-    try session.append(.{ .role = "user", .content = "hello" });
-    try session.append(.{ .role = "assistant", .tool_calls = &.{.{
+    try session.append(.{ .role = .user, .content = "hello" });
+    try session.append(.{ .role = .assistant, .tool_calls = &.{.{
         .id = "call_1",
         .function = .{ .name = "bash", .arguments = "{}" },
     }} });
@@ -1719,12 +1721,12 @@ test "a resume answers a tool call a killed run left open" {
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
     try expectSessionConvo(&resumed, &.{
-        .{ .role = "user", .content = "hello" },
-        .{ .role = "assistant", .tool_calls = &.{.{
+        .{ .role = .user, .content = "hello" },
+        .{ .role = .assistant, .tool_calls = &.{.{
             .id = "call_1",
             .function = .{ .name = "bash", .arguments = "{}" },
         }} },
-        .{ .role = "tool", .tool_call_id = "call_1", .content = interrupted_result },
+        .{ .role = .tool, .tool_call_id = "call_1", .content = interrupted_result },
     });
 }
 
@@ -1735,29 +1737,29 @@ test "a resume answers every call a kill left open, in the order made" {
     var session = try newTestSession(&tmp);
     defer session.deinit();
 
-    try session.append(.{ .role = "user", .content = "go" });
-    try session.append(.{ .role = "assistant", .tool_calls = &.{
+    try session.append(.{ .role = .user, .content = "go" });
+    try session.append(.{ .role = .assistant, .tool_calls = &.{
         .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{}" } },
         .{ .id = "call_2", .function = .{ .name = "read", .arguments = "{}" } },
     } });
-    try session.append(.{ .role = "tool", .tool_call_id = "call_1", .content = "the first result" });
+    try session.append(.{ .role = .tool, .tool_call_id = "call_1", .content = "the first result" });
     // Killed before the second result, and the user typed on afterwards, so the
     // message that follows the run is not a result at all.
-    try session.append(.{ .role = "user", .content = "still there?" });
+    try session.append(.{ .role = .user, .content = "still there?" });
 
     // The result the file held stays with its call, and the call it lost is
     // answered in the place it was made rather than after the user message.
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
     try expectSessionConvo(&resumed, &.{
-        .{ .role = "user", .content = "go" },
-        .{ .role = "assistant", .tool_calls = &.{
+        .{ .role = .user, .content = "go" },
+        .{ .role = .assistant, .tool_calls = &.{
             .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{}" } },
             .{ .id = "call_2", .function = .{ .name = "read", .arguments = "{}" } },
         } },
-        .{ .role = "tool", .tool_call_id = "call_1", .content = "the first result" },
-        .{ .role = "tool", .tool_call_id = "call_2", .content = interrupted_result },
-        .{ .role = "user", .content = "still there?" },
+        .{ .role = .tool, .tool_call_id = "call_1", .content = "the first result" },
+        .{ .role = .tool, .tool_call_id = "call_2", .content = interrupted_result },
+        .{ .role = .user, .content = "still there?" },
     });
 }
 
@@ -1771,15 +1773,15 @@ test "a resume leaves a finished conversation alone" {
     // A run that finished leaves every call answered and its compaction in
     // place, which is what the repair must not disturb.
     try session.setSystemPrompt("be terse");
-    try session.append(.{ .role = "user", .content = "go" });
-    try session.append(.{ .role = "assistant", .tool_calls = &.{
+    try session.append(.{ .role = .user, .content = "go" });
+    try session.append(.{ .role = .assistant, .tool_calls = &.{
         .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{}" } },
         .{ .id = "call_2", .function = .{ .name = "read", .arguments = "{}" } },
     } });
-    try session.append(.{ .role = "tool", .tool_call_id = "call_1", .content = "one" });
-    try session.append(.{ .role = "tool", .tool_call_id = "call_2", .content = "two" });
+    try session.append(.{ .role = .tool, .tool_call_id = "call_1", .content = "one" });
+    try session.append(.{ .role = .tool, .tool_call_id = "call_2", .content = "two" });
     try session.appendCompaction("summarize this", "the summary");
-    try session.append(.{ .role = "assistant", .content = "done" });
+    try session.append(.{ .role = .assistant, .content = "done" });
 
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
@@ -1799,8 +1801,8 @@ test "a repair moves a compaction that sits behind the turn it completes" {
     // A file that holds a compaction right behind a call with no result, as one
     // written by hand can: the answer the repair inserts lands in front of both
     // the prompt and the summary.
-    try session.append(.{ .role = "user", .content = "go" });
-    try session.append(.{ .role = "assistant", .tool_calls = &.{.{
+    try session.append(.{ .role = .user, .content = "go" });
+    try session.append(.{ .role = .assistant, .tool_calls = &.{.{
         .id = "call_1",
         .function = .{ .name = "read", .arguments = "{}" },
     }} });
@@ -1830,12 +1832,12 @@ test "a conversation writes the messages a request would have carried" {
     // alongside the result that answers it. The system prompt is its own field,
     // which the request opens with.
     try session.setSystemPrompt("be terse");
-    try session.append(.{ .role = "user", .content = "hello" });
-    try session.append(.{ .role = "assistant", .tool_calls = &.{.{
+    try session.append(.{ .role = .user, .content = "hello" });
+    try session.append(.{ .role = .assistant, .tool_calls = &.{.{
         .id = "call_1",
         .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" },
     }} });
-    try session.append(.{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;\n" });
+    try session.append(.{ .role = .tool, .tool_call_id = "call_1", .content = "1\tconst x = 1;\n" });
 
     const expected = "[{\"role\":\"system\",\"content\":\"be terse\"}," ++
         "{\"role\":\"user\",\"content\":\"hello\"}," ++
@@ -1861,14 +1863,14 @@ test "an extra message is written after the conversation, and is not part of it"
     var session = try newTestSession(&tmp);
     defer session.deinit();
     try session.setSystemPrompt("be terse");
-    try session.append(.{ .role = "user", .content = "hello" });
-    try session.append(.{ .role = "assistant", .content = "hi" });
+    try session.append(.{ .role = .user, .content = "hello" });
+    try session.append(.{ .role = .assistant, .content = "hi" });
     const before = session.messages.items.len;
 
     // A request that carries one message more than the session holds, such as the
     // prompt that asks for a title: the extra is written last, as the newest
     // message, and the session is left exactly as it was.
-    const extra = [_]llm.Message{.{ .role = "user", .content = "give it a title" }};
+    const extra = [_]llm.Message{.{ .role = .user, .content = "give it a title" }};
     try expectRequestJson(&session, &extra, "[{\"role\":\"system\",\"content\":\"be terse\"}," ++
         "{\"role\":\"user\",\"content\":\"hello\"}," ++
         "{\"role\":\"assistant\",\"content\":\"hi\"}," ++
@@ -1886,7 +1888,7 @@ test "a string that is not valid UTF-8 is repaired on the way into the pool" {
     // A command's output and a file read back are arbitrary bytes, so a result
     // holds a stray continuation byte and a cut-off sequence, neither of which
     // is UTF-8.
-    try session.append(.{ .role = "tool", .tool_call_id = "call_1", .content = "a\x80b\xffc" });
+    try session.append(.{ .role = .tool, .tool_call_id = "call_1", .content = "a\x80b\xffc" });
 
     // The pool holds text, so a request writes the content as a string. Left as
     // bytes, Zig would write it as an array of numbers the API rejects.
@@ -1932,8 +1934,8 @@ test "a stored message reads back as its parts" {
     var session = try newTestSession(&tmp);
     defer session.deinit();
 
-    try session.append(.{ .role = "user", .content = "hello" });
-    try session.append(.{ .role = "assistant", .tool_calls = &.{
+    try session.append(.{ .role = .user, .content = "hello" });
+    try session.append(.{ .role = .assistant, .tool_calls = &.{
         .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" } },
         .{ .id = "call_2", .function = .{ .name = "bash", .arguments = "{}" } },
     } });
@@ -1968,12 +1970,12 @@ test "a tool result is found only from where the search starts" {
     var session = try newTestSession(&tmp);
     defer session.deinit();
 
-    try session.append(.{ .role = "assistant", .tool_calls = &.{.{
+    try session.append(.{ .role = .assistant, .tool_calls = &.{.{
         .id = "call_1",
         .function = .{ .name = "read", .arguments = "{}" },
     }} });
-    try session.append(.{ .role = "tool", .tool_call_id = "call_1", .content = "the result" });
-    try session.append(.{ .role = "tool", .tool_call_id = "old", .content = "an earlier result" });
+    try session.append(.{ .role = .tool, .tool_call_id = "call_1", .content = "the result" });
+    try session.append(.{ .role = .tool, .tool_call_id = "old", .content = "an earlier result" });
 
     // The replay searches from the message after the call, which is where its
     // result sits.
@@ -1987,28 +1989,27 @@ test "a tool result is found only from where the search starts" {
     try std.testing.expectEqualStrings("", session.toolResult(99, "call_1"));
 }
 
-test "an equal string is interned once and shared" {
+test "every string is kept as it was written, and reads back as its own" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var session = try newTestSession(&tmp);
     defer session.deinit();
 
-    try session.append(.{ .role = "user", .content = "hello" });
-    try session.append(.{ .role = "assistant", .content = "hello" });
+    try session.append(.{ .role = .user, .content = "hello" });
+    try session.append(.{ .role = .assistant, .content = "hello" });
     try session.append(.{
-        .role = "assistant",
+        .role = .assistant,
         .tool_calls = &.{
             .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{}" } },
-            // The same call read twice: its id and its name are already in the
-            // pool, and only the arguments that differ are added.
             .{ .id = "call_1", .function = .{ .name = "read", .arguments = "[]" } },
         },
     });
 
-    // Each distinct string once, in the order it was first seen.
+    // Each distinct string once, in the order it was first seen. A role is not
+    // among them: it is the enum, so no copy of "user" or "assistant" is kept.
     try std.testing.expectEqualStrings(
-        "/work\x00user\x00hello\x00assistant\x00call_1\x00function\x00read\x00{}\x00[]\x00",
+        "/work\x00hello\x00call_1\x00function\x00read\x00{}\x00[]\x00",
         session.pool.strings.items,
     );
     // The two equal contents, and the repeated parts of the two tool calls,
@@ -2017,7 +2018,6 @@ test "an equal string is interned once and shared" {
     const calls = session.messages.items[2].tool_calls.resolve(&session);
     try std.testing.expectEqual(calls[0].id, calls[1].id);
     try std.testing.expectEqual(calls[0].function.name, calls[1].function.name);
-    try std.testing.expect(calls[0].function.arguments != calls[1].function.arguments);
 }
 
 test "a version 2 file's system prompt is lifted into its own field" {
@@ -2056,8 +2056,8 @@ test "a compaction is appended and a request starts at its summary" {
     defer session.deinit();
 
     try session.setSystemPrompt("be terse");
-    try session.append(.{ .role = "user", .content = "one" });
-    try session.append(.{ .role = "assistant", .content = "first answer" });
+    try session.append(.{ .role = .user, .content = "one" });
+    try session.append(.{ .role = .assistant, .content = "first answer" });
     // Nothing compacted yet, so a request carries the whole conversation.
     try std.testing.expectEqual(0, session.sentFrom());
 
@@ -2082,7 +2082,7 @@ test "a compaction is appended and a request starts at its summary" {
     try std.testing.expect(!session.isCompaction(99));
 
     // The messages after the compaction are sent in full.
-    try session.append(.{ .role = "user", .content = "next" });
+    try session.append(.{ .role = .user, .content = "next" });
     try std.testing.expectEqual(3, session.sentFrom());
 }
 
@@ -2093,9 +2093,9 @@ test "a compaction survives a save and resume" {
     var session = try newTestSession(&tmp);
     defer session.deinit();
     try session.setSystemPrompt("be terse");
-    try session.append(.{ .role = "user", .content = "one" });
+    try session.append(.{ .role = .user, .content = "one" });
     try session.appendCompaction("summarize this", "the summary");
-    try session.append(.{ .role = "user", .content = "next" });
+    try session.append(.{ .role = .user, .content = "next" });
 
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
@@ -2141,12 +2141,12 @@ test "the messages a request carries start at the latest compaction" {
     var session = try newTestSession(&tmp);
     defer session.deinit();
     try session.setSystemPrompt("s");
-    try session.append(.{ .role = "user", .content = "old" });
+    try session.append(.{ .role = .user, .content = "old" });
     // Two compactions: a request starts at the later summary, not the earlier.
     try session.appendCompaction("p1", "summary one");
-    try session.append(.{ .role = "user", .content = "middle" });
+    try session.append(.{ .role = .user, .content = "middle" });
     try session.appendCompaction("p2", "summary two");
-    try session.append(.{ .role = "user", .content = "latest" });
+    try session.append(.{ .role = .user, .content = "latest" });
 
     // The system prompt, then the latest summary and the prompt after it: the
     // first compaction and everything before it is left out.
@@ -2170,7 +2170,7 @@ test "the system prompt is kept apart from the conversation and is not replaced"
     try std.testing.expectEqual(0, session.messages.items.len);
 
     // A session that already has one keeps it, which is what a resume relies on.
-    try session.append(.{ .role = "user", .content = "hi" });
+    try session.append(.{ .role = .user, .content = "hi" });
     try session.ensureSystemPrompt("a different prompt");
     try std.testing.expectEqualStrings("current prompt", session.pool.get(session.system_prompt).?);
     try std.testing.expectEqual(1, session.messages.items.len);
@@ -2232,7 +2232,7 @@ test "ensureTools stores the tools and only sets them once" {
         error.FileNotFound,
         tmp.dir.statFile(std.testing.io, session.name(), .{}),
     );
-    try session.append(.{ .role = "user", .content = "hi" });
+    try session.append(.{ .role = .user, .content = "hi" });
 
     // The stored tools survive a save and resume.
     var resumed = try reopenTestSession(&tmp, session.id());
@@ -2283,7 +2283,7 @@ test "the token totals survive a save and resume" {
         .cache_hit_tokens = 90,
         .cache_miss_tokens = 10,
     }, 0.0001);
-    try session.append(.{ .role = "user", .content = "hi" });
+    try session.append(.{ .role = .user, .content = "hi" });
     // A second request adds to the totals rather than replacing them.
     session.recordUsage(.{
         .prompt_tokens = 200,
@@ -2292,7 +2292,7 @@ test "the token totals survive a save and resume" {
         .cache_hit_tokens = 180,
         .cache_miss_tokens = 20,
     }, 0.0002);
-    try session.append(.{ .role = "assistant", .content = "hello" });
+    try session.append(.{ .role = .assistant, .content = "hello" });
 
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
@@ -2335,11 +2335,11 @@ test "a new session does not reuse an id whose file exists" {
 
     var first = try newTestSession(&tmp);
     defer first.deinit();
-    try first.append(.{ .role = "user", .content = "keep me" });
+    try first.append(.{ .role = .user, .content = "keep me" });
 
     var second = try newTestSession(&tmp);
     defer second.deinit();
-    try second.append(.{ .role = "user", .content = "and me" });
+    try second.append(.{ .role = .user, .content = "and me" });
 
     try std.testing.expect(!std.mem.eql(u8, first.id(), second.id()));
 
@@ -2358,7 +2358,7 @@ test "the working directory is stored and restored on resume" {
     var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/home/user/project");
     defer session.deinit();
     try std.testing.expectEqualStrings("/home/user/project", session.cwd());
-    try session.append(.{ .role = "user", .content = "hello" });
+    try session.append(.{ .role = .user, .content = "hello" });
 
     // Resumed from somewhere else, it keeps the directory it was started in.
     var resumed = try Session.open(std.testing.io, tmp.dir, gpa, session.id(), "/somewhere/else");

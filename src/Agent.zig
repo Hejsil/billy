@@ -637,7 +637,7 @@ pub fn ask(agent: *Agent, emitter: Emitter, session: *Session, text: []const u8)
     const first_turn = session.messages.items.len == 0;
     _ = try nameFromPrompt(session, text);
 
-    try session.append(.{ .role = "user", .content = text });
+    try session.append(.{ .role = .user, .content = text });
     try emitter.show(.{ .prompt = text });
     try turn(agent, emitter, session);
 
@@ -967,7 +967,7 @@ fn runCalls(
         }
 
         try session.append(.{
-            .role = "tool",
+            .role = .tool,
             .tool_call_id = call.id,
             .content = result.written(),
         });
@@ -1053,7 +1053,7 @@ const title_prompt =
 /// usable leaves the session as it is, so the title it already has (the one
 /// derived from the first prompt) stands.
 fn titleSession(agent: *Agent, session: *Session) !void {
-    const extra = [_]llm.Message{.{ .role = "user", .content = title_prompt }};
+    const extra = [_]llm.Message{.{ .role = .user, .content = title_prompt }};
     const completion = try agent.client.complete(agent.gpa, session.conversation(&extra), session.toolSet());
     defer completion.deinit();
     session.recordCost(completion.usage, costOf(agent.rateNow(), completion.usage));
@@ -1193,7 +1193,7 @@ fn summarize(agent: *Agent, session: *Session) !?[]const u8 {
     // message on the end, so the model reads exactly what happened. Nothing is
     // added to the session: the prompt is written straight out of the local
     // array and is gone when this returns.
-    const extra = [_]llm.Message{.{ .role = "user", .content = compact_prompt }};
+    const extra = [_]llm.Message{.{ .role = .user, .content = compact_prompt }};
     const completion = try agent.client.complete(agent.gpa, session.conversation(&extra), session.toolSet());
     defer completion.deinit();
     session.recordCost(completion.usage, costOf(agent.rateNow(), completion.usage));
@@ -1239,14 +1239,14 @@ test "printTranscript shows only the last blocks and counts the rest" {
     defer session.deinit();
     // A prompt, one assistant message that asks for two tools, their results, and
     // a reply: four blocks, with two of them in the one tool-calling message.
-    try session.append(.{ .role = "user", .content = "one" });
-    try session.append(.{ .role = "assistant", .tool_calls = &.{
+    try session.append(.{ .role = .user, .content = "one" });
+    try session.append(.{ .role = .assistant, .tool_calls = &.{
         .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" } },
         .{ .id = "call_2", .function = .{ .name = "read", .arguments = "{\"path\":\"b.zig\"}" } },
     } });
-    try session.append(.{ .role = "tool", .tool_call_id = "call_1", .content = "contents a" });
-    try session.append(.{ .role = "tool", .tool_call_id = "call_2", .content = "contents b" });
-    try session.append(.{ .role = "assistant", .content = "done" });
+    try session.append(.{ .role = .tool, .tool_call_id = "call_1", .content = "contents a" });
+    try session.append(.{ .role = .tool, .tool_call_id = "call_2", .content = "contents b" });
+    try session.append(.{ .role = .assistant, .content = "done" });
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -1284,14 +1284,14 @@ test "printTranscript replays a conversation as the blocks it was made of" {
             "▸ read a.zig\n▾ output\n1\tconst x = 1;\n\n" ++
             "◆ answer\ndone\n",
         &.{
-            .{ .role = "system", .content = "ignore me" },
-            .{ .role = "user", .content = "hello" },
-            .{ .role = "assistant", .tool_calls = &.{.{
+            .{ .role = .system, .content = "ignore me" },
+            .{ .role = .user, .content = "hello" },
+            .{ .role = .assistant, .tool_calls = &.{.{
                 .id = "call_1",
                 .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" },
             }} },
-            .{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;" },
-            .{ .role = "assistant", .content = "done" },
+            .{ .role = .tool, .tool_call_id = "call_1", .content = "1\tconst x = 1;" },
+            .{ .role = .assistant, .content = "done" },
         },
         .plain,
     );
@@ -1303,8 +1303,8 @@ test "printTranscript leaves out the system prompt and an unpaired tool result" 
     try expectTranscript(
         "",
         &.{
-            .{ .role = "system", .content = "ignore me" },
-            .{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;" },
+            .{ .role = .system, .content = "ignore me" },
+            .{ .role = .tool, .tool_call_id = "call_1", .content = "1\tconst x = 1;" },
         },
         .plain,
     );
@@ -1315,14 +1315,14 @@ test "a reply is headed by its own header, and its markdown laid out" {
     // off and the text is set as a terminal shows it.
     try expectTranscript(
         "◆ answer\nhi\n",
-        &.{.{ .role = "assistant", .content = "**hi**" }},
+        &.{.{ .role = .assistant, .content = "**hi**" }},
         .plain,
     );
 
     // An empty reply is said to be empty rather than shown blank.
     try expectTranscript(
         "◆ answer\n(empty reply)\n",
-        &.{.{ .role = "assistant", .content = "" }},
+        &.{.{ .role = .assistant, .content = "" }},
         .plain,
     );
 }
@@ -1331,7 +1331,7 @@ test "a prompt from the session is headed and laid out like a reply" {
     // A prompt is markdown too, so it is laid out by the same renderer.
     try expectTranscript(
         "\n» prompt\nhi\n\n",
-        &.{.{ .role = "user", .content = "**hi**" }},
+        &.{.{ .role = .user, .content = "**hi**" }},
         .plain,
     );
 }
@@ -1339,7 +1339,7 @@ test "a prompt from the session is headed and laid out like a reply" {
 test "an empty reply is shown under its header, in place of the text" {
     try expectTranscript(
         "◆ answer\n(empty reply)\n",
-        &.{.{ .role = "assistant", .content = "" }},
+        &.{.{ .role = .assistant, .content = "" }},
         .plain,
     );
 }
@@ -1351,8 +1351,8 @@ test "a prompt and a reply are headed alike, in the colours of the display" {
         "\n\x1b[34m»\x1b[0m \x1b[1mprompt\x1b[0m\nhello\n\n" ++
             "\x1b[32m◆\x1b[0m \x1b[1manswer\x1b[0m\nhi\n",
         &.{
-            .{ .role = "user", .content = "hello" },
-            .{ .role = "assistant", .content = "hi" },
+            .{ .role = .user, .content = "hello" },
+            .{ .role = .assistant, .content = "hi" },
         },
         .ansi,
     );
@@ -1367,11 +1367,11 @@ test "printTranscript shows a compaction as a single line" {
     var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
     try session.setSystemPrompt("be terse");
-    try session.append(.{ .role = "user", .content = "one" });
-    try session.append(.{ .role = "assistant", .content = "a1" });
+    try session.append(.{ .role = .user, .content = "one" });
+    try session.append(.{ .role = .assistant, .content = "a1" });
     try session.appendCompaction("summarize this", "the summary");
-    try session.append(.{ .role = "user", .content = "two" });
-    try session.append(.{ .role = "assistant", .content = "a2" });
+    try session.append(.{ .role = .user, .content = "two" });
+    try session.append(.{ .role = .assistant, .content = "a2" });
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -1411,9 +1411,9 @@ test "a compaction is headed by its own mark, and hides what it stands for" {
     var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
     try session.setSystemPrompt("s");
-    try session.append(.{ .role = "user", .content = "hi" });
+    try session.append(.{ .role = .user, .content = "hi" });
     try session.appendCompaction("ASKEDFORTHEcompaction", "THESUMMARYTEXT");
-    try session.append(.{ .role = "user", .content = "next" });
+    try session.append(.{ .role = .user, .content = "next" });
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -1433,12 +1433,12 @@ test "printTranscript gives each call the result that names it" {
         "▸ read a.zig\n▾ output\ncontents of a\n\n" ++
             "▸ read b.zig\n▾ output\ncontents of b\n\n",
         &.{
-            .{ .role = "assistant", .tool_calls = &.{
+            .{ .role = .assistant, .tool_calls = &.{
                 .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" } },
                 .{ .id = "call_2", .function = .{ .name = "read", .arguments = "{\"path\":\"b.zig\"}" } },
             } },
-            .{ .role = "tool", .tool_call_id = "call_1", .content = "contents of a" },
-            .{ .role = "tool", .tool_call_id = "call_2", .content = "contents of b" },
+            .{ .role = .tool, .tool_call_id = "call_1", .content = "contents of a" },
+            .{ .role = .tool, .tool_call_id = "call_2", .content = "contents of b" },
         },
         .plain,
     );
@@ -1450,14 +1450,14 @@ test "printTranscript rebuilds an edit's diff from the stored call" {
     try expectTranscript(
         "✎ edit a.zig\n▾ diff\n-old\n+new\n\n",
         &.{
-            .{ .role = "assistant", .tool_calls = &.{.{
+            .{ .role = .assistant, .tool_calls = &.{.{
                 .id = "call_1",
                 .function = .{
                     .name = "edit",
                     .arguments = "{\"path\":\"a.zig\",\"old_string\":\"old\",\"new_string\":\"new\"}",
                 },
             }} },
-            .{ .role = "tool", .tool_call_id = "call_1", .content = "replaced 1 occurrence(s) in a.zig" },
+            .{ .role = .tool, .tool_call_id = "call_1", .content = "replaced 1 occurrence(s) in a.zig" },
         },
         .plain,
     );
@@ -1952,13 +1952,13 @@ test "maybeCompact folds the conversation once it has filled the window" {
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
     try session.setSystemPrompt("be terse");
-    try session.append(.{ .role = "user", .content = "OLDPROMPT" });
-    try session.append(.{ .role = "assistant", .tool_calls = &.{.{
+    try session.append(.{ .role = .user, .content = "OLDPROMPT" });
+    try session.append(.{ .role = .assistant, .tool_calls = &.{.{
         .id = "call_x",
         .function = .{ .name = "bash", .arguments = "{}" },
     }} });
-    try session.append(.{ .role = "tool", .tool_call_id = "call_x", .content = "OLDTOOLOUTPUT" });
-    try session.append(.{ .role = "assistant", .content = "OLDANSWER" });
+    try session.append(.{ .role = .tool, .tool_call_id = "call_x", .content = "OLDTOOLOUTPUT" });
+    try session.append(.{ .role = .assistant, .content = "OLDANSWER" });
 
     var config = testConfig("m", "/work", null);
     config.model_info = .{
@@ -2035,7 +2035,7 @@ test "maybeCompact does nothing below the threshold, off, or with nothing new" {
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
     try session.setSystemPrompt("s");
-    try session.append(.{ .role = "user", .content = "hello" });
+    try session.append(.{ .role = .user, .content = "hello" });
 
     var config = testConfig("m", "/work", null);
     config.model_info = .{ .provider = .deepseek, .model = "m", .context_window = 1000, .price = .{} };
@@ -2079,8 +2079,8 @@ test "a compaction asked for now folds the conversation in whatever its size" {
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
     try session.setSystemPrompt("s");
-    try session.append(.{ .role = "user", .content = "hello" });
-    try session.append(.{ .role = "assistant", .content = "hi" });
+    try session.append(.{ .role = .user, .content = "hello" });
+    try session.append(.{ .role = .assistant, .content = "hi" });
 
     var config = testConfig("m", "/work", null);
     config.model_info = .{ .provider = .deepseek, .model = "m", .context_window = 1000, .price = .{} };
@@ -2354,7 +2354,7 @@ test "a prompt after the first leaves the session as it was set up" {
     defer agent.deinit();
 
     _ = try agent.start(&session, "the first thing", .general);
-    try session.append(.{ .role = "assistant", .content = "done" });
+    try session.append(.{ .role = .assistant, .content = "done" });
 
     // A session that has been asked something is not started again: its mode is
     // the one it was saved with, and a mode command in a later prompt is part of

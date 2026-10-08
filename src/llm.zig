@@ -4,9 +4,31 @@ const std = @import("std");
 const Health = @import("Health.zig");
 const Mock = @import("Mock.zig");
 
+/// Who a message is from. The API names these as strings; they are an enum here
+/// because they are a fixed set that is compared and stored far more often than
+/// it is written, and a string would be interned, hashed and compared by bytes
+/// on every one of them.
+pub const Role = enum {
+    system,
+    user,
+    assistant,
+    tool,
+
+    /// The name the API knows the role by, which is the variant's own.
+    pub fn name(role: Role) []const u8 {
+        return @tagName(role);
+    }
+
+    /// Writes the role as the string the API expects, so a request carries
+    /// `"role":"user"` rather than a number.
+    pub fn jsonStringify(role: Role, json: anytype) !void {
+        try json.write(role.name());
+    }
+};
+
 /// A message in the conversation, as sent to and received from the API.
 pub const Message = struct {
-    role: []const u8,
+    role: Role,
     content: ?[]const u8 = null,
     tool_calls: ?[]const ToolCall = null,
     tool_call_id: ?[]const u8 = null,
@@ -418,7 +440,7 @@ const NoTools = struct {};
 
 test "what a request asks of the model's thinking, by setting" {
     const gpa = std.testing.allocator;
-    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+    const messages = [_]Message{.{ .role = .user, .content = "hi" }};
 
     // The three shapes, and the field each puts on the wire: none at all for the
     // model's own default, the toggle for no thinking, and the level for an
@@ -449,13 +471,13 @@ test "a request counts out to exactly the body it writes" {
     const gpa = std.testing.allocator;
 
     const messages = [_]Message{
-        .{ .role = "system", .content = "be terse" },
-        .{ .role = "user", .content = "hello \"world\"\n" },
-        .{ .role = "assistant", .tool_calls = &.{.{
+        .{ .role = .system, .content = "be terse" },
+        .{ .role = .user, .content = "hello \"world\"\n" },
+        .{ .role = .assistant, .tool_calls = &.{.{
             .id = "call_1",
             .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" },
         }} },
-        .{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;\n" },
+        .{ .role = .tool, .tool_call_id = "call_1", .content = "1\tconst x = 1;\n" },
     };
     const request: Request(@TypeOf(&messages), []const NoTools) = .{
         .model = "some-model",
@@ -485,13 +507,13 @@ test "a request reaches the wire with the body the head promised" {
     const io = std.testing.io;
 
     const messages = [_]Message{
-        .{ .role = "system", .content = "be terse" },
-        .{ .role = "user", .content = "say \"hi\"\n" },
-        .{ .role = "assistant", .tool_calls = &.{.{
+        .{ .role = .system, .content = "be terse" },
+        .{ .role = .user, .content = "say \"hi\"\n" },
+        .{ .role = .assistant, .tool_calls = &.{.{
             .id = "call_1",
             .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" },
         }} },
-        .{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;\n" },
+        .{ .role = .tool, .tool_call_id = "call_1", .content = "1\tconst x = 1;\n" },
     };
     const expected = try std.json.Stringify.valueAlloc(
         gpa,
@@ -610,7 +632,7 @@ fn completeAgainst(gpa: std.mem.Allocator, io: std.Io, url: []const u8, max_atte
         .retry_backoff = .zero,
         .http = &http,
     };
-    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+    const messages = [_]Message{.{ .role = .user, .content = "hi" }};
     return client.complete(gpa, &messages, @as([]const NoTools, &.{}));
 }
 
@@ -701,7 +723,7 @@ test "the HTTP client is kept, so requests reuse one connection" {
     // have to open a second connection, which this server, on one, never
     // accepts; the second request only completes because the connection is
     // reused.
-    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+    const messages = [_]Message{.{ .role = .user, .content = "hi" }};
     for (0..2) |_| {
         const completion = try client.complete(gpa, &messages, @as([]const NoTools, &.{}));
         defer completion.deinit();

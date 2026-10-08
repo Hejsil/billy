@@ -1444,21 +1444,21 @@ test "a whole conversation is rendered, a tool call and a compaction included" {
     // and a compaction standing in for the conversation before it. The system
     // prompt is its own field, which the conversation does not show.
     try session.setSystemPrompt("be terse");
-    try session.append(.{ .role = "user", .content = "read it" });
-    try session.append(.{ .role = "assistant", .tool_calls = &.{.{
+    try session.append(.{ .role = .user, .content = "read it" });
+    try session.append(.{ .role = .assistant, .tool_calls = &.{.{
         .id = "call_1",
         .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" },
     }} });
-    try session.append(.{ .role = "tool", .tool_call_id = "call_1", .content = "1\tconst x = 1;" });
-    try session.append(.{ .role = "assistant", .tool_calls = &.{.{
+    try session.append(.{ .role = .tool, .tool_call_id = "call_1", .content = "1\tconst x = 1;" });
+    try session.append(.{ .role = .assistant, .tool_calls = &.{.{
         .id = "call_2",
         .function = .{
             .name = "edit",
             .arguments = "{\"path\":\"a.zig\",\"old_string\":\"old\",\"new_string\":\"new\"}",
         },
     }} });
-    try session.append(.{ .role = "tool", .tool_call_id = "call_2", .content = "replaced 1 occurrence(s) in a.zig" });
-    try session.append(.{ .role = "assistant", .content = "done **now**" });
+    try session.append(.{ .role = .tool, .tool_call_id = "call_2", .content = "replaced 1 occurrence(s) in a.zig" });
+    try session.append(.{ .role = .assistant, .content = "done **now**" });
     try session.appendCompaction("summarize", "the summary so far");
 
     var out: std.Io.Writer.Allocating = .init(gpa);

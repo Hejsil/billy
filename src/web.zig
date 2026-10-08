@@ -1019,7 +1019,7 @@ const TestServer = struct {
         var opened = try Session.open(std.testing.io, server.setup.sessions, std.testing.allocator, null, ".");
         defer opened.deinit();
         if (title) |name| try opened.setTitle(name);
-        try opened.append(.{ .role = "user", .content = "hello" });
+        try opened.append(.{ .role = .user, .content = "hello" });
         try opened.save();
         return std.testing.allocator.dupe(u8, opened.id());
     }
