@@ -255,7 +255,7 @@ fn runSession(
             out,
             &session,
             config.display,
-            setup.settings.resume_blocks,
+            setup.config.stored.resume_blocks,
         );
     }
     try billy.agent.run(io, init.gpa, out, config, &session);

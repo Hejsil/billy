@@ -148,18 +148,6 @@ const Stored = struct {
         // and would be sent to the provider as one.
         if (stored.reasoning.len == 0) return error.InvalidConfig;
     }
-
-    /// Reads the settings of the file back into `config`, the same fields the two
-    /// share, by name. The configuration keeps its own arena, which the file does
-    /// not hold.
-    fn toConfig(stored: Stored, config: *Config) void {
-        const fields = @typeInfo(Stored).@"struct".field_names;
-        inline for (fields) |name| {
-            if (comptime @hasField(Config, name)) {
-                @field(config, name) = @field(stored, name);
-            }
-        }
-    }
 };
 
 /// Backs every string the configuration holds, which is the format scripts read
@@ -167,25 +155,7 @@ const Stored = struct {
 /// configuration with `deinit` rather than tracking each string, and every
 /// allocation `open` makes goes through it.
 arena_state: std.heap.ArenaAllocator,
-
-/// Model turns allowed for one request before the harness gives up on it.
-max_turns: usize = Stored.default.max_turns,
-/// How many of the most recent blocks a resumed session replays, so resuming a
-/// long conversation is quick. Zero replays the whole session.
-resume_blocks: usize = Stored.default.resume_blocks,
-/// How full the context window must be, as a whole percentage, before the
-/// conversation is compacted into a summary, so a long session keeps going
-/// rather than failing on an overlong request. Zero turns compaction off.
-compact_at: usize = Stored.default.compact_at,
-/// Whether billy asks the model for a short title for a session, after its first
-/// turn, so the web frontend can list it by name. Off leaves sessions listed by
-/// id, and saves a request per session.
-title: bool = Stored.default.title,
-/// What billy asks of the model's thinking: `off` for none, `default` to leave
-/// it to the model's provider, or an effort level of the provider's own.
-reasoning: []const u8 = Stored.default.reasoning,
-/// Settings for the tools the agent can call, by tool name.
-tools: Tools = Stored.default.tools,
+stored: Stored = .default,
 
 /// An empty configuration, with the arena a file read fills in. Its settings
 /// are the defaults, which is what a missing file is written with.
@@ -196,21 +166,6 @@ pub fn init(gpa: std.mem.Allocator) Config {
 /// Frees every string the configuration holds, at once.
 pub fn deinit(config: *Config) void {
     config.arena_state.deinit();
-}
-
-/// The settings of the configuration as they are written to disk. Every field
-/// the file and the configuration share is taken across by name, so a setting
-/// added to both is written without a line here; `version` is the file's own and
-/// has no field in the configuration.
-fn toStored(config: *const Config) Stored {
-    var stored: Stored = .{};
-    const fields = @typeInfo(Stored).@"struct".field_names;
-    inline for (fields) |name| {
-        if (comptime @hasField(Config, name)) {
-            @field(stored, name) = @field(config, name);
-        }
-    }
-    return stored;
 }
 
 /// Reads the configuration from `dir`, writing `file_name` with the defaults
@@ -233,14 +188,12 @@ pub fn open(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator) !Opened {
         else => return err,
     };
 
-    const stored = std.json.parseFromSliceLeaky(Stored, arena, text, .{
+    config.stored = std.json.parseFromSliceLeaky(Stored, arena, text, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_if_needed,
     }) catch return error.CorruptConfig;
 
-    try stored.validate();
-    stored.toConfig(&config);
-
+    try config.stored.validate();
     return .{ .config = config, .created = false };
 }
 
@@ -258,29 +211,10 @@ pub fn save(config: *const Config, io: std.Io, dir: std.Io.Dir) !void {
     var buf: [std.heap.page_size_min]u8 = undefined;
     var file = atomic.file.writer(io, &buf);
 
-    const stored = config.toStored();
-    try std.json.Stringify.value(stored, .{ .whitespace = .indent_2 }, &file.interface);
+    try std.json.Stringify.value(config.stored, .{ .whitespace = .indent_2 }, &file.interface);
 
     try file.flush();
     try atomic.replace(io);
-}
-
-// A setting that lives in the configuration but never reaches the file is half
-// a setting, so one added without the other is a mistake worth stopping over.
-// The version belongs to the file alone, and the arena to the configuration.
-comptime {
-    for (@typeInfo(Config).@"struct".field_names) |name| {
-        if (std.mem.eql(u8, name, "arena_state")) continue;
-        if (!@hasField(Stored, name)) {
-            @compileError("Config." ++ name ++ " would not be saved: add it to Stored as well");
-        }
-    }
-    for (@typeInfo(Stored).@"struct".field_names) |name| {
-        if (std.mem.eql(u8, name, "version")) continue;
-        if (!@hasField(Config, name)) {
-            @compileError("Stored." ++ name ++ " has no field in Config: add one so it is read back");
-        }
-    }
 }
 
 /// Sets the option named by the dotted `path` -- such as `tools.bash.format` --
@@ -295,8 +229,7 @@ comptime {
 /// configuration unusable, such as a zero timeout, is refused rather than
 /// stored. Strings are kept in the configuration's own arena.
 pub fn set(config: *Config, path: []const u8, value: []const u8) !void {
-    var stored = config.toStored();
-
+    var stored = config.stored;
     try setPath(Stored, &stored, path, config.arena_state.allocator(), value);
 
     // A value that would make the configuration one the next read refuses, such
@@ -305,7 +238,7 @@ pub fn set(config: *Config, path: []const u8, value: []const u8) !void {
         error.InvalidConfig => return error.InvalidValue,
         else => |other| return other,
     };
-    stored.toConfig(config);
+    config.stored = stored;
 }
 
 /// Walks `path` into `target` one field at a time and sets the leaf it names.
@@ -495,13 +428,13 @@ test "open writes the defaults when the file is missing" {
     var first = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
     defer first.config.deinit();
     try std.testing.expect(first.created);
-    try std.testing.expectEqual(Stored.default.max_turns, first.config.max_turns);
+    try std.testing.expectEqual(Stored.default.max_turns, first.config.stored.max_turns);
 
     // The file is now there, so a second open leaves it alone and reads it back.
     var second = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
     defer second.config.deinit();
     try std.testing.expect(!second.created);
-    try std.testing.expectEqual(Stored.default.max_turns, second.config.max_turns);
+    try std.testing.expectEqual(Stored.default.max_turns, second.config.stored.max_turns);
 }
 
 test "open reads the max_turns and the bash format from the file" {
@@ -513,10 +446,10 @@ test "open reads the max_turns and the bash format from the file" {
         "\"tools\":{\"bash\":{\"format\":\"shfmt | bat -l bash\",\"unknown\":1}}}");
     defer opened.config.deinit();
     try std.testing.expect(!opened.created);
-    try std.testing.expectEqual(7, opened.config.max_turns);
-    try std.testing.expectEqualStrings("shfmt | bat -l bash", opened.config.tools.bash.format.?);
+    try std.testing.expectEqual(7, opened.config.stored.max_turns);
+    try std.testing.expectEqualStrings("shfmt | bat -l bash", opened.config.stored.tools.bash.format.?);
     // A file without a replay count shows the default number of blocks.
-    try std.testing.expectEqual(Stored.default.resume_blocks, opened.config.resume_blocks);
+    try std.testing.expectEqual(Stored.default.resume_blocks, opened.config.stored.resume_blocks);
 }
 
 test "open reads the block count a resume replays from the file" {
@@ -525,12 +458,12 @@ test "open reads the block count a resume replays from the file" {
 
     var opened = try openFrom(&tmp, "{\"resume_blocks\":3}");
     defer opened.config.deinit();
-    try std.testing.expectEqual(3, opened.config.resume_blocks);
+    try std.testing.expectEqual(3, opened.config.stored.resume_blocks);
 
     // Zero is allowed: it shows the whole session.
     var whole = try openFrom(&tmp, "{\"resume_blocks\":0}");
     defer whole.config.deinit();
-    try std.testing.expectEqual(0, whole.config.resume_blocks);
+    try std.testing.expectEqual(0, whole.config.stored.resume_blocks);
 }
 
 test "open reads the compaction threshold from the file" {
@@ -539,17 +472,17 @@ test "open reads the compaction threshold from the file" {
 
     var opened = try openFrom(&tmp, "{\"compact_at\":50}");
     defer opened.config.deinit();
-    try std.testing.expectEqual(50, opened.config.compact_at);
+    try std.testing.expectEqual(50, opened.config.stored.compact_at);
 
     // A file without it falls back to the default.
     var bare = try openFrom(&tmp, "{}");
     defer bare.config.deinit();
-    try std.testing.expectEqual(Stored.default.compact_at, bare.config.compact_at);
+    try std.testing.expectEqual(Stored.default.compact_at, bare.config.stored.compact_at);
 
     // Zero turns compaction off; it is a setting, not a mistake.
     var off = try openFrom(&tmp, "{\"compact_at\":0}");
     defer off.config.deinit();
-    try std.testing.expectEqual(0, off.config.compact_at);
+    try std.testing.expectEqual(0, off.config.stored.compact_at);
 }
 
 test "a retired markdown setting in the file is ignored" {
@@ -561,8 +494,8 @@ test "a retired markdown setting in the file is ignored" {
     // is: left alone, without making the file unusable.
     var opened = try openFrom(&tmp, "{\"markdown\":{\"format\":\"glow -\"},\"max_turns\":7}");
     defer opened.config.deinit();
-    try std.testing.expectEqual(7, opened.config.max_turns);
-    try std.testing.expect(opened.config.tools.bash.format == null);
+    try std.testing.expectEqual(7, opened.config.stored.max_turns);
+    try std.testing.expect(opened.config.stored.tools.bash.format == null);
 }
 
 test "open leaves the bash format unset when the file does not set one" {
@@ -572,14 +505,14 @@ test "open leaves the bash format unset when the file does not set one" {
     // A session saved before the setting existed has no tools at all.
     var older = try openFrom(&tmp, "{\"max_turns\":7}");
     defer older.config.deinit();
-    try std.testing.expect(older.config.tools.bash.format == null);
+    try std.testing.expect(older.config.stored.tools.bash.format == null);
     // The timeout the setting was added with is the default for a file without one.
-    try std.testing.expectEqual(Stored.default.tools.bash.timeout_s, older.config.tools.bash.timeout_s);
+    try std.testing.expectEqual(Stored.default.tools.bash.timeout_s, older.config.stored.tools.bash.timeout_s);
 
     // A format of null is the same as not setting one.
     var explicit = try openFrom(&tmp, "{\"tools\":{\"bash\":{\"format\":null}}}");
     defer explicit.config.deinit();
-    try std.testing.expect(explicit.config.tools.bash.format == null);
+    try std.testing.expect(explicit.config.stored.tools.bash.format == null);
 }
 
 test "open reads the bash timeout from the file" {
@@ -589,13 +522,13 @@ test "open reads the bash timeout from the file" {
     // The timeout is set alongside the format, and each is read on its own.
     var opened = try openFrom(&tmp, "{\"tools\":{\"bash\":{\"format\":\"shfmt\",\"timeout_s\":30}}}");
     defer opened.config.deinit();
-    try std.testing.expectEqual(30, opened.config.tools.bash.timeout_s);
-    try std.testing.expectEqualStrings("shfmt", opened.config.tools.bash.format.?);
+    try std.testing.expectEqual(30, opened.config.stored.tools.bash.timeout_s);
+    try std.testing.expectEqualStrings("shfmt", opened.config.stored.tools.bash.format.?);
 
     // A file without one falls back to the default.
     var bare = try openFrom(&tmp, "{\"tools\":{\"bash\":{\"format\":\"shfmt\"}}}");
     defer bare.config.deinit();
-    try std.testing.expectEqual(Stored.default.tools.bash.timeout_s, bare.config.tools.bash.timeout_s);
+    try std.testing.expectEqual(Stored.default.tools.bash.timeout_s, bare.config.stored.tools.bash.timeout_s);
 }
 
 test "open reads a self-hosted backend's instance from the file" {
@@ -607,12 +540,12 @@ test "open reads a self-hosted backend's instance from the file" {
     var opened = try openFrom(&tmp, "{\"tools\":{\"web_search\":{" ++
         "\"providers\":[\"searxng\"],\"searxng\":{\"url\":\"https://searx.example.org\"}}}}");
     defer opened.config.deinit();
-    try std.testing.expectEqual(toolset.web.Search.Provider.searxng, opened.config.tools.web_search.providers[0]);
-    try std.testing.expectEqualStrings("https://searx.example.org", opened.config.tools.web_search.searxng.url.?);
+    try std.testing.expectEqual(toolset.web.Search.Provider.searxng, opened.config.stored.tools.web_search.providers[0]);
+    try std.testing.expectEqualStrings("https://searx.example.org", opened.config.stored.tools.web_search.searxng.url.?);
 
     var known = try openFrom(&tmp, "{\"tools\":{\"web_search\":{\"providers\":[\"exa\"]}}}");
     defer known.config.deinit();
-    try std.testing.expect(known.config.tools.web_search.searxng.url == null);
+    try std.testing.expect(known.config.stored.tools.web_search.searxng.url == null);
 }
 
 test "open reads the web search backends and result count from the file" {
@@ -624,14 +557,14 @@ test "open reads the web search backends and result count from the file" {
     var opened = try openFrom(&tmp, "{\"tools\":{\"web_search\":{" ++
         "\"providers\":[\"tavily\",\"brave\"],\"max_results\":3}}}");
     defer opened.config.deinit();
-    try std.testing.expectEqualSlices(toolset.web.Search.Provider, &.{ .tavily, .brave }, opened.config.tools.web_search.providers);
-    try std.testing.expectEqual(3, opened.config.tools.web_search.max_results);
+    try std.testing.expectEqualSlices(toolset.web.Search.Provider, &.{ .tavily, .brave }, opened.config.stored.tools.web_search.providers);
+    try std.testing.expectEqual(3, opened.config.stored.tools.web_search.max_results);
 
     // The defaults leave it off, and the count ready for a backend to be named.
     var bare = try openFrom(&tmp, "{}");
     defer bare.config.deinit();
-    try std.testing.expectEqual(@as(usize, 0), bare.config.tools.web_search.providers.len);
-    try std.testing.expectEqual(Stored.default.tools.web_search.max_results, bare.config.tools.web_search.max_results);
+    try std.testing.expectEqual(@as(usize, 0), bare.config.stored.tools.web_search.providers.len);
+    try std.testing.expectEqual(Stored.default.tools.web_search.max_results, bare.config.stored.tools.web_search.max_results);
 
     // A name that is not a backend makes the file unusable rather than reading
     // as "no search", so a typo is not silently dropped.
@@ -644,12 +577,13 @@ test "save round-trips a custom max_turns" {
 
     var config = Config.init(std.testing.allocator);
     defer config.deinit();
-    config.max_turns = 3;
+
+    config.stored.max_turns = 3;
     try config.save(std.testing.io, tmp.dir);
 
     var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
     defer opened.config.deinit();
-    try std.testing.expectEqual(3, opened.config.max_turns);
+    try std.testing.expectEqual(3, opened.config.stored.max_turns);
 }
 
 test "the file is indented, so it can be read and edited by hand" {
@@ -660,7 +594,8 @@ test "the file is indented, so it can be read and edited by hand" {
 
     var config = Config.init(gpa);
     defer config.deinit();
-    config.max_turns = 3;
+
+    config.stored.max_turns = 3;
     try config.save(std.testing.io, tmp.dir);
 
     const text = try tmp.dir.readFileAlloc(std.testing.io, file_name, gpa, .unlimited);
@@ -706,13 +641,14 @@ test "save round-trips a configured search backend" {
     // as the variant it names.
     var config = Config.init(std.testing.allocator);
     defer config.deinit();
-    config.tools.web_search = .{ .providers = &.{.tavily}, .max_results = 4 };
+
+    config.stored.tools.web_search = .{ .providers = &.{.tavily}, .max_results = 4 };
     try config.save(std.testing.io, tmp.dir);
 
     var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
     defer opened.config.deinit();
-    try std.testing.expectEqual(toolset.web.Search.Provider.tavily, opened.config.tools.web_search.providers[0]);
-    try std.testing.expectEqual(4, opened.config.tools.web_search.max_results);
+    try std.testing.expectEqual(toolset.web.Search.Provider.tavily, opened.config.stored.tools.web_search.providers[0]);
+    try std.testing.expectEqual(4, opened.config.stored.tools.web_search.max_results);
 }
 
 test "open rejects damaged, future and unusable configurations" {
@@ -735,29 +671,29 @@ test "set names a setting by its dotted path" {
     defer config.deinit();
 
     try config.set("tools.bash.format", "shfmt | bat -l bash");
-    try std.testing.expectEqualStrings("shfmt | bat -l bash", config.tools.bash.format.?);
+    try std.testing.expectEqualStrings("shfmt | bat -l bash", config.stored.tools.bash.format.?);
 
     try config.set("tools.bash.timeout_s", "30");
-    try std.testing.expectEqual(30, config.tools.bash.timeout_s);
+    try std.testing.expectEqual(30, config.stored.tools.bash.timeout_s);
 
     try config.set("tools.edit.format", "delta --paging=never");
-    try std.testing.expectEqualStrings("delta --paging=never", config.tools.edit.format.?);
+    try std.testing.expectEqualStrings("delta --paging=never", config.stored.tools.edit.format.?);
 
     try config.set("max_turns", "7");
-    try std.testing.expectEqual(7, config.max_turns);
+    try std.testing.expectEqual(7, config.stored.max_turns);
 
     try config.set("resume_blocks", "0");
-    try std.testing.expectEqual(0, config.resume_blocks);
+    try std.testing.expectEqual(0, config.stored.resume_blocks);
 
     try config.set("compact_at", "60");
-    try std.testing.expectEqual(60, config.compact_at);
+    try std.testing.expectEqual(60, config.stored.compact_at);
     try config.set("compact_at", "0");
-    try std.testing.expectEqual(0, config.compact_at);
+    try std.testing.expectEqual(0, config.stored.compact_at);
 
     try config.set("tools.web_search.max_results", "3");
-    try std.testing.expectEqual(3, config.tools.web_search.max_results);
+    try std.testing.expectEqual(3, config.stored.tools.web_search.max_results);
     try config.set("tools.web_search.searxng.url", "https://searx.example.org");
-    try std.testing.expectEqualStrings("https://searx.example.org", config.tools.web_search.searxng.url.?);
+    try std.testing.expectEqualStrings("https://searx.example.org", config.stored.tools.web_search.searxng.url.?);
 }
 
 test "set writes null to clear a setting that has no value" {
@@ -766,11 +702,11 @@ test "set writes null to clear a setting that has no value" {
 
     try config.set("tools.edit.format", "delta");
     try config.set("tools.edit.format", "null");
-    try std.testing.expect(config.tools.edit.format == null);
+    try std.testing.expect(config.stored.tools.edit.format == null);
 
     try config.set("tools.web_search.searxng.url", "https://searx.example.org");
     try config.set("tools.web_search.searxng.url", "null");
-    try std.testing.expect(config.tools.web_search.searxng.url == null);
+    try std.testing.expect(config.stored.tools.web_search.searxng.url == null);
 }
 
 test "set refuses a setting that is unknown, a section, or a bad value" {
@@ -795,8 +731,8 @@ test "set refuses a setting that is unknown, a section, or a bad value" {
     // the setting keeps what it had.
     try std.testing.expectError(error.InvalidValue, config.set("tools.bash.timeout_s", "0"));
     try std.testing.expectError(error.InvalidValue, config.set("max_turns", "0"));
-    try std.testing.expectEqual(Stored.default.tools.bash.timeout_s, config.tools.bash.timeout_s);
-    try std.testing.expectEqual(Stored.default.max_turns, config.max_turns);
+    try std.testing.expectEqual(Stored.default.tools.bash.timeout_s, config.stored.tools.bash.timeout_s);
+    try std.testing.expectEqual(Stored.default.max_turns, config.stored.max_turns);
 }
 
 test "a setting set by path is written and read back" {
@@ -812,9 +748,10 @@ test "a setting set by path is written and read back" {
 
     var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
     defer opened.config.deinit();
-    try std.testing.expectEqualStrings("shfmt", opened.config.tools.bash.format.?);
-    try std.testing.expectEqual(45, opened.config.tools.bash.timeout_s);
-    try std.testing.expectEqualStrings("https://searx.example.org", opened.config.tools.web_search.searxng.url.?);
+
+    try std.testing.expectEqualStrings("shfmt", opened.config.stored.tools.bash.format.?);
+    try std.testing.expectEqual(45, opened.config.stored.tools.bash.timeout_s);
+    try std.testing.expectEqualStrings("https://searx.example.org", opened.config.stored.tools.web_search.searxng.url.?);
 }
 
 test "run sets a setting in the file, creating it when it is missing" {
@@ -841,11 +778,13 @@ test "run sets a setting in the file, creating it when it is missing" {
     const dir_path = try std.fs.path.join(arena, &.{ base, app_dir });
     var dir = try std.Io.Dir.cwd().createDirPathOpen(std.testing.io, dir_path, .{});
     defer dir.close(std.testing.io);
+
     var opened = try Config.open(std.testing.io, dir, gpa);
     defer opened.config.deinit();
-    try std.testing.expectEqualStrings("shfmt", opened.config.tools.bash.format.?);
+
+    try std.testing.expectEqualStrings("shfmt", opened.config.stored.tools.bash.format.?);
     // The other settings keep their defaults, so the file is a whole one.
-    try std.testing.expectEqual(Stored.default.max_turns, opened.config.max_turns);
+    try std.testing.expectEqual(Stored.default.max_turns, opened.config.stored.max_turns);
     // The message names the setting and the file it was written to.
     try std.testing.expect(std.mem.indexOf(u8, sink.written(), "tools.bash.format") != null);
     try std.testing.expect(std.mem.indexOf(u8, sink.written(), file_name) != null);

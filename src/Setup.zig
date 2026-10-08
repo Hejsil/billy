@@ -28,7 +28,7 @@ environ: *const std.process.Environ.Map,
 
 /// The configuration. It owns an arena of its own for the strings read out of
 /// the file, which `deinit` frees.
-settings: Config,
+config: Config,
 /// Directory handle holding the session files.
 sessions: std.Io.Dir,
 /// The directories billy's own files were found in, held so they stay open for
@@ -104,7 +104,7 @@ pub fn open(init: std.process.Init, out: *std.Io.Writer) !Setup {
         .io = io,
         .gpa = init.gpa,
         .environ = environ,
-        .settings = settings.config,
+        .config = settings.config,
         .sessions = files.sessions,
         .data_dir = files.data_dir,
         .config_dir = files.config_dir,
@@ -248,7 +248,7 @@ const Endpoint = struct {
 
 pub fn deinit(setup: *Setup) void {
     setup.health.deinit();
-    setup.settings.deinit();
+    setup.config.deinit();
     setup.sessions.close(setup.io);
     setup.config_dir.close(setup.io);
     setup.data_dir.close(setup.io);
@@ -278,16 +278,16 @@ fn searchConfig(
     arena: std.mem.Allocator,
     store: *const credentials.Store,
     environ: *const std.process.Environ.Map,
-    settings: Config,
+    config: Config,
     failed: *tools.web.Search.Provider,
 ) !?tools.web.Search.Config {
-    const web_settings = settings.tools.web_search;
-    if (web_settings.providers.len == 0) return null;
+    const web_config = config.stored.tools.web_search;
+    if (web_config.providers.len == 0) return null;
 
     // Each backend resolves its own key, or, for the one that is self-hosted,
     // needs the instance named instead.
-    const backends = try arena.alloc(tools.web.Search.Backend, web_settings.providers.len);
-    for (web_settings.providers, backends) |provider, *backend| {
+    const backends = try arena.alloc(tools.web.Search.Backend, web_config.providers.len);
+    for (web_config.providers, backends) |provider, *backend| {
         failed.* = provider;
         const service = credentials.searchService(provider);
         backend.* = .{
@@ -298,16 +298,16 @@ fn searchConfig(
             else blk: {
                 // A backend billy knows the address of needs only its key; one it
                 // does not, SearXNG, needs the instance named.
-                const url = web_settings.searxng.url orelse
+                const url = web_config.searxng.url orelse
                     return error.MissingSearchUrl;
                 if (url.len == 0) return error.MissingSearchUrl;
                 break :blk "";
             },
             // Only a self-hosted backend is reached somewhere billy does not know.
-            .endpoint = if (service == null) web_settings.searxng.url else null,
+            .endpoint = if (service == null) web_config.searxng.url else null,
         };
     }
-    return .{ .backends = backends, .max_results = web_settings.max_results };
+    return .{ .backends = backends, .max_results = web_config.max_results };
 }
 
 /// The web fetch settings for a configuration that names a backend, or null when
@@ -317,14 +317,14 @@ fn fetchConfig(
     arena: std.mem.Allocator,
     store: *const credentials.Store,
     environ: *const std.process.Environ.Map,
-    settings: Config,
+    config: Config,
     failed: *tools.web.Fetch.Provider,
 ) !?tools.web.Fetch.Config {
-    const web_settings = settings.tools.web_fetch;
-    if (web_settings.providers.len == 0) return null;
+    const web_config = config.stored.tools.web_fetch;
+    if (web_config.providers.len == 0) return null;
 
-    const backends = try arena.alloc(tools.web.Fetch.Backend, web_settings.providers.len);
-    for (web_settings.providers, backends) |provider, *backend| {
+    const backends = try arena.alloc(tools.web.Fetch.Backend, web_config.providers.len);
+    for (web_config.providers, backends) |provider, *backend| {
         failed.* = provider;
         const service = credentials.fetchService(provider);
         backend.* = .{
@@ -389,13 +389,13 @@ fn reportFetchFailure(err: anyerror, provider: tools.web.Fetch.Provider) void {
 /// Nothing is allocated here: every string is one the setup already holds, so
 /// asking for this once a turn costs nothing that would have to be freed.
 pub fn agentConfig(setup: *Setup, cwd: []const u8, style: Terminal.Style) agent.Config {
-    const settings = &setup.settings;
+    const config = &setup.config.stored;
     return .{
         .api_key = setup.api_key,
         .url = setup.url,
         .model = setup.model,
-        .max_turns = settings.max_turns,
-        .bash_timeout_s = settings.tools.bash.timeout_s,
+        .max_turns = config.max_turns,
+        .bash_timeout_s = config.tools.bash.timeout_s,
         .cwd = cwd,
         .home = setup.environ.get("HOME"),
         // The user's own instructions, which live beside the configuration and
@@ -403,13 +403,13 @@ pub fn agentConfig(setup: *Setup, cwd: []const u8, style: Terminal.Style) agent.
         // every runner built from this.
         .user_instructions_dir = setup.config_dir,
         .model_info = models.lookup(models.Provider.fromUrl(setup.base_url), setup.model),
-        .compact_at = settings.compact_at,
-        .title = settings.title,
+        .compact_at = config.compact_at,
+        .title = config.title,
         // A model whose provider billy does not know is left alone: the fields
         // are one provider's own, and an endpoint that does not know them may
         // refuse a request that carries them.
         .reasoning = if (models.Provider.fromUrl(setup.base_url) != null)
-            reasoningOf(settings.reasoning)
+            reasoningOf(config.reasoning)
         else
             .provider_default,
         // How billy lays out and decorates what it shows. A bash command is laid
@@ -421,12 +421,12 @@ pub fn agentConfig(setup: *Setup, cwd: []const u8, style: Terminal.Style) agent.
         // prompt are markdown, laid out by billy's own renderer.
         .display = .{
             .formats = .{
-                .bash = if (settings.tools.bash.format) |script| .{
+                .bash = if (config.tools.bash.format) |script| .{
                     .script = script,
                     .io = setup.io,
                     .gpa = setup.gpa,
                 } else null,
-                .edit = if (settings.tools.edit.format) |script| .{
+                .edit = if (config.tools.edit.format) |script| .{
                     .script = script,
                     .io = setup.io,
                     .gpa = setup.gpa,
@@ -465,7 +465,8 @@ test "each backend resolves its own key, and SearXNG its instance" {
     // error rather than a silent "no search".
     var naming = Config.init(gpa);
     defer naming.deinit();
-    naming.tools.web_search.providers = &.{.tavily};
+
+    naming.stored.tools.web_search.providers = &.{.tavily};
     try std.testing.expectError(error.MissingApiKey, searchConfig(arena, &store, &environ, naming, &failed));
     // The backend at fault is the one the report names.
     try std.testing.expectEqual(tools.web.Search.Provider.tavily, failed);
@@ -473,11 +474,12 @@ test "each backend resolves its own key, and SearXNG its instance" {
     // SearXNG needs no key, but needs the instance named.
     var searx = Config.init(gpa);
     defer searx.deinit();
-    searx.tools.web_search.providers = &.{.searxng};
+
+    searx.stored.tools.web_search.providers = &.{.searxng};
     try std.testing.expectError(error.MissingSearchUrl, searchConfig(arena, &store, &environ, searx, &failed));
 
     // Every named backend becomes a backend to try, in the order named.
-    searx.tools.web_search.searxng.url = "https://searx.example.org";
+    searx.stored.tools.web_search.searxng.url = "https://searx.example.org";
     const config = (try searchConfig(arena, &store, &environ, searx, &failed)).?;
     try std.testing.expectEqual(@as(usize, 1), config.backends.len);
     try std.testing.expectEqual(tools.web.Search.Provider.searxng, config.backends[0].provider);
@@ -499,6 +501,7 @@ test "a fetch backend is asked for its key, and raw for none" {
     // no key stored at all.
     var raw = Config.init(gpa);
     defer raw.deinit();
+
     var failed: tools.web.Fetch.Provider = .raw;
     const config = (try fetchConfig(arena, &store, &environ, raw, &failed)).?;
     try std.testing.expectEqual(@as(usize, 1), config.backends.len);
@@ -508,14 +511,16 @@ test "a fetch backend is asked for its key, and raw for none" {
     // A service needs its key, on the same terms as a search backend.
     var naming = Config.init(gpa);
     defer naming.deinit();
-    naming.tools.web_fetch.providers = &.{.tavily};
+
+    naming.stored.tools.web_fetch.providers = &.{.tavily};
     try std.testing.expectError(error.MissingApiKey, fetchConfig(arena, &store, &environ, naming, &failed));
     try std.testing.expectEqual(tools.web.Fetch.Provider.tavily, failed);
 
     // A set with nothing in it leaves `web_fetch` out of the request.
     var none = Config.init(gpa);
     defer none.deinit();
-    none.tools.web_fetch.providers = &.{};
+
+    none.stored.tools.web_fetch.providers = &.{};
     try std.testing.expect((try fetchConfig(arena, &store, &environ, none, &failed)) == null);
 }
 

@@ -972,7 +972,7 @@ const TestServer = struct {
         errdefer tmp.cleanup();
 
         const sessions = try tmp.dir.createDirPathOpen(std.testing.io, "sessions", .{});
-        const settings = Config.init(gpa);
+        const config = Config.init(gpa);
         const environ = try gpa.create(std.process.Environ.Map);
         errdefer gpa.destroy(environ);
         environ.* = .init(gpa);
@@ -982,7 +982,7 @@ const TestServer = struct {
         errdefer health.deinit();
         return .{
             .tmp = tmp,
-            .settings = settings,
+            .settings = config,
             .environ = environ,
             .health = health,
             .registry = .{ .io = std.testing.io, .gpa = gpa },
@@ -991,7 +991,7 @@ const TestServer = struct {
                 .io = std.testing.io,
                 .gpa = gpa,
                 .environ = environ,
-                .settings = settings,
+                .config = config,
                 .sessions = sessions,
                 .data_dir = tmp.dir,
                 .config_dir = tmp.dir,
