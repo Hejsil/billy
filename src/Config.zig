@@ -154,18 +154,18 @@ const Stored = struct {
 /// out of the file. The configuration owns it, so a caller frees the whole
 /// configuration with `deinit` rather than tracking each string, and every
 /// allocation `open` makes goes through it.
-arena_state: std.heap.ArenaAllocator,
+arena: std.heap.ArenaAllocator,
 stored: Stored = .default,
 
 /// An empty configuration, with the arena a file read fills in. Its settings
 /// are the defaults, which is what a missing file is written with.
 pub fn init(gpa: std.mem.Allocator) Config {
-    return .{ .arena_state = .init(gpa) };
+    return .{ .arena = .init(gpa) };
 }
 
 /// Frees every string the configuration holds, at once.
 pub fn deinit(config: *Config) void {
-    config.arena_state.deinit();
+    config.arena.deinit();
 }
 
 /// Reads the configuration from `dir`, writing `file_name` with the defaults
@@ -178,7 +178,7 @@ pub fn open(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator) !Opened {
     var config = Config.init(gpa);
     errdefer config.deinit();
 
-    const arena = config.arena_state.allocator();
+    const arena = config.arena.allocator();
 
     const text = dir.readFileAlloc(io, file_name, arena, .unlimited) catch |err| switch (err) {
         error.FileNotFound => {
@@ -230,7 +230,7 @@ pub fn save(config: *const Config, io: std.Io, dir: std.Io.Dir) !void {
 /// stored. Strings are kept in the configuration's own arena.
 pub fn set(config: *Config, path: []const u8, value: []const u8) !void {
     var stored = config.stored;
-    try setPath(Stored, &stored, path, config.arena_state.allocator(), value);
+    try setPath(Stored, &stored, path, config.arena.allocator(), value);
 
     // A value that would make the configuration one the next read refuses, such
     // as a zero timeout, is a value this setting does not take.
