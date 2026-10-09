@@ -72,9 +72,9 @@ pub fn run(search: Search, gpa: std.mem.Allocator, http: *std.http.Client, confi
     for (search_config.backends) |backend| {
         // A backend that failed not long ago is skipped, so a backend that is
         // down, rate-limited or out of credit is not asked again yet.
-        if (setAside(health, backend.provider, now_ms)) continue;
+        if (Health.isSetAside(health, @tagName(backend.provider), now_ms)) continue;
         const value = searchBackend(gpa, http, backend, search.query, search_config.max_results) catch |err| {
-            try giveUp(health, backend.provider, null, now_ms);
+            try Health.recordFailure(health, @tagName(backend.provider), null, now_ms);
             std.log.warn("search: {s} failed: {s}, trying the next", .{
                 @tagName(backend.provider), @errorName(err),
             });
@@ -84,11 +84,11 @@ pub fn run(search: Search, gpa: std.mem.Allocator, http: *std.http.Client, confi
         switch (value) {
             .text => |text| {
                 defer gpa.free(text);
-                try answered(health, backend.provider);
+                try Health.recordAnswer(health, @tagName(backend.provider));
                 return out.writeAll(text);
             },
             .retry_after_ms => |ms| {
-                try giveUp(health, backend.provider, ms, now_ms);
+                try Health.recordFailure(health, @tagName(backend.provider), ms, now_ms);
                 std.log.warn("search: {s} is set aside for {d}ms, trying the next", .{
                     @tagName(backend.provider), ms,
                 });
@@ -134,24 +134,6 @@ fn reach(backend: Backend) []const u8 {
         .brave => brave.search_endpoint,
         .searxng => unreachable,
     };
-}
-
-/// Whether `provider` is set aside at `now`, and so should be skipped.
-fn setAside(health: ?*Health, provider: Provider, now: i64) bool {
-    const store = health orelse return false;
-    return store.skips(@tagName(provider), now);
-}
-
-/// Records that `provider` failed, so it is skipped for a while.
-fn giveUp(health: ?*Health, provider: Provider, retry_after_ms: ?i64, now: i64) !void {
-    const store = health orelse return;
-    try store.record(@tagName(provider), retry_after_ms, now);
-}
-
-/// Records that `provider` answered, clearing any wait it had.
-fn answered(health: ?*Health, provider: Provider) !void {
-    const store = health orelse return;
-    try store.clear(@tagName(provider));
 }
 
 test "the backends are tried in order until one answers" {

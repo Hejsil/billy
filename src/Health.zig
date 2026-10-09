@@ -183,6 +183,22 @@ pub fn clear(self: *Health, name: []const u8) !void {
     try self.write();
 }
 
+/// `skips` for a table that may be absent, as in a test: with none, nothing is
+/// set aside.
+pub fn isSetAside(health: ?*Health, name: []const u8, now_ms: i64) bool {
+    return (health orelse return false).skips(name, now_ms);
+}
+
+/// `record` for a table that may be absent.
+pub fn recordFailure(health: ?*Health, name: []const u8, retry_after_ms: ?i64, now_ms: i64) !void {
+    try (health orelse return).record(name, retry_after_ms, now_ms);
+}
+
+/// `clear` for a table that may be absent.
+pub fn recordAnswer(health: ?*Health, name: []const u8) !void {
+    try (health orelse return).clear(name);
+}
+
 /// The wait held for `name`, or null when there is none. The name is looked up
 /// as the text it is, so a name nothing is held for is not added to the pool.
 fn lookup(self: *Health, name: []const u8) ?*Wait {
@@ -528,4 +544,18 @@ test "writing the waits allocates nothing" {
     try t.health.clear("brave");
     try t.health.record("tavily", 60_000, 0);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "the optional helpers do nothing without a table, and act on one" {
+    // No table: nothing is set aside and nothing is recorded.
+    try std.testing.expect(!isSetAside(null, "a", 0));
+    try recordFailure(null, "a", null, 0);
+    try recordAnswer(null, "a");
+
+    var t = try Test.init(null);
+    defer t.deinit();
+    try recordFailure(&t.health, "a", null, 1000);
+    try std.testing.expect(isSetAside(&t.health, "a", 1000));
+    try recordAnswer(&t.health, "a");
+    try std.testing.expect(!isSetAside(&t.health, "a", 1000));
 }

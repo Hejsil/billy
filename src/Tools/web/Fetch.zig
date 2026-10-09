@@ -78,7 +78,7 @@ pub fn run(fetch: Fetch, gpa: std.mem.Allocator, http: *std.http.Client, config:
     // coming back with nothing.
     var unreadable = false;
     for (fetch_config.backends) |backend| {
-        if (setAside(health, backend.provider, now_ms)) continue;
+        if (Health.isSetAside(health, @tagName(backend.provider), now_ms)) continue;
         const value = fetchBackend(gpa, http, backend, fetch.url) catch |err| {
             // A url the backend could not read is not a backend that is down:
             // it answered, so the next backend is tried without setting this
@@ -91,7 +91,7 @@ pub fn run(fetch: Fetch, gpa: std.mem.Allocator, http: *std.http.Client, config:
                 unreadable = true;
                 continue;
             }
-            try giveUp(health, backend.provider, null, now_ms);
+            try Health.recordFailure(health, @tagName(backend.provider), null, now_ms);
             std.log.warn("fetch: {s} failed: {s}, trying the next", .{
                 @tagName(backend.provider), @errorName(err),
             });
@@ -101,11 +101,11 @@ pub fn run(fetch: Fetch, gpa: std.mem.Allocator, http: *std.http.Client, config:
         switch (value) {
             .text => |text| {
                 defer gpa.free(text);
-                try answered(health, backend.provider);
+                try Health.recordAnswer(health, @tagName(backend.provider));
                 return out.writeAll(text);
             },
             .retry_after_ms => |ms| {
-                try giveUp(health, backend.provider, ms, now_ms);
+                try Health.recordFailure(health, @tagName(backend.provider), ms, now_ms);
                 std.log.warn("fetch: {s} is set aside for {d}ms, trying the next", .{
                     @tagName(backend.provider), ms,
                 });
@@ -150,24 +150,6 @@ fn reach(backend: Backend) []const u8 {
         // Raw reads the url of the call, so it is never reached here.
         .raw => unreachable,
     };
-}
-
-/// Whether `provider` is set aside at `now`, and so should be skipped.
-fn setAside(health: ?*Health, provider: Provider, now: i64) bool {
-    const store = health orelse return false;
-    return store.skips(@tagName(provider), now);
-}
-
-/// Records that `provider` failed, so it is skipped for a while.
-fn giveUp(health: ?*Health, provider: Provider, retry_after_ms: ?i64, now: i64) !void {
-    const store = health orelse return;
-    try store.record(@tagName(provider), retry_after_ms, now);
-}
-
-/// Records that `provider` answered, clearing any wait it had.
-fn answered(health: ?*Health, provider: Provider) !void {
-    const store = health orelse return;
-    try store.clear(@tagName(provider));
 }
 
 test "a url no backend could read does not set the backend aside" {
