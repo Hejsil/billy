@@ -1800,10 +1800,11 @@ test "a result longer than the cap is cut and says what it lost" {
     const cut = std.mem.indexOf(u8, written, marker) orelse return error.NoTruncation;
     // What the reader kept is exactly the cap, and what the note counts is
     // everything past it. The reader numbers each line, so what it wrote is not
-    // the file's length: six columns, a tab, the ninety-nine characters of the
-    // line and its newline, a thousand times.
+    // the file's length: four columns for the number (1000 is the largest), a
+    // colon and a space, the ninety-nine characters of the line and its newline,
+    // a thousand times.
     try std.testing.expectEqual(max_result_len, cut);
-    const per_line = 6 + 1 + 99 + 1;
+    const per_line = 4 + 2 + 99 + 1;
     const written_by_tool = 1000 * per_line;
     const lost = try std.fmt.parseInt(usize, written[cut + marker.len .. written.len - " more bytes".len], 10);
     try std.testing.expectEqual(written_by_tool - max_result_len, lost);
