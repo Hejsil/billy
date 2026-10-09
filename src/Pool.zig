@@ -11,8 +11,9 @@
 //! repeated -- nine megabytes to save a few kilobytes of roles and tool names,
 //! which the roles are an enum for now anyway. Text is kept as it comes.
 //!
-//! Everything a pool holds is valid UTF-8. Text that is not is repaired as it is
-//! added, so anything written from the pool can be carried as a JSON string.
+//! Everything a pool holds is valid UTF-8 with no NUL in it. Text that is not is
+//! repaired as it is added, so anything written from the pool can be carried as
+//! a JSON string, and a NUL cannot end a string early.
 
 const std = @import("std");
 
@@ -35,15 +36,22 @@ pub fn deinit(pool: *Pool, gpa: std.mem.Allocator) void {
 /// Adds `text` to the pool and returns its index, or `.none` for null.
 ///
 /// Text that is not valid UTF-8 is repaired, since Zig writes a byte slice that
-/// is not as an array of numbers, which JSON rejects. `fmtUtf8` passes
-/// well-formed text through unchanged and repairs anything ill-formed, so every
-/// string the pool holds is one a JSON string can carry.
+/// is not as an array of numbers, which JSON rejects. A NUL is repaired the same
+/// way, since it would end the string where it stands.
 pub fn intern(pool: *Pool, gpa: std.mem.Allocator, text: ?[]const u8) !Index {
     const value = text orelse return .none;
 
     const start: u32 = @intCast(pool.strings.items.len);
-    try pool.strings.print(gpa, "{f}", .{std.unicode.fmtUtf8(value)});
     errdefer pool.strings.shrinkRetainingCapacity(start);
+    // A NUL is never inside a multi-byte sequence, so repairing each side of it
+    // on its own repairs the whole.
+    var parts = std.mem.splitScalar(u8, value, 0);
+    var first = true;
+    while (parts.next()) |part| {
+        if (!first) try pool.strings.appendSlice(gpa, "\u{FFFD}");
+        first = false;
+        try pool.strings.print(gpa, "{f}", .{std.unicode.fmtUtf8(part)});
+    }
     try pool.strings.append(gpa, 0);
     return @fromBackingInt(start);
 }
@@ -116,6 +124,22 @@ test "text that is not valid UTF-8 is repaired on the way into the pool" {
     // text is the byte it was short by two.
     try std.testing.expectEqual(broken.len + 2, repaired.len);
     try std.testing.expect(std.mem.indexOf(u8, repaired, "\u{FFFD}") != null);
+}
+
+test "a NUL in the text does not end the string early" {
+    const gpa = std.testing.allocator;
+
+    var pool: Pool = .{};
+    defer pool.deinit(gpa);
+
+    const middle = try pool.intern(gpa, "a\x00b");
+    const edges = try pool.intern(gpa, "\x00x\x00");
+    const after = try pool.intern(gpa, "next");
+
+    try std.testing.expectEqualStrings("a\u{FFFD}b", pool.get(middle).?);
+    try std.testing.expectEqualStrings("\u{FFFD}x\u{FFFD}", pool.get(edges).?);
+    // The string after it is still where it was put, not swallowed by a NUL.
+    try std.testing.expectEqualStrings("next", pool.get(after).?);
 }
 
 test "a string read back is the whole string, not the rest of the pool" {
