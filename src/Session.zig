@@ -835,6 +835,9 @@ fn loadPromptAndMessages(
 /// is sorted. A migrated file's indices name the messages as they were stored, so
 /// each is shifted by the `lead` lifted out of the front of them.
 fn loadCompactions(session: *Session, stored: []const u32, lead: usize) !void {
+    // A summary stands at a message, so with none there is nothing to point at.
+    if (session.messages.items.len == 0) return;
+
     try session.compactions.appendSlice(session.gpa, stored);
     std.mem.sort(u32, session.compactions.items, {}, std.sort.asc(u32));
 
@@ -2167,6 +2170,24 @@ test "the compaction list is sorted and clamped when a session is read" {
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 1, 2 }, session.compactions.items);
     try std.testing.expectEqual(2, session.sentFrom());
     try std.testing.expect(session.isCompaction(1));
+}
+
+test "compactions in a file with no messages are dropped" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Hand-written: a summary is named, but there is no conversation for it to
+    // stand in.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "empty.json",
+        .data = "{\"version\":3,\"messages\":[],\"compactions\":[0,5]}",
+    });
+
+    var session = try reopenTestSession(&tmp, "empty");
+    defer session.deinit();
+    try std.testing.expectEqual(0, session.messages.items.len);
+    try std.testing.expectEqual(0, session.compactions.items.len);
+    try std.testing.expectEqual(0, session.sentFrom());
 }
 
 test "the messages a request carries start at the latest compaction" {
