@@ -388,17 +388,14 @@ pub fn displayPath(out: *std.Io.Writer, cwd: []const u8, home: ?[]const u8) !voi
     return out.writeAll(cwd);
 }
 
-/// A session being asked things: the model client and the tools it runs with,
-/// working in the session's own directory. Both frontends need the same of this,
-/// so it is built in one place and neither can drift from the other.
-///
-/// The HTTP client is the run's own, borrowed by pointer, so every request of
-/// every session shares its connections and the certificates it scanned once.
+/// A session being asked things: the model client and the tools it runs with.
+/// Both frontends build it here so neither can drift from the other. The HTTP
+/// client is the run's own, so every request shares its connections.
 io: std.Io,
 gpa: std.mem.Allocator,
 config: Config,
-/// The directory the session works in. For a resumed session it is the one
-/// the session was started in, wherever billy runs from now.
+/// The directory the session works in. For a resumed session it is the one the
+/// session was started in.
 work_dir: std.Io.Dir,
 /// The tools, working in `work_dir`.
 tool_set: Tools,
@@ -454,22 +451,16 @@ pub fn deinit(agent: *Agent) void {
     agent.work_dir.close(agent.io);
 }
 
-/// Gives `session` the system prompt and the tools it runs with, if it has
-/// none of its own.
+/// Gives `session` the system prompt and tools it runs with, if it has none.
 ///
-/// The prompt and the tools are stored with the session and reused on a
-/// resume, so the request sent then matches the earlier run byte for byte and
-/// hits the prompt cache. Both are therefore set only on a session that has
-/// neither, so a new session gets the current ones while a resumed one keeps
-/// what it was saved with. The user's instructions are read from the
-/// configuration directory and the project's from the session's directory,
-/// and both are part of the prompt, so they are sent with every request.
+/// Both are stored with the session and reused on a resume, so the request
+/// matches the earlier run byte for byte and hits the prompt cache. The user's
+/// instructions come from the configuration directory and the project's from the
+/// session's directory.
 pub fn prepare(agent: *Agent, session: *Session) !void {
-    // A session with a conversation keeps the mode and prompt it was saved
-    // with, so its request matches the earlier run; a new one takes the mode
-    // the frontend chose, which its first prompt may have named with
-    // `/chat`. Either way the agent's mode matches the session's, so the
-    // tool set it offers and the guard it runs are the session's own.
+    // A session with a conversation keeps the mode and prompt it was saved with;
+    // a new one takes the mode the frontend chose. Either way the agent's mode
+    // ends up the session's own.
     if (session.messages.items.len > 0) {
         agent.config.mode = session.mode;
     } else {
@@ -482,8 +473,7 @@ pub fn prepare(agent: *Agent, session: *Session) !void {
             agent.config.mode,
         );
         defer agent.gpa.free(prompt_text);
-        // A mode with no prompt of its own sends no system message, so the
-        // request is the conversation alone.
+        // A mode with no prompt sends no system message.
         if (prompt_text.len > 0) try session.setSystemPrompt(prompt_text);
     }
     try session.ensureTools(agent.tool_set.definitions(agent.config.mode));
@@ -491,45 +481,33 @@ pub fn prepare(agent: *Agent, session: *Session) !void {
 
 /// What asking `agent` to start a session with a first prompt came to.
 pub const Started = union(enum) {
-    /// What to ask. The prompt with any mode command taken off it, which is the
-    /// text the turn carries.
+    /// What to ask: the prompt with any mode command taken off.
     prompt: []const u8,
-    /// The prompt named only a mode, so there is nothing to ask yet: the session
-    /// is set up for that mode and waits for the next prompt.
+    /// The prompt named only a mode, so the session is set up for it and waits.
     mode_only,
-    /// The session has been asked something before, so this prompt is not its
-    /// first and the mode it runs in is the one it was saved with.
+    /// The session has been asked before, so it keeps the mode it was saved with.
     asked_before,
 };
 
 /// What a line typed into a session came to.
 pub const Waiting = union(enum) {
-    /// The line is asked of the model, with any mode command taken off it.
+    /// The line is asked of the model, with any mode command taken off.
     ask: []const u8,
-    /// The line named a mode and nothing else, so the session is set up for it
-    /// and there is nothing to ask yet.
+    /// The line named only a mode, so the session is set up and nothing is asked.
     ready,
-    /// The line was a command, which the agent has already run. Everything it
-    /// had to say has gone out through the emitter.
+    /// The line was a command, already run; what it had to say went out through
+    /// the emitter.
     ran,
 };
 
-/// Takes a line typed into `session` and does what it asks for, except asking
-/// the model, which is left to `ask`.
-///
-/// This is the whole of what a frontend has to know about a line: a command is
-/// run here and reported through the emitter, the first prompt settles the mode
-/// and gives the session its prompt and tools, and anything else comes back as
-/// the text to ask. Compaction is the agent's own business, so neither frontend
-/// names it, calls it, or words what it says when there is nothing to fold.
+/// Takes a line typed into `session` and does what it asks for, except asking the
+/// model, which is left to `ask`. A frontend need know nothing more of a line:
+/// commands, the first-prompt rules and compaction are all handled here.
 pub fn take(agent: *Agent, emitter: Emitter, session: *Session, line: []const u8, default: Mode) !Waiting {
-    // A command comes first: it is run rather than asked, and the session is not
-    // touched by it beyond what the command does.
+    // A command is run rather than asked.
     if (Command.of(line)) |cmd| {
         switch (cmd) {
             .compact => {
-                // A session that has been asked nothing has nothing to fold in,
-                // and neither has one with nothing new since the last compaction.
                 if (!agent.compact(emitter, session))
                     try emitter.show(.{ .notice = "nothing to compact" });
             },
@@ -537,33 +515,24 @@ pub fn take(agent: *Agent, emitter: Emitter, session: *Session, line: []const u8
         return .ran;
     }
 
-    // The conversation is compacted before a request that would carry it, so a
-    // long session goes on rather than failing on an overlong request. It is
-    // done here, before the prompt is added, so the prompt is not folded into
-    // the summary it triggers.
+    // Before the prompt is added, so the prompt is not folded into the summary
+    // it triggers.
     agent.compactIfNeeded(emitter, session);
 
     const started = try agent.start(session, line, default);
     return switch (started) {
         .prompt => |text| .{ .ask = text },
         .mode_only => .ready,
-        // A session that has been asked something keeps the mode it was saved
-        // with, so the line is asked as it was typed.
         .asked_before => .{ .ask = line },
     };
 }
 
-/// Settles the mode a session runs in from its first prompt, and gives a new
-/// session the system prompt and tools it needs before its first request.
-///
-/// This is the one place the "first prompt" rules live, so both frontends get
-/// them the same way: `/chat` and `/general` name the mode and the rest of the
-/// line is what is asked; a prompt naming only a mode sets the session up and
-/// asks nothing; and anything else is the mode `default`, which is each
-/// frontend's own (see `Mode.start`).
-///
-/// A session that has been asked before keeps what it was saved with, so this
-/// only reports that its prompt is not the first.
+/// Settles the mode from a session's first prompt and gives a new session its
+/// system prompt and tools. This is the one place the first-prompt rules live:
+/// `/chat` and `/general` name the mode and the rest of the line is asked; a
+/// prompt naming only a mode asks nothing; anything else gets the frontend's
+/// `default` (see `Mode.start`). A session asked before keeps what it was saved
+/// with.
 pub fn start(agent: *Agent, session: *Session, text: []const u8, default: Mode) !Started {
     if (session.messages.items.len > 0) return .asked_before;
 
@@ -574,16 +543,11 @@ pub fn start(agent: *Agent, session: *Session, text: []const u8, default: Mode) 
     return .{ .prompt = choice.text };
 }
 
-/// Compacts the conversation if it has outgrown the context window, so that
-/// a long session goes on rather than failing on an overlong request. When it
-/// compacts, the session's prompt and tools are refreshed, so the next
-/// request carries the current ones (see `refreshLead`).
-///
-/// A frontend calls this before it adds a prompt and, on a terminal, before
-/// it shows the header, so the prompt is not folded into the summary it
-/// triggers and the header reports the smaller conversation. A failure is
-/// not fatal: the conversation is left as it is and the request goes out with
-/// it, which is what would have happened without compaction at all.
+/// Compacts the conversation if it has outgrown the context window, so a long
+/// session goes on rather than failing on an overlong request. A frontend calls
+/// this before it adds a prompt and before it shows the header, so the prompt is
+/// not folded into the summary it triggers. A failure is logged: the request goes
+/// out with the conversation as it is.
 fn compactIfNeeded(agent: *Agent, emitter: Emitter, session: *Session) void {
     const compacted = agent.maybeCompact(emitter, session) catch |err| {
         std.log.warn("compaction failed: {s}", .{@errorName(err)});
@@ -592,11 +556,9 @@ fn compactIfNeeded(agent: *Agent, emitter: Emitter, session: *Session) void {
     if (compacted) agent.refresh(session);
 }
 
-/// Compacts the conversation now, whatever it has grown to, because the user
-/// asked with `/compact` rather than because a request would not fit. Says
-/// whether it compacted anything: a conversation with nothing new since the
-/// last compaction has nothing to fold in, and neither has one that has not
-/// been asked anything. A failure is logged and reads as nothing compacted.
+/// Compacts the conversation now, because the user asked with `/compact`. Says
+/// whether it compacted anything; a failure is logged and reads as nothing
+/// compacted.
 fn compact(agent: *Agent, emitter: Emitter, session: *Session) bool {
     const compacted = agent.fold(emitter, session) catch |err| {
         std.log.warn("compaction failed: {s}", .{@errorName(err)});
@@ -606,31 +568,23 @@ fn compact(agent: *Agent, emitter: Emitter, session: *Session) bool {
     return compacted;
 }
 
-/// Re-reads the prompt and the tools into the session, so a session that has
-/// been running a while picks up a changed prompt, instruction files or tool
-/// set. A compaction is the one moment replacing the front of a request costs
-/// no cache that was not already being thrown away.
-///
-/// A refresh that fails is not the turn's: the session keeps the prompt and
-/// tools it had, which are the ones its last request was sent with, and the
-/// run goes on.
+/// Re-reads the prompt and tools into the session, so one that has been running
+/// a while picks up a changed prompt, instruction file or tool set. Done at a
+/// compaction, the one moment replacing the front of a request costs no cache
+/// that was not already being thrown away. A failure is logged and the session
+/// keeps what it had.
 fn refresh(agent: *Agent, session: *Session) void {
     const mode = agent.config.mode;
     refreshLead(agent, mode, agent.tool_set.definitions(mode), session) catch |err|
         std.log.warn("could not refresh the prompt and tools: {s}", .{@errorName(err)});
 }
 
-/// Asks `session` one thing and shows how the answer is reached: the prompt,
-/// the tool calls it makes, and the reply. This is what one prompt of a
-/// session is, whether it was typed at a terminal or sent from a page.
-///
-/// On the first turn the session is given a title: first one derived from
-/// what was asked, so it is named at once, and then, when the model is asked
-/// for titles, one it writes, which replaces the first.
+/// Asks `session` one thing and shows how the answer is reached: the prompt, the
+/// tool calls, and the reply. On the first turn the session is named from what
+/// was asked, and then, if titles are on, by a title the model writes.
 pub fn ask(agent: *Agent, emitter: Emitter, session: *Session, text: []const u8) !void {
-    // The first turn is the session's first message; the system prompt is
-    // kept apart from the conversation, so a session that has been asked
-    // nothing has none.
+    // The system prompt is kept apart from the conversation, so the first turn is
+    // the session's first message.
     const first_turn = session.messages.items.len == 0;
     _ = try nameFromPrompt(session, text);
 

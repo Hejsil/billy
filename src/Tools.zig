@@ -19,13 +19,9 @@ const Tools = @This();
 /// Laying a bash command out for the display.
 pub const Format = formatting.Format;
 
-/// The formatter scripts a tool's block is laid out with, gathered so a caller
-/// passes one value rather than a run of them. A bash command and an edit diff
-/// are the two things a script lays out; either may be null to show the text as
-/// written.
-///
-/// The layout is presentation only: the command that runs, the diff of the call,
-/// what a session stores and what the model is sent keep the text it was given.
+/// The formatter scripts a tool's block is laid out with. Null shows the text as
+/// written. Presentation only: what runs, what a session stores and what the
+/// model is sent keep the text they were given.
 pub const Formats = struct {
     /// How a bash command is laid out before it is shown.
     bash: Format = null,
@@ -40,9 +36,7 @@ const max_result_len = 30_000;
 /// the whole result; only the display is cut short.
 const max_block_lines = 5;
 
-/// A tool call parsed into the arguments of the call it names. Parsing happens
-/// once, in `run`, and both the block the user sees and the tool itself read
-/// from here.
+/// A tool call parsed into the arguments of the tool it names.
 pub const Call = union(enum) {
     read: Read,
     write: Write,
@@ -62,65 +56,40 @@ pub const Call = union(enum) {
 };
 
 io: std.Io,
-/// The directory the tools work in: the one the session was started in, so a
-/// resumed session reads and writes where it did rather than wherever billy
-/// happens to be run from. Every path a tool is given is relative to it.
+/// The session's own directory, so a resumed session works where it started.
+/// Every path a tool is given is relative to it.
 dir: std.Io.Dir,
 /// For temporary buffers.
 gpa: std.mem.Allocator,
-/// How a tool's block is laid out for the user. Shared with the transcript, so a
-/// replayed session shows a call the way the run did.
+/// Shared with the transcript, so a replay shows a call the way the run did.
 formats: Formats,
-/// Longest a bash command may run before it is killed, in seconds. Set by
-/// the configuration, so a runaway command cannot hang the agent forever.
+/// Longest a bash command may run before it is killed, in seconds.
 bash_timeout_s: usize,
-/// How the lines billy prints itself are decorated. Shared with the
-/// transcript, so a replayed session looks like the run it continues.
+/// Shared with the transcript, so a replay looks like the run.
 style: Terminal.Style,
-/// The search backends the configuration named, with their keys resolved, or
-/// null to leave `web_search` out of the tool set billy offers, so the model is
-/// never given a tool that could not run.
+/// Null leaves `web_search` out of the tools offered, so the model is never given
+/// one that could not run.
 search: ?web.Search.Config,
-/// The fetch backends, on the same terms. A set with no backend leaves
-/// `web_fetch` out.
+/// As `search`, for `web_fetch`.
 fetch: ?web.Fetch.Config,
-/// The run's one HTTP client, borrowed by a web tool when one is configured, so
-/// a search or a fetch shares connections and scanned certificates with the
-/// model requests.
+/// The run's one HTTP client, shared with the model requests so connections and
+/// scanned certificates are reused.
 http: *std.http.Client,
-/// The waits of every backend, so one that just failed is skipped. Null runs
-/// without them, which is what a test wants.
+/// Null runs without backend waits, which is what a test wants.
 health: ?*Health,
 
-/// What a tool set is built from, gathered into one so the constructor reads
-/// as what each value is rather than as a run of positional arguments, which
-/// had grown too long to read at the call site.
+/// What a tool set is built from. The fields are those of `Tools`.
 pub const Options = struct {
     io: std.Io,
-    /// The directory the tools work in. See `Tools.dir`.
     dir: std.Io.Dir,
-    /// For temporary buffers.
     gpa: std.mem.Allocator,
-    /// How a tool's block is laid out for the user. Null layouts, for both a bash
-    /// command and an edit diff, show the text as written.
     formats: Formats = .{},
-    /// Longest a bash command may run before it is killed, in seconds. No
-    /// default: every caller has one to give, and a missing one is a mistake
-    /// worth catching at the call site rather than papering over with 120.
+    /// No default: a missing timeout is worth catching at the call site.
     bash_timeout_s: usize,
-    /// How the lines billy prints itself are decorated.
     style: Terminal.Style = .plain,
-    /// The backend the configuration asked for, with its key resolved, or null
-    /// to leave web search out. A null also leaves `web_search` out of the
-    /// tool set billy offers, so the model is never given a tool that could
-    /// not run.
     search: ?web.Search.Config = null,
-    /// The fetch backends the configuration asked for, with their keys resolved,
-    /// or null to leave `web_fetch` out.
     fetch: ?web.Fetch.Config = null,
-    /// The run's one HTTP client, borrowed by a web tool when one is configured.
     http: *std.http.Client,
-    /// The waits of every backend, so one that just failed is skipped.
     health: ?*Health = null,
 };
 
@@ -139,16 +108,14 @@ pub fn init(options: Options) !Tools {
     };
 }
 
-/// Whether any web tool is offered: a search backend or a fetch backend, each
-/// with its own set, so a configuration may have one without the other.
+/// Whether any web tool is offered. A configuration may have search without
+/// fetch, or the reverse.
 pub fn hasWeb(tools: *const Tools) bool {
     return tools.search != null or tools.fetch != null;
 }
 
-/// The definitions a session should be given: the tools the mode allows, in the
-/// spec table's order, with the web tools last when a backend is configured. The
-/// strings are the spec table's own, which are comptime, so this builds nothing;
-/// the session interns and stores them.
+/// The definitions a session is given: the tools the mode allows, with the web
+/// tools last when a backend is configured. Comptime strings, so nothing is built.
 pub fn definitions(tools: *const Tools, mode: agent.Mode) []const Session.Definition {
     return switch (mode) {
         .general => if (tools.hasWeb()) &specs_with_web else &specs,
@@ -156,60 +123,42 @@ pub fn definitions(tools: *const Tools, mode: agent.Mode) []const Session.Defini
     };
 }
 
-/// The name of the tool `call` names, for a caller that has to check it against
-/// a mode without showing the call.
+/// The name of the tool `call` names, for checking it against a mode without
+/// showing the call.
 pub fn callName(call: Call) []const u8 {
     return switch (call) {
-        // The two a call carries its own name in: one never named a tool, and the
-        // other is the name whose arguments could not be parsed.
         .unknown => |name| name,
         .malformed => |bad| bad.name,
-        // Every other tag is the tool's own name, so it is not written twice.
         inline else => |_, tag| @tagName(tag),
     };
 }
 
-/// What one call produced is written, not returned: `run` writes the result text
-/// to the writer it is given, so the caller decides where a result lands and the
-/// tools own no buffer of their own.
-///
-/// A result longer than `max_result_len` is cut there, with a count of what was
-/// left out, so a tool that returns a wall of text cannot fill the model's
-/// context. That is billy's rule for every call rather than a tool's, so it is
-/// applied here, where a call's result passes, and no tool has to know about it.
+/// Writes the result of `call` to `result`, cut at `max_result_len` with a count of
+/// what was left out, so no tool can fill the model's context. The cap is applied
+/// here so no tool has to know about it.
 pub fn run(tools: *Tools, call: Call, result: *std.Io.Writer) !void {
     var buffer: [result_buffer_len]u8 = undefined;
     var limited = Limited.init(result, &buffer, max_result_len);
     try tools.dispatch(call, &limited.writer);
-    // What is still gathered has to be passed on before the count of what was
-    // dropped is known, and before the caller reads the result.
+    // The dropped count is only final once what is gathered has been passed on.
     try limited.writer.flush();
-    // A tool that wrote past the limit is told what it lost, which the model
-    // reads as a truncation rather than as the result simply ending.
+    // Reads to the model as a truncation, not as the result ending.
     if (limited.dropped > 0) {
         try result.print("\n… {d} more bytes", .{limited.dropped});
     }
 }
 
-/// How much of a result is gathered before it is passed on: room for a good few
-/// lines, so a tool that writes a line at a time does not become a call to the
-/// writer behind this for every line, while staying small enough to keep on the
-/// stack.
+/// Gathered before being passed on, so a tool that writes a line at a time is not
+/// a call to the writer behind this for every line.
 ///
 /// TODO: `writeSplatHeaderLimit` would merge a format's slices, repeats and
-/// header into one write, but it can consume less than it was given, so using it
-/// means rebuilding what is left. Worth it only if this shows up in a profile.
+/// header into one write, but it can consume less than it was given. Worth it
+/// only if this shows up in a profile.
 const result_buffer_len = 4096;
 
-/// A writer that gathers what is written and passes it to another writer, up to
-/// a limit. Everything past the limit is counted and dropped rather than written,
-/// so a caller can put a ceiling on how much text reaches where it is going
-/// without the tool that writes it having to know.
-///
-/// The dropped count is what `run` reports once the call is done, which is why
-/// the last of what is gathered has to be flushed out first. Writing past the
-/// limit is not an error, so a tool that fills the buffer is not turned into a
-/// failed call by it.
+/// A writer that passes what is written to another writer up to a limit, and
+/// counts and drops the rest. Writing past the limit is not an error, so a tool
+/// that fills the buffer is not turned into a failed call.
 const Limited = struct {
     /// Where the bytes that fit are passed on.
     inner: *std.Io.Writer,
@@ -231,23 +180,19 @@ const Limited = struct {
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *Limited = @alignCast(@fieldParentPtr("writer", w));
 
-        // What is gathered was written before the slices handed over now, so it
-        // goes first. What fits is handed on in one write rather than a byte at
-        // a time, since `writeAll` loops on its own until it is all through.
+        // What is already gathered goes first.
         const header = w.buffer[0..w.end];
         w.end = 0;
         try self.hand(header);
 
-        // Every slice but the last is written once. A slice that does not fit
-        // whole is handed on as the prefix of it that does.
+        // Every slice but the last is written once; the last is repeated `splat`
+        // times.
         for (data[0 .. data.len - 1]) |bytes| try self.hand(bytes);
 
-        // The copies go over together, which is what makes the padding of a
-        // format such as `{d:>6}` one write rather than six.
+        // The repeats go over together, so padding is one write, not one per byte.
         try self.repeat(data[data.len - 1], splat);
 
-        // Every byte handed over is consumed here, whether it was written or
-        // dropped: the caller has none of it left to hand over again.
+        // Dropped bytes count as consumed, or the caller would offer them again.
         var offered: usize = data[data.len - 1].len * splat;
         for (data[0 .. data.len - 1]) |bytes| offered += bytes.len;
         return offered;
@@ -271,8 +216,7 @@ const Limited = struct {
         self.dropped += offered - fits;
         if (fits == 0 or pattern.len == 0) return;
 
-        // `writeSplatAll` shuffles the slices as it consumes them, so it takes
-        // them mutably; what is copied here is the list, not the bytes.
+        // `writeSplatAll` takes the slice list mutably; only the list is copied.
         const whole = fits / pattern.len;
         if (whole > 0) {
             var repeated = [_][]const u8{pattern};
@@ -283,17 +227,14 @@ const Limited = struct {
     }
 };
 
-/// Writes the reason a call could not run, which is how a failed call is told
-/// from one that answered: every failure begins with `error: `, and a result is
-/// read for it both by the terminal and by the page (see `printResult` and
-/// `html.block`). A tool that fails through this writes only what went wrong,
-/// and the mark that makes it a failure is added here rather than by each tool.
+/// Writes why a call could not run. Every failure begins with `error: `, which
+/// `printResult` and `html.block` read to tell a failure from an answer, so tools
+/// write only what went wrong.
 pub fn fail(out: *std.Io.Writer, comptime format: []const u8, args: anytype) !void {
     try out.print("error: " ++ format, args);
 }
 
-/// Runs a parsed call, writing the result of it -- or the reason it could not
-/// run -- to `out`, in the shape the model is given it.
+/// Runs a parsed call, writing its result or the reason it could not run to `out`.
 fn dispatch(tools: *Tools, call: Call, out: *std.Io.Writer) !void {
     switch (call) {
         .edit => |edit| try edit.run(tools.gpa, tools.io, tools.dir, out),
@@ -327,9 +268,8 @@ fn dispatch(tools: *Tools, call: Call, out: *std.Io.Writer) !void {
     }
 }
 
-/// Runs one call the way the agent does -- parse it, then run it -- writing the
-/// result into `result`. The parsed call is handed back, so a test can give both
-/// to `describe` exactly as the terminal emitter does.
+/// Parses and runs one call as the agent does, and hands the parsed call back so a
+/// test can give both to `describe`.
 fn runCall(
     arena: std.mem.Allocator,
     tools: *Tools,
@@ -341,24 +281,18 @@ fn runCall(
     return parsed;
 }
 
-/// Parses a tool call into the arguments of the call it names. It never fails:
-/// an unimplemented tool becomes `unknown` and arguments that do not fit become
-/// `malformed`, so a caller can still name the call it could not run.
-///
-/// The parsed call lives in `arena`, which has to outlive the `run` that is
-/// given it and whatever shows the call.
+/// Parses a tool call into the arguments of the tool it names. It never fails: an
+/// unimplemented tool becomes `unknown` and arguments that do not fit become
+/// `malformed`, so a caller can still name the call it could not run. The result
+/// lives in `arena`.
 pub fn parse(arena: std.mem.Allocator, call: llm.ToolCall) Call {
     return parseCallNamed(arena, call.function.name, call.function.arguments);
 }
 
-/// Parses a call from the name of the tool and the arguments it was given, which
-/// is the pair a session stores. This is what a transcript reads a call with, so
-/// that replaying one does not have to build the `llm.ToolCall` it came from.
+/// Parses a call from a tool's name and arguments, the pair a session stores, so a
+/// transcript need not build the `llm.ToolCall` it came from.
 pub fn parseCallNamed(arena: std.mem.Allocator, name: []const u8, arguments: []const u8) Call {
-    // The tools a call can name, by the tag they parse into. The tag is the name
-    // a model uses, so the two are not written side by side: a tool whose
-    // arguments do not fit becomes `malformed` rather than failing the call, so a
-    // caller can still name what it could not run.
+    // The tag is the tool's name, so the two are not written side by side.
     const fields = @typeInfo(Call).@"union".field_types;
     inline for (.{ Call.read, Call.write, Call.edit, Call.bash, Call.web_search, Call.web_fetch }) |tag| {
         if (std.mem.eql(u8, name, @tagName(tag))) {
@@ -380,12 +314,10 @@ fn fromJson(comptime T: type, arena: std.mem.Allocator, json: []const u8) !T {
     });
 }
 
-/// Prints the block a live session shows for a tool call and its result: a
-/// header naming the tool, what it acts on, and its output. The transcript
-/// reuses it so that replaying a session matches the run exactly.
-///
-/// `scratch` is free for the block to build with, such as an edit's diff; it is
-/// the caller's, dropped once the block is printed.
+/// Prints the block for a tool call and its result: a header naming the tool and
+/// what it acts on, then its output. The transcript reuses it so a replay matches
+/// the run. `scratch` is the caller's, for what the block builds, such as an
+/// edit's diff.
 pub fn describe(
     scratch: std.mem.Allocator,
     call: Call,
