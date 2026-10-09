@@ -575,8 +575,14 @@ fn refresh(agent: *Agent, session: *Session) void {
 }
 
 /// Asks `session` one thing and shows how the answer is reached: the prompt, the
-/// tool calls, and the reply. On the first turn the session is named from what
-/// was asked, and then, if titles are on, by a title the model writes.
+/// tool calls it makes, and the reply. This is what one prompt of a
+/// conversation comes to, and the same in either frontend.
+///
+/// A turn that fails is reported through `emitter` as a notice rather than
+/// returned: a request that did not go through leaves the conversation as it was
+/// and is the user's to try again, which a frontend shows and the run carries
+/// on from. Only a failure of the emitter itself, which is the frontend going
+/// away, is passed on to the caller.
 pub fn ask(agent: *Agent, emitter: Emitter, session: *Session, text: []const u8) !void {
     // The system prompt is kept apart from the conversation, so the first turn is
     // the session's first message.
@@ -585,12 +591,33 @@ pub fn ask(agent: *Agent, emitter: Emitter, session: *Session, text: []const u8)
 
     try session.append(.{ .role = .user, .content = text });
     try emitter.show(.{ .prompt = text });
-    try turn(agent, emitter, session);
+
+    // A turn that failed is shown where the answer would have been, so the loss
+    // is visible in the conversation rather than only in a log. The turn is
+    // given up rather than retried: what went wrong is the provider's or the
+    // network's, and asking again is the user's decision.
+    turn(agent, emitter, session) catch |err| {
+        std.log.err("a request failed: {s}", .{@errorName(err)});
+        var notice: [256]u8 = undefined;
+        return emitter.show(.{ .notice = failureNotice(&notice, err) });
+    };
 
     if (first_turn and agent.config.title) {
         titleSession(agent, session) catch |err|
             std.log.warn("could not title the session: {s}", .{@errorName(err)});
     }
+}
+
+/// What a failed turn is reported as, written into `buffer`: the reason the
+/// request did not go through, so the user can tell a dropped connection from a
+/// provider that refused, and knows the turn is theirs to ask again.
+///
+/// The buffer is the caller's, since the notice is shown as it is written and
+/// nothing keeps it: an allocation here would have to be freed after a call that
+/// cannot fail without losing the word the user needs.
+fn failureNotice(buffer: []u8, err: anyerror) []const u8 {
+    return std.fmt.bufPrint(buffer, "the request failed: {s} — nothing was sent, try again", .{@errorName(err)}) catch
+        "the request failed — nothing was sent, try again";
 }
 
 pub fn run(
@@ -652,10 +679,12 @@ pub fn run(
         // to the input, not to what was said. Flushed before the request, which
         // may take a while, so the user sees what was sent.
         //
-        // A failed request must not end the session: report it and take the next
-        // request from the user.
+        // A request that failed has been reported through the emitter by `ask`,
+        // and the session carries on: a dropped connection is not the end of the
+        // conversation. Only a failure of the emitter itself, which is this
+        // terminal going away, reaches here.
         agent.ask(emitter, session, text) catch |err|
-            std.log.err("request failed: {s}", .{@errorName(err)});
+            std.log.err("could not show the turn: {s}", .{@errorName(err)});
         try out.flush();
     }
     try out.flush();
@@ -921,6 +950,7 @@ fn runCalls(
 fn leadPrompt(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir, user_dir: ?std.Io.Dir, mode: Mode) ![]u8 {
     var text: std.Io.Writer.Allocating = .init(gpa);
     errdefer text.deinit();
+
     // The mode's text first, then each section of instructions as it is found,
     // so the whole prompt is written once into one buffer with no part of it
     // built apart and then copied in.

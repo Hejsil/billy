@@ -817,8 +817,11 @@ fn serveTurn(
         return;
     }
 
+    // A request that failed has been reported through the emitter by `ask`,
+    // which is the same notice the terminal shows. Only a failure of the stream
+    // itself, which is this page going away, reaches here.
     agent.ask(emitter, session, text) catch |err| {
-        std.log.err("a request failed: {s}", .{@errorName(err)});
+        std.log.err("could not show the turn: {s}", .{@errorName(err)});
         try stream.fail(@errorName(err));
     };
 
