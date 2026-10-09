@@ -289,10 +289,10 @@ fn list(
 
     for (services) |service| {
         try out.print("{s}", .{service.name()});
-        try spaces(out, name_width - service.name().len);
+        try out.splatByteAll(' ', name_width - service.name().len);
         try out.writeAll("  ");
         try out.print("{s}", .{service.purpose()});
-        try spaces(out, purpose_width - service.purpose().len);
+        try out.splatByteAll(' ', purpose_width - service.purpose().len);
         try out.writeAll("  ");
         if (store.get(service) != null) {
             try out.writeAll("stored");
@@ -304,11 +304,6 @@ fn list(
         try out.writeAll("\n");
     }
     try out.print("\n`billy login <service>` stores a key in {s}\n", .{path});
-}
-
-fn spaces(out: *std.Io.Writer, count: usize) !void {
-    var i: usize = 0;
-    while (i < count) : (i += 1) try out.writeAll(" ");
 }
 
 /// Reads one line from the terminal, with echo off so a key is not left on the

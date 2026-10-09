@@ -17,6 +17,7 @@ const std = @import("std");
 const md = @import("../md.zig");
 const md4c = @import("../md4c.zig");
 const Style = @import("style.zig").Style;
+const terminal_width = @import("width.zig");
 
 const Markdown = @This();
 
@@ -416,7 +417,7 @@ fn closeTable(self: *Markdown) bool {
     for (self.rows.items) |row| {
         for (row.cells.items, 0..) |cell, column| {
             if (column >= columns) break;
-            widths[column] = @max(widths[column], textWidth(cell));
+            widths[column] = @max(widths[column], terminal_width.columns(cell));
         }
     }
 
@@ -444,26 +445,32 @@ fn writeRule(self: *Markdown, widths: []const usize, columns: usize) bool {
     if (!self.writeIndent()) return false;
     for (0..columns) |column| {
         if (column > 0 and !self.raw("  ")) return false;
-        var i: usize = 0;
-        while (i < widths[column]) : (i += 1) if (!self.raw("-")) return false;
+        if (!self.fill('-', widths[column])) return false;
     }
     self.endLine();
     return true;
 }
 
 fn writeCell(self: *Markdown, text: []const u8, width: usize, alignment: md.c.MD_ALIGN, pad_right: bool) bool {
-    const pad = width - textWidth(text);
+    const pad = width - terminal_width.columns(text);
     const before = switch (alignment) {
         md.c.MD_ALIGN_RIGHT => pad,
         md.c.MD_ALIGN_CENTER => pad / 2,
         else => 0,
     };
     const after = if (pad_right) pad else before;
-    var i: usize = 0;
-    while (i < before) : (i += 1) if (!self.raw(" ")) return false;
+    if (!self.fill(' ', before)) return false;
     if (!self.raw(text)) return false;
-    i = before;
-    while (i < after) : (i += 1) if (!self.raw(" ")) return false;
+    return self.fill(' ', after - before);
+}
+
+/// Writes `byte` `count` times.
+fn fill(self: *Markdown, byte: u8, count: usize) bool {
+    if (self.err != null) return false;
+    self.out.splatByteAll(byte, count) catch |err| {
+        self.err = err;
+        return false;
+    };
     return true;
 }
 

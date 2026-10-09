@@ -5,6 +5,7 @@
 //! without editing, which keeps the harness usable from a pipe.
 
 const std = @import("std");
+const terminal_width = @import("Terminal/width.zig");
 
 const LineEditor = @This();
 
@@ -874,12 +875,7 @@ fn isContinuation(byte: u8) bool {
     return byte & 0xc0 == 0x80;
 }
 
-/// Columns `text` takes on the terminal: one per character. A double-width
-/// character counts as one too, so a line of them is folded a little wide;
-/// everything the prompt and the header are made of is one column.
-fn columns(text: []const u8) usize {
-    return std.unicode.utf8CountCodepoints(text) catch text.len;
-}
+const columns = terminal_width.columns;
 
 /// Byte offset of the character `count` characters into `text`, clamped to its
 /// end, so that a slice never splits a character.
