@@ -3,7 +3,6 @@
 
 const std = @import("std");
 const Health = @import("../../Health.zig");
-const transport = @import("../web.zig");
 const tools = @import("../../Tools.zig");
 const outcome = @import("Outcome.zig");
 const exa = @import("provider/exa.zig");

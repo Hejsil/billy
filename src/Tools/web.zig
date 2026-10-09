@@ -2,11 +2,9 @@
 
 const std = @import("std");
 const Health = @import("../Health.zig");
-const tools = @import("../Tools.zig");
 
 pub const Search = @import("web/Search.zig");
 pub const Fetch = @import("web/Fetch.zig");
-pub const outcome = @import("web/Outcome.zig");
 
 /// What one request to a provider came back with: the body, or the wait the
 /// provider asked for before it is asked again.
