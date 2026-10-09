@@ -932,15 +932,15 @@ test "a bash block shows only the streams the command filled" {
 
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
-    var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    defer http_client.deinit();
 
     var tool_set = try Tools.init(.{
         .io = std.testing.io,
         .dir = std.Io.Dir.cwd(),
         .gpa = gpa,
         .bash_timeout_s = 120,
-        .http = &http,
+        .http = &http_client,
     });
     const cases = [_]struct { command: []const u8, expected: []const u8 }{
         // Nothing printed: the status is all there is.
@@ -1164,15 +1164,15 @@ test "run logs exactly what describe prints" {
 
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
-    var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    defer http_client.deinit();
 
     var tool_set = try Tools.init(.{
         .io = std.testing.io,
         .dir = std.Io.Dir.cwd(),
         .gpa = gpa,
         .bash_timeout_s = 120,
-        .http = &http,
+        .http = &http_client,
     });
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
@@ -1197,8 +1197,8 @@ test "the format changes what is shown and nothing else" {
 
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
-    var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    defer http_client.deinit();
 
     // The format script writes the command back upper case, so what is shown is
     // plainly not what runs.
@@ -1209,7 +1209,7 @@ test "the format changes what is shown and nothing else" {
         .gpa = gpa,
         .formats = .{ .bash = format },
         .bash_timeout_s = 120,
-        .http = &http,
+        .http = &http_client,
     });
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
@@ -1315,8 +1315,8 @@ test "a bash command that outlives the timeout is killed and reported" {
 
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
-    var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    defer http_client.deinit();
 
     // A one-second limit kills a command that would otherwise run far longer,
     // and the model is told so rather than left waiting for it to finish.
@@ -1325,7 +1325,7 @@ test "a bash command that outlives the timeout is killed and reported" {
         .dir = std.Io.Dir.cwd(),
         .gpa = gpa,
         .bash_timeout_s = 1,
-        .http = &http,
+        .http = &http_client,
     });
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
@@ -1549,14 +1549,14 @@ test "the tools work in the directory they are given, wherever billy runs" {
 
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
-    var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    defer http_client.deinit();
     var tool_set = try Tools.init(.{
         .io = std.testing.io,
         .dir = work,
         .gpa = gpa,
         .bash_timeout_s = 120,
-        .http = &http,
+        .http = &http_client,
     });
 
     // A file written by the tool lands in that directory. The result is not
@@ -1707,14 +1707,14 @@ test "a result longer than the cap is cut and says what it lost" {
     for (0..1000) |_| try big.appendSlice(gpa, line);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big.txt", .data = big.items });
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    defer http_client.deinit();
     var tool_set = try Tools.init(.{
         .io = std.testing.io,
         .dir = tmp.dir,
         .gpa = gpa,
         .bash_timeout_s = 120,
-        .http = &http,
+        .http = &http_client,
     });
 
     var result: std.Io.Writer.Allocating = .init(gpa);

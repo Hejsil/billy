@@ -54,7 +54,7 @@ raw: bool = false,
 
 /// Fetches one url and writes its content as text. A page is extracted by a
 /// backend; `raw` reads the url directly, for an API or a file.
-pub fn run(fetch: Fetch, gpa: std.mem.Allocator, http: *std.http.Client, config: ?Config, health: ?*Health, out: *std.Io.Writer) !void {
+pub fn run(fetch: Fetch, gpa: std.mem.Allocator, http_client: *std.http.Client, config: ?Config, health: ?*Health, out: *std.Io.Writer) !void {
     if (fetch.url.len == 0) return tools.fail(out, "no url to fetch", .{});
 
     const fetch_config = config orelse return tools.fail(
@@ -63,11 +63,11 @@ pub fn run(fetch: Fetch, gpa: std.mem.Allocator, http: *std.http.Client, config:
         .{},
     );
 
-    const now_ms = std.Io.Clock.real.now(http.io).toMilliseconds();
+    const now_ms = std.Io.Clock.real.now(http_client.io).toMilliseconds();
 
     // A raw fetch asks for the url itself, so no backend is consulted.
     if (fetch.raw) {
-        const value = try direct.fetch(gpa, http, fetch.url);
+        const value = try direct.fetch(gpa, http_client, fetch.url);
         defer gpa.free(value.text);
         return out.writeAll(value.text);
     }
@@ -79,7 +79,7 @@ pub fn run(fetch: Fetch, gpa: std.mem.Allocator, http: *std.http.Client, config:
     var unreadable = false;
     for (fetch_config.backends) |backend| {
         if (Health.isSetAside(health, @tagName(backend.provider), now_ms)) continue;
-        const value = fetchBackend(gpa, http, backend, fetch.url) catch |err| {
+        const value = fetchBackend(gpa, http_client, backend, fetch.url) catch |err| {
             // A url the backend could not read is not a backend that is down:
             // it answered, so the next backend is tried without setting this
             // one aside. Anything else -- no answer, or an answer that is not a
@@ -116,7 +116,7 @@ pub fn run(fetch: Fetch, gpa: std.mem.Allocator, http: *std.http.Client, config:
     // A backend answered and could not read this url, so it is read directly: a
     // page billy can reach itself is still worth having. A set with no backend
     // in it asks for no extraction at all, so that is where it ends.
-    if (unreadable) return readDirectly(gpa, http, fetch.url, out);
+    if (unreadable) return readDirectly(gpa, http_client, fetch.url, out);
     if (fetch_config.backends.len == 0) return tools.fail(
         out,
         "no fetch backend is configured; add one to tools.web_fetch.providers, or pass raw",
@@ -127,18 +127,18 @@ pub fn run(fetch: Fetch, gpa: std.mem.Allocator, http: *std.http.Client, config:
 
 /// Reads `url` with no backend at all, which is what a fetch falls back to when
 /// no configured backend reads it, and what the `raw` provider does on its own.
-fn readDirectly(gpa: std.mem.Allocator, http: *std.http.Client, url: []const u8, out: *std.Io.Writer) !void {
-    const value = try direct.fetch(gpa, http, url);
+fn readDirectly(gpa: std.mem.Allocator, http_client: *std.http.Client, url: []const u8, out: *std.Io.Writer) !void {
+    const value = try direct.fetch(gpa, http_client, url);
     defer gpa.free(value.text);
     return out.writeAll(value.text);
 }
 
 /// Fetches one url with one backend, whichever it is.
-fn fetchBackend(gpa: std.mem.Allocator, http: *std.http.Client, backend: Backend, url: []const u8) !transport.Answer {
+fn fetchBackend(gpa: std.mem.Allocator, http_client: *std.http.Client, backend: Backend, url: []const u8) !transport.Answer {
     return switch (backend.provider) {
-        .tavily => tavily.fetch(gpa, http, backend.api_key, reach(backend), url),
-        .exa => exa.fetch(gpa, http, backend.api_key, reach(backend), url),
-        .raw => direct.fetch(gpa, http, url),
+        .tavily => tavily.fetch(gpa, http_client, backend.api_key, reach(backend), url),
+        .exa => exa.fetch(gpa, http_client, backend.api_key, reach(backend), url),
+        .raw => direct.fetch(gpa, http_client, url),
     };
 }
 
@@ -172,8 +172,8 @@ test "a url no backend could read does not set the backend aside" {
     defer mock.deinit();
     try mock.serve();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
 
     var health = try Health.load(io, gpa, tmp.dir);
     defer health.deinit();
@@ -184,7 +184,7 @@ test "a url no backend could read does not set the backend aside" {
     defer out.deinit();
     // Tavily is the only configured backend and it could not read the url, so
     // the url is read directly instead -- from the same mock.
-    try run(.{ .url = mock.url }, gpa, &http, config, &health, &out.writer);
+    try run(.{ .url = mock.url }, gpa, &http_client, config, &health, &out.writer);
     try mock.group.await(io);
     if (mock.err) |err| return err;
 
@@ -208,12 +208,12 @@ test "a raw fetch reads the url directly, without any backend" {
     defer mock.deinit();
     try mock.serve();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try run(.{ .url = mock.url, .raw = true }, gpa, &http, .{ .backends = &.{} }, null, &out.writer);
+    try run(.{ .url = mock.url, .raw = true }, gpa, &http_client, .{ .backends = &.{} }, null, &out.writer);
     try mock.group.await(io);
     if (mock.err) |err| return err;
 
@@ -226,12 +226,12 @@ test "a fetch with no backend named says so rather than reading the url" {
 
     // An empty set is a configuration that wants no page extraction; a call that
     // did not ask for `raw` cannot be answered by guessing the address.
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try run(.{ .url = "https://example.org" }, gpa, &http, .{ .backends = &.{} }, null, &out.writer);
+    try run(.{ .url = "https://example.org" }, gpa, &http_client, .{ .backends = &.{} }, null, &out.writer);
     try std.testing.expectEqualStrings(
         "error: no fetch backend is configured; add one to tools.web_fetch.providers, or pass raw",
         out.written(),
@@ -242,11 +242,11 @@ test "a fetch of an empty url is refused before any backend is asked" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try run(.{ .url = "" }, gpa, &http, .{ .backends = &.{} }, null, &out.writer);
+    try run(.{ .url = "" }, gpa, &http_client, .{ .backends = &.{} }, null, &out.writer);
     try std.testing.expectEqualStrings("error: no url to fetch", out.written());
 }

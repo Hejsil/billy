@@ -10,7 +10,7 @@ const Mock = @import("../../../Mock.zig");
 /// engines it searched. It takes no result count, so the cap is applied here.
 pub fn search(
     gpa: std.mem.Allocator,
-    http: *std.http.Client,
+    http_client: *std.http.Client,
     base: []const u8,
     query: []const u8,
     max_results: usize,
@@ -23,7 +23,7 @@ pub fn search(
     const url = try transport.queryUrl(gpa, endpoint, query, "&format=json", .{});
     defer gpa.free(url);
 
-    const reply = switch (try transport.requestJson(Response, gpa, http, .GET, url, null, &.{}, "search")) {
+    const reply = switch (try transport.requestJson(Response, gpa, http_client, .GET, url, null, &.{}, "search")) {
         .parsed => |parsed| parsed,
         .retry_after_ms => |ms| return .{ .retry_after_ms = ms },
     };
@@ -58,12 +58,12 @@ test "a searxng search sends the query to the instance, and caps the results" {
     defer mock.deinit();
     try mock.serve();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
 
     // The cap is applied here, since SearXNG takes no result count: only the
     // first of the two results is rendered.
-    const value = try search(gpa, &http, mock.url, "zig lang", 1);
+    const value = try search(gpa, &http_client, mock.url, "zig lang", 1);
     defer gpa.free(value.text);
     try mock.group.await(io);
     if (mock.err) |err| return err;

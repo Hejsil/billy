@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Health = @import("../Health.zig");
+const http = @import("../http.zig");
 
 pub const Search = @import("web/Search.zig");
 pub const Fetch = @import("web/Fetch.zig");
@@ -24,14 +25,14 @@ pub const Answer = union(enum) {
 /// still parses.
 pub fn request(
     gpa: std.mem.Allocator,
-    http: *std.http.Client,
+    http_client: *std.http.Client,
     method: std.http.Method,
     location: []const u8,
     payload: ?[]const u8,
     headers: []const std.http.Header,
     what: []const u8,
 ) !Answer {
-    var req = try http.request(method, try std.Uri.parse(location), .{
+    var req = try http_client.request(method, try std.Uri.parse(location), .{
         .headers = .{
             .content_type = if (payload) |_| .{ .override = "application/json" } else .default,
         },
@@ -67,23 +68,7 @@ pub fn request(
         return error.RequestFailed;
     }
 
-    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
-        .identity => &.{},
-        .zstd => try gpa.alloc(u8, std.compress.zstd.default_window_len),
-        .deflate, .gzip => try gpa.alloc(u8, std.compress.flate.max_window_len),
-        .compress => return error.UnsupportedCompressionMethod,
-    };
-    defer gpa.free(decompress_buffer);
-
-    var body_writer: std.Io.Writer.Allocating = .init(gpa);
-    errdefer body_writer.deinit();
-
-    var transfer_buffer: [64]u8 = undefined;
-    var decompress: std.http.Decompress = undefined;
-    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-    _ = try reader.streamRemaining(&body_writer.writer);
-
-    return .{ .text = try body_writer.toOwnedSlice() };
+    return .{ .text = try http.readBody(gpa, &response) };
 }
 
 /// What `requestJson` came back with: the reply parsed as `T`, or the wait the
@@ -100,14 +85,14 @@ pub fn JsonAnswer(comptime T: type) type {
 pub fn requestJson(
     comptime T: type,
     gpa: std.mem.Allocator,
-    http: *std.http.Client,
+    http_client: *std.http.Client,
     method: std.http.Method,
     location: []const u8,
     payload: ?[]const u8,
     headers: []const std.http.Header,
     what: []const u8,
 ) !JsonAnswer(T) {
-    const text = switch (try request(gpa, http, method, location, payload, headers, what)) {
+    const text = switch (try request(gpa, http_client, method, location, payload, headers, what)) {
         .text => |text| text,
         .retry_after_ms => |ms| return .{ .retry_after_ms = ms },
     };
@@ -156,13 +141,13 @@ test "a JSON reply is parsed, and one of another shape is a bad reply" {
     const io = std.testing.io;
     const Shape = struct { a: u32 };
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
 
     var good = try Mock.start("/x", 1, Mock.fixed("{\"a\":7,\"extra\":1}"));
     defer good.deinit();
     try good.serve();
-    const answer = try requestJson(Shape, gpa, &http, .GET, good.url, null, &.{}, "search");
+    const answer = try requestJson(Shape, gpa, &http_client, .GET, good.url, null, &.{}, "search");
     defer answer.parsed.deinit();
     try good.group.await(io);
     if (good.err) |err| return err;
@@ -173,7 +158,7 @@ test "a JSON reply is parsed, and one of another shape is a bad reply" {
     try bad.serve();
     try std.testing.expectError(
         error.BadReply,
-        requestJson(Shape, gpa, &http, .GET, bad.url, null, &.{}, "search"),
+        requestJson(Shape, gpa, &http_client, .GET, bad.url, null, &.{}, "search"),
     );
     try bad.group.await(io);
     if (bad.err) |err| return err;

@@ -402,13 +402,13 @@ tool_set: Tools,
 /// The model client, sending the conversation to `config.url`.
 client: llm.Client,
 
-/// Opens a session for asking things, working in `cwd` and sharing `http`.
+/// Opens a session for asking things, working in `cwd` and sharing `http_client`.
 pub fn init(
     io: std.Io,
     gpa: std.mem.Allocator,
     config: Config,
     cwd: []const u8,
-    http: *std.http.Client,
+    http_client: *std.http.Client,
 ) !Agent {
     var work_dir = std.Io.Dir.openDirAbsolute(io, cwd, .{}) catch |err| {
         std.log.err("cannot work in {s}: {s}", .{ cwd, @errorName(err) });
@@ -425,7 +425,7 @@ pub fn init(
         .style = config.display.style,
         .search = config.search,
         .fetch = config.fetch,
-        .http = http,
+        .http = http_client,
         .health = config.health,
     });
 
@@ -441,7 +441,7 @@ pub fn init(
             .api_key = config.api_key,
             .url = config.url,
             .model = config.model,
-            .http = http,
+            .http = http_client,
             .reasoning = config.reasoning,
         },
     };
@@ -608,10 +608,10 @@ pub fn run(
     // One HTTP client for the run, shared by the model requests and the search
     // backend, so both reuse its connections and share the certificates it scans
     // once. Every session asked in this run borrows it.
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
 
-    var agent = try Agent.init(io, gpa, config, session.cwd(), &http);
+    var agent = try Agent.init(io, gpa, config, session.cwd(), &http_client);
     defer agent.deinit();
     // A resumed session keeps the prompt and tools it was saved with, so it is
     // prepared here; a new one gets them from its first prompt, through `start`.
@@ -1421,10 +1421,10 @@ test "printTranscript rebuilds an edit's diff from the stored call" {
 /// only drives the loop passes null, and the client it is given is never read.
 /// That is what keeps the setup of an unused client out of every test: the field
 /// is a pointer, so a null is only a null until a web tool is called.
-fn testAgent(io: std.Io, gpa: std.mem.Allocator, config: Config, http: ?*std.http.Client) !Agent {
+fn testAgent(io: std.Io, gpa: std.mem.Allocator, config: Config, http_client: ?*std.http.Client) !Agent {
     const work_dir = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(work_dir);
-    return testAgentIn(io, gpa, config, work_dir, http);
+    return testAgentIn(io, gpa, config, work_dir, http_client);
 }
 
 /// An agent for a test working in `work_dir`, which is where the project's
@@ -1435,9 +1435,9 @@ fn testAgentIn(
     gpa: std.mem.Allocator,
     config: Config,
     work_dir: []const u8,
-    http: ?*std.http.Client,
+    http_client: ?*std.http.Client,
 ) !Agent {
-    if (http) |client| return Agent.init(io, gpa, config, work_dir, client);
+    if (http_client) |client| return Agent.init(io, gpa, config, work_dir, client);
 
     var unused: std.http.Client = undefined;
     return Agent.init(io, gpa, config, work_dir, &unused);
@@ -1932,12 +1932,12 @@ test "maybeCompact folds the conversation once it has filled the window" {
     defer mock.deinit();
     try mock.serve();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
     config.url = mock.url;
     config.api_key = "k";
 
-    var agent = try testAgent(io, gpa, config, &http);
+    var agent = try testAgent(io, gpa, config, &http_client);
     defer agent.deinit();
 
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -2046,12 +2046,12 @@ test "a compaction asked for now folds the conversation in whatever its size" {
     defer mock.deinit();
     try mock.serve();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
     config.url = mock.url;
     config.api_key = "k";
 
-    var agent = try testAgent(io, gpa, config, &http);
+    var agent = try testAgent(io, gpa, config, &http_client);
     defer agent.deinit();
 
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -2324,14 +2324,14 @@ test "the terminal shows a tool call the way a replay does" {
     var call_state = std.heap.ArenaAllocator.init(gpa);
     defer call_state.deinit();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    defer http_client.deinit();
     var tool_set = try Tools.init(.{
         .io = std.testing.io,
         .dir = std.Io.Dir.cwd(),
         .gpa = gpa,
         .bash_timeout_s = 120,
-        .http = &http,
+        .http = &http_client,
     });
 
     const call: llm.ToolCall = .{ .id = "1", .function = .{
@@ -2452,13 +2452,13 @@ test "a turn shows the tool it runs and then the answer" {
     defer mock.deinit();
     try mock.serve();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
 
     var config = testConfig("m", "/work", null);
     config.url = mock.url;
     config.api_key = "k";
-    var agent = try testAgent(io, gpa, config, &http);
+    var agent = try testAgent(io, gpa, config, &http_client);
     defer agent.deinit();
 
     var recorder = Recorder{ .gpa = arena_state.allocator() };
@@ -2521,9 +2521,9 @@ test "the first turn names the session, and the naming is not part of it" {
     config.url = mock.url;
     // `Agent.init` opens the directory it works in, so it has to be one that
     // exists; the session's recorded directory is separate and stays "/work".
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
-    var agent = try testAgent(io, gpa, config, &http);
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+    var agent = try testAgent(io, gpa, config, &http_client);
     defer agent.deinit();
 
     var out: std.Io.Writer.Allocating = .init(gpa);

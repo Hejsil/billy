@@ -64,8 +64,8 @@ pub fn serve(setup: *Setup, out: *std.Io.Writer, host: []const u8, port: u16) !v
     // One HTTP client for the whole server, shared by every request of every
     // session, so they reuse its connections and share the certificates it scans
     // once.
-    var http: std.http.Client = .{ .allocator = setup.gpa, .io = setup.io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = setup.gpa, .io = setup.io };
+    defer http_client.deinit();
 
     // What the server knows about sessions beyond their files. It outlives every
     // connection, which is why it is here and not in the handler.
@@ -94,7 +94,7 @@ pub fn serve(setup: *Setup, out: *std.Io.Writer, host: []const u8, port: u16) !v
             slots.post(setup.io);
             return err;
         };
-        group.concurrent(setup.io, handle, .{ setup, &registry, &http, stream, &slots }) catch |err| {
+        group.concurrent(setup.io, handle, .{ setup, &registry, &http_client, stream, &slots }) catch |err| {
             // A connection that cannot be given a task is one to let go of,
             // rather than one to bring the server down over.
             slots.post(setup.io);
@@ -178,7 +178,7 @@ const Registry = struct {
 fn handle(
     setup: *Setup,
     registry: *Registry,
-    http: *std.http.Client,
+    http_client: *std.http.Client,
     stream: std.Io.net.Stream,
     slots: *std.Io.Semaphore,
 ) void {
@@ -210,7 +210,7 @@ fn handle(
     // The flag inside tells the failure path below whether a status is still
     // possible: a reply that has begun has sent its head already.
     var r = Request{ .setup = setup, .request = &request };
-    route(&r, registry, http) catch |err| {
+    route(&r, registry, http_client) catch |err| {
         std.log.err("cannot answer a request: {s}", .{@errorName(err)});
         // Nothing has been sent, so the browser can be told what happened
         // rather than only watching the connection drop.
@@ -292,7 +292,7 @@ const Request = struct {
 ///
 /// The handlers are given one of these, which carries everything a route needs
 /// and answers the failures they all share.
-fn route(r: *Request, registry: *Registry, http: *std.http.Client) !void {
+fn route(r: *Request, registry: *Registry, http_client: *std.http.Client) !void {
     // The path is the target up to a query, which none of these routes take.
     const target = r.request.head.target;
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
@@ -311,7 +311,7 @@ fn route(r: *Request, registry: *Registry, http: *std.http.Client) !void {
 
     if (std.mem.eql(u8, path, "/api/sessions")) switch (r.request.head.method) {
         .GET => return listSessions(r),
-        .POST => return createSession(r, registry, http),
+        .POST => return createSession(r, registry, http_client),
         else => return r.replyNotAllowed(),
     };
 
@@ -322,7 +322,7 @@ fn route(r: *Request, registry: *Registry, http: *std.http.Client) !void {
 
         // /api/sessions/{id}/message
         if (std.mem.eql(u8, path[id_end..], "/message")) switch (r.request.head.method) {
-            .POST => return askSession(r, registry, http, id),
+            .POST => return askSession(r, registry, http_client, id),
             else => return r.replyNotAllowed(),
         };
 
@@ -705,7 +705,7 @@ fn parsePrompt(gpa: std.mem.Allocator, body: []const u8) !std.json.Parsed(Prompt
 /// A new session has no id on the page until it is asked something, so the id it
 /// is given here is the first event of the stream: that is how the page learns it
 /// and adds the session to its list.
-fn createSession(r: *Request, registry: *Registry, http: *std.http.Client) !void {
+fn createSession(r: *Request, registry: *Registry, http_client: *std.http.Client) !void {
     const gpa = r.setup.gpa;
     const parsed = (try readPrompt(r)) orelse return;
     defer parsed.deinit();
@@ -726,14 +726,14 @@ fn createSession(r: *Request, registry: *Registry, http: *std.http.Client) !void
     var config = r.setup.agentConfig(session.cwd(), .plain);
     config.mode = choice.mode;
 
-    try serveTurn(r, http, &session, config, choice.text, session.id());
+    try serveTurn(r, http_client, &session, config, choice.text, session.id());
 }
 
 /// `POST /api/sessions/{id}/message`: asks the session `text`, answering with the
 /// run as it happens.
 ///
 /// A session a turn is already running for answers 409: one thing at a time.
-fn askSession(r: *Request, registry: *Registry, http: *std.http.Client, id: []const u8) !void {
+fn askSession(r: *Request, registry: *Registry, http_client: *std.http.Client, id: []const u8) !void {
     const parsed = (try readPrompt(r)) orelse return;
     defer parsed.deinit();
     if (parsed.value.text.len == 0)
@@ -749,7 +749,7 @@ fn askSession(r: *Request, registry: *Registry, http: *std.http.Client, id: []co
     var session = (try r.openSession(id)) orelse return;
     defer session.deinit();
 
-    try serveTurn(r, http, &session, r.setup.agentConfig(session.cwd(), .plain), parsed.value.text, null);
+    try serveTurn(r, http_client, &session, r.setup.agentConfig(session.cwd(), .plain), parsed.value.text, null);
 }
 
 /// Answers one prompt as the run happens: the run's blocks as the events of a
@@ -762,14 +762,14 @@ fn askSession(r: *Request, registry: *Registry, http: *std.http.Client, id: []co
 /// the page already has.
 fn serveTurn(
     r: *Request,
-    http: *std.http.Client,
+    http_client: *std.http.Client,
     session: *Session,
     config: Agent.Config,
     text: []const u8,
     announce_id: ?[]const u8,
 ) !void {
     const gpa = r.setup.gpa;
-    var agent = try Agent.init(r.setup.io, gpa, config, session.cwd(), http);
+    var agent = try Agent.init(r.setup.io, gpa, config, session.cwd(), http_client);
     defer agent.deinit();
     // The session is prepared from the mode the caller settled, which is the
     // session's own once it has been asked something.
@@ -1048,7 +1048,7 @@ const Exchange = struct {
     fn run(
         setup: *Setup,
         registry: *Registry,
-        http: *std.http.Client,
+        http_client: *std.http.Client,
         method: std.http.Method,
         path: []const u8,
         body: ?[]const u8,
@@ -1076,7 +1076,7 @@ const Exchange = struct {
         var server: std.http.Server = .init(&reader, &writer);
         var request = try server.receiveHead();
         var r = Request{ .setup = setup, .request = &request };
-        try route(&r, registry, http);
+        try route(&r, registry, http_client);
         exchange.answered = r.answered;
         try exchange.written.writer.writeAll(writer.buffered());
         return exchange;

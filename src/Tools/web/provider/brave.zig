@@ -10,7 +10,7 @@ const Mock = @import("../../../Mock.zig");
 /// sit under `web`.
 pub fn search(
     gpa: std.mem.Allocator,
-    http: *std.http.Client,
+    http_client: *std.http.Client,
     api_key: []const u8,
     endpoint: []const u8,
     query: []const u8,
@@ -19,7 +19,7 @@ pub fn search(
     const url = try transport.queryUrl(gpa, endpoint, query, "&count={d}", .{max_results});
     defer gpa.free(url);
 
-    const reply = switch (try transport.requestJson(Response, gpa, http, .GET, url, null, &.{
+    const reply = switch (try transport.requestJson(Response, gpa, http_client, .GET, url, null, &.{
         .{ .name = "x-subscription-token", .value = api_key },
         .{ .name = "accept", .value = "application/json" },
     }, "search")) {
@@ -62,10 +62,10 @@ test "a brave search sends the query in the url and reads the results back" {
     defer mock.deinit();
     try mock.serve();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
 
-    const value = try search(gpa, &http, "secret", mock.url, "zig lang", 3);
+    const value = try search(gpa, &http_client, "secret", mock.url, "zig lang", 3);
     defer gpa.free(value.text);
     try mock.group.await(io);
     if (mock.err) |err| return err;

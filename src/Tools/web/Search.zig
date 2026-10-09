@@ -60,20 +60,20 @@ query: []const u8,
 /// Runs one web search and writes its results as text. No backend is configured
 /// only when a resumed session carries the tool from a run that had one; the
 /// model is told so rather than the call failing outright.
-pub fn run(search: Search, gpa: std.mem.Allocator, http: *std.http.Client, config: ?Config, health: ?*Health, out: *std.Io.Writer) !void {
+pub fn run(search: Search, gpa: std.mem.Allocator, http_client: *std.http.Client, config: ?Config, health: ?*Health, out: *std.Io.Writer) !void {
     const search_config = config orelse return tools.fail(
         out,
         "web search is not configured",
         .{},
     );
 
-    const now_ms = std.Io.Clock.real.now(http.io).toMilliseconds();
+    const now_ms = std.Io.Clock.real.now(http_client.io).toMilliseconds();
     var failed: ?anyerror = null;
     for (search_config.backends) |backend| {
         // A backend that failed not long ago is skipped, so a backend that is
         // down, rate-limited or out of credit is not asked again yet.
         if (Health.isSetAside(health, @tagName(backend.provider), now_ms)) continue;
-        const value = searchBackend(gpa, http, backend, search.query, search_config.max_results) catch |err| {
+        const value = searchBackend(gpa, http_client, backend, search.query, search_config.max_results) catch |err| {
             try Health.recordFailure(health, @tagName(backend.provider), null, now_ms);
             std.log.warn("search: {s} failed: {s}, trying the next", .{
                 @tagName(backend.provider), @errorName(err),
@@ -109,7 +109,7 @@ pub fn run(search: Search, gpa: std.mem.Allocator, http: *std.http.Client, confi
 /// Runs one query against one backend, whichever it is.
 fn searchBackend(
     gpa: std.mem.Allocator,
-    http: *std.http.Client,
+    http_client: *std.http.Client,
     backend: Backend,
     query: []const u8,
     max_results: usize,
@@ -117,11 +117,11 @@ fn searchBackend(
     // The same cap for every backend, whatever the configuration says.
     const asked = @min(max_results, Result.result_limit);
     return switch (backend.provider) {
-        .tavily => tavily.search(gpa, http, backend.api_key, reach(backend), query, asked),
-        .exa => exa.search(gpa, http, backend.api_key, reach(backend), query, asked),
-        .brave => brave.search(gpa, http, backend.api_key, reach(backend), query, asked),
+        .tavily => tavily.search(gpa, http_client, backend.api_key, reach(backend), query, asked),
+        .exa => exa.search(gpa, http_client, backend.api_key, reach(backend), query, asked),
+        .brave => brave.search(gpa, http_client, backend.api_key, reach(backend), query, asked),
         // The instance is the configuration's, so it is always named.
-        .searxng => searxng.search(gpa, http, reach(backend), query, asked),
+        .searxng => searxng.search(gpa, http_client, reach(backend), query, asked),
     };
 }
 
@@ -151,8 +151,8 @@ test "the backends are tried in order until one answers" {
     defer mock.deinit();
     try mock.serve();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
 
     // Two backends, both standing in for the same server, so what is tested is
     // the order rather than which backend it is.
@@ -166,7 +166,7 @@ test "the backends are tried in order until one answers" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try run(.{ .query = "zig lang" }, gpa, &http, config, null, &out.writer);
+    try run(.{ .query = "zig lang" }, gpa, &http_client, config, null, &out.writer);
     try mock.group.await(io);
     if (mock.err) |err| return err;
 
@@ -187,8 +187,8 @@ test "a search fails only when every backend has failed" {
     defer mock.deinit();
     try mock.serve();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
 
     const config: Config = .{
         .backends = &.{
@@ -200,7 +200,7 @@ test "a search fails only when every backend has failed" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try run(.{ .query = "zig lang" }, gpa, &http, config, null, &out.writer);
+    try run(.{ .query = "zig lang" }, gpa, &http_client, config, null, &out.writer);
     try mock.group.await(io);
     if (mock.err) |err| return err;
 
@@ -226,8 +226,8 @@ test "a backend that failed is set aside, so the next search skips it" {
     defer mock.deinit();
     try mock.serve();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
 
     var health = try Health.load(io, gpa, tmp.dir);
     defer health.deinit();
@@ -245,7 +245,7 @@ test "a backend that failed is set aside, so the next search skips it" {
 
     // The first search falls through Tavily, which fails, to Brave, which
     // answers, and Tavily is left set aside.
-    try run(.{ .query = "zig lang" }, gpa, &http, config, &health, &out.writer);
+    try run(.{ .query = "zig lang" }, gpa, &http_client, config, &health, &out.writer);
     try std.testing.expectEqualStrings("1. Zig\n   https://ziglang.org\n   A language.\n", out.written());
     try std.testing.expect(health.skips("tavily", std.Io.Clock.real.now(io).toMilliseconds()));
     try std.testing.expect(!health.skips("brave", std.Io.Clock.real.now(io).toMilliseconds()));
@@ -254,7 +254,7 @@ test "a backend that failed is set aside, so the next search skips it" {
     // Brave asks in the url, so the third request arriving with no body is
     // Brave answering, not Tavily being asked again.
     out.clearRetainingCapacity();
-    try run(.{ .query = "zig lang" }, gpa, &http, config, &health, &out.writer);
+    try run(.{ .query = "zig lang" }, gpa, &http_client, config, &health, &out.writer);
     try mock.group.await(io);
     if (mock.err) |err| return err;
 
@@ -271,8 +271,8 @@ test "brave is asked for no more results than billy allows any backend" {
     defer mock.deinit();
     try mock.serve();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
 
     const config: Config = .{
         .backends = &.{.{ .provider = .brave, .api_key = "b", .endpoint = mock.url }},
@@ -280,7 +280,7 @@ test "brave is asked for no more results than billy allows any backend" {
     };
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try run(.{ .query = "zig" }, gpa, &http, config, null, &out.writer);
+    try run(.{ .query = "zig" }, gpa, &http_client, config, null, &out.writer);
     try mock.group.await(io);
     if (mock.err) |err| return err;
 
@@ -302,8 +302,8 @@ test "searxng results are capped at the most billy allows any backend" {
     defer mock.deinit();
     try mock.serve();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
 
     const config: Config = .{
         .backends = &.{.{ .provider = .searxng, .endpoint = mock.url }},
@@ -311,7 +311,7 @@ test "searxng results are capped at the most billy allows any backend" {
     };
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try run(.{ .query = "zig" }, gpa, &http, config, null, &out.writer);
+    try run(.{ .query = "zig" }, gpa, &http_client, config, null, &out.writer);
     try mock.group.await(io);
     if (mock.err) |err| return err;
 
@@ -329,8 +329,8 @@ test "a search with every backend set aside says so, without asking any" {
     var mock = try Mock.start("/search", 1, Mock.fixed("{}"));
     defer mock.deinit();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
 
     var health = try Health.load(io, gpa, tmp.dir);
     defer health.deinit();
@@ -348,7 +348,7 @@ test "a search with every backend set aside says so, without asking any" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try run(.{ .query = "zig lang" }, gpa, &http, config, &health, &out.writer);
+    try run(.{ .query = "zig lang" }, gpa, &http_client, config, &health, &out.writer);
 
     try std.testing.expectEqual(@as(usize, 0), mock.served);
     try std.testing.expectEqualStrings(

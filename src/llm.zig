@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Health = @import("Health.zig");
+const http = @import("http.zig");
 const Mock = @import("Mock.zig");
 
 /// Who a message is from. The API names these as strings; they are an enum here
@@ -284,28 +285,12 @@ pub const Client = struct {
         const status = response.head.status;
         const retry_after_ms = Health.retryAfterMs(response.head.bytes);
 
-        // The body of the response is read the way `fetch` reads it, so that a
-        // provider answering with a compressed body still parses.
-        const decompress_buffer: []u8 = switch (response.head.content_encoding) {
-            .identity => &.{},
-            .zstd => try client.gpa.alloc(u8, std.compress.zstd.default_window_len),
-            .deflate, .gzip => try client.gpa.alloc(u8, std.compress.flate.max_window_len),
-            .compress => return error.UnsupportedCompressionMethod,
-        };
-        defer client.gpa.free(decompress_buffer);
-
-        var response_text: std.Io.Writer.Allocating = .init(client.gpa);
-        errdefer response_text.deinit();
-
-        var transfer_buffer: [64]u8 = undefined;
-        var decompress: std.http.Decompress = undefined;
-        const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-        _ = try reader.streamRemaining(&response_text.writer);
+        const answer_body = try http.readBody(client.gpa, &response);
 
         return .{
             .status = status,
             .retry_after_ms = retry_after_ms,
-            .body = try response_text.toOwnedSlice(),
+            .body = answer_body,
         };
     }
 
@@ -533,15 +518,15 @@ test "a request reaches the wire with the body the head promised" {
     defer mock.deinit();
     try mock.serve();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
     var client: Client = .{
         .gpa = gpa,
         .io = io,
         .api_key = "secret",
         .url = mock.url,
         .model = "some-model",
-        .http = &http,
+        .http = &http_client,
     };
 
     const completion = try client.complete(gpa, &messages, @as([]const NoTools, &.{}));
@@ -581,15 +566,15 @@ test "transportWorthRetrying retries a connection and not a permanent failure" {
 
 test "pauseFor honors Retry-After and otherwise backs off with jitter" {
     const gpa = std.testing.allocator;
-    var http: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    defer http_client.deinit();
     var client: Client = .{
         .gpa = gpa,
         .io = std.testing.io,
         .api_key = "k",
         .url = "u",
         .model = "m",
-        .http = &http,
+        .http = &http_client,
     };
 
     // The server's own wait, clamped so it cannot park billy.
@@ -620,8 +605,8 @@ test "pauseFor honors Retry-After and otherwise backs off with jitter" {
 /// test costs no real time. The caller owns the returned completion and frees it
 /// with `deinit`.
 fn completeAgainst(gpa: std.mem.Allocator, io: std.Io, url: []const u8, max_attempts: usize) !Completion {
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
     var client: Client = .{
         .gpa = gpa,
         .io = io,
@@ -630,7 +615,7 @@ fn completeAgainst(gpa: std.mem.Allocator, io: std.Io, url: []const u8, max_atte
         .model = "m",
         .max_attempts = max_attempts,
         .retry_backoff = .zero,
-        .http = &http,
+        .http = &http_client,
     };
     const messages = [_]Message{.{ .role = .user, .content = "hi" }};
     return client.complete(gpa, &messages, @as([]const NoTools, &.{}));
@@ -708,15 +693,15 @@ test "the HTTP client is kept, so requests reuse one connection" {
     defer mock.deinit();
     try mock.serve();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
     var client: Client = .{
         .gpa = gpa,
         .io = io,
         .api_key = "k",
         .url = mock.url,
         .model = "m",
-        .http = &http,
+        .http = &http_client,
     };
 
     // Two completions through one client. A fresh HTTP client per request would

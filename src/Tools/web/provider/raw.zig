@@ -4,8 +4,8 @@ const std = @import("std");
 const transport = @import("../../web.zig");
 
 /// Reads `url` directly with a GET: the bytes as the server sent them.
-pub fn fetch(gpa: std.mem.Allocator, http: *std.http.Client, url: []const u8) !transport.Answer {
-    return switch (try transport.request(gpa, http, .GET, url, null, &.{}, "fetch")) {
+pub fn fetch(gpa: std.mem.Allocator, http_client: *std.http.Client, url: []const u8) !transport.Answer {
+    return switch (try transport.request(gpa, http_client, .GET, url, null, &.{}, "fetch")) {
         .text => |text| .{ .text = text },
         .retry_after_ms => |ms| .{ .retry_after_ms = ms },
     };
@@ -24,10 +24,10 @@ test "a raw fetch reads the url directly, and keeps the bytes as they are" {
     defer mock.deinit();
     try mock.serve();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
 
-    const value = try fetch(gpa, &http, mock.url);
+    const value = try fetch(gpa, &http_client, mock.url);
     defer gpa.free(value.text);
     try mock.group.await(io);
     if (mock.err) |err| return err;
@@ -48,10 +48,10 @@ test "a raw fetch keeps a body of any size whole" {
     defer mock.deinit();
     try mock.serve();
 
-    var http: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http.deinit();
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
 
-    const value = try fetch(gpa, &http, mock.url);
+    const value = try fetch(gpa, &http_client, mock.url);
     defer gpa.free(value.text);
     try mock.group.await(io);
     if (mock.err) |err| return err;
