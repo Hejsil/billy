@@ -521,8 +521,6 @@ fn printDiff(
     try diffing.print(diff, style, out);
 }
 
-/// Prints a block header: the glyph of the tool in its colour, its name in bold
-/// and what it acts on, when there is one, dimmed: `▸ read a.zig`.
 /// The mark in front of the labels that break a block into sections, such as
 /// `▾ stdout`. It points down at the lines under it, where the glyph of a tool
 /// points at the call it names.
@@ -813,8 +811,7 @@ const web_specs = [_]Session.Definition{ search_spec, fetch_spec };
 /// is what keeps the set growing by appending rather than reordering.
 const specs_with_web = specs ++ web_specs;
 
-/// Why the filtered specs are returned by value rather than as a slice: a slice
-/// would point into a comptime local, which a global const may not hold.
+/// How many of `source` the mode allows.
 fn allowedCount(comptime source: []const Session.Definition, comptime mode: agent.Mode) usize {
     var n: usize = 0;
     for (source) |spec| if (mode.allows(spec.name)) {
@@ -823,8 +820,10 @@ fn allowedCount(comptime source: []const Session.Definition, comptime mode: agen
     return n;
 }
 
-/// The specs of `source` the chat mode allows, filtered at comptime so the result
-/// is the spec table's own strings and nothing is built at run time.
+/// The specs of `source` the mode allows, filtered at comptime so the result is
+/// the spec table's own strings and nothing is built at run time. Returned by
+/// value: a slice would point into a comptime local, which a global const may
+/// not hold.
 fn allowedSpecs(comptime source: []const Session.Definition, comptime mode: agent.Mode) [allowedCount(source, mode)]Session.Definition {
     var buffer: [allowedCount(source, mode)]Session.Definition = undefined;
     var n: usize = 0;

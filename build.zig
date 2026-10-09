@@ -20,8 +20,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     md4c_zig.addIncludePath(md4c.path("src"));
-    // A reply is UTF-8, and md4c is told which encoding to expect rather than
-    // guessing at it.
+    // Also set in the C flags below, so the translated header and the compiled
+    // library agree on the encoding.
     md4c_zig.defineCMacro("MD4C_USE_UTF8", null);
 
     const mod = b.addModule("billy", .{
@@ -35,9 +35,7 @@ pub fn build(b: *std.Build) void {
         .root = md4c.path("src"),
         .files = &.{ "md4c.c", "md4c-html.c", "entity.c" },
         // C99, because the library is written in it, so a compiler whose default
-        // is newer or older does not decide whether it builds. UTF-8, because a
-        // reply is UTF-8 and md4c is told which encoding to expect rather than
-        // guessing.
+        // is newer or older does not decide whether it builds.
         .flags = &.{ "-std=c99", "-DMD4C_USE_UTF8" },
     });
 

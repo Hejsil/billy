@@ -110,8 +110,6 @@ fn printElided(count: usize, style: Style, out: *std.Io.Writer) !void {
     try out.print("{s}… {d} earlier blocks{s}\n", .{ style.on("2"), count, style.off() });
 }
 
-/// The marks the messages of the transcript are headed by. None of them is a
-/// tool, so none carries a tool's glyph.
 /// The marks the blocks of a run are headed by, which is the vocabulary both
 /// frontends show a block in: the terminal colours them and the web gives them
 /// classes, but a prompt is a prompt in either.

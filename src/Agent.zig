@@ -96,10 +96,6 @@ pub const Display = struct {
     style: Terminal.Style = .plain,
 };
 
-/// One unit of what a run shows: the pieces a conversation is made of, each
-/// finished before the next begins. A block is what the run says happened; how it
-/// looks is the frontend's, so nothing here is text. A tool call and the result
-/// that answered it are one block, since that is one thing the model did.
 /// One unit of what a run shows: the pieces a conversation is made of, in the
 /// order they happened. A block is what the run says happened; how it looks is
 /// the frontend's, so nothing here is text.

@@ -80,7 +80,6 @@ fn writeField(out: *std.Io.Writer, text: []const u8) !void {
 /// margin is part of no heading, so it is skipped; that is what makes text that
 /// is not a result list, such as `(no results)`, yield nothing rather than
 /// something wrong.
-/// Reads a list of results back, one at a time.
 pub const Reader = struct {
     lines: std.mem.SplitIterator(u8, .scalar),
 

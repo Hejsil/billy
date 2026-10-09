@@ -212,9 +212,8 @@ id_buf: [max_id_len]u8 = @splat(0),
 /// buffer beside the id and zero-filled past the name for the same reason.
 name_buf: [max_id_len + extension.len]u8 = @splat(0),
 
-/// All string data, one NUL-terminated copy per distinct string. Two equal
-/// strings share an index, so a conversation that repeats its roles, its tool
-/// names and what a repeated call returned pays for each of them once.
+/// All string data. The pool keeps text as it comes and does not look for
+/// strings it already holds; see `Pool`.
 pool: Pool = .{},
 
 tool_calls: std.ArrayList(ToolCall) = .empty,

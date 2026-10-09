@@ -432,9 +432,7 @@ fn schemeOf(url: []const u8, buffer: []u8) []const u8 {
     return buffer[0..n];
 }
 
-/// Writes the HTML for one block, span or run of text, driving md4c. Each
-/// callback is C, so it returns a number: zero to carry on, non-zero to stop the
-/// parse, which is how a failed write stops it.
+/// Writes an edit's diff as a `<pre>` of marked lines.
 pub fn diff(lines: []const diffing.Line, out: *std.Io.Writer) !void {
     try out.writeAll("<pre class=\"diff\">");
     for (lines) |line| {
