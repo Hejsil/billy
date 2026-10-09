@@ -480,15 +480,7 @@ fn writeSession(
 
     var header: std.Io.Writer.Allocating = .init(gpa);
     defer header.deinit();
-    try html.header(.{
-        .id = session.id(),
-        .model = setup.model,
-        .cwd = session.cwd(),
-        .home = setup.environ.get("HOME"),
-        .context_tokens = session.context_tokens,
-        .model_info = models.lookup(models.Provider.fromUrl(setup.base_url), setup.model),
-        .cost = session.cost,
-    }, &header.writer);
+    try writeHeader(setup, &session, &header.writer);
 
     var blocks: std.Io.Writer.Allocating = .init(gpa);
     defer blocks.deinit();
@@ -836,11 +828,8 @@ fn serveTurn(
     try stream.done();
 }
 
-/// Sends the header line the page shows above a conversation: the session's state
-/// now, so the gauge and cost are current.
-fn sendHeader(setup: *Setup, gpa: std.mem.Allocator, session: *const Session, stream: *Stream) !void {
-    var header: std.Io.Writer.Allocating = .init(gpa);
-    defer header.deinit();
+/// Writes the header line the page shows above `session`'s conversation.
+fn writeHeader(setup: *Setup, session: *const Session, out: *std.Io.Writer) !void {
     try html.header(.{
         .id = session.id(),
         .model = setup.model,
@@ -849,7 +838,15 @@ fn sendHeader(setup: *Setup, gpa: std.mem.Allocator, session: *const Session, st
         .context_tokens = session.context_tokens,
         .model_info = models.lookup(models.Provider.fromUrl(setup.base_url), setup.model),
         .cost = session.cost,
-    }, &header.writer);
+    }, out);
+}
+
+/// Sends the header line the page shows above a conversation: the session's state
+/// now, so the gauge and cost are current.
+fn sendHeader(setup: *Setup, gpa: std.mem.Allocator, session: *const Session, stream: *Stream) !void {
+    var header: std.Io.Writer.Allocating = .init(gpa);
+    defer header.deinit();
+    try writeHeader(setup, session, &header.writer);
     try stream.send("header", HtmlEvent{ .html = header.written() });
 }
 
