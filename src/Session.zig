@@ -1092,15 +1092,18 @@ fn listIn(dir: std.Io.Dir, io: std.Io, gpa: std.mem.Allocator) ![]Named {
         if (entry.kind != .file) continue;
         const stem = idInName(entry.name) orelse continue;
 
-        // A file that cannot be asked about is one to leave out rather than one
-        // to fail the listing over.
-        const stat = dir.statFile(io, entry.name, .{}) catch continue;
+        // One handle gives both the time the file was written and its title. A
+        // file that cannot be opened or asked about is left out rather than
+        // failing the listing.
+        var file = dir.openFile(io, entry.name, .{}) catch continue;
+        defer file.close(io);
+        const stat = file.stat(io) catch continue;
 
         // The title is read from the front of the file, which keeps a listing
         // cheap however large the conversations are. A file that is not a session
         // is left out before anything is allocated for it, so `continue` leaks
         // nothing and the two lists stay the same length.
-        const stored_title = readTitle(io, gpa, dir, entry.name) catch |err| switch (err) {
+        const stored_title = readTitle(io, gpa, file) catch |err| switch (err) {
             error.SyntaxError => continue,
             else => return err,
         };
@@ -1127,15 +1130,12 @@ fn listIn(dir: std.Io.Dir, io: std.Io, gpa: std.mem.Allocator) ![]Named {
 /// longer title grows the buffer rather than being refused.
 const title_read_buffer_len = 1024;
 
-/// The title stored in the session file `file_name`, or "" when it has none.
+/// The title stored in the session file `file`, or "" when it has none.
 ///
 /// Only the front of the file is read, and only as far as the title: the fields
 /// it opens with are stepped over a token at a time, so a listing reads a few
 /// dozen bytes rather than the whole conversation, however large the file is.
-fn readTitle(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir, file_name: []const u8) ![]const u8 {
-    var file = dir.openFile(io, file_name, .{}) catch return gpa.dupe(u8, "");
-    defer file.close(io);
-
+fn readTitle(io: std.Io, gpa: std.mem.Allocator, file: std.Io.File) ![]const u8 {
     var reader_buf: [std.heap.page_size_min]u8 = undefined;
     var reader = file.reader(io, &reader_buf);
     return (try titleFrom(&reader.interface, gpa)) orelse "";
