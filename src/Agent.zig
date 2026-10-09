@@ -331,7 +331,8 @@ pub fn costOf(price: models.Price, usage: llm.Usage) f64 {
 /// decimals. Shared with the web header, so both show a count the same way.
 pub fn formatTokens(out: *std.Io.Writer, count: usize) !void {
     if (count < 1000) return out.print("{d}", .{count});
-    if (count < 1_000_000) return formatScaled(out, count, 1000, 'k');
+    // Rounds up to 1000k from here, which reads better as 1M.
+    if (count < 999_500) return formatScaled(out, count, 1000, 'k');
     return formatScaled(out, count, 1_000_000, 'M');
 }
 
@@ -1640,6 +1641,9 @@ test "token counts are whole and prices keep at most two decimals" {
     try expectTokens("13k", 12_500);
     try expectTokens("128k", 128_000);
     try expectTokens("1M", 1_000_000);
+    try expectTokens("999k", 999_499);
+    try expectTokens("1M", 999_500);
+    try expectTokens("1M", 999_999);
 
     // A price is rounded to the cent, and the zeros it does not need are dropped.
     try expectMoney("$0", 0);
