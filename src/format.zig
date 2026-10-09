@@ -25,6 +25,7 @@ const sides_prefix = "billy-edit-";
 const suffix_bytes = 8;
 /// How many names to try before giving up on finding a free one.
 const name_attempts = 8;
+const side_mode: std.Io.File.Permissions = @fromBackingInt(@intCast(0o600));
 /// Longest path made: `/tmp/`, the prefix, the hex suffix, `-`, and the kind.
 const max_path = sides_dir.len + 1 + sides_prefix.len + suffix_bytes * 2 + 1 + "old".len;
 
@@ -73,16 +74,21 @@ fn run(format: Format, text: []const u8, args: []const []const u8, out: *std.Io.
         .stdout = .pipe,
         .stderr = .ignore,
     }) catch return false;
+    // Declared before the kill so the kill runs first: it is what unblocks a
+    // writer whose script has gone.
+    var feeding: std.Io.Group = .init;
+    defer feeding.cancel(formatter.io);
     defer child.kill(formatter.io);
 
-    // The text goes in on standard input, which is what the format script reads.
-    // Closing the pipe is what tells it there is no more.
-    var in_buffer: [4096]u8 = undefined;
-    var script: std.Io.File.Writer = .init(child.stdin.?, formatter.io, &in_buffer);
-    try script.interface.writeAll(text);
-    try script.interface.flush();
-    child.stdin.?.close(formatter.io);
+    // The text goes in on standard input from a task of its own, so the script can
+    // write while it is still reading. One thread doing both blocks on a full pipe
+    // as soon as the text and the output are each larger than the pipe holds.
+    const stdin = child.stdin.?;
     child.stdin = null;
+    feeding.concurrent(formatter.io, feed, .{ formatter.io, stdin, text }) catch {
+        stdin.close(formatter.io);
+        return false;
+    };
 
     var out_buffer: [4096]u8 = undefined;
     var reader: std.Io.File.Reader = .init(child.stdout.?, formatter.io, &out_buffer);
@@ -97,6 +103,17 @@ fn run(format: Format, text: []const u8, args: []const []const u8, out: *std.Io.
 
     try out.writeAll(laid_out);
     return true;
+}
+
+/// Writes `text` to the script's standard input and closes it, which is what
+/// tells the script there is no more. A script that stops reading early ends the
+/// write with an error, which is not the formatter's to report.
+fn feed(io: std.Io, stdin: std.Io.File, text: []const u8) void {
+    defer stdin.close(io);
+    var buffer: [4096]u8 = undefined;
+    var writer: std.Io.File.Writer = .init(stdin, io, &buffer);
+    writer.interface.writeAll(text) catch return;
+    writer.interface.flush() catch return;
 }
 
 /// Runs the formatter for a block with two sides, such as an edit's diff. `text`
@@ -139,8 +156,12 @@ fn writeSide(io: std.Io, dir: std.Io.Dir, data: []const u8, kind: []const u8, bu
         ) catch return null;
 
         // The create is exclusive: a name already taken is one to stay away from,
-        // so it is retried rather than written over.
-        const file = dir.createFile(io, std.fs.path.basename(path), .{ .exclusive = true }) catch |err| switch (err) {
+        // so it is retried rather than written over. The file is the owner's alone,
+        // since an edit's text can be anything.
+        const file = dir.createFile(io, std.fs.path.basename(path), .{
+            .exclusive = true,
+            .permissions = side_mode,
+        }) catch |err| switch (err) {
             error.PathAlreadyExists => continue,
             else => return null,
         };
@@ -199,4 +220,31 @@ test "each side is written to its own fresh file" {
     const contents = try dir.readFileAlloc(std.testing.io, std.fs.path.basename(first), gpa, .unlimited);
     defer gpa.free(contents);
     try std.testing.expectEqualStrings("one", contents);
+}
+
+test "a text larger than a pipe holds is laid out without deadlock" {
+    const gpa = std.testing.allocator;
+
+    // `cat` writes as it reads, so its output fills the pipe back to billy while
+    // billy is still writing: with both on one thread, neither could go on.
+    const text = try gpa.alloc(u8, 1 << 20);
+    defer gpa.free(text);
+    @memset(text, 'a');
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    const format: Format = .{ .script = "cat", .io = std.testing.io, .gpa = gpa };
+    try std.testing.expect(try apply(format, text, &out.writer));
+    try std.testing.expectEqualStrings(text, out.written());
+}
+
+test "an edit's sides are readable by their owner alone" {
+    const gpa = std.testing.allocator;
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    // The script prints the mode of the file it is given as `$1`.
+    const format: Format = .{ .script = "stat -c %a \"$1\"", .io = std.testing.io, .gpa = gpa };
+    try std.testing.expect(try runDiff(format, "x", "old", "new", &out.writer));
+    try std.testing.expectEqualStrings("600", out.written());
 }
