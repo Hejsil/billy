@@ -522,14 +522,17 @@ pub fn callAt(session: *const Session, message: Message, index: usize) Call {
 /// after the one that asked for it. Empty when the session does not hold it, so
 /// a file written without one still replays.
 ///
-/// Every string compared is a window into the pool, so finding a result costs
-/// nothing to allocate.
+/// Only the run of tool messages that starts at `from` is searched: some
+/// providers reuse call ids from one turn to the next, so a later turn's result
+/// must not answer this call. Every string compared is a window into the pool,
+/// so finding a result costs nothing to allocate.
 pub fn toolResult(session: *const Session, from: usize, call: []const u8) []const u8 {
     const messages = session.messages.items;
     if (from >= messages.len)
         return "";
 
     for (messages[from..]) |message| {
+        if (message.role != .tool) break;
         const call_id = session.pool.get(message.tool_call_id) orelse continue;
         if (std.mem.eql(u8, call_id, call))
             return session.pool.get(message.content) orelse "";
@@ -2024,6 +2027,30 @@ test "a tool result is found only from where the search starts" {
     // A result the session does not hold, and a search past the end of it.
     try std.testing.expectEqualStrings("", session.toolResult(1, "nothing"));
     try std.testing.expectEqualStrings("", session.toolResult(99, "call_1"));
+}
+
+test "a result is not taken from a later turn that reuses the call id" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try newTestSession(&tmp);
+    defer session.deinit();
+
+    // Some providers number calls from the start every turn. The first call got
+    // no result, so what answers `call_0` further on belongs to the second.
+    try session.append(.{ .role = .assistant, .tool_calls = &.{.{
+        .id = "call_0",
+        .function = .{ .name = "read", .arguments = "{}" },
+    }} });
+    try session.append(.{ .role = .user, .content = "next" });
+    try session.append(.{ .role = .assistant, .tool_calls = &.{.{
+        .id = "call_0",
+        .function = .{ .name = "read", .arguments = "{}" },
+    }} });
+    try session.append(.{ .role = .tool, .tool_call_id = "call_0", .content = "second result" });
+
+    try std.testing.expectEqualStrings("", session.toolResult(1, "call_0"));
+    try std.testing.expectEqualStrings("second result", session.toolResult(3, "call_0"));
 }
 
 test "every string is kept as it was written, and reads back as its own" {
