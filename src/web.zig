@@ -361,8 +361,8 @@ fn deleteSession(r: *Request, registry: *Registry, id: []const u8) !void {
 /// The body a rename sends: the session's new name.
 const Rename = struct { title: []const u8 };
 
-/// `PATCH /api/sessions/{id}`: renames a session. The name is trimmed and cut the
-/// way a model's title is (`Session.setTitle`), and written out at once, so the
+/// `PATCH /api/sessions/{id}`: renames a session. The name is trimmed the way
+/// `Session.setTitle` trims it, and written out at once, so the
 /// list shows it. A session a turn is running for answers 409, since renaming it
 /// would race the turn writing the same file.
 fn renameSession(r: *Request, registry: *Registry, id: []const u8) !void {

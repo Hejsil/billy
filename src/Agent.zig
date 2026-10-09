@@ -1067,7 +1067,7 @@ fn titleSession(agent: *Agent, session: *Session) !void {
 
 /// The title `raw` holds, cut down to one clean line, or null when nothing
 /// usable is left: the first line, trimmed, with any quotes or backticks the
-/// model wrapped it in taken off, and cut to the longest a title may be.
+/// model wrapped it in taken off.
 fn cleanTitle(gpa: std.mem.Allocator, raw: []const u8) !?[]u8 {
     const line = std.mem.sliceTo(raw, '\n');
     const unquoted = std.mem.trim(u8, std.mem.trim(u8, line, " \t\r"), "\"'`");
@@ -1078,15 +1078,13 @@ fn cleanTitle(gpa: std.mem.Allocator, raw: []const u8) !?[]u8 {
 
 /// A title derived from the first thing asked, so a session is named the moment
 /// it is created, before the model has named it. The model's title replaces it
-/// after the first turn. It is the first line, trimmed and cut to fit, which for
-/// a coding session is usually already a serviceable name.
+/// after the first turn. It is the first line, trimmed, which for a coding
+/// session is usually already a serviceable name.
 fn provisionalTitle(text: []const u8) []const u8 {
     const line = std.mem.sliceTo(text, '\n');
     return std.mem.trim(u8, line, " \t\r");
 }
 
-/// `text` cut to at most `len` bytes, without splitting a character. A byte that
-/// continues a UTF-8 sequence is not a place to end.
 /// Names `session` from `text`, the first thing asked, if it has no title yet,
 /// so a session is named the moment it starts rather than only once the model has
 /// answered. Returns whether it named it.

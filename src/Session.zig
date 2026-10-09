@@ -480,7 +480,7 @@ pub fn title(session: *const Session) ?[]const u8 {
 }
 
 /// Names the session, replacing any title it had. The whitespace around it is
-/// trimmed and the title itself is kept as written. It is held in the pool and
+/// trimmed and the title has no length limit. It is held in the pool and
 /// reaches the file with the next save.
 pub fn setTitle(session: *Session, text: []const u8) !void {
     session.title_index = try session.pool.intern(session.gpa, std.mem.trim(u8, text, " \t\r\n"));
@@ -1617,7 +1617,7 @@ test "a listing carries each session's title" {
     }
 }
 
-test "a title is trimmed and cut to the most a title may be when it is set" {
+test "a title is trimmed when it is set, and kept whole however long" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var session = try newTestSession(&tmp);
@@ -1627,7 +1627,7 @@ test "a title is trimmed and cut to the most a title may be when it is set" {
     try session.setTitle("  Fix the parser\n");
     try std.testing.expectEqualStrings("Fix the parser", session.title().?);
 
-    // A title of any length is kept whole: there is no limit.
+    // A title of any length is kept whole.
     // The euro sign is three bytes in UTF-8, so this is not one byte repeated.
     const many_euros = comptime blk: {
         var out: [3 * 500]u8 = undefined;
