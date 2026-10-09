@@ -27,6 +27,9 @@ connections: usize = 0,
 /// The body of each request, in the order they arrived
 bodies: std.ArrayList([]const u8) = .empty,
 
+/// The target (path and query) of each request, in the order they arrived
+targets: std.ArrayList([]const u8) = .empty,
+
 /// The length the last request announced, when it carried one
 content_length: ?u64 = null,
 
@@ -80,6 +83,8 @@ pub fn deinit(mock: *Mock) void {
     mock.gpa.free(mock.url);
     for (mock.bodies.items) |body| mock.gpa.free(body);
     mock.bodies.deinit(mock.gpa);
+    for (mock.targets.items) |target| mock.gpa.free(target);
+    mock.targets.deinit(mock.gpa);
     mock.clearHeaders();
     mock.headers.deinit(mock.gpa);
 }
@@ -139,6 +144,7 @@ fn serveConnection(mock: *Mock, io: std.Io, stream: std.Io.net.Stream) !void {
         var request = server.receiveHead() catch return; // the client closed it
 
         mock.content_length = request.head.content_length;
+        try mock.targets.append(mock.gpa, try mock.gpa.dupe(u8, request.head.target));
         mock.clearHeaders();
         var headers = request.iterateHeaders();
         while (headers.next()) |one| {

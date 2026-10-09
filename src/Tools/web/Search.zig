@@ -114,12 +114,14 @@ fn searchBackend(
     query: []const u8,
     max_results: usize,
 ) !outcome.Value {
+    // The same cap for every backend, whatever the configuration says.
+    const asked = @min(max_results, Result.result_limit);
     return switch (backend.provider) {
-        .tavily => tavily.search(gpa, http, backend.api_key, reach(backend), query, max_results),
-        .exa => exa.search(gpa, http, backend.api_key, reach(backend), query, max_results),
-        .brave => brave.search(gpa, http, backend.api_key, reach(backend), query, max_results),
+        .tavily => tavily.search(gpa, http, backend.api_key, reach(backend), query, asked),
+        .exa => exa.search(gpa, http, backend.api_key, reach(backend), query, asked),
+        .brave => brave.search(gpa, http, backend.api_key, reach(backend), query, asked),
         // The instance is the configuration's, so it is always named.
-        .searxng => searxng.search(gpa, http, reach(backend), query, max_results),
+        .searxng => searxng.search(gpa, http, reach(backend), query, asked),
     };
 }
 
@@ -277,6 +279,61 @@ test "a backend that failed is set aside, so the next search skips it" {
     try std.testing.expectEqual(@as(usize, 3), mock.served);
     try std.testing.expectEqualStrings("", mock.bodies.items[2]);
     try std.testing.expectEqualStrings("b", mock.header("x-subscription-token").?);
+}
+
+test "brave is asked for no more results than billy allows any backend" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var mock = try Mock.start("/search", 1, Mock.fixed("{\"web\":{\"results\":[]}}"));
+    defer mock.deinit();
+    try mock.serve();
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+
+    const config: Config = .{
+        .backends = &.{.{ .provider = .brave, .api_key = "b", .endpoint = mock.url }},
+        .max_results = 1000,
+    };
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try run(.{ .query = "zig" }, gpa, &http, config, null, &out.writer);
+    try mock.group.await(io);
+    if (mock.err) |err| return err;
+
+    try std.testing.expectEqualStrings("/search?q=zig&count=20", mock.targets.items[0]);
+}
+
+test "searxng results are capped at the most billy allows any backend" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const reply = comptime blk: {
+        var text: []const u8 = "{\"results\":[";
+        for (0..25) |i| {
+            text = text ++ (if (i > 0) "," else "") ++ "{\"title\":\"t\",\"url\":\"u\",\"content\":\"c\"}";
+        }
+        break :blk text ++ "]}";
+    };
+    var mock = try Mock.start("", 1, Mock.fixed(reply));
+    defer mock.deinit();
+    try mock.serve();
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+
+    const config: Config = .{
+        .backends = &.{.{ .provider = .searxng, .endpoint = mock.url }},
+        .max_results = 1000,
+    };
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try run(.{ .query = "zig" }, gpa, &http, config, null, &out.writer);
+    try mock.group.await(io);
+    if (mock.err) |err| return err;
+
+    try std.testing.expectEqual(@as(usize, 20), std.mem.count(u8, out.written(), "   u\n"));
 }
 
 test "a search with every backend set aside says so, without asking any" {

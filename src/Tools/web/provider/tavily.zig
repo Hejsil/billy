@@ -20,7 +20,7 @@ pub fn search(
 ) !outcome.Value {
     const body = try std.json.Stringify.valueAlloc(gpa, Request{
         .query = query,
-        .max_results = @min(max_results, Search.Result.result_limit),
+        .max_results = max_results,
     }, .{ .emit_null_optional_fields = false });
     defer gpa.free(body);
 
