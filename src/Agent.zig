@@ -508,7 +508,7 @@ pub fn take(agent: *Agent, emitter: Emitter, session: *Session, line: []const u8
     if (Command.of(line)) |cmd| {
         switch (cmd) {
             .compact => {
-                if (!agent.compact(emitter, session))
+                if (agent.compact(emitter, session, .now) != .done)
                     try emitter.show(.{ .notice = "nothing to compact" });
             },
         }
@@ -517,7 +517,7 @@ pub fn take(agent: *Agent, emitter: Emitter, session: *Session, line: []const u8
 
     // Before the prompt is added, so the prompt is not folded into the summary
     // it triggers.
-    agent.compactIfNeeded(emitter, session);
+    _ = agent.compact(emitter, session, .when_needed);
 
     const started = try agent.start(session, line, default);
     return switch (started) {
@@ -543,29 +543,24 @@ pub fn start(agent: *Agent, session: *Session, text: []const u8, default: Mode) 
     return .{ .prompt = choice.text };
 }
 
-/// Compacts the conversation if it has outgrown the context window, so a long
-/// session goes on rather than failing on an overlong request. A frontend calls
-/// this before it adds a prompt and before it shows the header, so the prompt is
-/// not folded into the summary it triggers. A failure is logged: the request goes
-/// out with the conversation as it is.
-fn compactIfNeeded(agent: *Agent, emitter: Emitter, session: *Session) void {
-    const compacted = agent.maybeCompact(emitter, session) catch |err| {
-        std.log.warn("compaction failed: {s}", .{@errorName(err)});
-        return;
-    };
-    if (compacted) agent.refresh(session);
-}
+/// How a compaction went.
+const Compaction = enum { done, nothing, failed };
 
-/// Compacts the conversation now, because the user asked with `/compact`. Says
-/// whether it compacted anything; a failure is logged and reads as nothing
-/// compacted.
-fn compact(agent: *Agent, emitter: Emitter, session: *Session) bool {
-    const compacted = agent.fold(emitter, session) catch |err| {
+/// Compacts the conversation, and refreshes the prompt and tools when it did.
+/// `.when_needed` waits for the context to pass the threshold, so a long session
+/// goes on rather than failing on an overlong request; `.now` is for `/compact`. A
+/// failure is logged and the request goes out with the conversation as it is.
+fn compact(agent: *Agent, emitter: Emitter, session: *Session, when: enum { when_needed, now }) Compaction {
+    const compacted = (switch (when) {
+        .when_needed => agent.maybeCompact(emitter, session),
+        .now => agent.fold(emitter, session),
+    }) catch |err| {
         std.log.warn("compaction failed: {s}", .{@errorName(err)});
-        return false;
+        return .failed;
     };
-    if (compacted) agent.refresh(session);
-    return compacted;
+    if (!compacted) return .nothing;
+    agent.refresh(session);
+    return .done;
 }
 
 /// Re-reads the prompt and tools into the session, so one that has been running
@@ -740,11 +735,10 @@ fn emitMessage(
     }
     if (session.isCompaction(index + 1)) return;
 
-    const role = session.roleOf(message);
-    if (std.mem.eql(u8, role, "user")) {
+    if (message.role == .user) {
         return emitter.show(.{ .prompt = session.contentOf(message) orelse "" });
     }
-    if (!std.mem.eql(u8, role, "assistant")) return;
+    if (message.role != .assistant) return;
 
     const calls = message.tool_calls.len;
     if (calls == 0)
@@ -817,10 +811,10 @@ fn blocksIn(session: *const Session, messages: []const Session.Message, index: u
     // The message before a summary is the prompt that asked for the compaction
     // it produced, which shares the summary's one block.
     if (session.isCompaction(index + 1)) return 0;
-    const role = session.roleOf(messages[index]);
-    if (std.mem.eql(u8, role, "user")) return 1;
-    if (!std.mem.eql(u8, role, "assistant")) return 0;
-    const calls = messages[index].tool_calls.len;
+    const message = messages[index];
+    if (message.role == .user) return 1;
+    if (message.role != .assistant) return 0;
+    const calls = message.tool_calls.len;
     return if (calls == 0) 1 else calls;
 }
 
@@ -839,20 +833,8 @@ fn turn(agent: *Agent, emitter: Emitter, session: *Session) !void {
     // into a second failed one. The next turn tries afresh.
     var compact_failed = false;
     while (remaining > 0) : (remaining -= 1) {
-        // A conversation that has outgrown the context window is compacted
-        // before the request that would carry it, so a long session goes on
-        // instead of failing on an overlong request. A failure to compact is not
-        // the turn's: the request goes out with the conversation as it is. A
-        // compaction refreshes the prompt and tools before the next request, so
-        // the turn picks up the current ones.
-        if (!compact_failed) {
-            const compacted = agent.maybeCompact(emitter, session) catch |err| blk: {
-                std.log.warn("compaction failed: {s}", .{@errorName(err)});
-                compact_failed = true;
-                break :blk false;
-            };
-            if (compacted) refresh(agent, session);
-        }
+        // A failure to compact is not the turn's, and is not retried within it.
+        if (!compact_failed) compact_failed = agent.compact(emitter, session, .when_needed) == .failed;
 
         // The completion owns its parsed reply, and each tool result lives in the
         // tool set's scratch, so the turn allocates nothing of its own: the
@@ -1004,12 +986,8 @@ const title_prompt =
 /// usable leaves the session as it is, so the title it already has (the one
 /// derived from the first prompt) stands.
 fn titleSession(agent: *Agent, session: *Session) !void {
-    const extra = [_]llm.Message{.{ .role = .user, .content = title_prompt }};
-    const completion = try agent.client.complete(agent.gpa, session.conversation(&extra), session.toolSet());
-    defer completion.deinit();
-    session.recordCost(completion.usage, costOf(agent.rateNow(), completion.usage));
-
-    const raw = completion.message.content orelse return;
+    const raw = try agent.askWith(session, title_prompt) orelse return;
+    defer agent.gpa.free(raw);
     const title = try cleanTitle(agent.gpa, raw) orelse return;
     defer agent.gpa.free(title);
     try session.setTitle(title);
@@ -1113,7 +1091,7 @@ fn fold(agent: *Agent, emitter: Emitter, session: *Session) !bool {
     const sent_from = session.sentFrom();
     if (session.messages.items.len - sent_from <= 1) return false;
 
-    const summary = try agent.summarize(session) orelse return false;
+    const summary = try agent.askWith(session, compact_prompt) orelse return false;
     defer agent.gpa.free(summary);
 
     // The conversation a request now carries is the summary and little else, so
@@ -1127,22 +1105,15 @@ fn fold(agent: *Agent, emitter: Emitter, session: *Session) !bool {
     return true;
 }
 
-/// One request that asks the model to summarize the conversation it is being
-/// sent, returning the summary text, owned by the caller, or null when the model
-/// answered with no text.
-///
-/// The conversation is sent as a request would carry it, system prompt and tool
-/// calls and results included, so the model reads what actually happened, with
-/// the compacting prompt after it. The request cost real tokens, so it is billed
-/// like any other, but it must not move the context gauge: the conversation it
-/// was sent is about to be replaced by something far smaller.
-fn summarize(agent: *Agent, session: *Session) !?[]const u8 {
-    // The conversation the model has been given, with the compacting prompt as
-    // the message after it: the same request a turn would send, with one more
-    // message on the end, so the model reads exactly what happened. Nothing is
-    // added to the session: the prompt is written straight out of the local
-    // array and is gone when this returns.
-    const extra = [_]llm.Message{.{ .role = .user, .content = compact_prompt }};
+/// Asks the model `question` about the conversation: the conversation is sent as a
+/// request would carry it, system prompt and tool calls and results included,
+/// with `question` as one more message that is not kept in the session. Returns the
+/// reply, owned by the caller, or null when it has no text. The request is
+/// billed like any other but does not move the context gauge, since the
+/// conversation it was sent is about to be replaced or is not what the next
+/// request carries.
+fn askWith(agent: *Agent, session: *Session, question: []const u8) !?[]u8 {
+    const extra = [_]llm.Message{.{ .role = .user, .content = question }};
     const completion = try agent.client.complete(agent.gpa, session.conversation(&extra), session.toolSet());
     defer completion.deinit();
     session.recordCost(completion.usage, costOf(agent.rateNow(), completion.usage));

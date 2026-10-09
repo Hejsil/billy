@@ -540,13 +540,13 @@ pub fn printResult(call: Call, result: []const u8, style: Terminal.Style, out: *
 /// The status and the split are read back from the result, which is what billy
 /// stored and handed the model, so a replayed session shows the same block.
 fn printBash(result: []const u8, style: Terminal.Style, out: *std.Io.Writer) !void {
-    const parts = splitBash(result) orelse {
+    const parts = bashOutput(result) orelse {
         // A result that is not one billy wrote is shown as it is, so a session
         // saved before the status was written still shows everything.
         try printLabel("output", style, out);
         return printTruncated(result, .dim, style, out);
     };
-    try printExit(parts.status, style, out);
+    try printExit(parts.exit, style, out);
     const streams = [_]struct { name: []const u8, text: []const u8 }{
         .{ .name = "stdout", .text = parts.stdout },
         .{ .name = "stderr", .text = parts.stderr },
@@ -562,11 +562,10 @@ fn printBash(result: []const u8, style: Terminal.Style, out: *std.Io.Writer) !vo
 /// in green when the command succeeded, `✗ exit 1` and the rest in red when it
 /// did not. The stored line reads `exit code: N` for the model; only the line
 /// the user sees is marked and shortened.
-fn printExit(status: []const u8, style: Terminal.Style, out: *std.Io.Writer) !void {
-    const exit = parseExit(status);
+fn printExit(exit: Exit, style: Terminal.Style, out: *std.Io.Writer) !void {
     const mark = if (exit.ok) exit_marks.ok else exit_marks.failed;
     var buffer: [64]u8 = undefined;
-    const line = std.fmt.bufPrint(&buffer, "{s} exit {s}", .{ mark, exit.code }) catch status;
+    const line = std.fmt.bufPrint(&buffer, "{s} exit {s}", .{ mark, exit.code }) catch exit.code;
     try style.boldColor(if (exit.ok) .green else .red, line, out);
     try out.writeAll("\n");
 }
@@ -581,24 +580,10 @@ pub const Exit = struct {
     ok: bool,
 };
 
-/// Reads the status out of a stored status line, which reads `exit code: N`.
-/// A line of some other shape is taken as the code itself, so nothing is lost.
-fn parseExit(status: []const u8) Exit {
-    const prefix = "exit code: ";
-    const code = if (std.mem.startsWith(u8, status, prefix)) status[prefix.len..] else status;
-    return .{ .code = code, .ok = std.mem.eql(u8, code, "0") };
-}
+/// What a stored bash result opens with, before the exit code.
+const exit_prefix = "exit code: ";
 
-/// A bash result split back into the status line billy wrote and what the
-/// command printed on each stream. Null when the result does not open with a
-/// status, which is how a result stored before one was written reads.
-const BashResult = struct {
-    status: []const u8,
-    stdout: []const u8,
-    stderr: []const u8,
-};
-
-/// A bash result as a caller that shows it wants it: the status on its own, and
+/// A bash result as a frontend that shows it wants it: the status on its own, and
 /// the two streams without the markers that separated them in the stored text.
 pub const BashOutput = struct {
     exit: Exit,
@@ -606,45 +591,37 @@ pub const BashOutput = struct {
     stderr: []const u8,
 };
 
-/// Splits a stored bash result into the status and the streams, for a frontend
-/// that shows them apart. Null when the result is not one billy wrote.
+/// Splits a stored bash result into its status and streams. The shape is the one
+/// `bash` writes: the status on its own line, `(no output)` when the command
+/// printed nothing at all, the standard output, and finally the standard error
+/// behind a `stderr:` line of its own. Null when the result does not open with a
+/// status, which is how a result stored before one was written reads.
 pub fn bashOutput(result: []const u8) ?BashOutput {
-    const parts = splitBash(result) orelse return null;
-    return .{
-        .exit = parseExit(parts.status),
-        .stdout = parts.stdout,
-        .stderr = parts.stderr,
-    };
-}
-
-/// Splits a stored bash result. The shape is the one `bash` writes: the status
-/// on its own line, `(no output)` when the command printed nothing at all, the
-/// standard output, and finally the standard error behind a `stderr:` line of
-/// its own.
-fn splitBash(result: []const u8) ?BashResult {
     const newline = std.mem.indexOfScalar(u8, result, '\n') orelse return null;
     const status = result[0..newline];
-    if (!std.mem.startsWith(u8, status, "exit code: ")) return null;
+    if (!std.mem.startsWith(u8, status, exit_prefix)) return null;
+    const code = status[exit_prefix.len..];
+    const exit: Exit = .{ .code = code, .ok = std.mem.eql(u8, code, "0") };
     const body = result[newline + 1 ..];
     const trimmed = std.mem.trimEnd(u8, body, "\n");
 
     if (std.mem.eql(u8, trimmed, "(no output)")) {
-        return .{ .status = status, .stdout = "", .stderr = "" };
+        return .{ .exit = exit, .stdout = "", .stderr = "" };
     }
     // Standard error follows standard output, introduced by a `stderr:` line of
     // its own wherever the standard output ended.
     const marker = "stderr:\n";
     if (std.mem.startsWith(u8, body, marker)) {
-        return .{ .status = status, .stdout = "", .stderr = body[marker.len..] };
+        return .{ .exit = exit, .stdout = "", .stderr = body[marker.len..] };
     }
     if (std.mem.indexOf(u8, body, "\n" ++ marker)) |at| {
         return .{
-            .status = status,
+            .exit = exit,
             .stdout = body[0..at],
             .stderr = body[at + marker.len + 1 ..],
         };
     }
-    return .{ .status = status, .stdout = body, .stderr = "" };
+    return .{ .exit = exit, .stdout = body, .stderr = "" };
 }
 
 /// Prints `text`, keeping at most `max_block_lines` lines. When it had more, a
