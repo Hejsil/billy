@@ -210,22 +210,23 @@ pub fn readLine(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]con
                 return @as(?[]const u8, try ed.submit(line.items));
             },
             .backspace => if (cursor > 0) {
-                _ = line.orderedRemove(cursor - 1);
-                cursor -= 1;
+                const start = prevChar(line.items, cursor);
+                try line.replaceRange(ed.gpa, start, cursor - start, "");
+                cursor = start;
                 recalled = null;
                 dirty = true;
             },
             .delete => if (cursor < line.items.len) {
-                _ = line.orderedRemove(cursor);
+                try line.replaceRange(ed.gpa, cursor, nextChar(line.items, cursor) - cursor, "");
                 recalled = null;
                 dirty = true;
             },
             .left => if (cursor > 0) {
-                cursor -= 1;
+                cursor = prevChar(line.items, cursor);
                 dirty = true;
             },
             .right => if (cursor < line.items.len) {
-                cursor += 1;
+                cursor = nextChar(line.items, cursor);
                 dirty = true;
             },
             .home => {
@@ -303,7 +304,7 @@ pub fn readLine(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]con
                 try ed.out.flush();
                 return null;
             } else if (cursor < line.items.len) {
-                _ = line.orderedRemove(cursor);
+                try line.replaceRange(ed.gpa, cursor, nextChar(line.items, cursor) - cursor, "");
                 recalled = null;
                 dirty = true;
             },
@@ -739,6 +740,25 @@ fn wordStart(line: []const u8, cursor: usize) usize {
     return start;
 }
 
+/// Where the character before `cursor` starts, so a cursor on a character
+/// boundary stays on one.
+fn prevChar(line: []const u8, cursor: usize) usize {
+    var start = cursor;
+    while (start > 0) {
+        start -= 1;
+        if (!isContinuation(line[start])) break;
+    }
+    return start;
+}
+
+/// Where the character at `cursor` ends.
+fn nextChar(line: []const u8, cursor: usize) usize {
+    if (cursor >= line.len) return line.len;
+    var end = cursor + 1;
+    while (end < line.len and isContinuation(line[end])) end += 1;
+    return end;
+}
+
 /// A visual row of the rendered line: a run of the line that fits on one
 /// terminal row, `start..end` in bytes, on row `index` counted from the first.
 const Row = struct { index: usize, start: usize, end: usize };
@@ -901,6 +921,25 @@ test "wordStart skips trailing whitespace then the word" {
     try std.testing.expectEqual(0, wordStart("hello world", 6));
     try std.testing.expectEqual(4, wordStart("one two", 7));
     try std.testing.expectEqual(0, wordStart("", 0));
+}
+
+test "the cursor steps over whole characters, not bytes" {
+    // "a", "é" (2 bytes), "€" (3 bytes), "😀" (4 bytes), "b".
+    const line = "a\u{e9}\u{20ac}\u{1f600}b";
+    try std.testing.expectEqual(1, nextChar(line, 0));
+    try std.testing.expectEqual(3, nextChar(line, 1));
+    try std.testing.expectEqual(6, nextChar(line, 3));
+    try std.testing.expectEqual(10, nextChar(line, 6));
+    try std.testing.expectEqual(11, nextChar(line, 10));
+    // At the end there is nothing to step over.
+    try std.testing.expectEqual(11, nextChar(line, 11));
+
+    try std.testing.expectEqual(10, prevChar(line, 11));
+    try std.testing.expectEqual(6, prevChar(line, 10));
+    try std.testing.expectEqual(3, prevChar(line, 6));
+    try std.testing.expectEqual(1, prevChar(line, 3));
+    try std.testing.expectEqual(0, prevChar(line, 1));
+    try std.testing.expectEqual(0, prevChar(line, 0));
 }
 
 /// Decodes `bytes` into the keys the editor would read from them, with no
