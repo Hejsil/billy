@@ -851,6 +851,7 @@ fn loadCompactions(session: *Session, stored: []const u32, lead: usize) !void {
 /// arguments schema becomes the JSON text the request sends it as.
 fn loadTools(session: *Session, stored: []const StoredTool) !void {
     const tools = try session.gpa.alloc(Tool, stored.len);
+    errdefer session.gpa.free(tools);
     for (stored, tools) |stored_tool, *tool| {
         tool.* = .{
             .name = try session.pool.intern(session.gpa, stored_tool.function.name),
@@ -2188,6 +2189,27 @@ test "compactions in a file with no messages are dropped" {
     try std.testing.expectEqual(0, session.messages.items.len);
     try std.testing.expectEqual(0, session.compactions.items.len);
     try std.testing.expectEqual(0, session.sentFrom());
+}
+
+fn openOnce(gpa: std.mem.Allocator, dir: std.Io.Dir) !void {
+    var session = try Session.open(std.testing.io, dir, gpa, "tools", "/work");
+    session.deinit();
+}
+
+test "a session that fails part way through reading its tools frees what it took" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "tools.json",
+        .data = "{\"version\":3,\"tools\":[" ++
+            "{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"d\",\"parameters\":{\"type\":\"object\"}}}," ++
+            "{\"type\":\"function\",\"function\":{\"name\":\"write\",\"description\":\"d\",\"parameters\":{\"type\":\"object\"}}}]," ++
+            "\"messages\":[]}",
+    });
+
+    // Fails each allocation in turn, and checks that nothing is left behind.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, openOnce, .{tmp.dir});
 }
 
 test "the messages a request carries start at the latest compaction" {
