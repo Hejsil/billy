@@ -1089,22 +1089,23 @@ fn listIn(dir: std.Io.Dir, io: std.Io, gpa: std.mem.Allocator) ![]Named {
         // A file that cannot be asked about is one to leave out rather than one
         // to fail the listing over.
         const stat = dir.statFile(io, entry.name, .{}) catch continue;
-        try written.append(gpa, stat.mtime.toMilliseconds());
-
-        // The name is a window into the iterator, which the next entry moves on,
-        // so the id is copied out before it can go.
-        const owned_id = try gpa.dupe(u8, stem);
-        // A failed append leaves the copy unheld, so it is freed on the way out.
-        errdefer gpa.free(owned_id);
 
         // The title is read from the front of the file, which keeps a listing
-        // cheap however large the conversations are.
+        // cheap however large the conversations are. A file that is not a session
+        // is left out before anything is allocated for it, so `continue` leaks
+        // nothing and the two lists stay the same length.
         const stored_title = readTitle(io, gpa, dir, entry.name) catch |err| switch (err) {
             error.SyntaxError => continue,
             else => return err,
         };
         errdefer gpa.free(stored_title);
 
+        // The name is a window into the iterator, which the next entry moves on,
+        // so the id is copied out before it can go.
+        const owned_id = try gpa.dupe(u8, stem);
+        errdefer gpa.free(owned_id);
+
+        try written.append(gpa, stat.mtime.toMilliseconds());
         try names.append(gpa, .{ .id = owned_id, .title = stored_title });
     }
 
@@ -1434,9 +1435,19 @@ fn freeList(names: []Named, gpa: std.mem.Allocator) void {
 /// milliseconds after the epoch, so a listing can be checked for the order it
 /// puts the files in. The file's content does not matter to a listing.
 fn writeSessionAt(tmp: *std.testing.TmpDir, gpa: std.mem.Allocator, session_id: []const u8, written_ms: i64) !void {
+    try writeFileAt(tmp, gpa, session_id, "{}", written_ms);
+}
+
+fn writeFileAt(
+    tmp: *std.testing.TmpDir,
+    gpa: std.mem.Allocator,
+    session_id: []const u8,
+    data: []const u8,
+    written_ms: i64,
+) !void {
     const file_name = try std.fmt.allocPrint(gpa, "{s}{s}", .{ session_id, extension });
     defer gpa.free(file_name);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = data });
     try tmp.dir.setTimestamps(std.testing.io, file_name, .{
         .modify_timestamp = .{ .new = std.Io.Timestamp.fromNanoseconds(
             @as(i96, written_ms) * std.time.ns_per_ms,
@@ -1531,6 +1542,28 @@ test "sessions written at the same moment are ordered by their ids" {
     try std.testing.expectEqual(@as(usize, 2), ids.len);
     try std.testing.expectEqualStrings(newer_buf[0..ulid.length], ids[0].id);
     try std.testing.expectEqualStrings(older_buf[0..ulid.length], ids[1].id);
+}
+
+test "a file that is not a session is left out without disturbing the order" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // The unreadable file is written between the others, so wherever the
+    // directory yields it, some session follows it. What it leaves behind, were
+    // it counted, would shift the times of the ones after it, and the testing
+    // allocator reports anything it allocated and did not free.
+    try writeSessionAt(&tmp, gpa, "a", 1_000);
+    try writeSessionAt(&tmp, gpa, "b", 2_000);
+    try writeFileAt(&tmp, gpa, "broken", "not json at all", 3_000);
+    try writeSessionAt(&tmp, gpa, "c", 4_000);
+    try writeSessionAt(&tmp, gpa, "d", 5_000);
+
+    const listed = try listIn(tmp.dir, std.testing.io, gpa);
+    defer freeList(listed, gpa);
+    try std.testing.expectEqual(@as(usize, 4), listed.len);
+    const expected = [_][]const u8{ "d", "c", "b", "a" };
+    for (listed, expected) |entry, want| try std.testing.expectEqualStrings(want, entry.id);
 }
 
 test "an empty sessions directory lists nothing" {
