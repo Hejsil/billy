@@ -6,8 +6,9 @@ const Health = @import("../Health.zig");
 pub const Search = @import("web/Search.zig");
 pub const Fetch = @import("web/Fetch.zig");
 
-/// What one request to a provider came back with: the body, or the wait the
-/// provider asked for before it is asked again.
+/// What a call to a provider came back with: its text, or the wait the provider
+/// asked for before it is asked again. The text is the response body for
+/// `request`, and what the model reads for a provider's `search` or `fetch`.
 pub const Answer = union(enum) {
     text: []const u8,
     retry_after_ms: i64,

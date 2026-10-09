@@ -4,7 +4,7 @@
 const std = @import("std");
 const Health = @import("../../Health.zig");
 const tools = @import("../../Tools.zig");
-const outcome = @import("Outcome.zig");
+const transport = @import("../web.zig");
 const exa = @import("provider/exa.zig");
 const direct = @import("provider/raw.zig");
 const Mock = @import("../../Mock.zig");
@@ -134,7 +134,7 @@ fn readDirectly(gpa: std.mem.Allocator, http: *std.http.Client, url: []const u8,
 }
 
 /// Fetches one url with one backend, whichever it is.
-fn fetchBackend(gpa: std.mem.Allocator, http: *std.http.Client, backend: Backend, url: []const u8) !outcome.Value {
+fn fetchBackend(gpa: std.mem.Allocator, http: *std.http.Client, backend: Backend, url: []const u8) !transport.Answer {
     return switch (backend.provider) {
         .tavily => tavily.fetch(gpa, http, backend.api_key, reach(backend), url),
         .exa => exa.fetch(gpa, http, backend.api_key, reach(backend), url),

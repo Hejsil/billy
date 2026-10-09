@@ -2,7 +2,6 @@
 
 const std = @import("std");
 const transport = @import("../../web.zig");
-const outcome = @import("../Outcome.zig");
 const Search = @import("../Search.zig");
 const Mock = @import("../../../Mock.zig");
 
@@ -17,7 +16,7 @@ pub fn search(
     endpoint: []const u8,
     query: []const u8,
     max_results: usize,
-) !outcome.Value {
+) !transport.Answer {
     const body = try std.json.Stringify.valueAlloc(gpa, Request{
         .query = query,
         .max_results = max_results,
@@ -58,7 +57,7 @@ pub fn fetch(
     api_key: []const u8,
     endpoint: []const u8,
     url: []const u8,
-) !outcome.Value {
+) !transport.Answer {
     const body = try std.json.Stringify.valueAlloc(gpa, ExtractRequest{
         .urls = &.{url},
     }, .{ .emit_null_optional_fields = false });

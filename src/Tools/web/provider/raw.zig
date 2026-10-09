@@ -2,10 +2,9 @@
 
 const std = @import("std");
 const transport = @import("../../web.zig");
-const outcome = @import("../Outcome.zig");
 
 /// Reads `url` directly with a GET: the bytes as the server sent them.
-pub fn fetch(gpa: std.mem.Allocator, http: *std.http.Client, url: []const u8) !outcome.Value {
+pub fn fetch(gpa: std.mem.Allocator, http: *std.http.Client, url: []const u8) !transport.Answer {
     return switch (try transport.request(gpa, http, .GET, url, null, &.{}, "fetch")) {
         .text => |text| .{ .text = text },
         .retry_after_ms => |ms| .{ .retry_after_ms = ms },

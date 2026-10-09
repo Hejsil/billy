@@ -2,7 +2,6 @@
 
 const std = @import("std");
 const transport = @import("../../web.zig");
-const outcome = @import("../Outcome.zig");
 const Search = @import("../Search.zig");
 const Mock = @import("../../../Mock.zig");
 
@@ -15,7 +14,7 @@ pub fn search(
     base: []const u8,
     query: []const u8,
     max_results: usize,
-) !outcome.Value {
+) !transport.Answer {
     const endpoint = try std.fmt.allocPrint(gpa, "{s}/search", .{
         std.mem.trimEnd(u8, base, "/"),
     });

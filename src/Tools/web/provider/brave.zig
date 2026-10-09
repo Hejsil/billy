@@ -2,7 +2,6 @@
 
 const std = @import("std");
 const transport = @import("../../web.zig");
-const outcome = @import("../Outcome.zig");
 const Search = @import("../Search.zig");
 const Mock = @import("../../../Mock.zig");
 
@@ -16,7 +15,7 @@ pub fn search(
     endpoint: []const u8,
     query: []const u8,
     max_results: usize,
-) !outcome.Value {
+) !transport.Answer {
     const url = try transport.queryUrl(gpa, endpoint, query, "&count={d}", .{max_results});
     defer gpa.free(url);
 
