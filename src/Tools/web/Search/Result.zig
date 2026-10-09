@@ -213,3 +213,11 @@ pub fn mapped(gpa: std.mem.Allocator, backend_results: anytype, comptime snippet
     }
     return mapped_results;
 }
+
+/// `mapped` and `render` in one, for a provider: a backend's results as the text
+/// the model reads, owned by `gpa`.
+pub fn renderMapped(gpa: std.mem.Allocator, backend_results: anytype, comptime snippet: []const u8) ![]const u8 {
+    const list = try mapped(gpa, backend_results, snippet);
+    defer gpa.free(list);
+    return renderAlloc(gpa, list);
+}

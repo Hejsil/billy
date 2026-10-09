@@ -26,26 +26,15 @@ pub fn search(
     const auth = try bearer(gpa, api_key);
     defer gpa.free(auth);
 
-    const text = switch (try transport.request(gpa, http, .POST, endpoint, body, &.{
+    const reply = switch (try transport.requestJson(Response, gpa, http, .POST, endpoint, body, &.{
         .{ .name = "authorization", .value = auth },
     }, "search")) {
-        .text => |text| text,
+        .parsed => |parsed| parsed,
         .retry_after_ms => |ms| return .{ .retry_after_ms = ms },
     };
-    defer gpa.free(text);
+    defer reply.deinit();
 
-    var parsed = std.json.parseFromSlice(Response, gpa, text, .{
-        .ignore_unknown_fields = true,
-    }) catch |err| {
-        std.log.warn("search: cannot read the reply: {s}", .{@errorName(err)});
-        return error.SearchFailed;
-    };
-    defer parsed.deinit();
-
-    const mapped = try Search.Result.mapped(gpa, parsed.value.results, "content");
-    defer gpa.free(mapped);
-
-    return .{ .text = try Search.Result.renderAlloc(gpa, mapped) };
+    return .{ .text = try Search.Result.renderMapped(gpa, reply.value.results, "content") };
 }
 
 /// One Tavily extraction. The url's text is the backend's; a url the backend
@@ -66,29 +55,21 @@ pub fn fetch(
     const auth = try bearer(gpa, api_key);
     defer gpa.free(auth);
 
-    const text = switch (try transport.request(gpa, http, .POST, endpoint, body, &.{
+    const reply = switch (try transport.requestJson(ExtractResponse, gpa, http, .POST, endpoint, body, &.{
         .{ .name = "authorization", .value = auth },
     }, "fetch")) {
-        .text => |text| text,
+        .parsed => |parsed| parsed,
         .retry_after_ms => |ms| return .{ .retry_after_ms = ms },
     };
-    defer gpa.free(text);
+    defer reply.deinit();
 
-    var parsed = std.json.parseFromSlice(ExtractResponse, gpa, text, .{
-        .ignore_unknown_fields = true,
-    }) catch |err| {
-        std.log.warn("fetch: cannot read the reply: {s}", .{@errorName(err)});
-        return error.FetchFailed;
-    };
-    defer parsed.deinit();
-
-    if (parsed.value.results.len == 0) {
-        for (parsed.value.failed_results) |failed| {
+    if (reply.value.results.len == 0) {
+        for (reply.value.failed_results) |failed| {
             std.log.warn("fetch: {s}: {s}", .{ failed.url, failed.@"error" });
         }
         return error.UrlUnreadable;
     }
-    return .{ .text = try gpa.dupe(u8, parsed.value.results[0].raw_content) };
+    return .{ .text = try gpa.dupe(u8, reply.value.results[0].raw_content) };
 }
 
 /// Tavily's own address for each kind of call.

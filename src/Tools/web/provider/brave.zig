@@ -19,27 +19,16 @@ pub fn search(
     const url = try transport.queryUrl(gpa, endpoint, query, "&count={d}", .{max_results});
     defer gpa.free(url);
 
-    const text = switch (try transport.request(gpa, http, .GET, url, null, &.{
+    const reply = switch (try transport.requestJson(Response, gpa, http, .GET, url, null, &.{
         .{ .name = "x-subscription-token", .value = api_key },
         .{ .name = "accept", .value = "application/json" },
     }, "search")) {
-        .text => |text| text,
+        .parsed => |parsed| parsed,
         .retry_after_ms => |ms| return .{ .retry_after_ms = ms },
     };
-    defer gpa.free(text);
+    defer reply.deinit();
 
-    var parsed = std.json.parseFromSlice(Response, gpa, text, .{
-        .ignore_unknown_fields = true,
-    }) catch |err| {
-        std.log.warn("search: cannot read the reply: {s}", .{@errorName(err)});
-        return error.SearchFailed;
-    };
-    defer parsed.deinit();
-
-    const mapped = try Search.Result.mapped(gpa, parsed.value.web.results, "description");
-    defer gpa.free(mapped);
-
-    return .{ .text = try Search.Result.renderAlloc(gpa, mapped) };
+    return .{ .text = try Search.Result.renderMapped(gpa, reply.value.web.results, "description") };
 }
 
 /// Brave's own address.

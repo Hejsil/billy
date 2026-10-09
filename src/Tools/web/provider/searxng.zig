@@ -23,27 +23,14 @@ pub fn search(
     const url = try transport.queryUrl(gpa, endpoint, query, "&format=json", .{});
     defer gpa.free(url);
 
-    const text = switch (try transport.request(gpa, http, .GET, url, null, &.{}, "search")) {
-        .text => |text| text,
+    const reply = switch (try transport.requestJson(Response, gpa, http, .GET, url, null, &.{}, "search")) {
+        .parsed => |parsed| parsed,
         .retry_after_ms => |ms| return .{ .retry_after_ms = ms },
     };
-    defer gpa.free(text);
+    defer reply.deinit();
 
-    var parsed = std.json.parseFromSlice(Response, gpa, text, .{
-        .ignore_unknown_fields = true,
-    }) catch |err| {
-        std.log.warn("search: cannot read the reply: {s}", .{@errorName(err)});
-        return error.SearchFailed;
-    };
-    defer parsed.deinit();
-
-    // The instance is the configuration's, so only it knows the address; there
-    // is no default to fall back on.
-    const capped = parsed.value.results[0..@min(parsed.value.results.len, max_results)];
-    const mapped = try Search.Result.mapped(gpa, capped, "content");
-    defer gpa.free(mapped);
-
-    return .{ .text = try Search.Result.renderAlloc(gpa, mapped) };
+    const capped = reply.value.results[0..@min(reply.value.results.len, max_results)];
+    return .{ .text = try Search.Result.renderMapped(gpa, capped, "content") };
 }
 
 /// The part of a SearXNG response billy uses, which is the same from every engine

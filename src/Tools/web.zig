@@ -86,6 +86,43 @@ pub fn request(
     return .{ .text = try body_writer.toOwnedSlice() };
 }
 
+/// What `requestJson` came back with: the reply parsed as `T`, or the wait the
+/// provider asked for.
+pub fn JsonAnswer(comptime T: type) type {
+    return union(enum) {
+        parsed: std.json.Parsed(T),
+        retry_after_ms: i64,
+    };
+}
+
+/// As `request`, for a provider whose reply is JSON of type `T`. The parsed reply
+/// owns its strings. A reply that does not parse is `error.BadReply`.
+pub fn requestJson(
+    comptime T: type,
+    gpa: std.mem.Allocator,
+    http: *std.http.Client,
+    method: std.http.Method,
+    location: []const u8,
+    payload: ?[]const u8,
+    headers: []const std.http.Header,
+    what: []const u8,
+) !JsonAnswer(T) {
+    const text = switch (try request(gpa, http, method, location, payload, headers, what)) {
+        .text => |text| text,
+        .retry_after_ms => |ms| return .{ .retry_after_ms = ms },
+    };
+    defer gpa.free(text);
+
+    const parsed = std.json.parseFromSlice(T, gpa, text, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch |err| {
+        std.log.warn("{s}: cannot read the reply: {s}", .{ what, @errorName(err) });
+        return error.BadReply;
+    };
+    return .{ .parsed = parsed };
+}
+
 /// A url carrying `query` as the `q` parameter, followed by `tail`, which is
 /// whatever else the provider wants such as a result count. The query is
 /// percent-encoded, so a space or an `&` in it is part of the value rather than
@@ -111,3 +148,33 @@ pub fn queryUrl(
 /// The longest a `Retry-After` is honored, so a provider cannot set billy aside
 /// for longer than the waits ever reach anyway.
 const max_retry_after_ms: u64 = @intCast(Health.max_wait_ms);
+
+const Mock = @import("../Mock.zig");
+
+test "a JSON reply is parsed, and one of another shape is a bad reply" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const Shape = struct { a: u32 };
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+
+    var good = try Mock.start("/x", 1, Mock.fixed("{\"a\":7,\"extra\":1}"));
+    defer good.deinit();
+    try good.serve();
+    const answer = try requestJson(Shape, gpa, &http, .GET, good.url, null, &.{}, "search");
+    defer answer.parsed.deinit();
+    try good.group.await(io);
+    if (good.err) |err| return err;
+    try std.testing.expectEqual(7, answer.parsed.value.a);
+
+    var bad = try Mock.start("/x", 1, Mock.fixed("not json"));
+    defer bad.deinit();
+    try bad.serve();
+    try std.testing.expectError(
+        error.BadReply,
+        requestJson(Shape, gpa, &http, .GET, bad.url, null, &.{}, "search"),
+    );
+    try bad.group.await(io);
+    if (bad.err) |err| return err;
+}

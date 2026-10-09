@@ -23,26 +23,15 @@ pub fn search(
     }, .{ .emit_null_optional_fields = false });
     defer gpa.free(body);
 
-    const text = switch (try transport.request(gpa, http, .POST, endpoint, body, &.{
+    const reply = switch (try transport.requestJson(Response, gpa, http, .POST, endpoint, body, &.{
         .{ .name = "x-api-key", .value = api_key },
     }, "search")) {
-        .text => |text| text,
+        .parsed => |parsed| parsed,
         .retry_after_ms => |ms| return .{ .retry_after_ms = ms },
     };
-    defer gpa.free(text);
+    defer reply.deinit();
 
-    var parsed = std.json.parseFromSlice(Response, gpa, text, .{
-        .ignore_unknown_fields = true,
-    }) catch |err| {
-        std.log.warn("search: cannot read the reply: {s}", .{@errorName(err)});
-        return error.SearchFailed;
-    };
-    defer parsed.deinit();
-
-    const mapped = try Search.Result.mapped(gpa, parsed.value.results, "text");
-    defer gpa.free(mapped);
-
-    return .{ .text = try Search.Result.renderAlloc(gpa, mapped) };
+    return .{ .text = try Search.Result.renderMapped(gpa, reply.value.results, "text") };
 }
 
 /// One Exa contents call, posted to `endpoint`. A url the backend could not read
@@ -59,24 +48,16 @@ pub fn fetch(
     }, .{ .emit_null_optional_fields = false });
     defer gpa.free(body);
 
-    const text = switch (try transport.request(gpa, http, .POST, endpoint, body, &.{
+    const reply = switch (try transport.requestJson(ContentsResponse, gpa, http, .POST, endpoint, body, &.{
         .{ .name = "x-api-key", .value = api_key },
     }, "fetch")) {
-        .text => |text| text,
+        .parsed => |parsed| parsed,
         .retry_after_ms => |ms| return .{ .retry_after_ms = ms },
     };
-    defer gpa.free(text);
+    defer reply.deinit();
 
-    var parsed = std.json.parseFromSlice(ContentsResponse, gpa, text, .{
-        .ignore_unknown_fields = true,
-    }) catch |err| {
-        std.log.warn("fetch: cannot read the reply: {s}", .{@errorName(err)});
-        return error.FetchFailed;
-    };
-    defer parsed.deinit();
-
-    if (parsed.value.results.len == 0 or parsed.value.results[0].text.len == 0) return error.UrlUnreadable;
-    return .{ .text = try gpa.dupe(u8, parsed.value.results[0].text) };
+    if (reply.value.results.len == 0 or reply.value.results[0].text.len == 0) return error.UrlUnreadable;
+    return .{ .text = try gpa.dupe(u8, reply.value.results[0].text) };
 }
 
 /// Exa's own address for each kind of call.
