@@ -1,6 +1,6 @@
-///! Shows blocks on the terminal, the way billy always has: the block headers, a
-///! reply's markdown laid out by the format script, and the tools laid out by
-///! theirs.
+//! Shows blocks on the terminal, the way billy always has: the block headers, a
+//! reply's markdown laid out by the built-in renderer, and the tools laid out by
+//! their format scripts.
 const std = @import("std");
 const agent = @import("Agent.zig");
 const Tools = @import("Tools.zig");

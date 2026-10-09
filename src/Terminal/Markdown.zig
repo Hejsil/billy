@@ -133,8 +133,11 @@ fn raw(self: *Markdown, bytes: []const u8) bool {
 /// closes on the block's last line rather than below it.
 fn flush(self: *Markdown) bool {
     var i: usize = 0;
-    while (i < self.pending_newlines) : (i += 1) if (!self.raw("\n")) return false;
-    if (self.pending_newlines > 0) self.at_line_start = true;
+    while (i < self.pending_newlines) : (i += 1)
+        if (!self.raw("\n")) return false;
+
+    if (self.pending_newlines > 0)
+        self.at_line_start = true;
     self.pending_newlines = 0;
     return true;
 }
@@ -158,13 +161,21 @@ fn endLine(self: *Markdown) void {
 /// for each list, and the code indent inside a code block. Only at the start
 /// of a line, so a block writes its own indent once.
 fn writeIndent(self: *Markdown) bool {
-    if (!self.at_line_start) return true;
+    if (!self.at_line_start)
+        return true;
+
     self.at_line_start = false;
     var i: usize = 0;
-    while (i < self.quote_depth) : (i += 1) if (!self.raw("> ")) return false;
+
+    while (i < self.quote_depth) : (i += 1)
+        if (!self.raw("> ")) return false;
+
     i = 0;
-    while (i < self.list_depth) : (i += 1) if (!self.raw("  ")) return false;
-    if (self.in_code and !self.raw(code_indent)) return false;
+    while (i < self.indentDepth()) : (i += 1)
+        if (!self.raw("  ")) return false;
+
+    if (self.in_code and !self.raw(code_indent))
+        return false;
     return true;
 }
 
@@ -319,12 +330,22 @@ pub fn closeBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyo
     return true;
 }
 
+/// How many lists deep the indent goes, which stops growing at `max_list_depth`.
+fn indentDepth(self: *const Markdown) usize {
+    return @min(self.list_depth, max_list_depth);
+}
+
 /// Opens a list: remembers whether it is ordered and where its numbering
 /// starts, so an item can write its own marker.
 fn openList(self: *Markdown, ordered: bool, start: usize) bool {
-    if (!self.beginBlock(false)) return false;
-    if (self.list_depth >= max_list_depth) return self.fail();
-    self.list[self.list_depth] = .{ .ordered = ordered, .next = start };
+    if (!self.beginBlock(false))
+        return false;
+
+    // Past the cap a list is still closed and indented like the one at the cap,
+    // and shares its numbering.
+    if (self.list_depth < max_list_depth)
+        self.list[self.list_depth] = .{ .ordered = ordered, .next = start };
+
     self.list_depth += 1;
     self.container_depth += 1;
     return true;
@@ -336,25 +357,35 @@ fn openItem(self: *Markdown, detail: *const md.c.MD_BLOCK_LI_DETAIL) bool {
     // Start on a line of the item's own, ending the one before it if it left
     // one open: a tight item has no paragraph to write the closing newline.
     self.endLine();
-    if (!self.flush()) return false;
+    if (!self.flush())
+        return false;
+
     // The item's own marker is one level in from the list's indent.
     self.at_line_start = true;
+
     var i: usize = 0;
-    while (i < self.quote_depth) : (i += 1) if (!self.raw("> ")) return false;
+    while (i < self.quote_depth) : (i += 1)
+        if (!self.raw("> ")) return false;
+
     i = 0;
-    while (i + 1 < self.list_depth) : (i += 1) if (!self.raw("  ")) return false;
+    while (i + 1 < self.indentDepth()) : (i += 1)
+        if (!self.raw("  ")) return false;
+
     self.at_line_start = false;
 
-    const frame = &self.list[self.list_depth - 1];
+    const frame = &self.list[self.indentDepth() - 1];
     var buffer: [24]u8 = undefined;
     const marker: []const u8 = if (frame.ordered) blk: {
         const written = std.fmt.bufPrint(&buffer, "{d}. ", .{frame.next}) catch return self.fail();
+
         frame.next += 1;
         break :blk written;
     } else if (detail.is_task != 0) blk: {
         break :blk if (detail.task_mark == 'x' or detail.task_mark == 'X') "- [x] " else "- [ ] ";
     } else "- ";
-    if (!self.raw(marker)) return false;
+    if (!self.raw(marker))
+        return false;
+
     self.container_depth += 1;
     return true;
 }
@@ -385,7 +416,7 @@ fn closeTable(self: *Markdown) bool {
     for (self.rows.items) |row| {
         for (row.cells.items, 0..) |cell, column| {
             if (column >= columns) break;
-            widths[column] = @max(widths[column], cell.len);
+            widths[column] = @max(widths[column], textWidth(cell));
         }
     }
 
@@ -421,7 +452,7 @@ fn writeRule(self: *Markdown, widths: []const usize, columns: usize) bool {
 }
 
 fn writeCell(self: *Markdown, text: []const u8, width: usize, alignment: md.c.MD_ALIGN, pad_right: bool) bool {
-    const pad = width - text.len;
+    const pad = width - textWidth(text);
     const before = switch (alignment) {
         md.c.MD_ALIGN_RIGHT => pad,
         md.c.MD_ALIGN_CENTER => pad / 2,
@@ -434,6 +465,12 @@ fn writeCell(self: *Markdown, text: []const u8, width: usize, alignment: md.c.MD
     i = before;
     while (i < after) : (i += 1) if (!self.raw(" ")) return false;
     return true;
+}
+
+/// Columns `text` takes in a table: one per character, so a cell with accents
+/// lines up. A double-width character counts as one.
+fn textWidth(text: []const u8) usize {
+    return std.unicode.utf8CountCodepoints(text) catch text.len;
 }
 
 fn columnCount(self: *Markdown) usize {
@@ -689,6 +726,34 @@ test "a table is aligned in columns" {
         "name  age\n----  ---\nana   3\nbo    12",
         "| name | age |\n| --- | --- |\n| ana | 3 |\n| bo | 12 |",
     );
+}
+
+test "a table is aligned by characters, not bytes" {
+    // "é" is two bytes but one column, so the cell is padded for one.
+    try expectPlain(
+        "name  n\n----  --\n\u{e9}     1\nabc   22",
+        "| name | n |\n| --- | --- |\n| \u{e9} | 1 |\n| abc | 22 |",
+    );
+}
+
+test "a list nested past the indent cap is still shown" {
+    const gpa = std.testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    for (0..max_list_depth + 4) |depth| {
+        for (0..depth) |_| try text.appendSlice(gpa, "  ");
+        try text.appendSlice(gpa, "- item\n");
+    }
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try write(gpa, text.items, .plain, &out.writer);
+
+    // The last line is as far in as the cap lets it go.
+    const written = out.written();
+    const last = written[std.mem.lastIndexOfScalar(u8, written, '\n').? + 1 ..];
+    const indent: [2 * (max_list_depth - 1)]u8 = @splat(' ');
+    try std.testing.expectEqualStrings(&indent ++ "- item", last);
 }
 
 test "a block is set off from the one before it" {
