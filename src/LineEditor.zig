@@ -11,7 +11,8 @@ const LineEditor = @This();
 /// A decoded key press. Bytes that are not printable or bound to an action are
 /// reported as `.none` and ignored.
 const Key = union(enum) {
-    byte: u8,
+    /// One whole UTF-8 character, zero-padded, so a line only ever holds valid text.
+    char: [4]u8,
     enter,
     /// Shift+Enter: insert a line break instead of submitting.
     newline,
@@ -185,9 +186,10 @@ pub fn readLine(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]con
         }
         switch (key) {
             .none => {},
-            .byte => |b| {
-                try line.insert(ed.gpa, cursor, b);
-                cursor += 1;
+            .char => |char| {
+                const text = std.mem.sliceTo(&char, 0);
+                try line.insertSlice(ed.gpa, cursor, text);
+                cursor += text.len;
                 recalled = null;
                 dirty = true;
             },
@@ -422,13 +424,7 @@ fn redraw(
             if (row > 0) try ed.out.writeAll("\r\n");
             try ed.out.writeAll(if (row == 0) prompt else indent);
             const from = pos;
-            var filled: usize = 0;
-            while (filled < content_width and pos < end) {
-                if (!isContinuation(line[pos])) filled += 1;
-                pos += 1;
-            }
-            // A fold never cuts a character in half.
-            while (pos < end and isContinuation(line[pos])) pos += 1;
+            pos = from + columnOffset(line[from..end], content_width);
             try ed.out.writeAll(line[from..pos]);
             row += 1;
             if (pos >= end) break;
@@ -578,8 +574,19 @@ fn nextKey(ed: *LineEditor) !Key {
         0x0c => .clear,
         0x03 => .interrupt,
         0x04 => .eof,
-        else => if (byte >= 0x20) .{ .byte = byte } else .none,
+        else => if (byte >= 0x20) try ed.readChar(byte) else .none,
     };
+}
+
+/// Reads the rest of the character `first` begins. A character that is cut short
+/// or malformed is dropped, so the line never holds half of one.
+fn readChar(ed: *LineEditor, first: u8) !Key {
+    const len = std.unicode.utf8ByteSequenceLength(first) catch return .none;
+    var char: [4]u8 = @splat(0);
+    char[0] = first;
+    for (char[1..len]) |*byte| byte.* = (try ed.nextByte()) orelse return .none;
+    if (!std.unicode.utf8ValidateSlice(char[0..len])) return .none;
+    return .{ .char = char };
 }
 
 /// Decodes the `CSI`/`SS3` sequences for the arrow and navigation keys, as
@@ -714,12 +721,7 @@ fn reflowed(line: []const u8, prompt_width: usize, old_content: usize, width: us
         var pos = start;
         while (true) {
             const from = pos;
-            var filled: usize = 0;
-            while (filled < old_content and pos < end) {
-                if (!isContinuation(line[pos])) filled += 1;
-                pos += 1;
-            }
-            while (pos < end and isContinuation(line[pos])) pos += 1;
+            pos = from + columnOffset(line[from..end], old_content);
             const wrapped = rowsFor(prompt_width + columns(line[from..pos]), width);
             if (from == old_at.start) {
                 // The cursor is on this painted row; it wrapped `cursor_col` in.
@@ -754,9 +756,13 @@ fn prevChar(line: []const u8, cursor: usize) usize {
 /// Where the character at `cursor` ends.
 fn nextChar(line: []const u8, cursor: usize) usize {
     if (cursor >= line.len) return line.len;
-    var end = cursor + 1;
-    while (end < line.len and isContinuation(line[end])) end += 1;
-    return end;
+    return @min(line.len, cursor + seqLen(line[cursor]));
+}
+
+/// Bytes in the character `first` begins; a byte that begins none is a character
+/// of its own, so stepping over bad input still moves.
+fn seqLen(first: u8) usize {
+    return std.unicode.utf8ByteSequenceLength(first) catch 1;
 }
 
 /// A visual row of the rendered line: a run of the line that fits on one
@@ -872,22 +878,15 @@ fn isContinuation(byte: u8) bool {
 /// character counts as one too, so a line of them is folded a little wide;
 /// everything the prompt and the header are made of is one column.
 fn columns(text: []const u8) usize {
-    var count: usize = 0;
-    for (text) |byte| {
-        if (!isContinuation(byte)) count += 1;
-    }
-    return count;
+    return std.unicode.utf8CountCodepoints(text) catch text.len;
 }
 
 /// Byte offset of the character `count` characters into `text`, clamped to its
 /// end, so that a slice never splits a character.
 fn columnOffset(text: []const u8, count: usize) usize {
-    var seen: usize = 0;
     var i: usize = 0;
-    while (i < text.len and seen < count) : (i += 1) {
-        if (!isContinuation(text[i])) seen += 1;
-    }
-    while (i < text.len and isContinuation(text[i])) i += 1;
+    var seen: usize = 0;
+    while (i < text.len and seen < count) : (seen += 1) i = nextChar(text, i);
     return i;
 }
 
@@ -906,8 +905,8 @@ fn visibleWidth(text: []const u8) usize {
             i += 1;
             continue;
         }
-        if (!isContinuation(text[i])) width += 1;
-        i += 1;
+        width += 1;
+        i += seqLen(text[i]);
     }
     return width;
 }
@@ -959,7 +958,7 @@ fn decodeKeys(bytes: []const u8) ![]u8 {
     var keys: std.ArrayList(u8) = .empty;
     while (ed.in_pos < ed.in_len) {
         try keys.append(std.testing.allocator, switch (try ed.nextKey()) {
-            .byte => |b| b,
+            .char => |c| if (c[1] == 0) c[0] else '#',
             .newline => '\n',
             .enter => 'E',
             .none => '.',
@@ -1000,6 +999,28 @@ test "a shifted enter and the arrow keys still decode" {
     const keys = try decodeKeys("a\x1b[13;2ub\x1b[Du\r");
     defer std.testing.allocator.free(keys);
     try std.testing.expectEqualStrings("a\nb?uE", keys);
+}
+
+test "a multi-byte character is one key, and a malformed byte is none" {
+    // "é" arrives as two bytes and is one key, shown as `#` by the decoder.
+    const keys = try decodeKeys("a\u{e9}b\u{1f600}c");
+    defer std.testing.allocator.free(keys);
+    try std.testing.expectEqualStrings("a#b#c", keys);
+
+    // A byte no character begins with is dropped rather than put in the line.
+    const bad = try decodeKeys("a\xffb");
+    defer std.testing.allocator.free(bad);
+    try std.testing.expectEqualStrings("a.b", bad);
+}
+
+test "columns and offsets count characters, and stay safe on malformed text" {
+    const line = "a\u{e9}\u{20ac}b";
+    try std.testing.expectEqual(4, columns(line));
+    try std.testing.expectEqual(3, columnOffset(line, 2));
+    try std.testing.expectEqual(line.len, columnOffset(line, 10));
+    // A stray byte counts as a character and moves on, so nothing loops or panics.
+    try std.testing.expectEqual(2, columns("\xff\xff"));
+    try std.testing.expectEqual(1, nextChar("\xff\xff", 0));
 }
 
 test "the history keeps the submitted lines in one pool" {
