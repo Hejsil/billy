@@ -73,7 +73,7 @@ const max_connections = 64;
 ///
 /// The URL is printed once the socket is bound, so what is printed is the port
 /// that was actually taken, and not the one that was asked for.
-pub fn serve(setup: *Setup, out: *std.Io.Writer, host: []const u8, port: u16) !void {
+pub fn serve(setup: *Setup, host: []const u8, port: u16) !void {
     const address = listenAddress(host, port) catch |err| {
         std.log.err(
             "cannot listen on '{s}': {s}; give an address such as 127.0.0.1, 0.0.0.0 or 192.168.1.5",
@@ -95,11 +95,10 @@ pub fn serve(setup: *Setup, out: *std.Io.Writer, host: []const u8, port: u16) !v
     var registry = Registry{ .io = setup.io, .gpa = setup.gpa };
     defer registry.deinit();
 
-    try out.print("billy serve is listening on http://{s}:{d}/\n", .{
+    std.log.info("billy serve is listening on http://{s}:{d}/\n", .{
         host,
         listener.socket.address.getPort(),
     });
-    try out.flush();
 
     // One task per connection, gathered so that they are all cancelled when the
     // loop ends, as they all share the listener's lifetime.
