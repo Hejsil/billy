@@ -1009,8 +1009,6 @@ const TestServer = struct {
             .registry = .{ .io = std.testing.io, .gpa = gpa },
             .http = .{ .allocator = gpa, .io = std.testing.io },
             .setup = .{
-                .io = std.testing.io,
-                .gpa = gpa,
                 .environ = environ,
                 .config = config,
                 .sessions = sessions,
@@ -1112,8 +1110,8 @@ const Exchange = struct {
         var request = try http_server.receiveHead();
 
         const server = Server{
-            .io = setup.io,
-            .gpa = setup.gpa,
+            .io = std.testing.io,
+            .gpa = gpa,
             .session_dir = setup.sessions,
             .setup = setup,
         };

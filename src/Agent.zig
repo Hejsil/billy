@@ -613,7 +613,7 @@ pub fn run(
 
     // The blocks of the run are shown on the terminal, the way billy has always
     // shown them.
-    var terminal = Terminal{ .out = out, .display = config.display, .scratch = gpa };
+    var terminal = Terminal{ .out = out, .io = io, .display = config.display, .scratch = gpa };
     const emitter = terminal.emitter();
 
     // The header is rebuilt for every prompt, so it reflects the context size
@@ -661,6 +661,7 @@ pub fn run(
 /// blocks come from `walk`, and each is shown as the run showed it, so a
 /// replayed prompt reads as the one that was typed.
 pub fn printTranscript(
+    io: std.Io,
     gpa: std.mem.Allocator,
     out: *std.Io.Writer,
     session: *const Session,
@@ -669,7 +670,7 @@ pub fn printTranscript(
 ) !void {
     // A replay is what the terminal is shown when a session is picked up again,
     // so a prompt opens with the blank line a live one does not need.
-    var terminal = Terminal{ .out = out, .display = display, .scratch = gpa, .replay = true };
+    var terminal = Terminal{ .out = out, .io = io, .display = display, .scratch = gpa, .replay = true };
     try walk(gpa, session, blocks, terminal.emitter());
     try out.flush();
 }
@@ -1117,12 +1118,13 @@ fn expectTranscript(
     messages: []const llm.Message,
     style: Terminal.Style,
 ) !void {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
     for (messages) |message| try session.append(message);
 
@@ -1131,16 +1133,18 @@ fn expectTranscript(
 
     // No bash format: what these cover is how a message is headed and laid out,
     // which the tool format does not touch. Zero shows the whole conversation.
-    try printTranscript(gpa, &out.writer, &session, .{ .style = style }, 0);
+    try printTranscript(io, gpa, &out.writer, &session, .{ .style = style }, 0);
     try std.testing.expectEqualStrings(expected, out.written());
 }
 
 test "printTranscript shows only the last blocks and counts the rest" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
     // A prompt, one assistant message that asks for two tools, their results, and
     // a reply: four blocks, with two of them in the one tool-calling message.
@@ -1159,7 +1163,7 @@ test "printTranscript shows only the last blocks and counts the rest" {
     // The last two blocks are the second call and the reply, so the trim falls
     // inside the tool-calling message: its first call and everything before it is
     // counted, and only its second call shows.
-    try printTranscript(gpa, &out.writer, &session, .{}, 2);
+    try printTranscript(io, gpa, &out.writer, &session, .{}, 2);
     try std.testing.expectEqualStrings(
         "… 2 earlier blocks\n" ++
             "▸ read b.zig\n▾ output\ncontents b\n\n" ++
@@ -1170,13 +1174,13 @@ test "printTranscript shows only the last blocks and counts the rest" {
 
     // A count larger than the conversation leaves nothing out, so nothing is
     // counted and the whole session shows.
-    try printTranscript(gpa, &out.writer, &session, .{}, 10);
+    try printTranscript(io, gpa, &out.writer, &session, .{}, 10);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "earlier blocks") == null);
     try std.testing.expect(std.mem.startsWith(u8, out.written(), "\n» prompt\none\n\n"));
     out.clearRetainingCapacity();
 
     // Zero shows the whole session too.
-    try printTranscript(gpa, &out.writer, &session, .{}, 0);
+    try printTranscript(io, gpa, &out.writer, &session, .{}, 0);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "earlier blocks") == null);
     try std.testing.expect(std.mem.startsWith(u8, out.written(), "\n» prompt\none\n\n"));
 }
@@ -1264,12 +1268,13 @@ test "a prompt and a reply are headed alike, in the colours of the display" {
 }
 
 test "printTranscript shows a compaction as a single line" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
     try session.setSystemPrompt("be terse");
     try session.append(.{ .role = .user, .content = "one" });
@@ -1284,7 +1289,7 @@ test "printTranscript shows a compaction as a single line" {
     // The prompt that asked for the compaction and the summary it produced show
     // as one line, headed like every other block, and the rest of the history
     // shows as it always did.
-    try printTranscript(gpa, &out.writer, &session, .{}, 0);
+    try printTranscript(io, gpa, &out.writer, &session, .{}, 0);
     try std.testing.expectEqualStrings(
         "\n» prompt\none\n\n" ++
             "◆ answer\na1\n" ++
@@ -1297,7 +1302,7 @@ test "printTranscript shows a compaction as a single line" {
 
     // The pair counts as one block, so a trim that keeps the last three blocks
     // starts at the compaction and counts what came before it.
-    try printTranscript(gpa, &out.writer, &session, .{}, 3);
+    try printTranscript(io, gpa, &out.writer, &session, .{}, 3);
     try std.testing.expectEqualStrings(
         "… 2 earlier blocks\n" ++
             "\n⊟ compacted\n" ++
@@ -1308,12 +1313,13 @@ test "printTranscript shows a compaction as a single line" {
 }
 
 test "a compaction is headed by its own mark, and hides what it stands for" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
     try session.setSystemPrompt("s");
     try session.append(.{ .role = .user, .content = "hi" });
@@ -1322,7 +1328,7 @@ test "a compaction is headed by its own mark, and hides what it stands for" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try printTranscript(gpa, &out.writer, &session, .{ .style = .ansi }, 0);
+    try printTranscript(io, gpa, &out.writer, &session, .{ .style = .ansi }, 0);
 
     // The line carries the compaction mark: the glyph in its colour and the name
     // in bold, the way every other block header is written.
@@ -1416,7 +1422,7 @@ fn testConfig(model: []const u8, cwd: []const u8, home: ?[]const u8) Config {
 /// returned value has to outlive the emitter taken from it, since the emitter
 /// borrows it.
 fn testTerminal(out: *std.Io.Writer, display: Display) Terminal {
-    return .{ .out = out, .display = display, .scratch = std.testing.allocator };
+    return .{ .out = out, .io = std.testing.io, .display = display, .scratch = std.testing.allocator };
 }
 
 /// The id the header tests run under. A real one is a ULID, but the header only
@@ -1544,10 +1550,13 @@ test "the project's instructions are read from the working directory" {
 }
 
 test "AGENTS.md is read before CLAUDE.md" {
+    const io = std.testing.io;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "agents" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "CLAUDE.md", .data = "claude" });
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "agents" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "CLAUDE.md", .data = "claude" });
 
     try expectInstructions(
         "\n\nThe project's instructions follow, read from AGENTS.md.\n\nagents",
@@ -1557,7 +1566,7 @@ test "AGENTS.md is read before CLAUDE.md" {
 
     // With no AGENTS.md the other name is read, so a project written for another
     // tool still works.
-    try tmp.dir.deleteFile(std.testing.io, "AGENTS.md");
+    try tmp.dir.deleteFile(io, "AGENTS.md");
     try expectInstructions(
         "\n\nThe project's instructions follow, read from CLAUDE.md.\n\nclaude",
         projectInstructions,
@@ -1566,14 +1575,17 @@ test "AGENTS.md is read before CLAUDE.md" {
 }
 
 test "the instructions are found in a parent up to the repository root" {
+    const io = std.testing.io;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // A repository root holding the instructions, and a subdirectory to run from.
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "root rules" });
-    try tmp.dir.createDirPath(std.testing.io, "a/b");
 
-    var deep = try tmp.dir.openDir(std.testing.io, "a/b", .{});
-    defer deep.close(std.testing.io);
+    // A repository root holding the instructions, and a subdirectory to run from.
+    try tmp.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "root rules" });
+    try tmp.dir.createDirPath(io, "a/b");
+
+    var deep = try tmp.dir.openDir(io, "a/b", .{});
+    defer deep.close(io);
     try expectInstructions(
         "\n\nThe project's instructions follow, read from AGENTS.md.\n\nroot rules",
         projectInstructions,
@@ -1591,23 +1603,29 @@ test "a project with no instructions has none" {
 }
 
 test "an empty instructions file is not used" {
+    const io = std.testing.io;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, ".git");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "" });
+
+    try tmp.dir.createDirPath(io, ".git");
+    try tmp.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "" });
 
     try expectNoInstructions(projectInstructions, tmp.dir);
 }
 
 test "the nearest instructions win over an ancestor's" {
+    const io = std.testing.io;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "outer" });
-    try tmp.dir.createDirPath(std.testing.io, "inner");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "inner/AGENTS.md", .data = "inner" });
 
-    var inner = try tmp.dir.openDir(std.testing.io, "inner", .{});
-    defer inner.close(std.testing.io);
+    try tmp.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "outer" });
+    try tmp.dir.createDirPath(io, "inner");
+    try tmp.dir.writeFile(io, .{ .sub_path = "inner/AGENTS.md", .data = "inner" });
+
+    var inner = try tmp.dir.openDir(io, "inner", .{});
+    defer inner.close(io);
 
     try expectInstructions(
         "\n\nThe project's instructions follow, read from AGENTS.md.\n\ninner",
@@ -1617,9 +1635,12 @@ test "the nearest instructions win over an ancestor's" {
 }
 
 test "the user's instructions are read from the configuration directory" {
+    const io = std.testing.io;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "Be terse.\n" });
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "Be terse.\n" });
 
     // The heading names the user rather than the project, so the two sections of
     // a prompt read apart, and the file is carried through as it was written.
@@ -1631,29 +1652,37 @@ test "the user's instructions are read from the configuration directory" {
 }
 
 test "the user's instructions are read from the directory alone, not above it" {
+    const io = std.testing.io;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+
     // A file above the directory handed in is not found: the configuration
     // directory is read on its own, with no project above it to walk up to.
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "outer" });
-    try tmp.dir.createDirPath(std.testing.io, "nested");
-    var nested = try tmp.dir.openDir(std.testing.io, "nested", .{});
-    defer nested.close(std.testing.io);
+    try tmp.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "outer" });
+    try tmp.dir.createDirPath(io, "nested");
+    var nested = try tmp.dir.openDir(io, "nested", .{});
+    defer nested.close(io);
 
     try expectNoInstructions(globalInstructions, nested);
 }
 
 test "a user's instructions file that is missing or empty is not used" {
+    const io = std.testing.io;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+
     try expectNoInstructions(globalInstructions, tmp.dir);
 
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "" });
     try expectNoInstructions(globalInstructions, tmp.dir);
 }
 
 test "a large instructions file is streamed whole" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1664,7 +1693,7 @@ test "a large instructions file is streamed whole" {
     const long_text: [5000]u8 = @splat('x');
     try file_text.writer.writeAll(&long_text);
     try file_text.writer.writeAll("\n");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = file_text.written() });
+    try tmp.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = file_text.written() });
 
     var expected: std.Io.Writer.Allocating = .init(gpa);
     defer expected.deinit();
@@ -1676,8 +1705,8 @@ test "a large instructions file is streamed whole" {
 }
 
 test "the prompt is billy's own, the user's instructions, then the project's" {
-    const gpa = std.testing.allocator;
     const io = std.testing.io;
+    const gpa = std.testing.allocator;
 
     // Two directories: the configuration one holding the user's file, and the
     // project one the session works in, which is separate so neither search can
@@ -2137,6 +2166,7 @@ test "prepare gives a chat session no prompt and only the tools it allows" {
 test "a first prompt names the mode and says what to ask" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2166,6 +2196,7 @@ test "a first prompt names the mode and says what to ask" {
 test "a first prompt that names only a mode asks nothing" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2186,6 +2217,7 @@ test "a first prompt that names only a mode asks nothing" {
 test "a prompt after the first leaves the session as it was set up" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2206,17 +2238,19 @@ test "a prompt after the first leaves the session as it was set up" {
 }
 
 test "the terminal shows a tool call the way a replay does" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
+
     // The parsed call's text is left in an allocator the caller drops in one go
     // (`Tools.parse`), so it gets an arena of its own; everything else is built
     // with the testing allocator, which reports anything not freed.
     var call_state = std.heap.ArenaAllocator.init(gpa);
     defer call_state.deinit();
 
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
     var tool_set = try Tools.init(.{
-        .io = std.testing.io,
+        .io = io,
         .dir = std.Io.Dir.cwd(),
         .gpa = gpa,
         .bash_timeout_s = 120,
@@ -2245,7 +2279,7 @@ test "the terminal shows a tool call the way a replay does" {
     // A replay renders the stored call on its own.
     var replayed: std.Io.Writer.Allocating = .init(gpa);
     defer replayed.deinit();
-    try Tools.describe(gpa, parsed, result.written(), .{}, .plain, &replayed.writer);
+    try Tools.describe(io, gpa, parsed, result.written(), .{}, .plain, &replayed.writer);
 
     // The two paths show the same bytes, which is what keeps a run and a resume
     // of it reading alike. The header before the result is what a slow command

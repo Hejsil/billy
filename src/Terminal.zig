@@ -11,6 +11,7 @@ pub const Markdown = @import("Terminal/Markdown.zig");
 const Terminal = @This();
 
 out: *std.Io.Writer,
+io: std.Io,
 display: agent.Display,
 /// For what showing a block builds, such as an edit's diff. Each block frees
 /// what it takes, so nothing is kept between them.
@@ -40,7 +41,7 @@ fn show(context: *anyopaque, block: agent.Block) anyerror!void {
         // The header goes out as the call begins, so a command that runs
         // long has it on screen while it runs.
         .tool_begin => |call| {
-            try Tools.printHead(self.scratch, call, self.display.formats, self.display.style, self.out);
+            try Tools.printHead(self.io, self.scratch, call, self.display.formats, self.display.style, self.out);
             try self.out.flush();
         },
         // The header is out already, so only the result is left; the blank

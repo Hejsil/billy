@@ -319,6 +319,7 @@ fn fromJson(comptime T: type, arena: std.mem.Allocator, json: []const u8) !T {
 /// the run. `scratch` is the caller's, for what the block builds, such as an
 /// edit's diff.
 pub fn describe(
+    io: std.Io,
     scratch: std.mem.Allocator,
     call: Call,
     result: []const u8,
@@ -326,7 +327,7 @@ pub fn describe(
     style: Terminal.Style,
     out: *std.Io.Writer,
 ) !void {
-    try printHead(scratch, call, formats, style, out);
+    try printHead(io, scratch, call, formats, style, out);
     try printResult(call, result, style, out);
     try out.writeAll("\n");
 }
@@ -402,15 +403,15 @@ pub fn headerLine(text: []const u8) []const u8 {
 /// bash command is laid out by the bash formatter, so it reads the way it runs;
 /// an edit is shown as the diff of the strings it works on; and a search shows
 /// the query it ran.
-pub fn printHead(scratch: std.mem.Allocator, call: Call, formats: Formats, style: Terminal.Style, out: *std.Io.Writer) !void {
+pub fn printHead(io: std.Io, scratch: std.mem.Allocator, call: Call, formats: Formats, style: Terminal.Style, out: *std.Io.Writer) !void {
     const head = Heading.of(call);
     const mark = Terminal.Style.Mark{ .glyph = head.glyph, .hue = head.hue };
     try mark.header(head.name, head.target, style, out);
     // What a call shows under its header: the change it means to make, or the
     // command it runs. Every other call is its header alone.
     switch (call) {
-        .edit => |args| try printDiff(scratch, args.old_string, args.new_string, formats.edit, style, out),
-        .bash => |args| try printScript(args.command, formats.bash, out),
+        .edit => |args| try printDiff(io, scratch, args.old_string, args.new_string, formats.edit, style, out),
+        .bash => |args| try printScript(io, scratch, args.command, formats.bash, out),
         else => {},
     }
 }
@@ -423,6 +424,7 @@ pub fn printHead(scratch: std.mem.Allocator, call: Call, formats: Formats, style
 /// can colour it or show word-level changes; without one, billy's own rendering
 /// is used. An edit that changes nothing shows no diff at all.
 fn printDiff(
+    io: std.Io,
     scratch: std.mem.Allocator,
     old: []const u8,
     new: []const u8,
@@ -442,10 +444,10 @@ fn printDiff(
     // own rendering, the same as every other formatter. The laid-out text is
     // written without its trailing newline, so one is added here to end the block
     // the way every other block ends.
-    if (format) |formatter| {
-        const text = try diffing.render(formatter.gpa, diff);
-        defer formatter.gpa.free(text);
-        if (try formatting.runDiff(format, text, old, new, out)) {
+    if (format != null) {
+        const text = try diffing.render(scratch, diff);
+        defer scratch.free(text);
+        if (try formatting.runDiff(format, io, scratch, text, old, new, out)) {
             try out.writeAll("\n");
             return;
         }
@@ -496,9 +498,9 @@ fn printInk(text: []const u8, ink: Ink, style: Terminal.Style, out: *std.Io.Writ
 /// the formatter when the configuration sets one and exactly as the model wrote
 /// it when there is none, or the formatter cannot be used. The trailing newline
 /// is dropped, so the block ends where the command does.
-fn printScript(command: []const u8, format: Format, out: *std.Io.Writer) !void {
+fn printScript(io: std.Io, scratch: std.mem.Allocator, command: []const u8, format: Format, out: *std.Io.Writer) !void {
     const script = std.mem.trimEnd(u8, command, "\n");
-    if (!try formatting.apply(format, script, out)) try out.writeAll(script);
+    if (!try formatting.apply(format, io, scratch, script, out)) try out.writeAll(script);
     try out.writeAll("\n");
 }
 
@@ -902,18 +904,20 @@ test "the exit status of a bash call is shown green or red" {
 }
 
 test "a bash block shows only the streams the command filled" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
+
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
     var tool_set = try Tools.init(.{
-        .io = std.testing.io,
+        .io = io,
         .dir = std.Io.Dir.cwd(),
         .gpa = gpa,
         .bash_timeout_s = 120,
@@ -947,13 +951,15 @@ test "a bash block shows only the streams the command filled" {
         );
         // `run` writes the result but shows nothing, so what a call and its
         // result look like is rendered here the way the terminal renders it.
-        try describe(gpa, parsed, result.written(), .{}, .plain, &log.writer);
+        try describe(io, gpa, parsed, result.written(), .{}, .plain, &log.writer);
         try std.testing.expectEqualStrings(case.expected, log.written());
     }
 }
 
 test "a bash result with no status line is shown as it is" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
+
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -968,7 +974,7 @@ test "a bash result with no status line is shown as it is" {
 
     // A session saved before the status was written into the result has none,
     // so nothing is claimed about the call and the whole result is shown.
-    try describe(gpa, parse(arena, call), "built\nnothing to do", .{}, .plain, &out.writer);
+    try describe(io, gpa, parse(arena, call), "built\nnothing to do", .{}, .plain, &out.writer);
     try std.testing.expectEqualStrings(
         "❯ bash\nmake\n▾ output\nbuilt\nnothing to do\n\n",
         out.written(),
@@ -1001,7 +1007,9 @@ test "a bash result splits into its status and its streams" {
 }
 
 test "what a call failed with is shown red, and what it left out is dimmed" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
+
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1010,7 +1018,7 @@ test "what a call failed with is shown red, and what it left out is dimmed" {
     defer out.deinit();
 
     // A failure is billy's own message, so the whole result is shown as one.
-    try describe(gpa, parse(arena, .{ .id = "1", .function = .{
+    try describe(io, gpa, parse(arena, .{ .id = "1", .function = .{
         .name = "read",
         .arguments = "{\"path\":\"a.zig\"}",
     } }), "error: cannot read a.zig: FileNotFound", .{}, .ansi, &out.writer);
@@ -1023,6 +1031,7 @@ test "what a call failed with is shown red, and what it left out is dimmed" {
 
     // The count of the lines left out is structure too, so it is dimmed.
     try describe(
+        io,
         arena_state.allocator(),
         .{ .read = .{ .path = "a.zig" } },
         "1\n2\n3\n4\n5\n6\n7\n",
@@ -1043,7 +1052,7 @@ test "a bash command is shown the way the formatter lays it out" {
     // way `shfmt | bat -l bash` reads it and writes it back laid out. The
     // command is shown as the formatter wrote it; its trailing newline does not
     // leave a blank line in the block.
-    const format: Format = .{ .script = "tr a-z A-Z | cat", .io = std.testing.io, .gpa = std.testing.allocator };
+    const format: Format = .{ .script = "tr a-z A-Z | cat" };
     try expectDescribe(
         "❯ bash\nLS -LA\n✓ exit 0\n\n",
         "bash",
@@ -1058,7 +1067,7 @@ test "a bash command is shown as written when the formatter cannot lay it out" {
     // all leave the command the model wrote for the user to read.
     const scripts = [_][]const u8{ "billy-no-such-formatter", "exit 1", "true" };
     for (scripts) |script| {
-        const format: Format = .{ .script = script, .io = std.testing.io, .gpa = std.testing.allocator };
+        const format: Format = .{ .script = script };
         try expectDescribe(
             "❯ bash\nls -la\n✓ exit 0\n\n",
             "bash",
@@ -1070,7 +1079,9 @@ test "a bash command is shown as written when the formatter cannot lay it out" {
 }
 
 test "describe keeps a block short and says how much it left out" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
+
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
 
@@ -1079,6 +1090,7 @@ test "describe keeps a block short and says how much it left out" {
 
     // Exactly the limit: nothing is left out.
     try describe(
+        io,
         arena_state.allocator(),
         .{ .read = .{ .path = "a.zig" } },
         "1\n2\n3\n4\n5",
@@ -1095,6 +1107,7 @@ test "describe keeps a block short and says how much it left out" {
     // Past the limit: the rest is replaced by a count of the lines left out. The
     // trailing newline of a result is not a line of its own.
     try describe(
+        io,
         arena_state.allocator(),
         .{ .read = .{ .path = "a.zig" } },
         "1\n2\n3\n4\n5\n6\n7\n",
@@ -1109,13 +1122,14 @@ test "describe keeps a block short and says how much it left out" {
     out.clearRetainingCapacity();
 
     // An empty result leaves the header with nothing under it.
-    try describe(arena_state.allocator(), .{ .read = .{ .path = "a.zig" } }, "", .{}, .plain, &out.writer);
+    try describe(io, arena_state.allocator(), .{ .read = .{ .path = "a.zig" } }, "", .{}, .plain, &out.writer);
     try std.testing.expectEqualStrings("▸ read a.zig\n▾ output\n\n", out.written());
     out.clearRetainingCapacity();
 
     // An edit shows the diff of the strings it worked on: the whole old side,
     // then the new, each line marked.
     try describe(
+        io,
         arena_state.allocator(),
         .{ .edit = .{
             .path = "a.zig",
@@ -1134,18 +1148,20 @@ test "describe keeps a block short and says how much it left out" {
 }
 
 test "run logs exactly what describe prints" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
+
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
     var tool_set = try Tools.init(.{
-        .io = std.testing.io,
+        .io = io,
         .dir = std.Io.Dir.cwd(),
         .gpa = gpa,
         .bash_timeout_s = 120,
@@ -1159,7 +1175,7 @@ test "run logs exactly what describe prints" {
     defer result.deinit();
     const parsed = try runCall(arena, &tool_set, call, &result.writer);
 
-    try describe(gpa, parsed, result.written(), .{}, .plain, &log.writer);
+    try describe(io, gpa, parsed, result.written(), .{}, .plain, &log.writer);
     try std.testing.expectEqualStrings(
         "❯ bash\ntrue\n✓ exit 0\n\n",
         log.written(),
@@ -1167,21 +1183,23 @@ test "run logs exactly what describe prints" {
 }
 
 test "the format changes what is shown and nothing else" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
+
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
     // The format script writes the command back upper case, so what is shown is
     // plainly not what runs.
-    const format: Format = .{ .script = "tr a-z A-Z", .io = std.testing.io, .gpa = gpa };
+    const format: Format = .{ .script = "tr a-z A-Z" };
     var tool_set = try Tools.init(.{
-        .io = std.testing.io,
+        .io = io,
         .dir = std.Io.Dir.cwd(),
         .gpa = gpa,
         .formats = .{ .bash = format },
@@ -1199,7 +1217,7 @@ test "the format changes what is shown and nothing else" {
     // The command that ran is the one the model wrote, so the result is its
     // output, and the user reads the command as the formatter laid it out.
     try std.testing.expectEqualStrings("exit code: 0\nhi\n", result.written());
-    try describe(gpa, parsed, result.written(), .{ .bash = format }, .plain, &log.writer);
+    try describe(io, gpa, parsed, result.written(), .{ .bash = format }, .plain, &log.writer);
     try std.testing.expectEqualStrings(
         "❯ bash\nECHO HI\n✓ exit 0\n▾ stdout\nhi\n\n",
         log.written(),
@@ -1207,6 +1225,7 @@ test "the format changes what is shown and nothing else" {
 }
 
 test "an edit diff is laid out by the edit format" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
 
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -1214,13 +1233,13 @@ test "an edit diff is laid out by the edit format" {
 
     // The script writes the diff back upper case, so what is shown is plainly not
     // what billy would render itself.
-    const format: Format = .{ .script = "tr a-z A-Z", .io = std.testing.io, .gpa = gpa };
+    const format: Format = .{ .script = "tr a-z A-Z" };
     const call: Call = .{ .edit = .{
         .path = "a.zig",
         .old_string = "old",
         .new_string = "new",
     } };
-    try describe(gpa, call, "replaced 1 occurrence(s) in a.zig", .{ .edit = format }, .plain, &out.writer);
+    try describe(io, gpa, call, "replaced 1 occurrence(s) in a.zig", .{ .edit = format }, .plain, &out.writer);
     try std.testing.expectEqualStrings(
         "✎ edit a.zig\n▾ diff\n-OLD\n+NEW\n\n",
         out.written(),
@@ -1228,6 +1247,7 @@ test "an edit diff is laid out by the edit format" {
 }
 
 test "an edit's two sides reach the format script as files" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
 
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -1237,15 +1257,13 @@ test "an edit's two sides reach the format script as files" {
     // handed, so what it shows proves the sides arrived as files it can name.
     const format: Format = .{
         .script = "printf '%s %s' \"$(cat \"$1\")\" \"$(cat \"$2\")\"",
-        .io = std.testing.io,
-        .gpa = gpa,
     };
     const call: Call = .{ .edit = .{
         .path = "a.zig",
         .old_string = "was here",
         .new_string = "now here",
     } };
-    try describe(gpa, call, "replaced 1 occurrence(s) in a.zig", .{ .edit = format }, .plain, &out.writer);
+    try describe(io, gpa, call, "replaced 1 occurrence(s) in a.zig", .{ .edit = format }, .plain, &out.writer);
     try std.testing.expectEqualStrings(
         "✎ edit a.zig\n▾ diff\nwas here now here\n\n",
         out.written(),
@@ -1253,6 +1271,7 @@ test "an edit's two sides reach the format script as files" {
 }
 
 test "an edit's sides are billy's own files in the temporary directory" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
 
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -1263,11 +1282,9 @@ test "an edit's sides are billy's own files in the temporary directory" {
     // collide.
     const format: Format = .{
         .script = "printf '%s %s' \"$1\" \"$2\"",
-        .io = std.testing.io,
-        .gpa = gpa,
     };
     const call: Call = .{ .edit = .{ .path = "a.zig", .old_string = "x", .new_string = "y" } };
-    try describe(gpa, call, "", .{ .edit = format }, .plain, &out.writer);
+    try describe(io, gpa, call, "", .{ .edit = format }, .plain, &out.writer);
 
     const written = out.written();
     try std.testing.expect(std.mem.startsWith(u8, written, "✎ edit a.zig\n▾ diff\n/tmp/billy-edit-"));
@@ -1276,29 +1293,31 @@ test "an edit's sides are billy's own files in the temporary directory" {
 }
 
 test "an edit whose format script fails falls back to billy's own diff" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    const format: Format = .{ .script = "exit 1", .io = std.testing.io, .gpa = gpa };
+    const format: Format = .{ .script = "exit 1" };
     const call: Call = .{ .edit = .{ .path = "a.zig", .old_string = "b", .new_string = "x" } };
-    try describe(gpa, call, "replaced 1 occurrence(s) in a.zig", .{ .edit = format }, .plain, &out.writer);
+    try describe(io, gpa, call, "replaced 1 occurrence(s) in a.zig", .{ .edit = format }, .plain, &out.writer);
     try std.testing.expectEqualStrings("✎ edit a.zig\n▾ diff\n-b\n+x\n\n", out.written());
 }
 
 test "a bash command that outlives the timeout is killed and reported" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
 
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
     // A one-second limit kills a command that would otherwise run far longer,
     // and the model is told so rather than left waiting for it to finish.
     var tool_set = try Tools.init(.{
-        .io = std.testing.io,
+        .io = io,
         .dir = std.Io.Dir.cwd(),
         .gpa = gpa,
         .bash_timeout_s = 1,
@@ -1379,13 +1398,15 @@ fn expectDescribe(
     result: []const u8,
     shown: Shown,
 ) !void {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
+
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try describe(arena_state.allocator(), parse(arena_state.allocator(), .{ .id = "1", .function = .{
+    try describe(io, arena_state.allocator(), parse(arena_state.allocator(), .{ .id = "1", .function = .{
         .name = name,
         .arguments = arguments,
     } }), result, shown.formats, shown.style, &out.writer);
@@ -1395,13 +1416,15 @@ fn expectDescribe(
 /// Writes the header of a call named `name` with `arguments`, and checks it
 /// against `expected`. A header alone, without a result under it.
 fn expectHead(expected: []const u8, name: []const u8, arguments: []const u8, shown: Shown) !void {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
+
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try printHead(arena_state.allocator(), parse(arena_state.allocator(), .{ .id = "1", .function = .{
+    try printHead(io, arena_state.allocator(), parse(arena_state.allocator(), .{ .id = "1", .function = .{
         .name = name,
         .arguments = arguments,
     } }), shown.formats, shown.style, &out.writer);
@@ -1510,7 +1533,9 @@ test "the web tools are offered only when a backend is configured" {
 }
 
 test "the tools work in the directory they are given, wherever billy runs" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
+
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1520,16 +1545,16 @@ test "the tools work in the directory they are given, wherever billy runs" {
 
     // A project directory that is not the one the tests run in, which is the
     // case a resumed session is in: it was started somewhere else.
-    try tmp.dir.createDirPath(std.testing.io, "project");
-    var work = try tmp.dir.openDir(std.testing.io, "project", .{});
-    defer work.close(std.testing.io);
+    try tmp.dir.createDirPath(io, "project");
+    var work = try tmp.dir.openDir(io, "project", .{});
+    defer work.close(io);
 
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
     var tool_set = try Tools.init(.{
-        .io = std.testing.io,
+        .io = io,
         .dir = work,
         .gpa = gpa,
         .bash_timeout_s = 120,
@@ -1543,7 +1568,7 @@ test "the tools work in the directory they are given, wherever billy runs" {
         .name = "write",
         .arguments = "{\"path\":\"note.txt\",\"content\":\"hi\"}",
     } }, &sink.writer);
-    const written = try tmp.dir.readFileAlloc(std.testing.io, "project/note.txt", arena, .limited(64));
+    const written = try tmp.dir.readFileAlloc(io, "project/note.txt", arena, .limited(64));
     try std.testing.expectEqualStrings("hi", written);
 
     // And a command runs there too, so `pwd` reports that directory and not the
@@ -1669,7 +1694,9 @@ test "the limiting writer hands the repeats over together" {
 }
 
 test "a result longer than the cap is cut and says what it lost" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
+
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1682,12 +1709,12 @@ test "a result longer than the cap is cut and says what it lost" {
     var big: std.ArrayList(u8) = .empty;
     defer big.deinit(gpa);
     for (0..1000) |_| try big.appendSlice(gpa, line);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big.txt", .data = big.items });
+    try tmp.dir.writeFile(io, .{ .sub_path = "big.txt", .data = big.items });
 
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
     var tool_set = try Tools.init(.{
-        .io = std.testing.io,
+        .io = io,
         .dir = tmp.dir,
         .gpa = gpa,
         .bash_timeout_s = 120,

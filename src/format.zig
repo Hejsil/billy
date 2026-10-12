@@ -38,9 +38,6 @@ pub const Format = ?Formatter;
 pub const Formatter = struct {
     /// The shell script, run with `bash -c`.
     script: []const u8,
-    io: std.Io,
-    /// Holds the laid-out text while it is printed.
-    gpa: std.mem.Allocator,
 };
 
 /// Runs `text` through the formatter with no arguments and writes what it makes
@@ -48,14 +45,14 @@ pub const Formatter = struct {
 /// so the caller can show the text as written. That is what no formatter gives,
 /// and a formatter that cannot be run, rejects the text, writes nothing or writes
 /// too much.
-pub fn apply(format: Format, text: []const u8, out: *std.Io.Writer) !bool {
-    return run(format, text, &.{}, out);
+pub fn apply(format: Format, io: std.Io, gpa: std.mem.Allocator, text: []const u8, out: *std.Io.Writer) !bool {
+    return run(format, io, gpa, text, &.{}, out);
 }
 
 /// Runs `text` through the formatter with `args` after the script, so the script
 /// can name them `$1`, `$2`. The text still goes in on standard input, so a
 /// script that takes no arguments is unaffected. Everything else is as `apply`.
-fn run(format: Format, text: []const u8, args: []const []const u8, out: *std.Io.Writer) !bool {
+fn run(format: Format, io: std.Io, gpa: std.mem.Allocator, text: []const u8, args: []const []const u8, out: *std.Io.Writer) !bool {
     const formatter = format orelse return false;
     std.debug.assert(args.len <= max_args);
 
@@ -68,7 +65,7 @@ fn run(format: Format, text: []const u8, args: []const []const u8, out: *std.Io.
     argv[3] = "billy";
     for (args, 4..) |arg, i| argv[i] = arg;
 
-    var child = std.process.spawn(formatter.io, .{
+    var child = std.process.spawn(io, .{
         .argv = argv[0 .. 4 + args.len],
         .stdin = .pipe,
         .stdout = .pipe,
@@ -77,27 +74,27 @@ fn run(format: Format, text: []const u8, args: []const []const u8, out: *std.Io.
     // Declared before the kill so the kill runs first: it is what unblocks a
     // writer whose script has gone.
     var feeding: std.Io.Group = .init;
-    defer feeding.cancel(formatter.io);
-    defer child.kill(formatter.io);
+    defer feeding.cancel(io);
+    defer child.kill(io);
 
     // The text goes in on standard input from a task of its own, so the script can
     // write while it is still reading. One thread doing both blocks on a full pipe
     // as soon as the text and the output are each larger than the pipe holds.
     const stdin = child.stdin.?;
     child.stdin = null;
-    feeding.concurrent(formatter.io, feed, .{ formatter.io, stdin, text }) catch {
-        stdin.close(formatter.io);
+    feeding.concurrent(io, feed, .{ io, stdin, text }) catch {
+        stdin.close(io);
         return false;
     };
 
     var out_buffer: [4096]u8 = undefined;
-    var reader: std.Io.File.Reader = .init(child.stdout.?, formatter.io, &out_buffer);
-    const written = reader.interface.allocRemaining(formatter.gpa, .unlimited) catch return false;
-    defer formatter.gpa.free(written);
+    var reader: std.Io.File.Reader = .init(child.stdout.?, io, &out_buffer);
+    const written = reader.interface.allocRemaining(gpa, .unlimited) catch return false;
+    defer gpa.free(written);
 
     // A formatter that failed, or left nothing behind, is one the text should
     // not disappear for; it is shown as written instead.
-    if (exitCode(child.wait(formatter.io) catch return false) != 0) return false;
+    if (exitCode(child.wait(io) catch return false) != 0) return false;
     const laid_out = std.mem.trimEnd(u8, written, "\n");
     if (laid_out.len == 0) return false;
 
@@ -121,21 +118,27 @@ fn feed(io: std.Io, stdin: std.Io.File, text: []const u8) void {
 /// own files and passed as the script's first two arguments, so a two-file
 /// differ is handed the files it wants. The files are removed once the script has
 /// run, whether or not it could be used.
-pub fn runDiff(format: Format, text: []const u8, old: []const u8, new: []const u8, out: *std.Io.Writer) !bool {
-    const formatter = format orelse return false;
-
-    var dir = std.Io.Dir.openDirAbsolute(formatter.io, sides_dir, .{}) catch return false;
-    defer dir.close(formatter.io);
+pub fn runDiff(
+    format: Format,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    text: []const u8,
+    old: []const u8,
+    new: []const u8,
+    out: *std.Io.Writer,
+) !bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, sides_dir, .{}) catch return false;
+    defer dir.close(io);
 
     var old_buffer: [max_path]u8 = undefined;
-    const old_path = writeSide(formatter.io, dir, old, "old", &old_buffer) orelse return false;
-    defer dir.deleteFile(formatter.io, std.fs.path.basename(old_path)) catch {};
+    const old_path = writeSide(io, dir, old, "old", &old_buffer) orelse return false;
+    defer dir.deleteFile(io, std.fs.path.basename(old_path)) catch {};
 
     var new_buffer: [max_path]u8 = undefined;
-    const new_path = writeSide(formatter.io, dir, new, "new", &new_buffer) orelse return false;
-    defer dir.deleteFile(formatter.io, std.fs.path.basename(new_path)) catch {};
+    const new_path = writeSide(io, dir, new, "new", &new_buffer) orelse return false;
+    defer dir.deleteFile(io, std.fs.path.basename(new_path)) catch {};
 
-    return run(format, text, &.{ old_path, new_path }, out);
+    return run(format, io, gpa, text, &.{ old_path, new_path }, out);
 }
 
 /// Writes `data` to a fresh file in `dir`, whose name is the prefix, a random
@@ -223,6 +226,7 @@ test "each side is written to its own fresh file" {
 }
 
 test "a text larger than a pipe holds is laid out without deadlock" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
 
     // `cat` writes as it reads, so its output fills the pipe back to billy while
@@ -233,18 +237,19 @@ test "a text larger than a pipe holds is laid out without deadlock" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    const format: Format = .{ .script = "cat", .io = std.testing.io, .gpa = gpa };
-    try std.testing.expect(try apply(format, text, &out.writer));
+    const format: Format = .{ .script = "cat" };
+    try std.testing.expect(try apply(format, io, gpa, text, &out.writer));
     try std.testing.expectEqualStrings(text, out.written());
 }
 
 test "an edit's sides are readable by their owner alone" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     // The script prints the mode of the file it is given as `$1`.
-    const format: Format = .{ .script = "stat -c %a \"$1\"", .io = std.testing.io, .gpa = gpa };
-    try std.testing.expect(try runDiff(format, "x", "old", "new", &out.writer));
+    const format: Format = .{ .script = "stat -c %a \"$1\"" };
+    try std.testing.expect(try runDiff(format, io, gpa, "x", "old", "new", &out.writer));
     try std.testing.expectEqualStrings("600", out.written());
 }

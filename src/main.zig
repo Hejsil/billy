@@ -179,12 +179,12 @@ pub fn main(init: std.process.Init) !void {
     // Everything else needs the whole of what billy reads in: the configuration,
     // the credentials and the directories it keeps its files in.
     var setup = try billy.Setup.open(init, out);
-    defer setup.deinit();
+    defer setup.deinit(io);
 
     if (options.serve) |serve| {
         const server = billy.Server{
-            .io = setup.io,
-            .gpa = setup.gpa,
+            .io = io,
+            .gpa = init.gpa,
             .session_dir = setup.sessions,
             .setup = &setup,
         };
@@ -260,6 +260,7 @@ fn runSession(
         // have to be remembered from the previous run. Only the last few blocks
         // are shown, so resuming a long one is quick.
         try billy.agent.printTranscript(
+            io,
             init.gpa,
             out,
             &session,

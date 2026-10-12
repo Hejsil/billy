@@ -20,10 +20,6 @@ const Terminal = @import("Terminal.zig");
 
 const Setup = @This();
 
-io: std.Io,
-/// Temporary allocations, and what a tool format script is given to lay its
-/// output out with.
-gpa: std.mem.Allocator,
 environ: *const std.process.Environ.Map,
 
 /// The configuration. It owns an arena of its own for the strings read out of
@@ -101,8 +97,6 @@ pub fn open(init: std.process.Init, out: *std.Io.Writer) !Setup {
     };
 
     return .{
-        .io = io,
-        .gpa = init.gpa,
         .environ = environ,
         .config = opened.config,
         .sessions = files.sessions,
@@ -246,12 +240,12 @@ const Endpoint = struct {
     model: []const u8,
 };
 
-pub fn deinit(setup: *Setup) void {
+pub fn deinit(setup: *Setup, io: std.Io) void {
     setup.health.deinit();
     setup.config.deinit();
-    setup.sessions.close(setup.io);
-    setup.config_dir.close(setup.io);
-    setup.data_dir.close(setup.io);
+    setup.sessions.close(io);
+    setup.config_dir.close(io);
+    setup.data_dir.close(io);
 }
 
 /// What the configuration's `reasoning` asks of the model's thinking: `off` for
@@ -421,16 +415,8 @@ pub fn agentConfig(setup: *Setup, cwd: []const u8, style: Terminal.Style) agent.
         // prompt are markdown, laid out by billy's own renderer.
         .display = .{
             .formats = .{
-                .bash = if (config.tools.bash.format) |script| .{
-                    .script = script,
-                    .io = setup.io,
-                    .gpa = setup.gpa,
-                } else null,
-                .edit = if (config.tools.edit.format) |script| .{
-                    .script = script,
-                    .io = setup.io,
-                    .gpa = setup.gpa,
-                } else null,
+                .bash = if (config.tools.bash.format) |script| .{ .script = script } else null,
+                .edit = if (config.tools.edit.format) |script| .{ .script = script } else null,
             },
             .style = style,
         },
