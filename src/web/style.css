@@ -8,48 +8,36 @@ html, body { height: 100%; margin: 0; }
 body {
   display: flex; background: var(--bg); color: var(--text);
   font: 14px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  /* `--app-height` is the visible area, set from the visual viewport so that an
-     on-screen keyboard shrinks the app rather than covering the prompt box.
-     `dvh` is the fallback for a browser with no visual viewport, and it also
-     covers the address bar. `overflow: hidden` keeps the page from scrolling as
-     a whole, the conversation scrolls instead. */
+  /* --app-height follows the visual viewport so an on-screen keyboard shrinks the app; dvh is the fallback. */
   height: var(--app-height, 100dvh); overflow: hidden;
   -webkit-text-size-adjust: 100%;
 }
 
-/* The button that opens the session list on a narrow screen. It is hidden
-   where the sidebar is always shown. */
-#topbar { display: flex; align-items: center; flex: none; }
-#menu {
-  display: none; flex: none; align-items: center; justify-content: center;
-  width: 44px; height: 40px; margin-left: 4px; padding: 0;
-  background: none; border: none; color: var(--text); font: inherit;
-  font-size: 18px; cursor: pointer;
-}
-
-/* The list of sessions down the left, and the button that starts a new one. */
+/* Sidebar: the session list and the new-session button. */
 #sidebar {
   width: 250px; flex: none; display: flex; flex-direction: column;
   background: var(--panel); border-right: 1px solid var(--line);
-}
-/* Dims the page behind the session list when it is open over it. */
-#backdrop {
-  display: none; position: fixed; inset: 0; z-index: 9; background: rgba(0, 0, 0, 0.5);
 }
 #sidebar header {
   display: flex; align-items: center; justify-content: space-between;
   padding: 9px 12px; border-bottom: 1px solid var(--line);
 }
 #sidebar h1 { margin: 0; font-size: 14px; font-weight: 600; }
+#backdrop { display: none; position: fixed; inset: 0; z-index: 9; background: rgba(0, 0, 0, 0.5); }
+
+/* Icon buttons: the glyph is centred by the box, not by its baseline. */
+#new, #menu, #list .act {
+  display: flex; align-items: center; justify-content: center; flex: none;
+  padding: 0; background: none; border: none; color: var(--dim);
+  font: inherit; line-height: 1; cursor: pointer;
+}
 #new {
-  /* The glyph is centred rather than positioned by its baseline: a `+` has no
-     descender, so a line box puts it off centre in a square button. */
-  display: flex; align-items: center; justify-content: center;
-  background: none; border: 1px solid var(--line); color: var(--accent);
-  border-radius: 6px; width: 26px; height: 26px; padding: 0;
-  font: inherit; font-size: 17px; line-height: 1; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 6px; color: var(--accent);
+  width: 26px; height: 26px; font-size: 17px;
 }
 #new:hover { border-color: var(--accent); }
+#menu { display: none; width: 44px; height: 40px; margin-left: 4px; color: var(--text); font-size: 18px; }
+
 #list { list-style: none; margin: 0; padding: 6px; overflow-y: auto; flex: 1; }
 #list li {
   padding: 6px 8px; border-radius: 6px; cursor: pointer; color: var(--dim);
@@ -57,36 +45,16 @@ body {
 }
 #list li:hover { background: #22242c; color: var(--text); }
 #list li.selected { background: #262a35; color: var(--text); }
-/* The name takes the room, with the delete button beside it, so a long title
-   is cut off rather than pushing the button out of the item. */
+/* min-width lets a long title be cut off instead of pushing the buttons out. */
 #list .name { flex: 1; min-width: 0; }
-/* A session is shown by its title, with the id it can be resumed by under it
-   in a smaller, dimmer line. A session that has not been named shows its id
-   alone, in the place of the title. */
-#list li .title {
-  color: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-#list li .ident {
-  color: #5f6675; font-size: 11px; overflow: hidden; text-overflow: ellipsis;
-  white-space: nowrap;
-}
+#list .title, #list .ident { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#list .ident { color: #5f6675; font-size: 11px; }
 #list li:not(.selected):hover .ident { color: var(--dim); }
-/* The rename and delete buttons sit at the right of a session row, dim until
-   the row is hovered so a list of sessions is not a row of buttons. */
-#list .act {
-  /* Centred the same way as `#new`: the glyphs are not on a shared baseline. */
-  display: flex; align-items: center; justify-content: center;
-  flex: none; width: 22px; height: 22px; padding: 0;
-  background: none; border: none; border-radius: 5px; cursor: pointer;
-  color: var(--dim); font: inherit; font-size: 13px; line-height: 1; opacity: 0;
-}
+#list .act { width: 22px; height: 22px; border-radius: 5px; font-size: 13px; opacity: 0; }
 #list li:hover .act, #list .act:focus { opacity: 1; }
 #list .act.ren:hover { color: var(--accent); background: rgba(122, 162, 247, 0.12); }
 #list .act.del:hover { color: var(--del); background: rgba(247, 118, 142, 0.12); }
-/* Where the screen is wide enough to hover, the buttons take no room either
-   until the row is hovered, so a long title is only ever cut short for
-   buttons that are on screen. Their own spacing comes with them, so what they
-   take when they appear is what they took before. */
+/* Where hover exists, the buttons take no room until the row is hovered. */
 @media (min-width: 721px) {
   #list li { gap: 0; }
   #list .act { width: 0; overflow: hidden; }
@@ -95,110 +63,73 @@ body {
 #list .empty { color: var(--dim); cursor: default; padding: 6px 8px; }
 #list .empty:hover { background: none; }
 
-/* The conversation in the middle, with the prompt box under it. */
+/* Main: header, conversation, prompt. */
 main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+#topbar { display: flex; align-items: center; flex: none; }
 #header {
-  flex: 1; min-width: 0;
-  padding: 7px 16px; border-bottom: 1px solid var(--line);
+  flex: 1; min-width: 0; padding: 7px 16px; border-bottom: 1px solid var(--line);
   color: var(--dim); font-size: 12px; display: flex; gap: 6px; flex-wrap: wrap;
 }
 #header:empty { display: none; }
 #header .sep { color: #3a3f4b; }
 #header .id { color: #6f7688; }
-/* The conversation and the pill that floats over its bottom edge. The wrapper
-   is what the pill is positioned against, so it sits above the prompt box
-   however tall that grows. */
+/* The pill is positioned against this wrapper so it stays above the prompt box. */
 #view { flex: 1; min-height: 0; position: relative; display: flex; }
-#conversation { flex: 1; overflow-y: auto; padding: 16px; }
+/* anywhere: a long url or hash must wrap rather than scroll the page sideways. */
+#conversation { flex: 1; overflow-y: auto; overflow-wrap: anywhere; padding: 16px; }
 #prompt { display: flex; padding: 12px 16px; border-top: 1px solid var(--line); }
-#text {
-  flex: 1; background: var(--panel); border: 1px solid var(--line);
-  color: var(--text); border-radius: 6px; padding: 8px 10px; font: inherit;
-  /* A prompt is a textarea so a newline can be typed into it. It starts one
-     line tall and grows with what is written, up to a share of the window,
-     after which it scrolls. */
-  resize: none; overflow-y: auto; min-height: 0; max-height: 40vh;
-}
-#text:disabled { color: var(--dim); }
-/* The mode picker beside the prompt box. It is only for a session that has not
-   been asked anything yet, so it is disabled once one has a conversation. */
-#mode {
-  flex: none; align-self: flex-end; margin-left: 8px; cursor: pointer;
+#text, #mode {
   background: var(--panel); border: 1px solid var(--line); color: var(--text);
   border-radius: 6px; padding: 8px 10px; font: inherit;
 }
-#mode:disabled { color: var(--dim); cursor: default; }
+#text { flex: 1; resize: none; overflow-y: auto; min-height: 0; max-height: 40vh; }
+#mode { flex: none; align-self: flex-end; margin-left: 8px; cursor: pointer; }
+#text:disabled, #mode:disabled, #prompt.working :is(#text, #mode) { color: var(--dim); }
+#mode:disabled { cursor: default; }
 
-/* A prompt or a reply: a headed block of markdown. */
+/* Blocks of markdown. */
 .block { margin-bottom: 16px; }
+.block :first-child { margin-top: 0; }
 .block .head { color: var(--dim); font-size: 12px; margin-bottom: 5px; }
 .block .head .name { color: var(--text); font-weight: 600; }
 .block.prompt .head .glyph { color: var(--accent); }
 .block.answer .head .glyph { color: var(--add); }
-.block :first-child { margin-top: 0; }
-/* Text breaks wherever it has to. A reply, a prompt and a tool's output can
-   hold a run of characters with nothing to break at -- a comma-separated list
-   of bytes, a long url, a hash -- and a line with nowhere to wrap pushes the
-   whole page sideways, which on a phone is a long horizontal scroll. Prose is
-   unaffected: this only decides what happens where there is no space to break
-   at, so an ordinary sentence still wraps at its spaces. */
-#conversation { overflow-wrap: anywhere; }
-.block p { margin: 0 0 8px; }
-.block ul, .block ol { margin: 0 0 8px; padding-left: 22px; }
+.block p, .block ul, .block ol, .block table, pre { margin: 0 0 8px; }
+.block ul, .block ol { padding-left: 22px; }
 .block h1, .block h2, .block h3, .block h4, .block h5, .block h6 { font-size: 15px; margin: 12px 0 6px; }
-/* A link, a table and an image are what a CommonMark renderer writes that the
-   blocks above do not already cover. */
 .block a { color: var(--accent); }
 .block img { max-width: 100%; }
-.block table { border-collapse: collapse; margin: 0 0 8px; }
+.block table { border-collapse: collapse; }
 .block th, .block td { border: 1px solid var(--line); padding: 3px 8px; text-align: left; }
 .block th { background: var(--panel); }
-.block blockquote {
-  margin: 0 0 8px; padding-left: 10px; border-left: 2px solid var(--line);
-  color: var(--dim);
-}
+.block blockquote { margin: 0 0 8px; padding-left: 10px; border-left: 2px solid var(--line); color: var(--dim); }
 .block hr { border: none; border-top: 1px solid var(--line); margin: 10px 0; }
 
-/* Code: inline, in a block of markdown, and as a tool's own output. */
-code {
-  background: #22242c; border-radius: 3px; padding: 1px 4px; font: inherit;
-}
-pre {
-  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
-  padding: 8px 10px; overflow-x: auto; margin: 0 0 8px;
-}
+code { background: #22242c; border-radius: 3px; padding: 1px 4px; font: inherit; }
+pre { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; overflow-x: auto; }
 pre code { background: none; padding: 0; }
-pre.error { color: var(--del); }
+pre.error, .failed { color: var(--del); }
+pre.diff .removed { color: var(--del); }
+pre.diff .added { color: var(--add); }
+pre.diff .context, pre.diff .elided { color: var(--dim); }
 
-/* A tool call: a headed summary that opens onto what the call ran and what it
-   produced, collapsed by default so a long conversation stays readable. */
+/* Tool calls: collapsed by default; the summary is one compact row. */
 details.tool { margin-bottom: 16px; }
 summary.tool-head {
   color: var(--dim); font-size: 12px; cursor: pointer; list-style: none;
   display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
-  /* One line, so a call stays a single compact row; a long description is cut
-     off with an ellipsis rather than wrapping. */
   white-space: nowrap; overflow: hidden;
 }
 summary.tool-head::-webkit-details-marker { display: none; }
 summary.tool-head:hover .name { text-decoration: underline; }
-/* The disclosure marker: a chevron that turns to point down once the call is
-   open. It is a chevron rather than a triangle so it is not mistaken for the
-   glyph of a `read`, which is a triangle too. */
+/* A chevron, not a triangle, so it is not mistaken for the `read` glyph. */
 summary.tool-head::before { content: '›'; color: #3a3f4b; flex: none; }
 details.tool[open] summary.tool-head::before { transform: rotate(90deg); }
 .tool-head .name { color: var(--text); font-weight: 600; flex: none; }
 .tool-head .target { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-/* What a call produced, on its own row under the head: a bash call's exit
-   status, and the bubbles of a web search's sources. It is in the summary, so
-   it shows whether the call is open or collapsed, and it comes after the head
-   in the markup, so it takes the whole row and the head keeps the first.
-   The status pill keeps the width of the longest status it holds, so a code
-   one or two digits wide does not make the bubble jump about. */
-.tool-head .produced {
-  flex-basis: 100%; display: flex; flex-wrap: wrap; align-items: center;
-  gap: 5px; margin-left: 14px;
-}
+/* Own row under the head; it stays visible when the call is collapsed. */
+.tool-head .produced { flex-basis: 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-left: 14px; }
+/* Fixed width so the pill does not jump between statuses. */
 .tool-head .exit {
   flex: none; display: inline-flex; align-items: center; justify-content: center;
   width: 4.5em; height: 18px; padding: 0 6px; border-radius: 9px;
@@ -208,10 +139,6 @@ details.tool[open] summary.tool-head::before { transform: rotate(90deg); }
 .tool-head .exit.ok { color: var(--add); border-color: rgba(158, 206, 106, 0.45); background: rgba(158, 206, 106, 0.10); }
 .tool-head .exit.failed { color: var(--del); border-color: rgba(247, 118, 142, 0.5); background: rgba(247, 118, 142, 0.12); }
 .tool-head .exit.running, .tool-head .exit.unknown { color: var(--dim); border-color: var(--line); background: rgba(255, 255, 255, 0.03); }
-/* A running call shows three dots that come and go in turn, so a call that is
-   still going reads as working rather than as one that finished with nothing
-   to say. They are laid out in the same fixed-width pill as an exit status, so
-   the row does not move when the call ends. */
 .tool-head .exit.running .dots { display: inline-flex; gap: 2px; }
 .tool-head .exit.running .dots i {
   width: 3px; height: 3px; border-radius: 50%; background: currentColor;
@@ -220,50 +147,29 @@ details.tool[open] summary.tool-head::before { transform: rotate(90deg); }
 .tool-head .exit.running .dots i:nth-child(2) { animation-delay: 0.18s; }
 .tool-head .exit.running .dots i:nth-child(3) { animation-delay: 0.36s; }
 @keyframes dot { 0%, 100% { opacity: 0.2; } 50% { opacity: 1; } }
-/* A reader who asked for less motion gets the dots at a steady middling
-   opacity rather than a pulse. */
 @media (prefers-reduced-motion: reduce) {
   .tool-head .exit.running .dots i { animation: none; opacity: 0.6; }
 }
-/* The body is indented under the summary, and its last piece does not add a
-   gap of its own. */
 .tool-body { margin: 5px 0 0 14px; }
 .tool-body > :last-child { margin-bottom: 0; }
 
-/* One small round bubble per source of a web search. Each holds the source's
-   own favicon, cropped to fill the circle, and opens it. */
+/* Web search sources: a round favicon over its initial, which shows if the icon fails. */
 .fav {
   position: relative; width: 16px; height: 16px; border-radius: 50%; flex: none;
   display: block; overflow: hidden; background: var(--line); text-decoration: none;
 }
-/* The letter sits behind the icon, so a source with no favicon still reads as a
-   small bubble with its initial rather than a broken image: the icon covers it
-   when it loads, and removes itself when it does not. */
+.fav .letter, .fav img { position: absolute; inset: 0; }
 .fav .letter {
-  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  display: flex; align-items: center; justify-content: center;
   color: var(--dim); font-size: 9px; font-weight: 600; text-transform: uppercase; line-height: 1;
 }
-.fav img {
-  position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block;
-}
+.fav img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .fav:hover img { filter: brightness(1.3); }
 .fav:hover .letter { color: var(--text); }
-pre.diff .removed { color: var(--del); }
-pre.diff .added { color: var(--add); }
-pre.diff .context, pre.diff .elided { color: var(--dim); }
 
-/* The lines billy writes itself, and what the page adds of its own. */
-.compacted, .notice, .elided {
-  color: var(--dim); font-size: 12px; margin-bottom: 16px;
-}
-.failed { color: var(--del); }
-#prompt.working #text { color: var(--dim); }
-#prompt.working #mode { color: var(--dim); }
+.compacted, .notice, .elided { color: var(--dim); font-size: 12px; margin-bottom: 16px; }
 
-/* Shown when the end of the conversation is off screen, whether because the
-   user scrolled up or because a turn added more below them. It floats over the
-   bottom of the conversation rather than taking a row of its own, so the
-   conversation keeps its height and nothing moves when it appears. */
+/* Floats over the conversation so nothing moves when it appears. */
 #latest {
   position: absolute; left: 50%; transform: translateX(-50%); bottom: 10px;
   z-index: 5; display: none; align-items: center; gap: 5px;
@@ -274,10 +180,7 @@ pre.diff .context, pre.diff .elided { color: var(--dim); }
 #latest:hover { border-color: var(--accent); }
 body.offscreen #latest { display: inline-flex; }
 
-/* A narrow screen: the conversation takes the whole width and the session list
-   is a drawer over it, opened by the menu button. Tap targets grow and the
-   prompt box is 16px, which is the size a phone will not zoom in on when it is
-   focused. */
+/* Narrow screen: the session list is a drawer; 16px inputs stop phones zooming on focus. */
 @media (max-width: 720px) {
   #menu { display: flex; }
   #sidebar {
@@ -289,9 +192,7 @@ body.offscreen #latest { display: inline-flex; }
   body.drawer #backdrop { display: block; }
   #new { width: 34px; height: 34px; font-size: 20px; }
   #list { padding: 8px; }
-  #list li { padding: 10px 10px; }
-  /* A touch screen has no hover, so the buttons are always shown and big
-     enough to tap. */
+  #list li { padding: 10px; }
   #list .act { opacity: 1; width: 30px; height: 30px; font-size: 15px; }
   #header { padding: 8px 12px; }
   #conversation { padding: 12px; }
