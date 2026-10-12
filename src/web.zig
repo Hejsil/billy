@@ -33,9 +33,32 @@ pub const default_port = 8787;
 /// means.
 pub const default_host = "127.0.0.1";
 
-/// The page the browser is given at `/`: one file, with its styles and its
-/// script in it, so the server serves it as it is and there is nothing to build.
-const page = @embedFile("web/index.html");
+/// The page the browser is given at `/`: one document, with its styles and its
+/// script in it, put together at compile time from `web/style.css`,
+/// `web/body.html` and `web/script.js`.
+const page =
+    \\<!doctype html>
+    \\<html lang="en">
+    \\<head>
+    \\<meta charset="utf-8">
+    \\<meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
+    \\<title>billy</title>
+    \\<style>
+    \\
+++ @embedFile("web/style.css") ++
+    \\</style>
+    \\</head>
+    \\<body>
+    \\
+++ @embedFile("web/body.html") ++
+    \\<script>
+    \\
+++ @embedFile("web/script.js") ++
+    \\</script>
+    \\</body>
+    \\</html>
+    \\
+;
 
 /// The most connections billy serves at once.
 ///
@@ -592,8 +615,7 @@ test "a parsed prompt is copied, so the body it came from can be freed" {
 }
 
 test "the page the browser is given is the one that was written" {
-    // The embedded page is served whole, so it is its own file and nothing is
-    // built to serve it.
+    // The embedded page is served whole, and nothing is built to serve it.
     try std.testing.expect(std.mem.indexOf(u8, page, "<!doctype html>") == 0);
     try std.testing.expect(std.mem.indexOf(u8, page, "/api/sessions") != null);
 }
@@ -1118,8 +1140,8 @@ test "the page is served at the root, byte for byte" {
     defer exchange.deinit();
 
     try std.testing.expectEqualStrings("HTTP/1.1 200 OK", exchange.statusLine());
-    // The answer is the embedded page and nothing else, so what is served is
-    // the file `index.html` holds rather than something built to look like it.
+    // The answer is the embedded page and nothing else, not something built to
+    // look like it.
     try std.testing.expect(exchange.contains(page));
 }
 

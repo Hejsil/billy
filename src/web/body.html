@@ -1,0 +1,26 @@
+<aside id="sidebar">
+  <header>
+    <h1>billy</h1>
+    <button id="new" title="new session">&plus;</button>
+  </header>
+  <ul id="list"></ul>
+</aside>
+
+<main>
+  <div id="topbar">
+    <button id="menu" title="sessions">&#9776;</button>
+    <div id="header"></div>
+  </div>
+  <div id="view">
+    <div id="conversation"></div>
+    <button id="latest" title="go to the newest">&#8595; new messages</button>
+  </div>
+  <form id="prompt">
+    <textarea id="text" rows="1" placeholder="ask billy something (shift+enter for a newline)" autocomplete="off"></textarea>
+    <select id="mode" title="what a new session may do">
+      <option value="chat">chat</option>
+      <option value="general">general</option>
+    </select>
+  </form>
+</main>
+<div id="backdrop"></div>
