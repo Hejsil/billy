@@ -182,7 +182,11 @@ pub fn main(init: std.process.Init) !void {
     defer setup.deinit();
 
     if (options.serve) |serve| {
-        const server = billy.Server{ .setup = &setup };
+        const server = billy.Server{
+            .io = setup.io,
+            .gpa = setup.gpa,
+            .setup = &setup,
+        };
         return server.serve(serve.host, serve.port);
     }
 

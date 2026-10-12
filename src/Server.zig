@@ -70,6 +70,8 @@ const page =
 /// while keeping a stranger from taking the machine down.
 const max_connections = 64;
 
+io: std.Io,
+gpa: std.mem.Allocator,
 setup: *Setup,
 
 /// Serves the frontend on the address `host` at `port`, until the process is
@@ -85,18 +87,18 @@ pub fn serve(server: *const Server, host: []const u8, port: u16) !void {
         );
         return err;
     };
-    var listener = try address.listen(server.setup.io, .{ .reuse_address = true });
-    defer listener.deinit(server.setup.io);
+    var listener = try address.listen(server.io, .{ .reuse_address = true });
+    defer listener.deinit(server.io);
 
     // One HTTP client for the whole server, shared by every request of every
     // session, so they reuse its connections and share the certificates it scans
     // once.
-    var http_client: std.http.Client = .{ .allocator = server.setup.gpa, .io = server.setup.io };
+    var http_client: std.http.Client = .{ .allocator = server.gpa, .io = server.io };
     defer http_client.deinit();
 
     // What the server knows about sessions beyond their files. It outlives every
     // connection, which is why it is here and not in the handler.
-    var registry = Registry{ .io = server.setup.io, .gpa = server.setup.gpa };
+    var registry = Registry{ .io = server.io, .gpa = server.gpa };
     defer registry.deinit();
 
     std.log.info("billy serve is listening on http://{s}:{d}/\n", .{
@@ -107,7 +109,7 @@ pub fn serve(server: *const Server, host: []const u8, port: u16) !void {
     // One task per connection, gathered so that they are all cancelled when the
     // loop ends, as they all share the listener's lifetime.
     var group: std.Io.Group = .init;
-    defer group.cancel(server.setup.io);
+    defer group.cancel(server.io);
 
     // At most `max_connections` are served at once. A permit is taken before a
     // connection is accepted, so one that arrives while the server is full waits
@@ -115,18 +117,18 @@ pub fn serve(server: *const Server, host: []const u8, port: u16) !void {
     // permit is given back when the connection is answered and its task ends.
     var slots: std.Io.Semaphore = .{ .permits = max_connections };
     while (true) {
-        try slots.wait(server.setup.io);
-        const stream = listener.accept(server.setup.io) catch |err| {
-            slots.post(server.setup.io);
+        try slots.wait(server.io);
+        const stream = listener.accept(server.io) catch |err| {
+            slots.post(server.io);
             return err;
         };
-        group.concurrent(server.setup.io, handle, .{ server, &registry, &http_client, stream, &slots }) catch |err| {
+        group.concurrent(server.io, handle, .{ server, &registry, &http_client, stream, &slots }) catch |err| {
             // A connection that cannot be given a task is one to let go of,
             // rather than one to bring the server down over.
-            slots.post(server.setup.io);
+            slots.post(server.io);
             std.log.err("cannot serve a connection: {s}", .{@errorName(err)});
             var copy = stream;
-            copy.close(server.setup.io);
+            copy.close(server.io);
             continue;
         };
     }
@@ -210,18 +212,18 @@ fn handle(
     stream: std.Io.net.Stream,
     slots: *std.Io.Semaphore,
 ) void {
-    defer slots.post(server.setup.io);
+    defer slots.post(server.io);
     defer {
         // `Stream.close` overwrites its argument with undefined, which it cannot
         // do to a parameter that was not declared mutable.
         var copy = stream;
-        copy.close(server.setup.io);
+        copy.close(server.io);
     }
 
     var recv_buffer: [4096]u8 = undefined;
     var send_buffer: [4096]u8 = undefined;
-    var reader = stream.reader(server.setup.io, &recv_buffer);
-    var writer = stream.writer(server.setup.io, &send_buffer);
+    var reader = stream.reader(server.io, &recv_buffer);
+    var writer = stream.writer(server.io, &send_buffer);
 
     // A `Server` is per-connection, not per-listener: it wraps this connection's
     // reader and writer and holds the protocol state for them, so it is built
@@ -271,7 +273,7 @@ const Request = struct {
     /// so the caller has nothing more to do. Which status an id deserves is
     /// decided here, once, rather than by every route that opens one.
     fn openSession(r: *Request, id: []const u8) !?Session {
-        return Session.open(r.server.setup.io, r.server.setup.sessions, r.server.setup.gpa, id, r.server.setup.cwd) catch |err| switch (err) {
+        return Session.open(r.server.io, r.server.setup.sessions, r.server.gpa, id, r.server.setup.cwd) catch |err| switch (err) {
             // An id that could not be a session name is a bad request rather than
             // a missing session: what was asked for could never exist.
             error.InvalidSessionId => {
@@ -380,7 +382,7 @@ fn deleteSession(r: *Request, registry: *Registry, id: []const u8) !void {
     if (!try r.claim(registry, id)) return;
     defer registry.release(id);
 
-    Session.delete(r.server.setup.io, r.server.setup.sessions, id) catch |err| switch (err) {
+    Session.delete(r.server.io, r.server.setup.sessions, id) catch |err| switch (err) {
         error.InvalidSessionId => return r.reply(.text, "bad session id\n", .bad_request),
         error.SessionNotFound => return r.noSession(),
         else => return err,
@@ -396,7 +398,7 @@ const Rename = struct { title: []const u8 };
 /// list shows it. A session a turn is running for answers 409, since renaming it
 /// would race the turn writing the same file.
 fn renameSession(r: *Request, registry: *Registry, id: []const u8) !void {
-    const gpa = r.server.setup.gpa;
+    const gpa = r.server.gpa;
 
     var body_buffer: [4096]u8 = undefined;
     const body_reader = r.request.readerExpectNone(&body_buffer);
@@ -438,12 +440,12 @@ const Listing = struct { sessions: []const Listed };
 
 /// `GET /api/sessions`: every session on disk, newest written first.
 fn listSessions(r: *Request) !void {
-    const gpa = r.server.setup.gpa;
+    const gpa = r.server.gpa;
 
     // What is on disk. Each id and title is its own allocation, freed once the
     // reply is built from them. The listing opens the directory itself, so a
     // listing here and one on another connection do not read over each other.
-    const stored = try Session.list(r.server.setup.io, r.server.setup.sessions, gpa);
+    const stored = try Session.list(r.server.io, r.server.setup.sessions, gpa);
     defer {
         for (stored) |named| {
             gpa.free(named.id);
@@ -478,7 +480,7 @@ const Opened = struct {
 /// anything, which is what a page should show: an empty conversation rather than
 /// a failure. Any other missing id is a 404.
 fn openSession(r: *Request, id: []const u8) !void {
-    const gpa = r.server.setup.gpa;
+    const gpa = r.server.gpa;
 
     var body: std.Io.Writer.Allocating = .init(gpa);
     defer body.deinit();
@@ -502,7 +504,7 @@ fn writeSession(
     id: []const u8,
     out: *std.Io.Writer,
 ) !bool {
-    var session = Session.open(server.setup.io, server.setup.sessions, gpa, id, server.setup.cwd) catch |err| switch (err) {
+    var session = Session.open(server.io, server.setup.sessions, gpa, id, server.setup.cwd) catch |err| switch (err) {
         error.SessionNotFound => return false,
         else => return err,
     };
@@ -691,7 +693,7 @@ const Prompt = struct {
 /// Reads the prompt a POST carries, or replies with why it could not and returns
 /// null, so the caller has nothing more to do.
 fn readPrompt(r: *Request) !?std.json.Parsed(Prompt) {
-    const gpa = r.server.setup.gpa;
+    const gpa = r.server.gpa;
     // The prompt is read first, so a request with nothing usable in it is
     // refused before a session is taken or made.
     var body_buffer: [4096]u8 = undefined;
@@ -727,12 +729,12 @@ fn parsePrompt(gpa: std.mem.Allocator, body: []const u8) !std.json.Parsed(Prompt
 /// is given here is the first event of the stream: that is how the page learns it
 /// and adds the session to its list.
 fn createSession(r: *Request, registry: *Registry, http_client: *std.http.Client) !void {
-    const gpa = r.server.setup.gpa;
+    const gpa = r.server.gpa;
     const parsed = (try readPrompt(r)) orelse return;
     defer parsed.deinit();
 
     // A fresh session with a new id and no file: the first message writes it.
-    var session = try Session.open(r.server.setup.io, r.server.setup.sessions, gpa, null, r.server.setup.cwd);
+    var session = try Session.open(r.server.io, r.server.setup.sessions, gpa, null, r.server.setup.cwd);
     defer session.deinit();
     if (!try r.claim(registry, session.id())) return;
     defer registry.release(session.id());
@@ -789,8 +791,8 @@ fn serveTurn(
     text: []const u8,
     announce_id: ?[]const u8,
 ) !void {
-    const gpa = r.server.setup.gpa;
-    var agent = try Agent.init(r.server.setup.io, gpa, config, session.cwd(), http_client);
+    const gpa = r.server.gpa;
+    var agent = try Agent.init(r.server.io, gpa, config, session.cwd(), http_client);
     defer agent.deinit();
     // The session is prepared from the mode the caller settled, which is the
     // session's own once it has been asked something.
@@ -1106,7 +1108,7 @@ const Exchange = struct {
         var http_server: std.http.Server = .init(&reader, &writer);
         var request = try http_server.receiveHead();
 
-        const server = Server{ .setup = setup };
+        const server = Server{ .io = setup.io, .gpa = setup.gpa, .setup = setup };
         var r = Request{ .server = &server, .request = &request };
         try route(&r, registry, http_client);
 
