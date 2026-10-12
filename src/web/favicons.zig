@@ -3,7 +3,7 @@
 //! collapsed.
 
 const std = @import("std");
-const escape = @import("../html.zig").escape;
+const html = @import("../html.zig");
 const models = @import("../models.zig");
 const Search = @import("../Tools/web/Search.zig");
 
@@ -31,14 +31,14 @@ pub fn write(result: []const u8, out: *std.Io.Writer) !void {
 fn bubble(found: Search.Result, origin: []const u8, out: *std.Io.Writer) !void {
     const host = models.hostOf(found.url) orelse return;
     try out.writeAll("<a class=\"fav\" href=\"");
-    try escape(found.url, out);
+    try html.escape(found.url, out);
     try out.writeAll("\" title=\"");
-    try escape(host, out);
+    try html.escape(host, out);
     try out.writeAll("\" target=\"_blank\" rel=\"noopener noreferrer\" onclick=\"event.stopPropagation()\">");
     try out.writeAll("<span class=\"letter\">");
-    try escape(host[0..1], out);
+    try html.escape(host[0..1], out);
     try out.writeAll("</span><img src=\"");
-    try escape(origin, out);
+    try html.escape(origin, out);
     try out.writeAll("/favicon.ico\" alt=\"\" onerror=\"this.remove()\"></a>");
 }
 
