@@ -12,12 +12,11 @@ pub const LineEditor = @import("LineEditor.zig");
 pub const llm = @import("llm.zig");
 pub const md = @import("md.zig");
 pub const models = @import("models.zig");
-pub const tools_web = @import("Tools/web.zig");
 pub const Setup = @import("Setup.zig");
 pub const Session = @import("Session.zig");
 pub const Terminal = @import("Terminal.zig");
 pub const Tools = @import("Tools.zig");
-pub const web = @import("web.zig");
+pub const Server = @import("Server.zig");
 pub const ulid = @import("ulid.zig");
 pub const xdg = @import("xdg.zig");
 

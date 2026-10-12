@@ -115,9 +115,9 @@ const Options = struct {
     const Serve = struct {
         /// The address to listen on. Loopback unless asked otherwise, since the
         /// server has no authentication and its routes run commands as the user.
-        host: []const u8 = billy.web.default_host,
+        host: []const u8 = billy.Server.default_host,
         /// The port to listen on. Zero asks the system for a free one.
-        port: u16 = billy.web.default_port,
+        port: u16 = billy.Server.default_port,
         /// Whether the user asked for this subcommand's usage.
         help: bool = false,
     };
@@ -181,7 +181,7 @@ pub fn main(init: std.process.Init) !void {
     var setup = try billy.Setup.open(init, out);
     defer setup.deinit();
 
-    if (options.serve) |serve| return billy.web.serve(&setup, out, serve.host, serve.port);
+    if (options.serve) |serve| return billy.Server.serve(&setup, out, serve.host, serve.port);
     return runSession(init, out, &setup, options.resume_id);
 }
 
@@ -391,7 +391,7 @@ test "parseArgs reads the serve subcommand on its own" {
     // An address that is not given a value is refused, like a port.
     try std.testing.expectError(error.MissingValue, parseArgs(&.{ "billy", "serve", "--host" }));
     // The default is to listen where only this machine can reach.
-    try expectHost(billy.web.default_host, try parseArgs(&.{ "billy", "serve" }));
+    try expectHost(billy.Server.default_host, try parseArgs(&.{ "billy", "serve" }));
 
     // The subcommand has its own usage.
     try expectOptions(.{ .serve = .{ .help = true } }, try parseArgs(&.{ "billy", "serve", "-h" }));
