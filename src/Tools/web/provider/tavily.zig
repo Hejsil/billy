@@ -1,7 +1,7 @@
 //! Tavily: a search and an extraction, both posted as JSON.
 
 const std = @import("std");
-const transport = @import("../../web.zig");
+const web = @import("../../web.zig");
 const Search = @import("../Search.zig");
 const Mock = @import("../../../Mock.zig");
 
@@ -16,7 +16,7 @@ pub fn search(
     endpoint: []const u8,
     query: []const u8,
     max_results: usize,
-) !transport.Answer {
+) !web.Answer {
     const body = try std.json.Stringify.valueAlloc(gpa, Request{
         .query = query,
         .max_results = max_results,
@@ -26,7 +26,7 @@ pub fn search(
     const auth = try bearer(gpa, api_key);
     defer gpa.free(auth);
 
-    const reply = switch (try transport.requestJson(Response, gpa, http_client, .POST, endpoint, body, &.{
+    const reply = switch (try web.requestJson(Response, gpa, http_client, .POST, endpoint, body, &.{
         .{ .name = "authorization", .value = auth },
     }, "search")) {
         .parsed => |parsed| parsed,
@@ -46,7 +46,7 @@ pub fn fetch(
     api_key: []const u8,
     endpoint: []const u8,
     url: []const u8,
-) !transport.Answer {
+) !web.Answer {
     const body = try std.json.Stringify.valueAlloc(gpa, ExtractRequest{
         .urls = &.{url},
     }, .{ .emit_null_optional_fields = false });
@@ -55,7 +55,7 @@ pub fn fetch(
     const auth = try bearer(gpa, api_key);
     defer gpa.free(auth);
 
-    const reply = switch (try transport.requestJson(ExtractResponse, gpa, http_client, .POST, endpoint, body, &.{
+    const reply = switch (try web.requestJson(ExtractResponse, gpa, http_client, .POST, endpoint, body, &.{
         .{ .name = "authorization", .value = auth },
     }, "fetch")) {
         .parsed => |parsed| parsed,

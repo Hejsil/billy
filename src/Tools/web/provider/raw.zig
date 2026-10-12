@@ -1,11 +1,11 @@
 //! Raw: the url itself, read directly rather than extracted by a service.
 
 const std = @import("std");
-const transport = @import("../../web.zig");
+const web = @import("../../web.zig");
 
 /// Reads `url` directly with a GET: the bytes as the server sent them.
-pub fn fetch(gpa: std.mem.Allocator, http_client: *std.http.Client, url: []const u8) !transport.Answer {
-    return switch (try transport.request(gpa, http_client, .GET, url, null, &.{}, "fetch")) {
+pub fn fetch(gpa: std.mem.Allocator, http_client: *std.http.Client, url: []const u8) !web.Answer {
+    return switch (try web.request(gpa, http_client, .GET, url, null, &.{}, "fetch")) {
         .text => |text| .{ .text = text },
         .retry_after_ms => |ms| .{ .retry_after_ms = ms },
     };

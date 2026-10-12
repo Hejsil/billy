@@ -1,7 +1,7 @@
 //! Exa: a search and a contents call, both posted as JSON.
 
 const std = @import("std");
-const transport = @import("../../web.zig");
+const web = @import("../../web.zig");
 const Search = @import("../Search.zig");
 const Mock = @import("../../../Mock.zig");
 
@@ -15,7 +15,7 @@ pub fn search(
     endpoint: []const u8,
     query: []const u8,
     max_results: usize,
-) !transport.Answer {
+) !web.Answer {
     const body = try std.json.Stringify.valueAlloc(gpa, Request{
         .query = query,
         .numResults = max_results,
@@ -23,7 +23,7 @@ pub fn search(
     }, .{ .emit_null_optional_fields = false });
     defer gpa.free(body);
 
-    const reply = switch (try transport.requestJson(Response, gpa, http_client, .POST, endpoint, body, &.{
+    const reply = switch (try web.requestJson(Response, gpa, http_client, .POST, endpoint, body, &.{
         .{ .name = "x-api-key", .value = api_key },
     }, "search")) {
         .parsed => |parsed| parsed,
@@ -42,13 +42,13 @@ pub fn fetch(
     api_key: []const u8,
     endpoint: []const u8,
     url: []const u8,
-) !transport.Answer {
+) !web.Answer {
     const body = try std.json.Stringify.valueAlloc(gpa, ContentsRequest{
         .urls = &.{url},
     }, .{ .emit_null_optional_fields = false });
     defer gpa.free(body);
 
-    const reply = switch (try transport.requestJson(ContentsResponse, gpa, http_client, .POST, endpoint, body, &.{
+    const reply = switch (try web.requestJson(ContentsResponse, gpa, http_client, .POST, endpoint, body, &.{
         .{ .name = "x-api-key", .value = api_key },
     }, "fetch")) {
         .parsed => |parsed| parsed,

@@ -5,7 +5,7 @@ const std = @import("std");
 const Health = @import("../../Health.zig");
 const tools = @import("../../Tools.zig");
 const Mock = @import("../../Mock.zig");
-const transport = @import("../web.zig");
+const web = @import("../web.zig");
 const brave = @import("provider/brave.zig");
 const exa = @import("provider/exa.zig");
 const searxng = @import("provider/searxng.zig");
@@ -113,7 +113,7 @@ fn searchBackend(
     backend: Backend,
     query: []const u8,
     max_results: usize,
-) !transport.Answer {
+) !web.Answer {
     // The same cap for every backend, whatever the configuration says.
     const asked = @min(max_results, Result.result_limit);
     return switch (backend.provider) {

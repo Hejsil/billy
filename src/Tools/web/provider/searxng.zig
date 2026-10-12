@@ -1,7 +1,7 @@
 //! SearXNG: a search against the user's own instance.
 
 const std = @import("std");
-const transport = @import("../../web.zig");
+const web = @import("../../web.zig");
 const Search = @import("../Search.zig");
 const Mock = @import("../../../Mock.zig");
 
@@ -14,16 +14,16 @@ pub fn search(
     base: []const u8,
     query: []const u8,
     max_results: usize,
-) !transport.Answer {
+) !web.Answer {
     const endpoint = try std.fmt.allocPrint(gpa, "{s}/search", .{
         std.mem.trimEnd(u8, base, "/"),
     });
     defer gpa.free(endpoint);
 
-    const url = try transport.queryUrl(gpa, endpoint, query, "&format=json", .{});
+    const url = try web.queryUrl(gpa, endpoint, query, "&format=json", .{});
     defer gpa.free(url);
 
-    const reply = switch (try transport.requestJson(Response, gpa, http_client, .GET, url, null, &.{}, "search")) {
+    const reply = switch (try web.requestJson(Response, gpa, http_client, .GET, url, null, &.{}, "search")) {
         .parsed => |parsed| parsed,
         .retry_after_ms => |ms| return .{ .retry_after_ms = ms },
     };

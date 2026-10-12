@@ -1,7 +1,7 @@
 //! Brave: a search, sent as a GET with the query in the url.
 
 const std = @import("std");
-const transport = @import("../../web.zig");
+const web = @import("../../web.zig");
 const Search = @import("../Search.zig");
 const Mock = @import("../../../Mock.zig");
 
@@ -15,11 +15,11 @@ pub fn search(
     endpoint: []const u8,
     query: []const u8,
     max_results: usize,
-) !transport.Answer {
-    const url = try transport.queryUrl(gpa, endpoint, query, "&count={d}", .{max_results});
+) !web.Answer {
+    const url = try web.queryUrl(gpa, endpoint, query, "&count={d}", .{max_results});
     defer gpa.free(url);
 
-    const reply = switch (try transport.requestJson(Response, gpa, http_client, .GET, url, null, &.{
+    const reply = switch (try web.requestJson(Response, gpa, http_client, .GET, url, null, &.{
         .{ .name = "x-subscription-token", .value = api_key },
         .{ .name = "accept", .value = "application/json" },
     }, "search")) {
@@ -86,7 +86,7 @@ test "a query is percent-encoded into a url" {
     const gpa = std.testing.allocator;
     // A space, `&`, `/` and a non-ASCII character are all part of the query
     // value, not the url around it.
-    const url = try transport.queryUrl(gpa, "https://x/search", "a b&c/dé", "&count={d}", .{3});
+    const url = try web.queryUrl(gpa, "https://x/search", "a b&c/dé", "&count={d}", .{3});
     defer gpa.free(url);
     try std.testing.expectEqualStrings("https://x/search?q=a%20b%26c%2fd%c3%a9&count=3", url);
 }
