@@ -185,6 +185,7 @@ pub fn main(init: std.process.Init) !void {
         const server = billy.Server{
             .io = setup.io,
             .gpa = setup.gpa,
+            .session_dir = setup.sessions,
             .setup = &setup,
         };
         return server.serve(serve.host, serve.port);

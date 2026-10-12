@@ -72,6 +72,7 @@ const max_connections = 64;
 
 io: std.Io,
 gpa: std.mem.Allocator,
+session_dir: std.Io.Dir,
 setup: *Setup,
 
 /// Serves the frontend on the address `host` at `port`, until the process is
@@ -273,7 +274,7 @@ const Request = struct {
     /// so the caller has nothing more to do. Which status an id deserves is
     /// decided here, once, rather than by every route that opens one.
     fn openSession(r: *Request, id: []const u8) !?Session {
-        return Session.open(r.server.io, r.server.setup.sessions, r.server.gpa, id, r.server.setup.cwd) catch |err| switch (err) {
+        return Session.open(r.server.io, r.server.session_dir, r.server.gpa, id, r.server.setup.cwd) catch |err| switch (err) {
             // An id that could not be a session name is a bad request rather than
             // a missing session: what was asked for could never exist.
             error.InvalidSessionId => {
@@ -382,7 +383,7 @@ fn deleteSession(r: *Request, registry: *Registry, id: []const u8) !void {
     if (!try r.claim(registry, id)) return;
     defer registry.release(id);
 
-    Session.delete(r.server.io, r.server.setup.sessions, id) catch |err| switch (err) {
+    Session.delete(r.server.io, r.server.session_dir, id) catch |err| switch (err) {
         error.InvalidSessionId => return r.reply(.text, "bad session id\n", .bad_request),
         error.SessionNotFound => return r.noSession(),
         else => return err,
@@ -445,7 +446,7 @@ fn listSessions(r: *Request) !void {
     // What is on disk. Each id and title is its own allocation, freed once the
     // reply is built from them. The listing opens the directory itself, so a
     // listing here and one on another connection do not read over each other.
-    const stored = try Session.list(r.server.io, r.server.setup.sessions, gpa);
+    const stored = try Session.list(r.server.io, r.server.session_dir, gpa);
     defer {
         for (stored) |named| {
             gpa.free(named.id);
@@ -504,7 +505,7 @@ fn writeSession(
     id: []const u8,
     out: *std.Io.Writer,
 ) !bool {
-    var session = Session.open(server.io, server.setup.sessions, gpa, id, server.setup.cwd) catch |err| switch (err) {
+    var session = Session.open(server.io, server.session_dir, gpa, id, server.setup.cwd) catch |err| switch (err) {
         error.SessionNotFound => return false,
         else => return err,
     };
@@ -734,7 +735,7 @@ fn createSession(r: *Request, registry: *Registry, http_client: *std.http.Client
     defer parsed.deinit();
 
     // A fresh session with a new id and no file: the first message writes it.
-    var session = try Session.open(r.server.io, r.server.setup.sessions, gpa, null, r.server.setup.cwd);
+    var session = try Session.open(r.server.io, r.server.session_dir, gpa, null, r.server.setup.cwd);
     defer session.deinit();
     if (!try r.claim(registry, session.id())) return;
     defer registry.release(session.id());
@@ -1050,7 +1051,10 @@ const TestServer = struct {
     fn session(server: *TestServer, title: ?[]const u8) ![]const u8 {
         var opened = try Session.open(std.testing.io, server.setup.sessions, std.testing.allocator, null, ".");
         defer opened.deinit();
-        if (title) |name| try opened.setTitle(name);
+
+        if (title) |name|
+            try opened.setTitle(name);
+
         try opened.append(.{ .role = .user, .content = "hello" });
         try opened.save();
         return std.testing.allocator.dupe(u8, opened.id());
@@ -1108,7 +1112,12 @@ const Exchange = struct {
         var http_server: std.http.Server = .init(&reader, &writer);
         var request = try http_server.receiveHead();
 
-        const server = Server{ .io = setup.io, .gpa = setup.gpa, .setup = setup };
+        const server = Server{
+            .io = setup.io,
+            .gpa = setup.gpa,
+            .session_dir = setup.sessions,
+            .setup = setup,
+        };
         var r = Request{ .server = &server, .request = &request };
         try route(&r, registry, http_client);
 
@@ -1232,6 +1241,7 @@ test "a session is renamed, and the name is on disk" {
     // The new name is on disk, not only in the answer.
     var reread = try Session.open(std.testing.io, server.setup.sessions, std.testing.allocator, id, ".");
     defer reread.deinit();
+
     try std.testing.expectEqualStrings("renamed by the test", reread.title().?);
 }
 
@@ -1258,6 +1268,7 @@ test "a rename that says nothing usable is refused" {
     // And the session is left unnamed rather than holding either of them.
     var reread = try Session.open(std.testing.io, server.setup.sessions, std.testing.allocator, id, ".");
     defer reread.deinit();
+
     try std.testing.expect(reread.title() == null);
 }
 
