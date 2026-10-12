@@ -114,17 +114,17 @@ pre.diff .added { color: var(--add); }
 pre.diff .context, pre.diff .elided { color: var(--dim); }
 
 /* Tool calls: collapsed by default; the summary is one compact row. */
-details.tool { margin-bottom: 16px; }
-summary.tool-head {
+details.tool, details.steps { margin-bottom: 16px; }
+summary.tool-head, summary.steps-head {
   color: var(--dim); font-size: 12px; cursor: pointer; list-style: none;
   display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
   white-space: nowrap; overflow: hidden;
 }
-summary.tool-head::-webkit-details-marker { display: none; }
-summary.tool-head:hover .name { text-decoration: underline; }
+summary.tool-head::-webkit-details-marker, summary.steps-head::-webkit-details-marker { display: none; }
+summary.tool-head:hover .name, summary.steps-head:hover { text-decoration: underline; }
 /* A chevron, not a triangle, so it is not mistaken for the `read` glyph. */
-summary.tool-head::before { content: '›'; color: #3a3f4b; flex: none; }
-details.tool[open] summary.tool-head::before { transform: rotate(90deg); }
+summary.tool-head::before, summary.steps-head::before { content: '›'; color: #3a3f4b; flex: none; }
+details.tool[open] summary.tool-head::before, details.steps[open] > summary.steps-head::before { transform: rotate(90deg); }
 .tool-head .name { color: var(--text); font-weight: 600; flex: none; }
 .tool-head .target { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 /* Own row under the head; it stays visible when the call is collapsed. */

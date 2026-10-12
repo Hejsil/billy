@@ -15,6 +15,8 @@ let working = false;
 let stick = true;
 // The `<details>` opened by `tool_begin`, which `tool_end` replaces.
 let openCall = null;
+// Where the running turn's tool calls go; open until another block closes it.
+let fold = null;
 
 // Asks the server and returns the response, or null after showing why it failed.
 // A status in `tolerate` counts as success.
@@ -94,7 +96,16 @@ async function open(id) {
   for (const item of list.children) item.classList.toggle('selected', item.dataset.id === id);
   closeDrawer();
   headerBox.innerHTML = body.header;
-  conversation.innerHTML = body.blocks;
+  conversation.replaceChildren();
+  fold = null;
+  const stored = document.createElement('template');
+  stored.innerHTML = body.blocks;
+  for (const el of [...stored.content.children]) {
+    conversation.append(el);
+    place(el);
+  }
+  // A turn that ended on a tool call has no later block to close its fold.
+  if (fold) closeFold();
   modeSelect.value = body.mode;
   // The mode is fixed once there is a conversation.
   modeSelect.disabled = body.blocks.trim() !== '';
@@ -169,6 +180,7 @@ async function send(text) {
   } finally {
     working = false;
     openCall = null;
+    fold = null;
     form.classList.remove('working');
     input.disabled = false;
     input.focus();
@@ -205,21 +217,21 @@ function handleFrame(frame) {
   if (data === '') return;
   const payload = JSON.parse(data);
   if (event === 'block') {
-    conversation.insertAdjacentHTML('beforeend', payload.html);
+    show(payload.html);
     scrollToEnd();
   } else if (event === 'tool_begin') {
-    conversation.insertAdjacentHTML('beforeend', payload.html);
-    openCall = conversation.lastElementChild;
+    openCall = show(payload.html);
+    labelFold(false);
     scrollToEnd();
   } else if (event === 'tool_end') {
     // Replaces the begun call in place, keeping whether the user opened it.
-    conversation.insertAdjacentHTML('beforeend', payload.html);
-    const finished = conversation.lastElementChild;
+    const finished = show(payload.html);
     if (openCall) {
       finished.open = openCall.open;
-      conversation.replaceChild(finished, openCall);
+      openCall.replaceWith(finished);
     }
     openCall = null;
+    labelFold(false);
     scrollToEnd();
   } else if (event === 'session') {
     selected = payload.id;
@@ -233,6 +245,42 @@ function handleFrame(frame) {
   } else if (event === 'error') {
     note(payload.message);
   }
+}
+
+// Adds a block of the running turn and returns its element.
+function show(html) {
+  conversation.insertAdjacentHTML('beforeend', html);
+  return place(conversation.lastElementChild);
+}
+
+// Tool calls go in a fold, made when the first one comes; any other block closes it.
+function place(el) {
+  if (el.matches('details.tool')) {
+    if (!fold) {
+      fold = document.createElement('details');
+      fold.className = 'steps';
+      fold.open = true;
+      fold.append(document.createElement('summary'), document.createElement('div'));
+      fold.firstChild.className = 'steps-head';
+      fold.lastChild.className = 'tool-body';
+      el.before(fold);
+    }
+    fold.lastChild.append(el);
+  } else if (fold) {
+    closeFold();
+  }
+  return el;
+}
+
+function closeFold() {
+  labelFold(true);
+  fold.open = false;
+  fold = null;
+}
+
+function labelFold(done) {
+  const count = fold.querySelectorAll('details.tool').length;
+  fold.firstChild.textContent = (done ? 'completed ' : '') + count + (count === 1 ? ' step' : ' steps');
 }
 
 // A line the page writes itself, as text since it is not the server's HTML.
@@ -292,6 +340,7 @@ function newDraft() {
   if (working) return;
   selected = null;
   openCall = null;
+  fold = null;
   headerBox.innerHTML = '';
   conversation.innerHTML = '';
   modeSelect.value = 'chat';
