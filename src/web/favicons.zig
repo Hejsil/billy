@@ -47,11 +47,13 @@ fn bubble(found: Search.Result, origin: []const u8, out: *std.Io.Writer) !void {
 /// favicon is fetched from its origin, so a bubble only makes sense for a result
 /// whose origin is one billy will fetch from.
 fn originOf(url: []const u8, buffer: []u8) ?[]const u8 {
-    const sep = std.mem.indexOf(u8, url, "://") orelse return null;
-    const scheme = url[0..sep];
-    if (!std.ascii.eqlIgnoreCase(scheme, "http") and !std.ascii.eqlIgnoreCase(scheme, "https")) return null;
-    const host = models.hostOf(url) orelse return null;
-    return std.fmt.bufPrint(buffer, "{s}://{s}", .{ scheme, host }) catch null;
+    const uri = std.Uri.parse(url) catch return null;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https"))
+        return null;
+    return std.fmt.bufPrint(buffer, "{f}", .{uri.fmt(.{
+        .scheme = true,
+        .authority = true,
+    })}) catch null;
 }
 
 test "a result with an http address is given a bubble, and one without is not" {
