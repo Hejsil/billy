@@ -51,9 +51,9 @@ pub const Config = struct {
     /// no such file. Borrowed from the setup, which owns it and outlives the
     /// agent, so nothing here closes it.
     user_instructions_dir: ?std.Io.Dir = null,
-    /// What is known about the provider and model: the context window and the
-    /// prices. Null for a model billy does not know, in which case the header
-    /// leaves out the context gauge and the cost.
+    /// What is known about the provider and model: the context window. Null for
+    /// a model billy does not know, in which case the header leaves out the
+    /// context gauge.
     model_info: ?models.Metadata,
     /// How full the context window must be, as a whole percentage, before the
     /// conversation is compacted into a summary. Zero turns compaction off.
@@ -282,11 +282,9 @@ const prompt = "> ";
 
 /// Writes the header line shown above the input prompt: the session id, the
 /// model, the working directory, how much of the context window the
-/// conversation fills, and what the session has cost so far. The id is shown so
-/// that a run can be named by what it prints, which is what `--resume` takes to
-/// continue it. The window size and the prices are not reported by the API, so
-/// they come from the model table. `cost` is the session total the loop has
-/// accumulated, so it does not move as the clock passes a rate change.
+/// conversation fills. The id is shown so that a run can be named by what it
+/// prints, which is what `--resume` takes to continue it. The window size is not
+/// reported by the API, so it comes from the model table.
 ///
 /// It is written to `out` rather than returned, so building the header
 /// allocates nothing; the caller holds the buffer, which it already has for
@@ -296,7 +294,6 @@ pub fn sessionHeader(
     config: Config,
     session_id: []const u8,
     context_tokens: usize,
-    cost: f64,
 ) !void {
     try out.print("billy · {s} · {s} · {s} · ", .{ @tagName(config.mode), session_id, config.model });
     try displayPath(out, config.cwd, config.home);
@@ -307,20 +304,8 @@ pub fn sessionHeader(
         try formatTokens(out, info.context_window);
         try out.writeAll(" (");
         try formatPercent(out, context_tokens, info.context_window);
-        try out.writeAll(") · ");
-        try formatMoney(out, cost);
+        try out.writeAll(")");
     }
-}
-
-/// What a usage costs at the given prices, in USD.
-pub fn costOf(price: models.Price, usage: llm.Usage) f64 {
-    const million = @as(f64, 1_000_000);
-    const hit: f64 = @floatFromInt(usage.cache_hit_tokens);
-    const miss: f64 = @floatFromInt(usage.cache_miss_tokens);
-    const output: f64 = @floatFromInt(usage.completion_tokens);
-    return (hit * price.cache_hit_input +
-        miss * price.cache_miss_input +
-        output * price.output) / million;
 }
 
 /// Writes a token count in a short form, such as `16k` or `128k`, with no
@@ -351,25 +336,6 @@ pub fn formatPercent(out: *std.Io.Writer, used: usize, total: usize) !void {
     const percent = used * 100 / total;
     if (percent == 0 and used > 0) return out.writeAll("<1%");
     try out.print("{d}%", .{percent});
-}
-
-/// Writes a dollar amount, rounded to the cent with the trailing zeros dropped,
-/// so that `$1.5` and `$0` read the same way `1.5k` does, without padding to a
-/// fixed number of places. The digits are formatted into a stack buffer first,
-/// since the trimmed amount is written before the ones it dropped are known.
-/// Shared with the web header, so both show the cost the same way.
-pub fn formatMoney(out: *std.Io.Writer, amount: f64) !void {
-    var buffer: [64]u8 = undefined;
-    var formatted: std.Io.Writer = .fixed(&buffer);
-    try formatted.print("{d:.2}", .{amount});
-    const digits = formatted.buffered();
-
-    // Drop the trailing zeros of the hundredths, then a bare decimal point.
-    var end = digits.len;
-    while (end > 0 and digits[end - 1] == '0') end -= 1;
-    if (end > 0 and digits[end - 1] == '.') end -= 1;
-
-    try out.print("${s}", .{digits[0..end]});
 }
 
 /// Writes the working directory as shown in the header: shortened to `~` when it
@@ -650,8 +616,8 @@ pub fn run(
     var terminal = Terminal{ .out = out, .display = config.display, .scratch = gpa };
     const emitter = terminal.emitter();
 
-    // The header is rebuilt for every prompt, so it reflects the tokens and cost
-    // of the turns run so far. One buffer holds it for the whole loop; each pass
+    // The header is rebuilt for every prompt, so it reflects the context size
+    // after the turns run so far. One buffer holds it for the whole loop; each pass
     // clears it and writes the header into it.
     var header: std.Io.Writer.Allocating = .init(gpa);
     defer header.deinit();
@@ -659,7 +625,7 @@ pub fn run(
         header.clearRetainingCapacity();
         // The header is built from the agent's config, so the mode it shows is
         // the one the session is running in, which the first prompt may have set.
-        try sessionHeader(&header.writer, agent.config, session.id(), session.context_tokens, session.cost);
+        try sessionHeader(&header.writer, agent.config, session.id(), session.context_tokens);
         const line = (try editor.readLine(header.written(), prompt)) orelse break;
         if (line.len == 0) continue;
         // What the line came to is the agent's to decide: a command is run and
@@ -873,11 +839,9 @@ fn turn(agent: *Agent, emitter: Emitter, session: *Session) !void {
         const completion = try agent.client.complete(agent.gpa, session.conversation(&.{}), session.toolSet());
         defer completion.deinit();
 
-        // The totals are recorded first, so the save inside `append` stores them
-        // along with the message. Each request is priced as it is made, at the
-        // rates in effect then, so a session running through a rate change is
-        // billed for what it actually cost.
-        session.recordUsage(completion.usage, costOf(agent.rateNow(), completion.usage));
+        // Recorded first, so the save inside `append` stores the size along with
+        // the message.
+        session.recordUsage(completion.usage);
         try session.append(completion.message);
 
         const message = completion.message;
@@ -1057,13 +1021,6 @@ pub fn nameFromPrompt(session: *Session, text: []const u8) !bool {
     return true;
 }
 
-/// The rates in effect right now. Zero for a model billy does not know, which
-/// has no prices to cost its tokens at.
-fn rateNow(agent: *const Agent) models.Price {
-    const info = agent.config.model_info orelse return .{};
-    return info.priceAt(@intCast(std.Io.Clock.real.now(agent.io).toSeconds()));
-}
-
 /// Sent as the last message of a compaction request, and stored with the summary
 /// it produces so the pair reads as a question and its answer. It is never sent
 /// to the model again: a request starts at the summary, not at the prompt.
@@ -1138,15 +1095,13 @@ fn fold(agent: *Agent, emitter: Emitter, session: *Session) !bool {
 /// Asks the model `question` about the conversation: the conversation is sent as a
 /// request would carry it, system prompt and tool calls and results included,
 /// with `question` as one more message that is not kept in the session. Returns the
-/// reply, owned by the caller, or null when it has no text. The request is
-/// billed like any other but does not move the context gauge, since the
-/// conversation it was sent is about to be replaced or is not what the next
-/// request carries.
+/// reply, owned by the caller, or null when it has no text. The context gauge is
+/// not moved, since the conversation it was sent is not what the next request
+/// carries.
 fn askWith(agent: *Agent, session: *Session, question: []const u8) !?[]u8 {
     const extra = [_]llm.Message{.{ .role = .user, .content = question }};
     const completion = try agent.client.complete(agent.gpa, session.conversation(&extra), session.toolSet());
     defer completion.deinit();
-    session.recordCost(completion.usage, costOf(agent.rateNow(), completion.usage));
 
     const content = completion.message.content orelse return null;
     if (content.len == 0) return null;
@@ -1464,21 +1419,16 @@ fn testTerminal(out: *std.Io.Writer, display: Display) Terminal {
     return .{ .out = out, .display = display, .scratch = std.testing.allocator };
 }
 
-/// Off-peak on a Friday, so the rates are the published base rates.
-const off_peak_utc = 1789732800; // Friday 2026-09-18 12:00 UTC
-/// Peak on a Friday, when DeepSeek doubles its rates.
-const peak_utc = 1789696800; // Friday 2026-09-18 02:00 UTC
-
 /// The id the header tests run under. A real one is a ULID, but the header only
 /// prints it, so the same id serves every test.
 const test_session_id = "01HF7YAT000000000000000000";
 
 /// Writes the header for `config` and compares it to `expected`, so a header
 /// test reads as the line it produces rather than as the buffer around it.
-fn expectHeader(expected: []const u8, config: Config, context_tokens: usize, cost: f64) !void {
+fn expectHeader(expected: []const u8, config: Config, context_tokens: usize) !void {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try sessionHeader(&out.writer, config, test_session_id, context_tokens, cost);
+    try sessionHeader(&out.writer, config, test_session_id, context_tokens);
     try std.testing.expectEqualStrings(expected, out.written());
 }
 
@@ -1490,19 +1440,10 @@ fn expectTokens(expected: []const u8, count: usize) !void {
     try std.testing.expectEqualStrings(expected, out.written());
 }
 
-/// Writes a money amount and compares it to `expected`.
-fn expectMoney(expected: []const u8, amount: f64) !void {
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-    try formatMoney(&out.writer, amount);
-    try std.testing.expectEqualStrings(expected, out.written());
-}
-
 test "header names the session, the model and the working directory" {
     try expectHeader(
         "billy · general · 01HF7YAT000000000000000000 · deepseek-flash · /work",
         testConfig("deepseek-flash", "/work", null),
-        0,
         0,
     );
 }
@@ -1510,7 +1451,7 @@ test "header names the session, the model and the working directory" {
 test "header names the mode the session runs in" {
     var config = testConfig("m", "/work", null);
     config.mode = .chat;
-    try expectHeader("billy · chat · 01HF7YAT000000000000000000 · m · /work", config, 0, 0);
+    try expectHeader("billy · chat · 01HF7YAT000000000000000000 · m · /work", config, 0);
 }
 
 test "header shortens a path inside the home directory" {
@@ -1518,20 +1459,17 @@ test "header shortens a path inside the home directory" {
         "billy · general · 01HF7YAT000000000000000000 · m · ~/repo/billy",
         testConfig("m", "/home/user/repo/billy", "/home/user"),
         0,
-        0,
     );
     // The home directory itself becomes just `~`.
     try expectHeader(
         "billy · general · 01HF7YAT000000000000000000 · m · ~",
         testConfig("m", "/home/user", "/home/user"),
         0,
-        0,
     );
     // A sibling that merely shares the prefix is left alone.
     try expectHeader(
         "billy · general · 01HF7YAT000000000000000000 · m · /home/user2",
         testConfig("m", "/home/user2", "/home/user"),
-        0,
         0,
     );
 }
@@ -1543,48 +1481,19 @@ test "header shows how full the context window is" {
         .provider = .deepseek,
         .model = "m",
         .context_window = 128_000,
-        .price = .{ .cache_hit_input = 0.003, .cache_miss_input = 0.15, .output = 0.6 },
     };
 
     // A fresh session has used nothing.
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 0/128k (0%) · $0", config, 0, 0);
+    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 0/128k (0%)", config, 0);
     // A rounded-to-zero percentage still shows the conversation is not empty.
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 500/128k (<1%) · $0", config, 500, 0);
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 16k/128k (12%) · $0", config, 16_000, 0);
+    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 500/128k (<1%)", config, 500);
+    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 16k/128k (12%)", config, 16_000);
     // A full window, and a count that rounds to a whole thousand.
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 128k/128k (100%) · $0", config, 128_000, 0);
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 13k/128k (9%) · $0", config, 12_500, 0);
+    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 128k/128k (100%)", config, 128_000);
+    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 13k/128k (9%)", config, 12_500);
 }
 
-test "header shows the accumulated session cost" {
-    // The real deepseek-flash rates, off-peak, against a window the totals fit.
-    const info = models.lookup(.deepseek, "deepseek-flash").?;
-    var config = testConfig("deepseek-flash", "/work", null);
-    config.model_info = .{
-        .provider = info.provider,
-        .model = info.model,
-        .context_window = 4_000_000,
-        .price = info.price,
-    };
-
-    // A million of each token, so the cost is large enough to show in cents:
-    // 1000000*0.003 + 1000000*0.15 + 1000000*0.6, all per million.
-    const usage: llm.Usage = .{
-        .prompt_tokens = 2_000_000,
-        .completion_tokens = 1_000_000,
-        .total_tokens = 3_000_000,
-        .cache_hit_tokens = 1_000_000,
-        .cache_miss_tokens = 1_000_000,
-    };
-    const off_peak_cost = costOf(info.priceAt(off_peak_utc), usage);
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · deepseek-flash · /work · 3M/4M (75%) · $0.75", config, 3_000_000, off_peak_cost);
-    // A request made in peak hours cost double, which stays on the total even if
-    // the header is shown later, off-peak.
-    const peak_cost = costOf(info.priceAt(peak_utc), usage);
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · deepseek-flash · /work · 3M/4M (75%) · $1.51", config, 3_000_000, peak_cost);
-}
-
-test "token counts are whole and prices keep at most two decimals" {
+test "token counts are whole" {
     // A count is never shown with a decimal, so half a thousand rounds up.
     try expectTokens("0", 0);
     try expectTokens("999", 999);
@@ -1595,30 +1504,12 @@ test "token counts are whole and prices keep at most two decimals" {
     try expectTokens("999k", 999_499);
     try expectTokens("1M", 999_500);
     try expectTokens("1M", 999_999);
-
-    // A price is rounded to the cent, and the zeros it does not need are dropped.
-    try expectMoney("$0", 0);
-    try expectMoney("$0.01", 0.007);
-    try expectMoney("$0.5", 0.5);
-    try expectMoney("$1", 1);
-    try expectMoney("$1.25", 1.25);
-    try expectMoney("$1.51", 1.506);
 }
 
-test "header leaves out the gauge and cost for an unknown model" {
+test "header leaves out the gauge for an unknown model" {
     const config = testConfig("who-knows", "/work", null);
     try std.testing.expect(config.model_info == null);
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · who-knows · /work", config, 5000, 12.34);
-}
-
-test "cost follows the cache hit, miss and output prices" {
-    const price = models.Price{ .cache_hit_input = 0.1, .cache_miss_input = 1, .output = 2 };
-    const usage: llm.Usage = .{
-        .completion_tokens = 1_000_000,
-        .cache_hit_tokens = 1_000_000,
-        .cache_miss_tokens = 1_000_000,
-    };
-    try std.testing.expectEqual(3.1, costOf(price, usage));
+    try expectHeader("billy · general · 01HF7YAT000000000000000000 · who-knows · /work", config, 5000);
 }
 
 /// Writes the section an instruction reader (`globalInstructions` or
@@ -1878,7 +1769,6 @@ test "the compaction threshold is the configured share of the window, or off" {
         .provider = .deepseek,
         .model = "m",
         .context_window = 1000,
-        .price = .{},
     };
 
     // The default is a share of the window, not the whole of it.
@@ -1918,7 +1808,6 @@ test "maybeCompact folds the conversation once it has filled the window" {
         .provider = .deepseek,
         .model = "m",
         .context_window = 1000,
-        .price = .{},
     };
     config.compact_at = 80;
     // A conversation that has filled the window past the threshold.
@@ -1969,9 +1858,8 @@ test "maybeCompact folds the conversation once it has filled the window" {
     try std.testing.expectEqual(5, session.sentFrom());
     try std.testing.expect(session.isCompaction(5));
 
-    // The compaction request was billed, but the gauge it would set is dropped
-    // since the conversation it measured has just been replaced.
-    try std.testing.expectEqual(105, session.usage.total_tokens);
+    // The gauge the compaction request would set is dropped, since the
+    // conversation it measured has just been replaced.
     try std.testing.expectEqual(0, session.context_tokens);
 
     // The user is told, in one line, that the conversation was compacted.
@@ -1991,7 +1879,7 @@ test "maybeCompact does nothing below the threshold, off, or with nothing new" {
     try session.append(.{ .role = .user, .content = "hello" });
 
     var config = testConfig("m", "/work", null);
-    config.model_info = .{ .provider = .deepseek, .model = "m", .context_window = 1000, .price = .{} };
+    config.model_info = .{ .provider = .deepseek, .model = "m", .context_window = 1000 };
 
     // Nothing is listening on this address, so a request made where the function
     // should have returned first would fail the test rather than pass it.
@@ -2036,7 +1924,7 @@ test "a compaction asked for now folds the conversation in whatever its size" {
     try session.append(.{ .role = .assistant, .content = "hi" });
 
     var config = testConfig("m", "/work", null);
-    config.model_info = .{ .provider = .deepseek, .model = "m", .context_window = 1000, .price = .{} };
+    config.model_info = .{ .provider = .deepseek, .model = "m", .context_window = 1000 };
     // Compaction is off, so only a manual one runs.
     config.compact_at = 0;
 
@@ -2099,7 +1987,7 @@ test "maybeCompact does not compact a summary that stands alone" {
     try session.appendCompaction("p", "a summary");
 
     var config = testConfig("m", "/work", null);
-    config.model_info = .{ .provider = .deepseek, .model = "m", .context_window = 1000, .price = .{} };
+    config.model_info = .{ .provider = .deepseek, .model = "m", .context_window = 1000 };
 
     // Over the threshold, but the last message is the summary itself, so there is
     // nothing new to fold in and a request would only re-summarize it.

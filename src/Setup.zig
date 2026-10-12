@@ -382,9 +382,9 @@ fn reportFetchFailure(err: anyerror, provider: tools.web.Fetch.Provider) void {
 /// The agent configuration for a session working in `cwd`, with its blocks
 /// decorated for `style`.
 ///
-/// The window and the prices are not reported by the API, so they are looked up
-/// by provider and model; an unknown model simply has no gauge and no cost, and
-/// so no compaction, which needs a window to measure a conversation against.
+/// The window is not reported by the API, so it is looked up by provider and
+/// model; an unknown model simply has no gauge, and so no compaction, which needs
+/// a window to measure a conversation against.
 ///
 /// Nothing is allocated here: every string is one the setup already holds, so
 /// asking for this once a turn costs nothing that would have to be freed.

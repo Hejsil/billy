@@ -858,7 +858,7 @@ fn serveTurn(
     };
 
     // What the run left the session at, so the page shows the new gauge and
-    // cost, and knows the turn is over.
+    // knows the turn is over.
     try r.server.sendHeader(gpa, session, &stream);
     try stream.done();
 }
@@ -872,12 +872,11 @@ fn writeHeader(server: *const Server, session: *const Session, out: *std.Io.Writ
         .home = server.setup.environ.get("HOME"),
         .context_tokens = session.context_tokens,
         .model_info = models.lookup(models.Provider.fromUrl(server.setup.base_url), server.setup.model),
-        .cost = session.cost,
     }, out);
 }
 
 /// Sends the header line the page shows above a conversation: the session's state
-/// now, so the gauge and cost are current.
+/// now, so the gauge is current.
 fn sendHeader(server: *const Server, gpa: std.mem.Allocator, session: *const Session, stream: *Stream) !void {
     var header: std.Io.Writer.Allocating = .init(gpa);
     defer header.deinit();

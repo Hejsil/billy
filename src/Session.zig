@@ -92,13 +92,9 @@ const Stored = struct {
     compactions: []const u32 = &.{},
     /// The tool definitions the conversation was started with.
     tools: []const StoredTool = &.{},
-    /// Tokens billed over the whole session, summed over every request.
-    usage: llm.Usage = .{},
     /// Tokens in the conversation as of the last request, which is what the
     /// context window gauge shows.
     context_tokens: usize = 0,
-    /// What the session has cost so far, in USD, summed request by request.
-    cost: f64 = 0,
     /// The directory the session was started in. Empty for a session saved
     /// before it was recorded, which is read as the directory billy runs in.
     cwd: ?[]const u8 = null,
@@ -244,17 +240,8 @@ compactions: std.ArrayList(u32) = .empty,
 /// is one array `deinit` frees; every string in it is interned in the pool.
 tools: []const Tool = &.{},
 
-/// Tokens billed over the whole session, summed over every request, so the
-/// cost of a resumed session includes what earlier runs spent.
-usage: llm.Usage = .{},
-
 /// Tokens in the conversation as of the last request.
 context_tokens: usize = 0,
-
-/// What the session has cost so far, in USD. Accumulated request by request
-/// because the rate depends on the time of the request, which the token
-/// totals alone could not recover.
-cost: f64 = 0,
 
 /// The directory the session was started in. A resumed session keeps it, so
 /// billy works where the session did rather than wherever it is run from now;
@@ -679,26 +666,11 @@ pub fn ensureTools(session: *Session, definitions: []const Definition) !void {
     try session.setTools(definitions);
 }
 
-/// Adds a request's tokens and cost to the session totals and remembers how
-/// full the context window is. The totals reach the file with the next save,
-/// which follows every message.
-///
-/// `cost` is priced by the caller, which knows the rates that applied when
-/// the request was made; the session only accumulates it, so a session that
-/// spans a rate change is billed at the rates it actually ran under.
-pub fn recordUsage(session: *Session, usage: llm.Usage, cost: f64) void {
-    session.recordCost(usage, cost);
+/// Remembers how full the context window is: the size of the conversation the
+/// last request was sent. It reaches the file with the next save, which follows
+/// every message.
+pub fn recordUsage(session: *Session, usage: llm.Usage) void {
     session.context_tokens = usage.total_tokens;
-}
-
-/// Adds a request's tokens and cost to the session totals without moving the
-/// context gauge. This is for a request whose conversation is not the one the
-/// session now holds, such as the summary a compaction was made from: the
-/// request was billed, but its size says nothing about how full the context
-/// window is going forward.
-pub fn recordCost(session: *Session, usage: llm.Usage, cost: f64) void {
-    session.usage = session.usage.plus(usage);
-    session.cost += cost;
 }
 
 pub fn save(session: *const Session) !void {
@@ -751,14 +723,8 @@ pub fn write(session: *const Session, writer: *std.Io.Writer) !void {
     try json.objectField("tools");
     try json.write(session.toolSet());
 
-    try json.objectField("usage");
-    try json.write(session.usage);
-
     try json.objectField("context_tokens");
     try json.write(session.context_tokens);
-
-    try json.objectField("cost");
-    try json.write(session.cost);
 
     try json.objectField("cwd");
     try json.write(session.cwd());
@@ -799,9 +765,7 @@ fn load(session: *Session) !void {
         try session.setTitle(stored_title);
 
     session.mode = stored.mode;
-    session.usage = stored.usage;
     session.context_tokens = stored.context_tokens;
-    session.cost = stored.cost;
     if (stored.cwd) |stored_cwd|
         session.interned_cwd = try session.pool.intern(session.gpa, stored_cwd);
 }
@@ -2373,42 +2337,23 @@ test "a session saved without tools loads with none" {
     try std.testing.expectEqual(0, session.tools.len);
 }
 
-test "the token totals survive a save and resume" {
+test "the context size survives a save and resume" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var session = try newTestSession(&tmp);
     defer session.deinit();
 
-    session.recordUsage(.{
-        .prompt_tokens = 100,
-        .completion_tokens = 10,
-        .total_tokens = 110,
-        .cache_hit_tokens = 90,
-        .cache_miss_tokens = 10,
-    }, 0.0001);
+    session.recordUsage(.{ .prompt_tokens = 100, .completion_tokens = 10, .total_tokens = 110 });
     try session.append(.{ .role = .user, .content = "hi" });
-    // A second request adds to the totals rather than replacing them.
-    session.recordUsage(.{
-        .prompt_tokens = 200,
-        .completion_tokens = 20,
-        .total_tokens = 220,
-        .cache_hit_tokens = 180,
-        .cache_miss_tokens = 20,
-    }, 0.0002);
+    // A second request replaces the size rather than adding to it.
+    session.recordUsage(.{ .prompt_tokens = 200, .completion_tokens = 20, .total_tokens = 220 });
     try session.append(.{ .role = .assistant, .content = "hello" });
 
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
 
-    try std.testing.expectEqual(300, resumed.usage.prompt_tokens);
-    try std.testing.expectEqual(30, resumed.usage.completion_tokens);
-    try std.testing.expectEqual(270, resumed.usage.cache_hit_tokens);
-    try std.testing.expectEqual(30, resumed.usage.cache_miss_tokens);
-    // The context gauge keeps the size of the last request's conversation.
     try std.testing.expectEqual(220, resumed.context_tokens);
-    // The cost accumulates across requests too.
-    try std.testing.expectApproxEqAbs(@as(f64, 0.0003), resumed.cost, 1e-12);
 }
 
 test "opening an unknown or damaged session is reported" {

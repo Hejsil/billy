@@ -1497,7 +1497,7 @@ test "a whole conversation is rendered, a tool call and a compaction included" {
 }
 
 /// The line above a conversation: the session, the model it runs, the directory
-/// it works in, how full the context window is and what it has cost. It is the
+/// it works in, and how full the context window is. It is the
 /// same text the terminal puts above its prompt, laid out for a page.
 pub const Header = struct {
     /// The session being shown.
@@ -1510,11 +1510,8 @@ pub const Header = struct {
     home: ?[]const u8,
     /// Tokens in the conversation as of the last request.
     context_tokens: usize,
-    /// The window and the prices, or null for a model billy does not know, which
-    /// has no gauge and no cost.
+    /// The window, or null for a model billy does not know, which has no gauge.
     model_info: ?models.Metadata,
-    /// What the session has cost so far, in USD.
-    cost: f64,
 };
 
 /// Writes the header as HTML. Every count is formatted by the same helpers the
@@ -1539,9 +1536,6 @@ pub fn header(h: Header, out: *std.Io.Writer) !void {
         try out.writeAll(" (");
         try agent.formatPercent(out, h.context_tokens, info.context_window);
         try out.writeAll(")</span>");
-        try out.writeAll("<span class=\"sep\">·</span><span class=\"cost\">");
-        try agent.formatMoney(out, h.cost);
-        try out.writeAll("</span>");
     }
     try out.writeAll("</div>\n");
 }
@@ -1569,9 +1563,7 @@ test "the header carries the model, the directory and the gauge" {
             .provider = .deepseek,
             .model = "deepseek-flash",
             .context_window = 128_000,
-            .price = .{},
         },
-        .cost = 0.42,
     }, &out.writer);
 
     // The same numbers the terminal header shows, each in a part of its own.
@@ -1582,14 +1574,13 @@ test "the header carries the model, the directory and the gauge" {
             "<span class=\"model\">deepseek-flash</span>" ++
             "<span class=\"sep\">·</span><span class=\"cwd\">~/repo/billy</span>" ++
             "<span class=\"sep\">·</span><span class=\"gauge\">16k/128k (12%)</span>" ++
-            "<span class=\"sep\">·</span><span class=\"cost\">$0.42</span>" ++
             "</div>\n",
         out.written(),
     );
     out.clearRetainingCapacity();
 
-    // A model billy does not know has no window and no prices, so the gauge and
-    // the cost are left out rather than shown as zero.
+    // A model billy does not know has no window, so the gauge is left out rather
+    // than shown as zero.
     try header(.{
         .id = "dev",
         .model = "who-knows",
@@ -1597,7 +1588,6 @@ test "the header carries the model, the directory and the gauge" {
         .home = null,
         .context_tokens = 5000,
         .model_info = null,
-        .cost = 12.34,
     }, &out.writer);
     try std.testing.expectEqualStrings(
         "<div class=\"header\">" ++
@@ -1618,7 +1608,6 @@ test "the header carries the model, the directory and the gauge" {
         .home = null,
         .context_tokens = 0,
         .model_info = null,
-        .cost = 0,
     }, &out.writer);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "x&lt;y") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "/a&lt;b") != null);
