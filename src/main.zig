@@ -181,7 +181,11 @@ pub fn main(init: std.process.Init) !void {
     var setup = try billy.Setup.open(init, out);
     defer setup.deinit();
 
-    if (options.serve) |serve| return billy.Server.serve(&setup, serve.host, serve.port);
+    if (options.serve) |serve| {
+        const server = billy.Server{ .setup = &setup };
+        return server.serve(serve.host, serve.port);
+    }
+
     return runSession(init, out, &setup, options.resume_id);
 }
 
