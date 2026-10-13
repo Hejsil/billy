@@ -195,11 +195,25 @@ pub fn main(init: std.process.Init) !void {
 }
 
 /// Reads a key for a service, or lists the services, so a run need not have the
-/// key exported. Only the credentials are read, since nothing else is touched.
+/// key exported.
+///
+/// The configuration is read for the names of the providers it defines, which
+/// are the only names beside billy's own that a key can be stored for. Nothing
+/// else of it is used.
 fn runLogin(init: std.process.Init, out: *std.Io.Writer, service: ?[]const u8) !void {
     const io = init.io;
     const arena = init.arena.allocator();
     const environ = init.environ_map;
+
+    var config_dir = try billy.Config.openDefaultDir(io, arena, environ);
+    defer config_dir.close(io);
+    var opened = try billy.Config.open(io, config_dir, init.gpa);
+    defer opened.config.deinit();
+
+    var provider_names: std.ArrayList([]const u8) = .empty;
+    for (opened.config.stored.providers.entries) |entry| {
+        try provider_names.append(arena, entry.name);
+    }
 
     const data_dir = try billy.Session.dataDir(arena, environ);
     var data_dir_handle = try billy.Session.openDataDir(io, arena, environ);
@@ -216,6 +230,7 @@ fn runLogin(init: std.process.Init, out: *std.Io.Writer, service: ?[]const u8) !
         data_dir_handle,
         data_dir,
         &credentials,
+        provider_names.items,
         service,
     );
 }

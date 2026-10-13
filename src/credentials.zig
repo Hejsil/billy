@@ -205,6 +205,11 @@ fn writeStored(store: *const Store, json: *std.json.Stringify) !void {
 /// key comes from; with one, reads a key for it and stores it. `dir_path` is the
 /// directory the credentials are kept in, named in what is printed.
 ///
+/// `providers` are the names the configuration defines, which are the other
+/// services a key may be stored for: a name billy does not ship is one only the
+/// file that names it can make sense of, so a key stored under any other is one
+/// nothing will ever read.
+///
 /// `arena` is the store's own allocator: the one `load` read it with, so a key
 /// added here is owned the same way the ones already there are. It must be the
 /// same one, or the store would hold keys two allocators own.
@@ -215,11 +220,23 @@ pub fn run(
     dir: std.Io.Dir,
     dir_path: []const u8,
     store: *Store,
+    providers: []const []const u8,
     service_name: ?[]const u8,
 ) !void {
     const path = try std.fs.path.join(arena, &.{ dir_path, file_name });
-    if (service_name) |name| return login(io, out, arena, dir, path, store, name);
-    try list(out, store, path);
+    if (service_name) |name| return login(io, out, arena, dir, path, store, providers, name);
+    try list(out, store, providers, path);
+}
+
+/// Whether a key can be stored for `name`: a service billy ships, or one the
+/// configuration names. Any other name is one no request will ever ask for, so
+/// storing a key under it would only look like it worked.
+fn acceptable(name: []const u8, providers: []const []const u8) bool {
+    if (purposeOf(name) != null) return true;
+    for (providers) |defined| {
+        if (std.mem.eql(u8, defined, name)) return true;
+    }
+    return false;
 }
 
 /// Reads a key for the named service and stores it, so the next run uses it.
@@ -230,11 +247,18 @@ fn login(
     dir: std.Io.Dir,
     path: []const u8,
     store: *Store,
+    providers: []const []const u8,
     name: []const u8,
 ) !void {
-    // A name billy does not know is stored all the same: the providers of the
-    // model endpoint are configured, so their names are the user's, and one
-    // billy has never heard of is the one a configuration of their own named.
+    if (!acceptable(name, providers)) {
+        std.log.err(
+            "'{s}' is neither a service billy knows nor a provider the configuration names;" ++
+                " run `billy login` to list them, or name it under `providers` in the configuration",
+            .{name},
+        );
+        return error.UnknownService;
+    }
+
     const purpose = purposeOf(name) orelse name;
     const prompt = try std.fmt.allocPrint(arena, "Enter {s}: ", .{purpose});
     const key = (try readSecret(io, out, arena, prompt)) orelse {
@@ -256,38 +280,62 @@ fn login(
     try out.print("stored the {s} key in {s}\n", .{ name, path });
 }
 
-/// Prints every service billy knows and whether a key is stored for it, then any
-/// other name a key is stored under. A name stored but not known is one a
-/// configuration of the user's own named, so it is listed rather than hidden.
-fn list(out: *std.Io.Writer, store: *const Store, path: []const u8) !void {
-    var name_width: usize = 0;
-    var purpose_width: usize = 0;
+/// What a provider the configuration names is listed as. Only the file that
+/// named it knows what it is for, so what it is for is not the thing to say.
+const configured_purpose = "a provider the configuration names";
+
+/// What a name neither billy nor the configuration knows is listed as. A key is
+/// still shown for it, since it is in the file, but nothing reads it.
+const dangling_purpose = "a service billy does not know";
+
+/// Prints every name a key can be stored for, and whether one is: the services
+/// billy ships, the providers the configuration names, and any other name a key
+/// is stored under. The last are listed rather than hidden, so a file written by
+/// hand or by a billy whose configuration has since changed is not a mystery.
+fn list(out: *std.Io.Writer, store: *const Store, providers: []const []const u8, path: []const u8) !void {
     // Every row that will be printed decides the columns, so a long name of the
     // user's own widens them all rather than running past the end.
-    var extra = false;
+    var name_width: usize = 0;
+    var purpose_width: usize = 0;
     for (known) |service| {
         name_width = @max(name_width, service.name.len);
         purpose_width = @max(purpose_width, service.purpose.len);
     }
+    for (providers) |name| {
+        name_width = @max(name_width, name.len);
+        purpose_width = @max(purpose_width, configured_purpose.len);
+    }
     for (store.names()) |name| {
         name_width = @max(name_width, name.len);
-        if (purposeOf(name) == null) extra = true;
+        if (purposeOf(name) == null and !definedIn(name, providers)) {
+            purpose_width = @max(purpose_width, dangling_purpose.len);
+        }
     }
-    if (extra) purpose_width = @max(purpose_width, unknown_purpose.len);
 
     for (known) |service| {
         try printRow(out, service.name, service.purpose, name_width, purpose_width, store.get(service.name) != null);
     }
+    for (providers) |name| {
+        // One billy already knows was printed as the service it is, with what
+        // its key is for rather than where it came from.
+        if (purposeOf(name) != null) continue;
+        try printRow(out, name, configured_purpose, name_width, purpose_width, store.get(name) != null);
+    }
     for (store.names()) |name| {
         if (purposeOf(name) != null) continue;
-        try printRow(out, name, unknown_purpose, name_width, purpose_width, true);
+        if (definedIn(name, providers)) continue;
+        try printRow(out, name, dangling_purpose, name_width, purpose_width, true);
     }
     try out.print("\n`billy login <service>` stores a key in {s}\n", .{path});
 }
 
-/// What a name billy does not know is listed as: there is no purpose to give it,
-/// since only the configuration that named it knows what it is for.
-const unknown_purpose = "a service billy does not know";
+/// Whether the configuration names `name` as one of its providers.
+fn definedIn(name: []const u8, providers: []const []const u8) bool {
+    for (providers) |defined| {
+        if (std.mem.eql(u8, defined, name)) return true;
+    }
+    return false;
+}
 
 /// One line of the listing: the name, what its key is for, and where the key is.
 fn printRow(
@@ -516,7 +564,7 @@ test "the listing shows each service billy knows and whether a key is stored" {
 
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try list(&sink.writer, &store, "/data/billy/credentials.json");
+    try list(&sink.writer, &store, &.{}, "/data/billy/credentials.json");
 
     try std.testing.expectEqualStrings(
         \\deepseek     DeepSeek API key           stored
@@ -539,7 +587,7 @@ test "the listing names a service that has no key of any kind" {
     const store: Store = .{};
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try list(&sink.writer, &store, "/c");
+    try list(&sink.writer, &store, &.{}, "/c");
 
     try std.testing.expectEqualStrings(
         \\deepseek     DeepSeek API key           not set
@@ -567,7 +615,7 @@ test "the listing shows a stored name billy does not know" {
 
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try list(&sink.writer, &store, "/c");
+    try list(&sink.writer, &store, &.{}, "/c");
 
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -586,6 +634,67 @@ test "the listing shows a stored name billy does not know" {
         sink.written(),
         "deepseek                   DeepSeek API key               not set",
     ) != null);
+}
+
+test "a key is stored only for a name something will ask for" {
+    // A service billy ships is always acceptable, since it knows what the key is
+    // for and a request may be sent with it.
+    try std.testing.expect(acceptable("deepseek", &.{}));
+    try std.testing.expect(acceptable("tavily", &.{}));
+
+    // One the configuration names is acceptable too, which is how a provider of
+    // the user's own is reached.
+    try std.testing.expect(acceptable("mock", &.{"mock"}));
+    try std.testing.expect(acceptable("mock", &.{ "other", "mock" }));
+
+    // Anything else is a key no request would ever carry, so storing it would
+    // only look like it worked.
+    try std.testing.expect(!acceptable("mock", &.{}));
+    try std.testing.expect(!acceptable("deepseekk", &.{ "deepseek", "opencode_go" }));
+    try std.testing.expect(!acceptable("", &.{"mock"}));
+}
+
+test "the listing names the providers the configuration defines" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    const store: Store = .{};
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try list(&sink.writer, &store, &.{"mock"}, "/c");
+
+    // A provider the configuration names is one a key can be stored for, so the
+    // listing shows it: `billy login` with no service is where a user looks to
+    // find out what to type.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        sink.written(),
+        "mock         a provider the configuration names  not set",
+    ) != null);
+    // One billy already knows is listed as the service it is, not as something
+    // the configuration happened to name.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, sink.written(), "deepseek"));
+    try std.testing.expect(std.mem.indexOf(u8, sink.written(), "a provider the configuration names") != null);
+}
+
+test "the listing shows a key under a name nothing names any more" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    // A key stored by hand, or by a billy whose configuration has since changed,
+    // is still in the file; showing it says why nothing uses it.
+    var store: Store = .{};
+    try store.put(allocator, "gone", "k");
+
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try list(&sink.writer, &store, &.{"mock"}, "/c");
+
+    try std.testing.expect(std.mem.indexOf(u8, sink.written(), "gone") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sink.written(), "a service billy does not know") != null);
 }
 
 test "load refuses a damaged or future credentials file" {
