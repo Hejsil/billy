@@ -268,7 +268,7 @@ fn runSession(
             setup.config.stored.resume_blocks,
         );
     }
-    try billy.agent.run(io, init.gpa, out, config, &session);
+    try billy.agent.run(io, init.gpa, out, config, &session, try setup.sessionTarget(init.gpa, &session));
 }
 
 /// Reads the command line, whose first entry is the executable name. The `login`

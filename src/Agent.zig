@@ -31,11 +31,35 @@ const Command = enum {
     }
 };
 
+/// Where a choice of provider and model is sent: what a request needs from it
+/// that the configuration's own endpoint cannot supply, since a session may name
+/// a provider other than the configured one.
+///
+/// It lives here rather than in `Setup`, which resolves it, because `Setup`
+/// imports this module; the resolver is handed in as a function, so neither has
+/// to know the other's type.
+pub const Target = struct {
+    base_url: []const u8,
+    /// Full URL of the chat completions endpoint under `base_url`.
+    url: []const u8,
+    api_key: []const u8,
+    /// The model id to send, which is the half of the choice after the provider.
+    model: []const u8,
+    /// What is known about the model: its window, for the gauge and the
+    /// compaction threshold. Null for a model billy has no numbers for.
+    info: ?models.Metadata,
+};
+
 pub const Config = struct {
     api_key: []const u8,
     /// Full URL of the chat completions endpoint.
     url: []const u8,
     model: []const u8,
+    /// The provider and model a new session starts on, as `provider/model`.
+    /// A session keeps the choice it was started with, so this is read once per
+    /// session: for a new one to record, and for an older one that recorded
+    /// none.
+    model_choice: []const u8 = "deepseek/deepseek-flash",
     /// Model turns allowed for one request before the harness gives up on it.
     max_turns: usize,
     /// Longest a bash command may run before it is killed, in seconds, from the
@@ -423,7 +447,15 @@ pub fn deinit(agent: *Agent) void {
 /// matches the earlier run byte for byte and hits the prompt cache. The user's
 /// instructions come from the configuration directory and the project's from the
 /// session's directory.
-pub fn prepare(agent: *Agent, session: *Session) !void {
+pub fn prepare(agent: *Agent, session: *Session, target: ?Target) !void {
+    // Where the session is sent follows the choice it recorded, not the
+    // configuration, so a session resumed against a provider other than the
+    // configured one still reaches its own. A session that recorded none takes
+    // the configured choice, which is where it was being sent anyway, and is
+    // saved with it from here on. The caller resolves the target, since it owns
+    // the credentials a provider's key is read from.
+    if (target) |resolved| agent.useTarget(resolved);
+
     // A session with a conversation keeps the mode and prompt it was saved with;
     // a new one takes the mode the frontend chose. Either way the agent's mode
     // ends up the session's own.
@@ -443,6 +475,20 @@ pub fn prepare(agent: *Agent, session: *Session) !void {
         if (prompt_text.len > 0) try session.setSystemPrompt(prompt_text);
     }
     try session.ensureTools(agent.tool_set.definitions(agent.config.mode));
+}
+
+/// Points the client at where the session is sent.
+///
+/// The resolved URL is owned by whoever resolved it, which outlives the session.
+fn useTarget(agent: *Agent, resolved: Target) void {
+    agent.client.url = resolved.url;
+    agent.client.api_key = resolved.api_key;
+    agent.client.model = resolved.model;
+    // The config's model is the id the header shows, so it is the resolved one
+    // rather than the configured choice: a session sent to its own provider
+    // would otherwise be headed with a model it is not asking.
+    agent.config.model = resolved.model;
+    agent.config.model_info = resolved.info;
 }
 
 /// What asking `agent` to start a session with a first prompt came to.
@@ -504,7 +550,7 @@ pub fn start(agent: *Agent, session: *Session, text: []const u8, default: Mode) 
 
     const choice = Mode.start(text, default);
     agent.config.mode = choice.mode;
-    try agent.prepare(session);
+    try agent.prepare(session, null);
     if (choice.text.len == 0) return .mode_only;
     return .{ .prompt = choice.text };
 }
@@ -592,6 +638,7 @@ pub fn run(
     out: *std.Io.Writer,
     config: Config,
     session: *Session,
+    target: ?Target,
 ) !void {
     // One HTTP client for the run, shared by the model requests and the search
     // backend, so both reuse its connections and share the certificates it scans
@@ -604,7 +651,7 @@ pub fn run(
     // A resumed session keeps the prompt and tools it was saved with, so it is
     // prepared here; a new one gets them from its first prompt, through `start`.
     const resumed = session.messages.items.len > 0;
-    if (resumed) try agent.prepare(session);
+    if (resumed) try agent.prepare(session, target);
 
     // The editor holds the lines it returns and its history in an arena of its
     // own, over `gpa`, so the run need not keep an allocator for them.
@@ -837,7 +884,12 @@ fn turn(agent: *Agent, emitter: Emitter, session: *Session) !void {
         // conversation is written straight onto the connection out of the pool,
         // the reply is freed when the turn ends, and the session interns what it
         // keeps.
-        const completion = try agent.client.complete(agent.gpa, session.conversation(&.{}), session.toolSet());
+        const completion = try agent.client.complete(
+            agent.gpa,
+            session.id(),
+            session.conversation(&.{}),
+            session.toolSet(),
+        );
         defer completion.deinit();
 
         // Recorded first, so the save inside `append` stores the size along with
@@ -1101,7 +1153,12 @@ fn fold(agent: *Agent, emitter: Emitter, session: *Session) !bool {
 /// carries.
 fn askWith(agent: *Agent, session: *Session, question: []const u8) !?[]u8 {
     const extra = [_]llm.Message{.{ .role = .user, .content = question }};
-    const completion = try agent.client.complete(agent.gpa, session.conversation(&extra), session.toolSet());
+    const completion = try agent.client.complete(
+        agent.gpa,
+        session.id(),
+        session.conversation(&extra),
+        session.toolSet(),
+    );
     defer completion.deinit();
 
     const content = completion.message.content orelse return null;
@@ -2120,7 +2177,7 @@ test "prepare gives a fresh session the user's instructions from the configurati
     var agent = try testAgent(io, gpa, config, null);
     defer agent.deinit();
 
-    try agent.prepare(&session);
+    try agent.prepare(&session, null);
 
     // The prompt the session runs with carries the user's instructions, so the
     // configuration directory is read for every session and not only a project.
@@ -2149,7 +2206,7 @@ test "prepare gives a chat session no prompt and only the tools it allows" {
     var agent = try testAgent(io, gpa, config, null);
     defer agent.deinit();
 
-    try agent.prepare(&session);
+    try agent.prepare(&session, null);
 
     // The mode is recorded, no system prompt is set at all (a chat request is the
     // conversation alone, so the instructions never reach it), and the tools
@@ -2507,4 +2564,92 @@ fn expectCleanTitle(gpa: std.mem.Allocator, expected: []const u8, raw: []const u
     const title = (try cleanTitle(gpa, raw)).?;
     defer gpa.free(title);
     try std.testing.expectEqualStrings(expected, title);
+}
+
+test "a session is sent where the choice it recorded points, not the configuration" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // The configuration names an endpoint nothing listens on, so a request that
+    // went there would fail rather than quietly answering.
+    var chosen = try Mock.start("/chat/completions", 1, Mock.fixed(
+        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"chosen\"}}]}",
+    ));
+    defer chosen.deinit();
+    try chosen.serve();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    var config = testConfig("m", "/work", null);
+    config.url = "http://127.0.0.1:1/chat/completions";
+    var agent = try testAgent(io, gpa, config, &http_client);
+    defer agent.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+
+    // The target the frontend resolves from the session's own choice: the
+    // endpoint it names, the key for it, and the model id with the provider
+    // stripped off.
+    try agent.prepare(&session, .{
+        .base_url = chosen.url,
+        .url = chosen.url,
+        .api_key = "k",
+        .model = "the-chosen-model",
+        // A window of its own, so the gauge is the session's and not the
+        // configured model's.
+        .info = .{ .provider = .opencode_go, .model = "the-chosen-model", .context_window = 42 },
+    });
+
+    // The client was pointed at the endpoint the session named rather than the
+    // configured one, the model id it was given is sent, and the header reads
+    // the window of that model.
+    try std.testing.expectEqualStrings(chosen.url, agent.client.url);
+    try std.testing.expect(!std.mem.eql(u8, config.url, agent.client.url));
+    try std.testing.expectEqualStrings("the-chosen-model", agent.client.model);
+    try std.testing.expectEqualStrings("the-chosen-model", agent.config.model);
+    try std.testing.expectEqual(@as(usize, 42), agent.config.model_info.?.context_window);
+    try std.testing.expectEqual(models.Provider.opencode_go, agent.config.model_info.?.provider);
+
+    // And the request goes there rather than to the configured endpoint, which
+    // nothing is listening on.
+    const completion = try agent.client.complete(gpa, "01SESSION", session.conversation(&.{}), session.toolSet());
+    defer completion.deinit();
+    try chosen.group.await(io);
+    if (chosen.err) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), chosen.served);
+    try std.testing.expectEqualStrings("chosen", completion.message.content.?);
+}
+
+test "a session with no recorded model takes the choice it is prepared with" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    var agent = try testAgent(io, gpa, testConfig("m", "/work", null), &http_client);
+    defer agent.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    // What an older session file reads back as.
+    try std.testing.expect(!session.hasModel());
+
+    try agent.prepare(&session, .{
+        .base_url = "https://api.deepseek.com",
+        .url = "https://api.deepseek.com/chat/completions",
+        .api_key = "k",
+        .model = "deepseek-flash",
+        .info = null,
+    });
+
+    // The session was sent to the configured model, which is recorded by the
+    // caller that resolved it, so a later run keeps it.
+    try std.testing.expectEqualStrings("deepseek-flash", agent.client.model);
 }

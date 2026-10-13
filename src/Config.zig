@@ -8,6 +8,7 @@
 //! newer billy does not break an older one.
 
 const std = @import("std");
+const models = @import("models.zig");
 const toolset = @import("Tools.zig");
 const xdg = @import("xdg.zig");
 
@@ -113,6 +114,15 @@ pub const Edit = struct {
 /// are the configuration's own, since the file holds exactly those.
 const Stored = struct {
     version: u32 = 1,
+    /// Which provider and model a new session asks for, as `provider/model`:
+    /// `deepseek/deepseek-v4-flash`, `opencode_go/glm-5.3-flash`.
+    ///
+    /// It is one setting rather than two because the two halves are only
+    /// meaningful together: a model id alone names no endpoint, and the model
+    /// ids of two providers do not overlap enough for the provider to be
+    /// guessed from one. A session keeps the choice it was started with, so
+    /// changing this affects new sessions and not the ones in progress.
+    model: []const u8 = "deepseek/deepseek-flash",
     max_turns: usize = 100,
     /// Blocks to replay on a resume. Zero shows the whole session.
     resume_blocks: usize = 10,
@@ -153,6 +163,30 @@ const Stored = struct {
         // An empty name is neither of the two billy knows nor an effort level,
         // and would be sent to the provider as one.
         if (stored.reasoning.len == 0) return error.InvalidConfig;
+        try stored.validateModel();
+    }
+
+    /// Whether the model setting names a provider billy can reach and a model of
+    /// it. A model of a provider billy does not know is refused here rather than
+    /// at the request, where it would fail as an endpoint it never had.
+    fn validateModel(stored: Stored) !void {
+        // Both halves are checked before either is judged: an empty setting has
+        // no provider to be unknown, and saying so is less confusing than
+        // calling the empty string a provider billy does not know.
+        if (!stored.choice().isComplete()) return error.InvalidConfig;
+        if (std.meta.stringToEnum(models.Provider, stored.providerName()) == null) {
+            return error.UnknownProvider;
+        }
+    }
+
+    /// The provider half of the model setting, before the first `/`.
+    fn providerName(stored: Stored) []const u8 {
+        return stored.choice().provider();
+    }
+
+    /// What the model setting asks for, as the pair of halves it holds.
+    pub fn choice(stored: Stored) models.Choice {
+        return .{ .text = stored.model };
     }
 };
 
@@ -609,6 +643,7 @@ test "the file is indented, so it can be read and edited by hand" {
     try std.testing.expectEqualStrings(
         \\{
         \\  "version": 1,
+        \\  "model": "deepseek/deepseek-flash",
         \\  "max_turns": 3,
         \\  "resume_blocks": 10,
         \\  "web_blocks": 200,
@@ -671,6 +706,39 @@ test "open rejects damaged, future and unusable configurations" {
     try std.testing.expectError(error.InvalidConfig, openFrom(&tmp, "{\"max_turns\":0}"));
 
     try std.testing.expectError(error.InvalidConfig, openFrom(&tmp, "{\"tools\":{\"bash\":{\"timeout_s\":0}}}"));
+}
+
+test "the model setting names a provider and a model of it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var opened = try openFrom(&tmp, "{\"model\":\"opencode_go/glm-5.3-flash\"}");
+    defer opened.config.deinit();
+    const choice = opened.config.stored.choice();
+    try std.testing.expectEqualStrings("opencode_go", choice.provider());
+    try std.testing.expectEqualStrings("glm-5.3-flash", choice.model());
+
+    // A model id may hold a slash of its own, so only the first one splits the
+    // string; the rest is the model.
+    const nested = models.Choice{ .text = "vendor/model/variant" };
+    try std.testing.expectEqualStrings("vendor", nested.provider());
+    try std.testing.expectEqualStrings("model/variant", nested.model());
+}
+
+test "a model setting billy cannot use is refused, not read as another endpoint" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A provider billy does not know names no endpoint it can send to.
+    try std.testing.expectError(error.UnknownProvider, openFrom(&tmp, "{\"model\":\"who-knows/m\"}"));
+    // A model with no provider in front of it, or a provider with no model
+    // after it, names a pair with a missing half rather than an unknown one.
+    try std.testing.expectError(error.InvalidConfig, openFrom(&tmp, "{\"model\":\"deepseek-flash\"}"));
+    try std.testing.expectError(error.InvalidConfig, openFrom(&tmp, "{\"model\":\"deepseek/\"}"));
+    try std.testing.expectError(error.InvalidConfig, openFrom(&tmp, "{\"model\":\"\"}"));
+
+    // The default the file is written with is one billy can use.
+    try Stored.default.validate();
 }
 
 test "set names a setting by its dotted path" {

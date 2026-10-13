@@ -796,8 +796,9 @@ fn serveTurn(
     var agent = try Agent.init(r.server.io, gpa, config, session.cwd(), http_client);
     defer agent.deinit();
     // The session is prepared from the mode the caller settled, which is the
-    // session's own once it has been asked something.
-    try agent.prepare(session);
+    // session's own once it has been asked something. It is sent where its own
+    // recorded provider lives, which may not be where the server is configured.
+    try agent.prepare(session, try r.server.setup.sessionTarget(gpa, session));
 
     // The head of the reply goes out before the run starts, so the page can read
     // the stream while the model is working. From here on a failure is part of
@@ -1019,6 +1020,9 @@ const TestServer = struct {
                 .base_url = "https://api.deepseek.com",
                 .url = "https://api.deepseek.com/chat/completions",
                 .model = "m",
+                .model_choice = "deepseek/m",
+                .store = .{},
+                .provider = .deepseek,
                 .search = null,
                 .fetch = null,
                 .health = health,

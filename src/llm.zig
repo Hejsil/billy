@@ -165,9 +165,15 @@ pub const Client = struct {
     ///
     /// `gpa` owns the parsed response the returned completion carries; the
     /// caller frees it with `Completion.deinit`.
+    ///
+    /// `session_id` names the conversation the request belongs to. Some
+    /// providers ask for it so they can route and cache a conversation
+    /// together, and one of them refuses a request without it; a provider that
+    /// wants none ignores the header.
     pub fn complete(
         client: *Client,
         gpa: std.mem.Allocator,
+        session_id: []const u8,
         messages: anytype,
         tools: anytype,
     ) !Completion {
@@ -186,7 +192,7 @@ pub const Client = struct {
 
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
-            const answer = client.send(authorization, request) catch |err| {
+            const answer = client.send(authorization, session_id, request) catch |err| {
                 // A request that reached the network and failed is nearly always
                 // worth another try; one that cannot ever work is not.
                 if (!transportWorthRetrying(err) or attempt + 1 >= client.max_attempts) return err;
@@ -209,13 +215,22 @@ pub const Client = struct {
     /// One request over a fresh connection, returning what the server answered
     /// with and the body, which the caller owns. Nothing is interpreted here: a
     /// failure is a failure to reach the server, not a decision about the reply.
-    fn send(client: *Client, authorization: []const u8, request: anytype) !Answer {
+    fn send(
+        client: *Client,
+        authorization: []const u8,
+        session_id: []const u8,
+        request: anytype,
+    ) !Answer {
         // The body is serialized twice: once into a counter, because the head has
         // to carry its length before any of it is sent, and once onto the
         // connection. Neither holds a copy of it, so a request does not allocate
         // its own body.
         var counted: std.Io.Writer.Discarding = .init("");
         try writeBody(&counted.writer, request);
+
+        const extra_headers = [_]std.http.Header{
+            .{ .name = "x-opencode-session", .value = session_id },
+        };
 
         var req = try client.http.request(.POST, try std.Uri.parse(client.url), .{
             // A redirect after a request has been sent cannot be followed without
@@ -224,7 +239,12 @@ pub const Client = struct {
             .headers = .{
                 .content_type = .{ .override = "application/json" },
                 .authorization = .{ .override = authorization },
+                // Named rather than left to the HTTP client's own, which is the
+                // library's name; a provider that rate-limits or blocks generic
+                // SDK traffic has nothing to go on otherwise.
+                .user_agent = .{ .override = user_agent },
             },
+            .extra_headers = &extra_headers,
         });
         defer req.deinit();
         req.transfer_encoding = .{ .content_length = counted.fullCount() };
@@ -276,6 +296,11 @@ pub const Client = struct {
         return .fromMilliseconds(@intCast(half + std.mem.readInt(u64, &seed, .little) % (half + 1)));
     }
 };
+
+/// What billy calls itself to a provider, rather than leaving the HTTP client's
+/// own name, which is the standard library's. A provider that watches its
+/// traffic for abuse asks to know what is talking to it.
+const user_agent = "billy/1.0";
 
 /// The longest a backoff waits, so a long outage does not turn a retry into a
 /// wait measured in minutes.
@@ -485,7 +510,7 @@ test "a request reaches the wire with the body the head promised" {
         .http = &http_client,
     };
 
-    const completion = try client.complete(gpa, &messages, @as([]const NoTools, &.{}));
+    const completion = try client.complete(gpa, "01SESSION", &messages, @as([]const NoTools, &.{}));
     defer completion.deinit();
 
     try mock.group.await(io);
@@ -497,6 +522,45 @@ test "a request reaches the wire with the body the head promised" {
     try std.testing.expectEqualStrings(expected, mock.bodies.items[0]);
     try std.testing.expectEqualStrings("hi there", completion.message.content.?);
     try std.testing.expectEqual(9, completion.usage.total_tokens);
+}
+
+test "a request names billy and carries the session it belongs to" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const messages = [_]Message{.{ .role = .user, .content = "hi" }};
+    var mock = try Mock.start("/chat/completions", 1, Mock.fixed(
+        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}",
+    ));
+    defer mock.deinit();
+    try mock.serve();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+    var client: Client = .{
+        .gpa = gpa,
+        .io = io,
+        .api_key = "k",
+        .url = mock.url,
+        .model = "m",
+        .http = &http_client,
+    };
+
+    const completion = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
+    defer completion.deinit();
+
+    try mock.group.await(io);
+    if (mock.err) |err| return err;
+
+    // The HTTP client's own name is the library's, which a provider that
+    // watches its traffic for abuse asks clients not to send, and the session
+    // is what a provider routes and caches a conversation by, so both have to
+    // reach the wire.
+    var found = std.StringHashMap([]const u8).init(gpa);
+    defer found.deinit();
+    for (mock.headers.items) |header| try found.put(header.name, header.value);
+    try std.testing.expectEqualStrings(user_agent, found.get("user-agent").?);
+    try std.testing.expectEqualStrings("01ABC", found.get("x-opencode-session").?);
 }
 
 test "worthRetrying is a rate limit or a server error" {
@@ -574,7 +638,7 @@ fn completeAgainst(gpa: std.mem.Allocator, io: std.Io, url: []const u8, max_atte
         .http = &http_client,
     };
     const messages = [_]Message{.{ .role = .user, .content = "hi" }};
-    return client.complete(gpa, &messages, @as([]const NoTools, &.{}));
+    return client.complete(gpa, "01SESSION", &messages, @as([]const NoTools, &.{}));
 }
 
 /// The answer of a mock that fails the first `fail_first` requests with a 503 and
@@ -666,7 +730,7 @@ test "the HTTP client is kept, so requests reuse one connection" {
     // reused.
     const messages = [_]Message{.{ .role = .user, .content = "hi" }};
     for (0..2) |_| {
-        const completion = try client.complete(gpa, &messages, @as([]const NoTools, &.{}));
+        const completion = try client.complete(gpa, "01SESSION", &messages, @as([]const NoTools, &.{}));
         defer completion.deinit();
         try std.testing.expectEqualStrings("hi", completion.message.content.?);
     }

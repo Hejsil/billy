@@ -81,6 +81,19 @@ const Stored = struct {
     /// The mode the session runs in, which fixes its prompt and its tools. A file
     /// saved before modes existed has none, and reads back as general.
     mode: agent.Mode = .general,
+    /// The provider and model this session was started on, as `provider/model`,
+    /// the same one string the configuration names it by.
+    ///
+    /// A session keeps the choice it began with rather than following the
+    /// configuration, because the conversation belongs to the model that
+    /// produced it: the tool calls in it are that model's ids and the cached
+    /// prefix is its bytes, and sending either to a different model is a
+    /// different request. Changing the configuration affects new sessions only.
+    ///
+    /// Empty for a session saved before this was recorded. Those are read as the
+    /// choice billy is configured with, which is where they were being sent
+    /// anyway, and are saved with it from then on.
+    model: ?[]const u8 = null,
     /// The conversation, oldest first.
     messages: []const llm.Message = &.{},
     /// Indices into `messages`, sorted, of the summaries a compaction produced.
@@ -231,6 +244,11 @@ title_index: StringIndex = .none,
 /// What the session may do and what its prompt says. Kept so a resume keeps the
 /// mode it started in rather than the default.
 mode: agent.Mode = .general,
+
+/// The provider and model this session was started on, interned in the pool like
+/// every other string. `.none` for a session saved before it was recorded, which
+/// is read as the choice billy is configured with.
+interned_model: StringIndex = .none,
 
 /// Indices into `messages` of the summaries a compaction produced
 compactions: std.ArrayList(u32) = .empty,
@@ -623,6 +641,27 @@ pub fn setMode(session: *Session, mode: agent.Mode) void {
     session.mode = mode;
 }
 
+/// Records the provider and model the session is sent to. Set once, when the
+/// session starts, and kept for every run after it; a session that already has
+/// one is left alone, since the conversation belongs to the model that produced
+/// it.
+pub fn setModel(session: *Session, choice: []const u8) !void {
+    session.interned_model = try session.pool.intern(session.gpa, choice);
+}
+
+/// The provider and model this session is sent to, or null for one saved before
+/// either was recorded. `fallback` is what such a session is read as: the choice
+/// billy is configured with, which is where it was being sent anyway.
+pub fn modelChoice(session: *const Session, fallback: []const u8) []const u8 {
+    return session.pool.get(session.interned_model) orelse fallback;
+}
+
+/// Whether the session records a choice of its own, which every session started
+/// since it was recorded does.
+pub fn hasModel(session: *const Session) bool {
+    return session.interned_model != .none;
+}
+
 /// Records `system_prompt` unless the session already has one. A resumed session
 /// carries the prompt it was saved with, which is kept so the request it sends
 /// matches the earlier run byte for byte; a new session gets the current one.
@@ -711,6 +750,12 @@ pub fn write(session: *const Session, writer: *std.Io.Writer) !void {
     try json.objectField("mode");
     try json.write(session.mode);
 
+    // Written whether or not the session has one, so a file always says which
+    // model it is for; a session that was resumed from an older file takes the
+    // configured choice and is saved with it from here on.
+    try json.objectField("model");
+    try json.write(session.pool.get(session.interned_model) orelse "");
+
     try json.objectField("messages");
     try json.beginArray();
     for (session.messages.items) |message|
@@ -765,6 +810,11 @@ fn load(session: *Session) !void {
         try session.setTitle(stored_title);
 
     session.mode = stored.mode;
+    if (stored.model) |stored_model| {
+        // An empty field is a file written without one rather than a session
+        // sent to no model, so it is left unset and read as the fallback.
+        if (stored_model.len > 0) try session.setModel(stored_model);
+    }
     session.context_tokens = stored.context_tokens;
     if (stored.cwd) |stored_cwd|
         session.interned_cwd = try session.pool.intern(session.gpa, stored_cwd);
@@ -2354,6 +2404,72 @@ test "the context size survives a save and resume" {
     defer resumed.deinit();
 
     try std.testing.expectEqual(220, resumed.context_tokens);
+}
+
+test "the provider and model a session was started on are saved and resumed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try newTestSession(&tmp);
+    defer session.deinit();
+    // A fresh session records nothing, so a caller has to say where it is sent.
+    try std.testing.expect(!session.hasModel());
+    try session.setModel("opencode_go/glm-5.3-flash");
+    try session.append(.{ .role = .user, .content = "hello" });
+    try session.append(.{ .role = .assistant, .content = "hi" });
+
+    var resumed = try reopenTestSession(&tmp, session.id());
+    defer resumed.deinit();
+
+    // The resumed session keeps the provider and model it was started on rather
+    // than following whatever the configuration now says, since the conversation
+    // belongs to the model that produced it.
+    try std.testing.expect(resumed.hasModel());
+    try std.testing.expectEqualStrings("opencode_go/glm-5.3-flash", resumed.modelChoice("deepseek/deepseek-flash"));
+}
+
+test "a session with no recorded model is read as the configured one" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A file written before this was recorded has no model field, and one with
+    // it empty is the same: both were being sent wherever billy was pointed, so
+    // that is what they are read as.
+    var session = try newTestSession(&tmp);
+    defer session.deinit();
+    try std.testing.expectEqualStrings("deepseek/deepseek-flash", session.modelChoice("deepseek/deepseek-flash"));
+
+    // The file only exists once the session has something to save.
+    try session.append(.{ .role = .user, .content = "hi" });
+    const file = try tmp.dir.readFileAlloc(std.testing.io, session.name(), std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(file);
+    // The file itself says which model it is for, so a session is never written
+    // without an answer to where it is sent.
+    try std.testing.expect(std.mem.indexOf(u8, file, "\"model\"") != null);
+}
+
+test "a session file written with an empty model reads as the configured one" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // What an older billy wrote: the field is there, with nothing in it, since
+    // those files record no choice. It reads as unset rather than as a session
+    // named by the empty string.
+    const session_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = session_id ++ ".json",
+        .data = "{\"version\":3,\"title\":null,\"system_prompt\":null,\"mode\":\"general\"," ++
+            "\"model\":\"\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]," ++
+            "\"compactions\":[],\"tools\":[],\"context_tokens\":0,\"cwd\":\"/work\"}",
+    });
+
+    var resumed = try reopenTestSession(&tmp, session_id);
+    defer resumed.deinit();
+    try std.testing.expect(!resumed.hasModel());
+    try std.testing.expectEqualStrings(
+        "opencode_go/glm-5.3-flash",
+        resumed.modelChoice("opencode_go/glm-5.3-flash"),
+    );
 }
 
 test "opening an unknown or damaged session is reported" {

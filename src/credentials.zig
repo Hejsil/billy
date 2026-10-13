@@ -30,6 +30,7 @@ const secret_mode: std.Io.File.Permissions = @fromBackingInt(@intCast(0o600));
 /// A service billy needs a credential for.
 pub const Service = enum {
     deepseek,
+    opencode_go,
     openai,
     tavily,
     exa,
@@ -45,6 +46,7 @@ pub const Service = enum {
     pub fn variable(service: Service) []const u8 {
         return switch (service) {
             .deepseek => "DEEPSEEK_API_KEY",
+            .opencode_go => "OPENCODE_API_KEY",
             .openai => "OPENAI_API_KEY",
             .tavily => "TAVILY_API_KEY",
             .exa => "EXA_API_KEY",
@@ -56,6 +58,7 @@ pub const Service = enum {
     pub fn purpose(service: Service) []const u8 {
         return switch (service) {
             .deepseek => "DeepSeek API key",
+            .opencode_go => "OpenCode Go API key",
             .openai => "OpenAI API key",
             .tavily => "Tavily web search API key",
             .exa => "Exa web search API key",
@@ -78,6 +81,7 @@ pub const Service = enum {
 pub fn modelService(provider: models.Provider) Service {
     return switch (provider) {
         .deepseek => .deepseek,
+        .opencode_go => .opencode_go,
     };
 }
 
@@ -127,7 +131,9 @@ pub fn modelKey(
     if (models.Provider.fromUrl(base_url)) |provider| {
         return credential(store, environ, modelService(provider));
     }
-    return credential(store, environ, .deepseek) orelse credential(store, environ, .openai);
+    return credential(store, environ, .deepseek) orelse
+        credential(store, environ, .opencode_go) orelse
+        credential(store, environ, .openai);
 }
 
 /// The credentials billy holds, one field per service, named after it and
@@ -140,6 +146,7 @@ pub fn modelKey(
 /// along with the store, so there is nothing to free.
 pub const Store = struct {
     deepseek: ?[]const u8 = null,
+    opencode_go: ?[]const u8 = null,
     openai: ?[]const u8 = null,
     tavily: ?[]const u8 = null,
     exa: ?[]const u8 = null,
@@ -366,7 +373,7 @@ test "a service names its variable and what its key is for" {
 
     try std.testing.expectEqual(Service.tavily, Service.fromName("tavily").?);
     try std.testing.expect(Service.fromName("google") == null);
-    try std.testing.expectEqual(5, Service.all().len);
+    try std.testing.expectEqual(6, Service.all().len);
 }
 
 test "load of a file that is not there is an empty store" {
@@ -572,11 +579,12 @@ test "the listing shows each service and where its key comes from" {
     try list(&sink.writer, &store, &environ, "/data/billy/credentials.json");
 
     try std.testing.expectEqualStrings(
-        \\deepseek  DeepSeek API key           stored
-        \\openai    OpenAI API key             not set
-        \\tavily    Tavily web search API key  set in TAVILY_API_KEY
-        \\exa       Exa web search API key     not set
-        \\brave     Brave web search API key   not set
+        \\deepseek     DeepSeek API key           stored
+        \\opencode_go  OpenCode Go API key        not set
+        \\openai       OpenAI API key             not set
+        \\tavily       Tavily web search API key  set in TAVILY_API_KEY
+        \\exa          Exa web search API key     not set
+        \\brave        Brave web search API key   not set
         \\
         \\`billy login <service>` stores a key in /data/billy/credentials.json
         \\
@@ -598,11 +606,12 @@ test "the listing names a service that has no key of any kind" {
     try list(&sink.writer, &store, &environ, "/c");
 
     try std.testing.expectEqualStrings(
-        \\deepseek  DeepSeek API key           not set
-        \\openai    OpenAI API key             not set
-        \\tavily    Tavily web search API key  not set
-        \\exa       Exa web search API key     not set
-        \\brave     Brave web search API key   not set
+        \\deepseek     DeepSeek API key           not set
+        \\opencode_go  OpenCode Go API key        not set
+        \\openai       OpenAI API key             not set
+        \\tavily       Tavily web search API key  not set
+        \\exa          Exa web search API key     not set
+        \\brave        Brave web search API key   not set
         \\
         \\`billy login <service>` stores a key in /c
         \\
