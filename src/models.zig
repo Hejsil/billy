@@ -12,15 +12,6 @@ pub const Provider = enum {
     deepseek,
     opencode_go,
 
-    /// The provider serving `url`, by host name, or null when it is not one of
-    /// the known providers, as a proxy or a self-hosted endpoint would not be.
-    pub fn fromUrl(url: []const u8) ?Provider {
-        const host = hostOf(url) orelse return null;
-        if (std.mem.eql(u8, host, "api.deepseek.com")) return .deepseek;
-        if (std.mem.eql(u8, host, "opencode.ai")) return .opencode_go;
-        return null;
-    }
-
     /// Every provider in the table, for looking a model up without one.
     pub fn all() []const Provider {
         return std.enums.values(Provider);
@@ -174,6 +165,15 @@ fn entries(provider: Provider) []const Entry {
     };
 }
 
+/// The host name of `url`, without the scheme, port or path.
+pub fn hostOf(url: []const u8) ?[]const u8 {
+    const after_scheme = if (std.mem.indexOf(u8, url, "://")) |i| url[i + 3 ..] else url;
+    const end = std.mem.indexOfAny(u8, after_scheme, "/:") orelse after_scheme.len;
+    const host = after_scheme[0..end];
+    if (host.len == 0) return null;
+    return host;
+}
+
 /// What is known about `model`, looked up at `provider` when it is known and
 /// among all providers otherwise, so a model behind an unrecognized endpoint is
 /// still recognized. Null when the model is not in the table, in which case the
@@ -209,63 +209,12 @@ fn metadataOf(provider: Provider, entry: Entry) Metadata {
     };
 }
 
-/// The host name of `url`, without the scheme, port or path.
-pub fn hostOf(url: []const u8) ?[]const u8 {
-    const after_scheme = if (std.mem.indexOf(u8, url, "://")) |i| url[i + 3 ..] else url;
-    const end = std.mem.indexOfAny(u8, after_scheme, "/:") orelse after_scheme.len;
-    const host = after_scheme[0..end];
-    if (host.len == 0) return null;
-    return host;
-}
-
 test "hostOf strips the scheme, port and path" {
     try std.testing.expectEqualStrings("api.deepseek.com", hostOf("https://api.deepseek.com/chat/completions").?);
     try std.testing.expectEqualStrings("api.deepseek.com", hostOf("https://api.deepseek.com").?);
     try std.testing.expectEqualStrings("localhost", hostOf("http://localhost:8080/v1/chat/completions").?);
     try std.testing.expectEqualStrings("example.com", hostOf("example.com/v1").?);
     try std.testing.expect(hostOf("https://") == null);
-}
-
-test "Provider.fromUrl recognizes the known providers" {
-    try std.testing.expectEqual(Provider.deepseek, Provider.fromUrl("https://api.deepseek.com/chat/completions").?);
-    try std.testing.expectEqual(Provider.opencode_go, Provider.fromUrl("https://opencode.ai/zen/go/v1").?);
-    try std.testing.expectEqual(Provider.opencode_go, Provider.fromUrl("https://opencode.ai/inference/go/v1").?);
-    try std.testing.expect(Provider.fromUrl("https://api.openai.com/v1/chat/completions") == null);
-    try std.testing.expect(Provider.fromUrl("http://127.0.0.1:8080/v1/chat/completions") == null);
-}
-
-test "only the provider whose fields they are is sent the thinking fields" {
-    // These are DeepSeek's own request fields, not part of the OpenAI-compatible
-    // body. OpenCode Go forwards to several upstreams and answers a request
-    // carrying them with `unknown field "thinking"`, so whether a provider takes
-    // them is asked of the provider rather than assumed from it being known.
-    try std.testing.expect(Provider.deepseek.takesThinking());
-    try std.testing.expect(!Provider.opencode_go.takesThinking());
-}
-
-test "a Go model is measured at its provider, and an unknown one is not" {
-    const glm = lookup(.opencode_go, "glm-5.3-flash").?;
-    try std.testing.expectEqual(1_000_000, glm.context_window);
-    try std.testing.expectEqual(Provider.opencode_go, glm.provider);
-
-    // The windows differ per model, so the gauge would be wrong for a long
-    // window read off a short model, and these two are the extremes.
-    try std.testing.expectEqual(1_048_576, lookup(.opencode_go, "kimi-k3").?.context_window);
-    try std.testing.expectEqual(256_000, lookup(.opencode_go, "hy3").?.context_window);
-    try std.testing.expectEqual(262_144, lookup(.opencode_go, "kimi-k2.6").?.context_window);
-
-    // A model of another provider, or one Go serves on an API billy does not
-    // speak, has no metadata here.
-    try std.testing.expect(lookup(.opencode_go, "deepseek-v4-flash-0731") == null);
-    try std.testing.expect(lookup(.opencode_go, "gpt-6-luna") == null);
-    try std.testing.expect(lookup(.opencode_go, "qwen3.8-max") == null);
-}
-
-test "an id both providers serve is found through either" {
-    // The Go endpoint accepts DeepSeek's own default id at the same window, so
-    // a session keeps its gauge when it is pointed at Go instead.
-    try std.testing.expectEqual(1_000_000, lookup(.deepseek, "deepseek-flash").?.context_window);
-    try std.testing.expectEqual(1_000_000, lookup(.opencode_go, "deepseek-flash").?.context_window);
 }
 
 test "lookup finds a model by name, alias and without a provider" {

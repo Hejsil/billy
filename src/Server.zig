@@ -795,10 +795,15 @@ fn serveTurn(
     const gpa = r.server.gpa;
     var agent = try Agent.init(r.server.io, gpa, config, session.cwd(), http_client);
     defer agent.deinit();
+    // Where the session is sent is resolved into a buffer of its own, freed
+    // when the turn is over: it is built per turn, and holding it in the
+    // server's own allocator would grow with every request the page makes.
+    var target_state = std.heap.ArenaAllocator.init(gpa);
+    defer target_state.deinit();
     // The session is prepared from the mode the caller settled, which is the
     // session's own once it has been asked something. It is sent where its own
     // recorded provider lives, which may not be where the server is configured.
-    try agent.prepare(session, try r.server.setup.sessionTarget(gpa, session));
+    try agent.prepare(session, try r.server.setup.sessionTarget(target_state.allocator(), session));
 
     // The head of the reply goes out before the run starts, so the page can read
     // the stream while the model is working. From here on a failure is part of
@@ -872,7 +877,7 @@ fn writeHeader(server: *const Server, session: *const Session, out: *std.Io.Writ
         .cwd = session.cwd(),
         .home = server.setup.environ.get("HOME"),
         .context_tokens = session.context_tokens,
-        .model_info = models.lookup(models.Provider.fromUrl(server.setup.base_url), server.setup.model),
+        .model_info = models.lookup(server.setup.provider, server.setup.model),
     }, out);
 }
 

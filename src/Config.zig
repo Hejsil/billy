@@ -123,6 +123,14 @@ const Stored = struct {
     /// guessed from one. A session keeps the choice it was started with, so
     /// changing this affects new sessions and not the ones in progress.
     model: []const u8 = "deepseek/deepseek-flash",
+    /// The endpoints billy talks to that its own table does not name: a proxy, a
+    /// server of the user's own, or a stand-in a test points a run at. Each is
+    /// written as a provider name with the base URL its completions path is
+    /// appended to, and named in `model` like any other provider.
+    ///
+    /// A name billy already knows may be given here too, which is how a proxy in
+    /// front of a known provider is reached.
+    providers: Providers = .{},
     max_turns: usize = 100,
     /// Blocks to replay on a resume. Zero shows the whole session.
     resume_blocks: usize = 10,
@@ -163,6 +171,7 @@ const Stored = struct {
         // An empty name is neither of the two billy knows nor an effort level,
         // and would be sent to the provider as one.
         if (stored.reasoning.len == 0) return error.InvalidConfig;
+        try stored.validateProviders();
         try stored.validateModel();
     }
 
@@ -174,8 +183,20 @@ const Stored = struct {
         // no provider to be unknown, and saying so is less confusing than
         // calling the empty string a provider billy does not know.
         if (!stored.choice().isComplete()) return error.InvalidConfig;
-        if (std.meta.stringToEnum(models.Provider, stored.providerName()) == null) {
-            return error.UnknownProvider;
+        const name = stored.providerName();
+        // A provider billy ships, or one the file defines itself: anything else
+        // names no endpoint, and would fail at the request as one it never had.
+        if (std.meta.stringToEnum(models.Provider, name) != null) return;
+        if (stored.providers.has(name)) return;
+        return error.UnknownProvider;
+    }
+
+    /// Whether every provider the file defines is one a request could be sent
+    /// to: a name to write in `model`, and a URL to send it to.
+    fn validateProviders(stored: Stored) !void {
+        for (stored.providers.entries) |entry| {
+            if (entry.name.len == 0) return error.InvalidConfig;
+            if (entry.base_url.len == 0) return error.InvalidConfig;
         }
     }
 
@@ -187,6 +208,72 @@ const Stored = struct {
     /// What the model setting asks for, as the pair of halves it holds.
     pub fn choice(stored: Stored) models.Choice {
         return .{ .text = stored.model };
+    }
+};
+
+/// The endpoints the configuration names itself, as the object the file holds
+/// them as: a name, and the settings of the provider stored under it.
+///
+/// Written as an object keyed by name rather than a list, since the name is what
+/// `model` and `credentials.json` both refer to, and a list would spell it twice.
+pub const Providers = struct {
+    entries: []const Entry = &.{},
+
+    pub const Entry = struct {
+        /// The name `model` writes before the `/`.
+        name: []const u8,
+        /// The base URL its completions path is appended to.
+        base_url: []const u8,
+    };
+
+    /// The base URL of `name`, or null when the configuration does not name it.
+    pub fn get(providers: Providers, name: []const u8) ?[]const u8 {
+        for (providers.entries) |entry| {
+            if (std.mem.eql(u8, entry.name, name)) return entry.base_url;
+        }
+        return null;
+    }
+
+    /// Whether the configuration names it at all.
+    pub fn has(providers: Providers, name: []const u8) bool {
+        return providers.get(name) != null;
+    }
+
+    /// The object is read as a value and walked, since the names are the user's
+    /// and no set of fields could hold them.
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !Providers {
+        const parsed = try std.json.Value.jsonParse(allocator, source, options);
+        if (parsed != .object) return error.UnexpectedToken;
+
+        var entries: std.ArrayList(Entry) = .empty;
+        var it = parsed.object.iterator();
+        while (it.next()) |setting| {
+            if (setting.value_ptr.* != .object) return error.UnexpectedToken;
+            const base_url = setting.value_ptr.object.get("base_url") orelse
+                return error.UnexpectedToken;
+            if (base_url != .string) return error.UnexpectedToken;
+            try entries.append(allocator, .{
+                .name = setting.key_ptr.*,
+                .base_url = base_url.string,
+            });
+        }
+        return .{ .entries = try entries.toOwnedSlice(allocator) };
+    }
+
+    pub fn jsonStringify(providers: Providers, json: anytype) !void {
+        try json.beginObject();
+        for (providers.entries) |entry| {
+            try json.objectField(entry.name);
+            try json.beginObject();
+            try json.objectField("base_url");
+            try json.write(entry.base_url);
+            try json.endObject();
+        }
+        try json.endObject();
     }
 };
 
@@ -644,6 +731,7 @@ test "the file is indented, so it can be read and edited by hand" {
         \\{
         \\  "version": 1,
         \\  "model": "deepseek/deepseek-flash",
+        \\  "providers": {},
         \\  "max_turns": 3,
         \\  "resume_blocks": 10,
         \\  "web_blocks": 200,
@@ -739,6 +827,53 @@ test "a model setting billy cannot use is refused, not read as another endpoint"
 
     // The default the file is written with is one billy can use.
     try Stored.default.validate();
+}
+
+test "the providers map names an endpoint of the user's own" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A provider billy does not ship, named by the file and used by `model`,
+    // which is how a proxy or a server of the user's own is reached.
+    var opened = try openFrom(&tmp,
+        \\{"model":"mock/m","providers":{"mock":{"base_url":"http://127.0.0.1:8901/v1"}}}
+    );
+    defer opened.config.deinit();
+    try std.testing.expectEqualStrings("http://127.0.0.1:8901/v1", opened.config.stored.providers.get("mock").?);
+    try std.testing.expect(opened.config.stored.providers.get("other") == null);
+
+    // It survives a save and a read back, so the file is the whole truth.
+    try opened.config.save(std.testing.io, tmp.dir);
+    var reread = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer reread.config.deinit();
+    try std.testing.expectEqualStrings("mock/m", reread.config.stored.model);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8901/v1", reread.config.stored.providers.get("mock").?);
+}
+
+test "a model naming a provider the file does not define is refused" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A provider billy ships needs no definition.
+    var known = try openFrom(&tmp, "{\"model\":\"opencode_go/glm-5.3-flash\"}");
+    defer known.config.deinit();
+
+    // One it does not, and the file does not either, names no endpoint.
+    try std.testing.expectError(error.UnknownProvider, openFrom(&tmp, "{\"model\":\"mock/m\"}"));
+}
+
+test "a provider entry with no name or no url is refused" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A name with no URL names nothing to send to; a URL with no name is one
+    // `model` could never write.
+    try std.testing.expectError(error.InvalidConfig, openFrom(&tmp,
+        \\{"model":"mock/m","providers":{"mock":{"base_url":""}}}
+    ));
+    try std.testing.expectError(error.InvalidConfig, openFrom(&tmp,
+        \\{"model":"deepseek/m","providers":{"":{"base_url":"http://127.0.0.1:9/v1"}}}
+    ));
 }
 
 test "set names a setting by its dotted path" {

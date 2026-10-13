@@ -47,8 +47,8 @@ url: []const u8,
 model: []const u8,
 /// The provider and model a new session starts on, as `provider/model`, after
 /// the environment's override. It is what a session records, so a run pointed at
-/// a proxy with `BILLY_BASE_URL` and `BILLY_MODEL` records the model it actually
-/// asked for rather than the configured one it did not.
+/// a provider the configuration defines records the name it gave it, so the run
+/// that resumes it resolves the same endpoint.
 model_choice: []const u8,
 /// The credentials the run read in. Kept for the whole run because a session
 /// names its own provider, which may not be the configured one, so the key for
@@ -95,23 +95,18 @@ pub fn open(init: std.process.Init, out: *std.Io.Writer) !Setup {
     };
     errdefer opened.config.deinit();
 
-    const endpoint = try openEndpoint(
-        arena,
-        environ,
-        &files.store,
-        opened.config.stored.choice(),
-    );
+    const endpoint = try openEndpoint(arena, opened.config, &files.store);
 
     // Which backend each set is built from, remembered so the report of a
     // failure can name it: only the builder knows which provider it was on.
     var search_failed: tools.web.Search.Provider = .tavily;
-    const search_config = searchConfig(arena, &files.store, environ, opened.config, &search_failed) catch |err| {
+    const search_config = searchConfig(arena, &files.store, opened.config, &search_failed) catch |err| {
         reportSearchFailure(err, search_failed);
         return err;
     };
 
     var fetch_failed: tools.web.Fetch.Provider = .raw;
-    const fetch_config = fetchConfig(arena, &files.store, environ, opened.config, &fetch_failed) catch |err| {
+    const fetch_config = fetchConfig(arena, &files.store, opened.config, &fetch_failed) catch |err| {
         reportFetchFailure(err, fetch_failed);
         return err;
     };
@@ -234,25 +229,17 @@ fn openConfig(
 /// agent configuration once per turn, so building it there would leak one
 /// allocation per turn into the process arena.
 ///
-/// The provider and model come from the configuration's one setting, which is
-/// what a new session is started on. `BILLY_BASE_URL` and `BILLY_MODEL` still
-/// override it, since a run against a proxy or a local model has no provider in
-/// billy's table to be configured by name; a `BILLY_MODEL` with no `/` in it is
-/// then a model of whatever `BILLY_BASE_URL` names.
+/// Everything comes from the configuration: the provider and model from its one
+/// `model` setting, and the endpoint from the provider table the file may add to.
 fn openEndpoint(
     arena: std.mem.Allocator,
-    environ: *const std.process.Environ.Map,
+    config: Config,
     store: *const credentials.Store,
-    default_choice: models.Choice,
 ) !Endpoint {
-    const choice = environ.get("BILLY_MODEL") orelse default_choice.text;
-    const base_url = try baseUrlOf(environ, choice);
-
-    const provider = models.Provider.fromUrl(base_url);
-    const api_key = credentials.modelKey(store, environ, base_url) orelse {
-        std.log.err("{s}", .{missingKeyHint(provider)});
-        return error.MissingApiKey;
-    };
+    const choice = config.stored.choice();
+    const name = providerName(choice.text);
+    const base_url = try resolveBaseUrl(config.stored.providers, choice.text);
+    const api_key = store.get(name) orelse return missingKey(name);
 
     return .{
         .base_url = base_url,
@@ -260,13 +247,18 @@ fn openEndpoint(
         // Every provider billy knows takes the completions path under its base,
         // so one is enough; a base that already carries it would double it, and
         // none of them do.
-        .url = try std.fmt.allocPrint(arena, "{s}/chat/completions", .{
-            std.mem.trimEnd(u8, base_url, "/"),
-        }),
-        .model = modelOf(choice),
-        .choice = choice,
-        .provider = provider,
+        .url = try completionsUrl(arena, base_url),
+        .model = modelOf(choice.text),
+        .choice = choice.text,
+        .provider = models.Provider.fromName(name),
     };
+}
+
+/// The full URL of the completions endpoint under `base_url`.
+fn completionsUrl(arena: std.mem.Allocator, base_url: []const u8) ![]u8 {
+    return std.fmt.allocPrint(arena, "{s}/chat/completions", .{
+        std.mem.trimEnd(u8, base_url, "/"),
+    });
 }
 
 /// The provider half of a choice: `deepseek` from `deepseek/deepseek-flash`.
@@ -274,16 +266,24 @@ fn providerName(choice: []const u8) []const u8 {
     return (models.Choice{ .text = choice }).provider();
 }
 
-/// Where the choice is sent: the URL the environment names outright, which is
-/// how a run reaches a proxy or a local server billy has no table entry for, and
-/// otherwise the base of the provider the choice names.
-fn baseUrlOf(environ: *const std.process.Environ.Map, choice: []const u8) ![]const u8 {
-    if (environ.get("BILLY_BASE_URL")) |given| return given;
-    const provider = models.Provider.fromName(providerName(choice)) orelse {
-        std.log.err("'{s}' names no provider billy knows", .{choice});
+/// Where the choice is sent: the base URL the configuration gives the provider,
+/// which may be one of its own or one of billy's the file overrides. Null when
+/// the configuration names neither, which the caller reports.
+fn baseUrlOf(providers: Config.Providers, choice: []const u8) ?[]const u8 {
+    const name = providerName(choice);
+    if (providers.get(name)) |base_url| return base_url;
+    const provider = models.Provider.fromName(name) orelse return null;
+    return models.Provider.baseUrl(provider);
+}
+
+/// The base URL a request is sent to, reporting a provider the configuration
+/// does not name before failing: the name came from a file the user wrote, so
+/// they are the one who can add it.
+fn resolveBaseUrl(providers: Config.Providers, choice: []const u8) error{UnknownProvider}![]const u8 {
+    return baseUrlOf(providers, choice) orelse {
+        std.log.err("'{s}' names no provider the configuration defines", .{choice});
         return error.UnknownProvider;
     };
-    return models.Provider.baseUrl(provider);
 }
 
 /// The model id to send, from the choice a run was given. A choice with a
@@ -295,15 +295,12 @@ fn modelOf(choice: []const u8) []const u8 {
     return choice;
 }
 
-/// What to tell the user when no key could be found: the login that stores one
-/// for the provider the endpoint belongs to, and both when billy cannot tell,
-/// since it then tries either key and either would do.
-fn missingKeyHint(provider: ?models.Provider) []const u8 {
-    return switch (provider orelse return "run `billy login deepseek` or `billy login opencode_go`," ++
-        " or set DEEPSEEK_API_KEY or OPENCODE_API_KEY to your API key") {
-        .deepseek => "run `billy login deepseek`, or set DEEPSEEK_API_KEY to your API key",
-        .opencode_go => "run `billy login opencode_go`, or set OPENCODE_API_KEY to your API key",
-    };
+/// Reports that no key is stored for the provider a request is sent to, naming
+/// the login that stores one. Fails the request rather than sending it without a
+/// key, which the provider would only refuse with less to go on.
+fn missingKey(name: []const u8) error{MissingApiKey} {
+    std.log.err("no key stored for '{s}'; run `billy login {s}` to store one", .{ name, name });
+    return error.MissingApiKey;
 }
 
 /// Where billy talks to the model, and as which model.
@@ -356,21 +353,13 @@ pub fn sessionTarget(setup: *Setup, gpa: std.mem.Allocator, session: *Session) !
 /// Where `choice` is sent, which is the four things a request needs that follow
 /// from it rather than from the configured endpoint.
 pub fn targetFor(setup: *Setup, arena: std.mem.Allocator, choice: []const u8) !agent.Target {
-    const chosen = models.Choice{ .text = choice };
-    const provider = models.Provider.fromName(chosen.provider());
-    // A run pointed at an endpoint by the environment stays there whatever
-    // choice a session recorded: the override *is* the endpoint, and a provider
-    // derived from the choice would send the conversation somewhere the run was
-    // deliberately not pointed. Its key is the one the override was read with.
-    const overridden = setup.environ.get("BILLY_BASE_URL") != null;
-    const base_url = if (overridden or provider == null) setup.base_url else models.Provider.baseUrl(provider.?);
-    const api_key = if (overridden or provider == null)
-        setup.api_key
-    else
-        credentials.credential(&setup.store, setup.environ, credentials.modelService(provider.?)) orelse {
-            std.log.err("{s}", .{missingKeyHint(provider)});
-            return error.MissingApiKey;
-        };
+    const providers = setup.config.stored.providers;
+    const name = providerName(choice);
+    // A session's own provider decides where it goes, resolved through the same
+    // table the configured one was: a provider the configuration defines, or one
+    // of billy's the file did not override.
+    const base_url = try resolveBaseUrl(providers, choice);
+    const api_key = setup.store.get(name) orelse return missingKey(name);
 
     // The model is copied out rather than sliced from `choice`: the choice a
     // session passes is a slice of its own string pool, and a pointer into that
@@ -379,12 +368,10 @@ pub fn targetFor(setup: *Setup, arena: std.mem.Allocator, choice: []const u8) !a
     const model = try arena.dupe(u8, modelOf(choice));
     return .{
         .base_url = base_url,
-        .url = try std.fmt.allocPrint(arena, "{s}/chat/completions", .{
-            std.mem.trimEnd(u8, base_url, "/"),
-        }),
+        .url = try completionsUrl(arena, base_url),
         .api_key = api_key,
         .model = model,
-        .info = models.lookup(provider, model),
+        .info = models.lookup(models.Provider.fromName(name), model),
     };
 }
 
@@ -419,7 +406,6 @@ fn reasoningOf(setting: []const u8) llm.Reasoning {
 fn searchConfig(
     arena: std.mem.Allocator,
     store: *const credentials.Store,
-    environ: *const std.process.Environ.Map,
     config: Config,
     failed: *tools.web.Search.Provider,
 ) !?tools.web.Search.Config {
@@ -434,9 +420,8 @@ fn searchConfig(
         const service = credentials.searchService(provider);
         backend.* = .{
             .provider = provider,
-            .api_key = if (service) |one|
-                credentials.credential(store, environ, one) orelse
-                    return error.MissingApiKey
+            .api_key = if (service) |name|
+                store.get(name) orelse return error.MissingApiKey
             else blk: {
                 // A backend billy knows the address of needs only its key; one it
                 // does not, SearXNG, needs the instance named.
@@ -458,7 +443,6 @@ fn searchConfig(
 fn fetchConfig(
     arena: std.mem.Allocator,
     store: *const credentials.Store,
-    environ: *const std.process.Environ.Map,
     config: Config,
     failed: *tools.web.Fetch.Provider,
 ) !?tools.web.Fetch.Config {
@@ -471,9 +455,8 @@ fn fetchConfig(
         const service = credentials.fetchService(provider);
         backend.* = .{
             .provider = provider,
-            .api_key = if (service) |one|
-                credentials.credential(store, environ, one) orelse
-                    return error.MissingApiKey
+            .api_key = if (service) |name|
+                store.get(name) orelse return error.MissingApiKey
             else
                 "",
         };
@@ -494,8 +477,8 @@ fn reportSearchFailure(err: anyerror, provider: tools.web.Search.Provider) void 
             // billy hosts itself is reached without one.
             const service = credentials.searchService(provider).?;
             std.log.err(
-                "run `billy login {s}`, or set {s} to use {s}, or clear tools.web_search in the configuration",
-                .{ service.name(), service.variable(), @tagName(provider) },
+                "run `billy login {s}` to use {s}, or clear tools.web_search in the configuration",
+                .{ service, @tagName(provider) },
             );
         },
         error.MissingSearchUrl => std.log.err(
@@ -513,8 +496,8 @@ fn reportFetchFailure(err: anyerror, provider: tools.web.Fetch.Provider) void {
         error.MissingApiKey => {
             const service = credentials.fetchService(provider).?;
             std.log.err(
-                "run `billy login {s}`, or set {s} to use {s}, or clear tools.web_fetch in the configuration",
-                .{ service.name(), service.variable(), @tagName(provider) },
+                "run `billy login {s}` to use {s}, or clear tools.web_fetch in the configuration",
+                .{ service, @tagName(provider) },
             );
         },
         else => {},
@@ -545,13 +528,13 @@ pub fn agentConfig(setup: *Setup, cwd: []const u8, style: Terminal.Style) agent.
         // join every session's prompt. The setup owns the directory and outlives
         // every runner built from this.
         .user_instructions_dir = setup.config_dir,
-        .model_info = models.lookup(models.Provider.fromUrl(setup.base_url), setup.model),
+        .model_info = models.lookup(setup.provider, setup.model),
         .compact_at = config.compact_at,
         .title = config.title,
         // The thinking fields are one provider's own, so they are sent only to a
         // provider that takes them: a model whose provider billy does not know,
         // or one whose endpoint does not accept them, is left alone.
-        .reasoning = if (models.Provider.fromUrl(setup.base_url)) |provider|
+        .reasoning = if (setup.provider) |provider|
             if (provider.takesThinking()) reasoningOf(config.reasoning) else .provider_default
         else
             .provider_default,
@@ -594,7 +577,7 @@ test "each backend resolves its own key, and SearXNG its instance" {
     var off = Config.init(gpa);
     defer off.deinit();
     var failed: tools.web.Search.Provider = .tavily;
-    try std.testing.expect((try searchConfig(arena, &store, &environ, off, &failed)) == null);
+    try std.testing.expect((try searchConfig(arena, &store, off, &failed)) == null);
 
     // A backend billy knows is asked for a key, and one that is not set is an
     // error rather than a silent "no search".
@@ -602,7 +585,7 @@ test "each backend resolves its own key, and SearXNG its instance" {
     defer naming.deinit();
 
     naming.stored.tools.web_search.providers = &.{.tavily};
-    try std.testing.expectError(error.MissingApiKey, searchConfig(arena, &store, &environ, naming, &failed));
+    try std.testing.expectError(error.MissingApiKey, searchConfig(arena, &store, naming, &failed));
     // The backend at fault is the one the report names.
     try std.testing.expectEqual(tools.web.Search.Provider.tavily, failed);
 
@@ -611,11 +594,11 @@ test "each backend resolves its own key, and SearXNG its instance" {
     defer searx.deinit();
 
     searx.stored.tools.web_search.providers = &.{.searxng};
-    try std.testing.expectError(error.MissingSearchUrl, searchConfig(arena, &store, &environ, searx, &failed));
+    try std.testing.expectError(error.MissingSearchUrl, searchConfig(arena, &store, searx, &failed));
 
     // Every named backend becomes a backend to try, in the order named.
     searx.stored.tools.web_search.searxng.url = "https://searx.example.org";
-    const config = (try searchConfig(arena, &store, &environ, searx, &failed)).?;
+    const config = (try searchConfig(arena, &store, searx, &failed)).?;
     try std.testing.expectEqual(@as(usize, 1), config.backends.len);
     try std.testing.expectEqual(tools.web.Search.Provider.searxng, config.backends[0].provider);
     try std.testing.expectEqualStrings("", config.backends[0].api_key);
@@ -638,7 +621,7 @@ test "a fetch backend is asked for its key, and raw for none" {
     defer raw.deinit();
 
     var failed: tools.web.Fetch.Provider = .raw;
-    const config = (try fetchConfig(arena, &store, &environ, raw, &failed)).?;
+    const config = (try fetchConfig(arena, &store, raw, &failed)).?;
     try std.testing.expectEqual(@as(usize, 1), config.backends.len);
     try std.testing.expectEqual(tools.web.Fetch.Provider.raw, config.backends[0].provider);
     try std.testing.expectEqualStrings("", config.backends[0].api_key);
@@ -648,7 +631,7 @@ test "a fetch backend is asked for its key, and raw for none" {
     defer naming.deinit();
 
     naming.stored.tools.web_fetch.providers = &.{.tavily};
-    try std.testing.expectError(error.MissingApiKey, fetchConfig(arena, &store, &environ, naming, &failed));
+    try std.testing.expectError(error.MissingApiKey, fetchConfig(arena, &store, naming, &failed));
     try std.testing.expectEqual(tools.web.Fetch.Provider.tavily, failed);
 
     // A set with nothing in it leaves `web_fetch` out of the request.
@@ -656,7 +639,7 @@ test "a fetch backend is asked for its key, and raw for none" {
     defer none.deinit();
 
     none.stored.tools.web_fetch.providers = &.{};
-    try std.testing.expect((try fetchConfig(arena, &store, &environ, none, &failed)) == null);
+    try std.testing.expect((try fetchConfig(arena, &store, none, &failed)) == null);
 }
 
 test "the model id is the half after the provider, and a bare one is itself" {
@@ -685,11 +668,14 @@ test "a target names bytes of its own, not a slice of the session's pool" {
 
     var environ: std.process.Environ.Map = .init(arena);
     defer environ.deinit();
-    try environ.put("BILLY_BASE_URL", "http://127.0.0.1:9/v1");
-    try environ.put("OPENCODE_API_KEY", "k");
 
     var opened = try Config.open(std.testing.io, tmp.dir, gpa);
     defer opened.config.deinit();
+    // The key a request is sent with is the one stored under the provider's
+    // name, so the store has to hold it for the target to resolve at all.
+    var store: credentials.Store = .{};
+    try store.put(arena, "opencode_go", "k");
+
     var setup: Setup = .{
         .environ = &environ,
         .config = opened.config,
@@ -698,11 +684,11 @@ test "a target names bytes of its own, not a slice of the session's pool" {
         .config_dir = tmp.dir,
         .cwd = "/work",
         .api_key = "k",
-        .base_url = "http://127.0.0.1:9/v1",
-        .url = "http://127.0.0.1:9/v1/chat/completions",
+        .base_url = "https://opencode.ai/zen/go/v1",
+        .url = "https://opencode.ai/zen/go/v1/chat/completions",
         .model = "glm-5.3-flash",
         .model_choice = "opencode_go/glm-5.3-flash",
-        .store = .{},
+        .store = store,
         .provider = .opencode_go,
         .search = null,
         .fetch = null,
@@ -725,49 +711,76 @@ test "a target names bytes of its own, not a slice of the session's pool" {
         try session.append(.{ .role = .user, .content = filler });
     }
     try std.testing.expectEqualStrings("glm-5.3-flash", target.model);
-    try std.testing.expectEqualStrings("http://127.0.0.1:9/v1/chat/completions", target.url);
+    try std.testing.expectEqualStrings("https://opencode.ai/zen/go/v1/chat/completions", target.url);
 }
 
-test "the endpoint comes from the choice's provider, and the environment wins" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    var environ: std.process.Environ.Map = .init(arena_state.allocator());
-    defer environ.deinit();
+test "the endpoint comes from the provider the choice names" {
+    const none: Config.Providers = .{};
 
-    // No override: the choice's provider decides, which is what makes a
-    // configured `opencode_go/glm-5.3-flash` reach Go without a URL anywhere.
+    // A provider billy ships decides its own endpoint, so a configured
+    // `opencode_go/glm-5.3-flash` reaches Go with no URL written anywhere.
     try std.testing.expectEqualStrings(
         "https://api.deepseek.com",
-        try baseUrlOf(&environ, "deepseek/deepseek-flash"),
+        baseUrlOf(none, "deepseek/deepseek-flash").?,
     );
     try std.testing.expectEqualStrings(
         "https://opencode.ai/zen/go/v1",
-        try baseUrlOf(&environ, "opencode_go/glm-5.3-flash"),
+        baseUrlOf(none, "opencode_go/glm-5.3-flash").?,
     );
 
-    // The environment names an endpoint outright for a proxy or a local server,
-    // which has no provider in billy's table.
-    try environ.put("BILLY_BASE_URL", "http://127.0.0.1:8080/v1");
-    try std.testing.expectEqualStrings("http://127.0.0.1:8080/v1", try baseUrlOf(&environ, "anything/m"));
+    // One the configuration defines does the same, which is how a proxy, a
+    // server of the user's own, or a stand-in a test points a run at is reached.
+    const defined: Config.Providers = .{ .entries = &.{
+        .{ .name = "mock", .base_url = "http://127.0.0.1:8901/v1" },
+    } };
+    try std.testing.expectEqualStrings("http://127.0.0.1:8901/v1", baseUrlOf(defined, "mock/m").?);
+
+    // A name the configuration gives to one of billy's own overrides what billy
+    // would have used, so a proxy in front of a known provider is reachable.
+    const overriding: Config.Providers = .{ .entries = &.{
+        .{ .name = "deepseek", .base_url = "http://127.0.0.1:9/v1" },
+    } };
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:9/v1",
+        baseUrlOf(overriding, "deepseek/deepseek-flash").?,
+    );
 }
 
-test "a provider billy does not know is refused rather than defaulted" {
-    // The check reads the provider name without resolving a URL, so a typo is
-    // caught before a request could be sent to the wrong endpoint. The URL
-    // lookup reports it too, with a message the user sees; that path logs, and
-    // logging is what a test run treats as a failure.
-    try std.testing.expect(models.Provider.fromName(providerName("who-knows/m")) == null);
-    try std.testing.expect(models.Provider.fromName(providerName("deepseek/deepseek-flash")) != null);
-    // A bare model id has no provider half at all, which is the same refusal.
-    try std.testing.expect(models.Provider.fromName(providerName("m")) == null);
+test "a provider the configuration does not name is refused, not defaulted" {
+    const none: Config.Providers = .{};
+    // A typo would otherwise send the conversation to whichever endpoint billy
+    // fell back on, which is worse than failing: the request would go somewhere
+    // the user did not name.
+    try std.testing.expect(baseUrlOf(none, "who-knows/m") == null);
+    try std.testing.expect(baseUrlOf(none, "m") == null);
+    try std.testing.expect(baseUrlOf(none, "/m") == null);
+
+    // Once the configuration defines the name, the same choice resolves, which
+    // is what makes a proxy or a server of the user's own reachable.
+    const defined: Config.Providers = .{ .entries = &.{
+        .{ .name = "who-knows", .base_url = "http://127.0.0.1:8901/v1" },
+    } };
+    try std.testing.expectEqualStrings("http://127.0.0.1:8901/v1", baseUrlOf(defined, "who-knows/m").?);
 }
 
-test "the key hint names the login of the provider the endpoint belongs to" {
-    try std.testing.expect(std.mem.indexOf(u8, missingKeyHint(.deepseek), "DEEPSEEK_API_KEY") != null);
-    try std.testing.expect(std.mem.indexOf(u8, missingKeyHint(.opencode_go), "OPENCODE_API_KEY") != null);
-    // An endpoint billy cannot place is given both, since it tries either key.
-    try std.testing.expect(std.mem.indexOf(u8, missingKeyHint(null), "DEEPSEEK_API_KEY") != null);
-    try std.testing.expect(std.mem.indexOf(u8, missingKeyHint(null), "OPENCODE_API_KEY") != null);
+test "the completions path is appended once, whatever the base carries" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.testing.expectEqualStrings(
+        "https://api.deepseek.com/chat/completions",
+        try completionsUrl(arena, "https://api.deepseek.com"),
+    );
+    // A base written with a trailing slash does not double it.
+    try std.testing.expectEqualStrings(
+        "https://api.deepseek.com/chat/completions",
+        try completionsUrl(arena, "https://api.deepseek.com/"),
+    );
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:8901/v1/chat/completions",
+        try completionsUrl(arena, "http://127.0.0.1:8901/v1"),
+    );
 }
 
 test "the reasoning setting names what billy asks of the model's thinking" {

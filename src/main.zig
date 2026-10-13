@@ -216,7 +216,6 @@ fn runLogin(init: std.process.Init, out: *std.Io.Writer, service: ?[]const u8) !
         data_dir_handle,
         data_dir,
         &credentials,
-        environ,
         service,
     );
 }
@@ -268,7 +267,13 @@ fn runSession(
             setup.config.stored.resume_blocks,
         );
     }
-    try billy.agent.run(io, init.gpa, out, config, &session, try setup.sessionTarget(init.gpa, &session));
+    // Where the session is sent is resolved into a buffer of its own, so the
+    // run frees every string it made for it when the session is over: the URL
+    // and the model are built per session, and nothing else holds them.
+    var target_state = std.heap.ArenaAllocator.init(init.gpa);
+    defer target_state.deinit();
+    const target = try setup.sessionTarget(target_state.allocator(), &session);
+    try billy.agent.run(io, init.gpa, out, config, &session, target);
 }
 
 /// Reads the command line, whose first entry is the executable name. The `login`
