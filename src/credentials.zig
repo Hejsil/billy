@@ -219,14 +219,13 @@ pub fn run(
     out: *std.Io.Writer,
     arena: std.mem.Allocator,
     dir: std.Io.Dir,
-    dir_path: []const u8,
     store: *Store,
     providers: []const []const u8,
     service_name: ?[]const u8,
 ) !void {
-    const path = try std.fs.path.join(arena, &.{ dir_path, file_name });
-    if (service_name) |name| return login(io, out, arena, dir, path, store, providers, name);
-    try list(out, store, providers, path);
+    if (service_name) |name|
+        return login(io, out, arena, dir, store, providers, name);
+    try list(out, store, providers);
 }
 
 /// Whether a key can be stored for `name`: a service billy ships, or one the
@@ -246,7 +245,6 @@ fn login(
     out: *std.Io.Writer,
     arena: std.mem.Allocator,
     dir: std.Io.Dir,
-    path: []const u8,
     store: *Store,
     providers: []const []const u8,
     name: []const u8,
@@ -275,10 +273,10 @@ fn login(
 
     try store.put(arena, name, key);
     save(store, io, dir) catch |err| {
-        std.log.err("cannot write the credentials in {s}: {s}", .{ path, @errorName(err) });
+        std.log.err("cannot write the credentials: {s}", .{@errorName(err)});
         return err;
     };
-    try out.print("stored the {s} key in {s}\n", .{ name, path });
+    try out.print("stored the {s} key\n", .{name});
 }
 
 /// What a provider the configuration names is listed as. Only the file that
@@ -293,7 +291,7 @@ const dangling_purpose = "a service billy does not know";
 /// billy ships, the providers the configuration names, and any other name a key
 /// is stored under. The last are listed rather than hidden, so a file written by
 /// hand or by a billy whose configuration has since changed is not a mystery.
-fn list(out: *std.Io.Writer, store: *const Store, providers: []const []const u8, path: []const u8) !void {
+fn list(out: *std.Io.Writer, store: *const Store, providers: []const []const u8) !void {
     // Every row that will be printed decides the columns, so a long name of the
     // user's own widens them all rather than running past the end.
     var name_width: usize = 0;
@@ -327,7 +325,7 @@ fn list(out: *std.Io.Writer, store: *const Store, providers: []const []const u8,
         if (definedIn(name, providers)) continue;
         try printRow(out, name, dangling_purpose, name_width, purpose_width, true);
     }
-    try out.print("\n`billy login <service>` stores a key in {s}\n", .{path});
+    try out.print("\n`billy login <service>` stores a key\n", .{});
 }
 
 /// Whether the configuration names `name` as one of its providers.
@@ -565,7 +563,7 @@ test "the listing shows each service billy knows and whether a key is stored" {
 
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try list(&sink.writer, &store, &.{}, "/data/billy/credentials.json");
+    try list(&sink.writer, &store, &.{});
 
     try std.testing.expectEqualStrings(
         \\deepseek     DeepSeek API key           stored
@@ -575,7 +573,7 @@ test "the listing shows each service billy knows and whether a key is stored" {
         \\exa          Exa web search API key     not set
         \\brave        Brave web search API key   not set
         \\
-        \\`billy login <service>` stores a key in /data/billy/credentials.json
+        \\`billy login <service>` stores a key
         \\
     , sink.written());
 }
@@ -588,7 +586,7 @@ test "the listing names a service that has no key of any kind" {
     const store: Store = .{};
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try list(&sink.writer, &store, &.{}, "/c");
+    try list(&sink.writer, &store, &.{});
 
     try std.testing.expectEqualStrings(
         \\deepseek     DeepSeek API key           not set
@@ -598,7 +596,7 @@ test "the listing names a service that has no key of any kind" {
         \\exa          Exa web search API key     not set
         \\brave        Brave web search API key   not set
         \\
-        \\`billy login <service>` stores a key in /c
+        \\`billy login <service>` stores a key
         \\
     , sink.written());
 }
@@ -616,7 +614,7 @@ test "the listing shows a stored name billy does not know" {
 
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try list(&sink.writer, &store, &.{}, "/c");
+    try list(&sink.writer, &store, &.{});
 
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -663,7 +661,7 @@ test "the listing names the providers the configuration defines" {
     const store: Store = .{};
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try list(&sink.writer, &store, &.{"mock"}, "/c");
+    try list(&sink.writer, &store, &.{"mock"});
 
     // A provider the configuration names is one a key can be stored for, so the
     // listing shows it: `billy login` with no service is where a user looks to
@@ -692,7 +690,7 @@ test "the listing shows a key under a name nothing names any more" {
 
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try list(&sink.writer, &store, &.{"mock"}, "/c");
+    try list(&sink.writer, &store, &.{"mock"});
 
     try std.testing.expect(std.mem.indexOf(u8, sink.written(), "gone") != null);
     try std.testing.expect(std.mem.indexOf(u8, sink.written(), "a service billy does not know") != null);

@@ -12,6 +12,7 @@ const agent = @import("Agent.zig");
 const llm = @import("llm.zig");
 const Config = @import("Config.zig");
 const credentials = @import("credentials.zig");
+const Dirs = @import("Dirs.zig");
 const Health = @import("Health.zig");
 const models = @import("models.zig");
 const tools = @import("Tools.zig");
@@ -87,10 +88,8 @@ pub fn open(init: std.process.Init, out: *std.Io.Writer) !Setup {
     var files = try openFiles(io, arena, environ);
     errdefer files.deinit(io);
 
-    var opened = openConfig(init, files.config_dir, files.config_dir_path, out) catch |err| {
-        std.log.err("cannot read the configuration in {s}: {s}", .{
-            files.config_dir_path, @errorName(err),
-        });
+    var opened = openConfig(init, files.dirs.config, out) catch |err| {
+        std.log.err("cannot read the configuration: {s}", .{@errorName(err)});
         return err;
     };
     errdefer opened.config.deinit();
@@ -114,9 +113,9 @@ pub fn open(init: std.process.Init, out: *std.Io.Writer) !Setup {
     return .{
         .environ = environ,
         .config = opened.config,
-        .sessions = files.sessions,
-        .data_dir = files.data_dir,
-        .config_dir = files.config_dir,
+        .sessions = files.dirs.sessions,
+        .data_dir = files.dirs.data,
+        .config_dir = files.dirs.config,
         .cwd = files.cwd,
         .api_key = endpoint.api_key,
         .base_url = endpoint.base_url,
@@ -128,7 +127,7 @@ pub fn open(init: std.process.Init, out: *std.Io.Writer) !Setup {
         .search = search_config,
         .fetch = fetch_config,
         // The waits web backends were last given, read from disk.
-        .health = try Health.load(io, init.gpa, files.data_dir),
+        .health = try Health.load(io, init.gpa, files.dirs.data),
     };
 }
 
@@ -141,21 +140,14 @@ const Files = struct {
     ///
     /// The paths are kept beside the handles because a report names the file that
     /// could not be read, and a handle has no name to give.
-    data_dir: std.Io.Dir,
-    data_dir_path: []const u8,
+    /// Every directory billy keeps its files in.
+    dirs: Dirs,
     store: credentials.Store,
-    /// The directory the configuration file is under.
-    config_dir: std.Io.Dir,
-    config_dir_path: []const u8,
-    /// The directory holding the session files.
-    sessions: std.Io.Dir,
     /// Where billy was started, so a new session records it.
     cwd: []const u8,
 
     fn deinit(files: *Files, io: std.Io) void {
-        files.sessions.close(io);
-        files.config_dir.close(io);
-        files.data_dir.close(io);
+        files.dirs.deinit(io);
     }
 };
 
@@ -171,18 +163,11 @@ fn openFiles(
     arena: std.mem.Allocator,
     environ: *const std.process.Environ.Map,
 ) !Files {
-    var data_dir = try Session.openDataDir(io, arena, environ);
-    errdefer data_dir.close(io);
+    var dirs = try Dirs.open(io, arena, environ);
+    errdefer dirs.deinit(io);
 
-    var config_dir = try Config.openDefaultDir(io, arena, environ);
-    errdefer config_dir.close(io);
-
-    var sessions = try Session.openDefaultDir(io, arena, environ);
-    errdefer sessions.close(io);
-
-    const data_dir_path = try Session.dataDir(arena, environ);
-    const store = credentials.load(io, data_dir, arena) catch |err| {
-        std.log.err("cannot read the credentials in {s}: {s}", .{ data_dir_path, @errorName(err) });
+    const store = credentials.load(io, dirs.data, arena) catch |err| {
+        std.log.err("cannot read the credentials: {s}", .{@errorName(err)});
         return err;
     };
 
@@ -192,12 +177,8 @@ fn openFiles(
     };
 
     return .{
-        .data_dir = data_dir,
-        .data_dir_path = data_dir_path,
+        .dirs = dirs,
         .store = store,
-        .config_dir = config_dir,
-        .config_dir_path = try Config.defaultDir(arena, environ),
-        .sessions = sessions,
         .cwd = cwd,
     };
 }
@@ -207,19 +188,12 @@ fn openFiles(
 ///
 /// The configuration owns an arena of its own for the strings it reads, so it is
 /// freed when the run is over rather than with the process arena.
-fn openConfig(
-    init: std.process.Init,
-    config_dir: std.Io.Dir,
-    config_dir_path: []const u8,
-    out: *std.Io.Writer,
-) !Config.Opened {
+fn openConfig(init: std.process.Init, config_dir: std.Io.Dir, out: *std.Io.Writer) !Config.Opened {
     var config = try Config.open(init.io, config_dir, init.gpa);
     errdefer config.config.deinit();
 
     if (config.created) {
-        try out.print("wrote the default configuration to {s}\n", .{
-            try std.fs.path.join(init.arena.allocator(), &.{ config_dir_path, Config.file_name }),
-        });
+        try out.print("wrote the default configuration\n", .{});
     }
     return config;
 }

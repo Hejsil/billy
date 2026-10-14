@@ -171,12 +171,14 @@ pub fn main(init: std.process.Init) !void {
         .config => |config| {
             if (config.help)
                 return printHelp(out, "billy config <setting> <value>", config_about, null, command_options);
+            var dirs = try billy.Dirs.open(io, arena, init.environ_map);
+            defer dirs.deinit(io);
+
             return billy.Config.run(
                 io,
                 out,
-                arena,
                 init.gpa,
-                init.environ_map,
+                dirs.config,
                 config.path.?,
                 config.value.?,
             );
@@ -200,9 +202,10 @@ fn runLogin(init: std.process.Init, out: *std.Io.Writer, service: ?[]const u8) !
     const arena = init.arena.allocator();
     const environ = init.environ_map;
 
-    var config_dir = try billy.Config.openDefaultDir(io, arena, environ);
-    defer config_dir.close(io);
-    var opened = try billy.Config.open(io, config_dir, init.gpa);
+    var dirs = try billy.Dirs.open(io, arena, environ);
+    defer dirs.deinit(io);
+
+    var opened = try billy.Config.open(io, dirs.config, init.gpa);
     defer opened.config.deinit();
 
     var provider_names: std.ArrayList([]const u8) = .empty;
@@ -210,20 +213,15 @@ fn runLogin(init: std.process.Init, out: *std.Io.Writer, service: ?[]const u8) !
         try provider_names.append(arena, entry.name);
     }
 
-    const data_dir = try billy.Session.dataDir(arena, environ);
-    var data_dir_handle = try billy.Session.openDataDir(io, arena, environ);
-    defer data_dir_handle.close(io);
-
-    var credentials = billy.credentials.load(io, data_dir_handle, arena) catch |err| {
-        std.log.err("cannot read the credentials in {s}: {s}", .{ data_dir, @errorName(err) });
+    var credentials = billy.credentials.load(io, dirs.data, arena) catch |err| {
+        std.log.err("cannot read the credentials: {s}", .{@errorName(err)});
         return err;
     };
     try billy.credentials.run(
         io,
         out,
         arena,
-        data_dir_handle,
-        data_dir,
+        dirs.data,
         &credentials,
         provider_names.items,
         service,

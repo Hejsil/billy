@@ -23,7 +23,6 @@
 const std = @import("std");
 const llm = @import("llm.zig");
 const ulid = @import("ulid.zig");
-const xdg = @import("xdg.zig");
 const agent = @import("Agent.zig");
 const Pool = @import("Pool.zig");
 
@@ -945,45 +944,6 @@ fn lastCall(session: *const Session) ?usize {
     return null;
 }
 
-/// The directory billy keeps its own files in: `$XDG_DATA_HOME/billy`, or
-/// `$HOME/.local/share/billy` when that is unset, as the XDG base directory
-/// specification prescribes. The credentials live in the directory itself, and
-/// the sessions in a subdirectory of it, so a listing of billy's data directory
-/// shows what billy keeps rather than a wall of session files.
-pub fn dataDir(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
-    return xdg.dir(gpa, environ, "XDG_DATA_HOME", &.{ ".local", "share" });
-}
-
-/// The directory holding the sessions: the `sessions` subdirectory of `dataDir`,
-/// so that the session files sit apart from what else billy keeps.
-pub fn defaultDir(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
-    const data_dir = try dataDir(gpa, environ);
-    defer gpa.free(data_dir);
-
-    return std.fs.path.join(gpa, &.{ data_dir, sessions_dir });
-}
-
-/// The data directory, made if it is not there yet. Building the path and making
-/// it is one intention, so the two error reports are written here rather than at
-/// every caller that needs the directory.
-pub fn openDataDir(
-    io: std.Io,
-    gpa: std.mem.Allocator,
-    environ: *const std.process.Environ.Map,
-) !std.Io.Dir {
-    return xdg.openDirBuilt(io, dataDir(gpa, environ), "billy's files");
-}
-
-/// The sessions directory, made if it is not there yet, on the same terms as
-/// `openDataDir`.
-pub fn openDefaultDir(
-    io: std.Io,
-    gpa: std.mem.Allocator,
-    environ: *const std.process.Environ.Map,
-) !std.Io.Dir {
-    return xdg.openDirBuilt(io, defaultDir(gpa, environ), "sessions");
-}
-
 /// The arguments schema of a tool as JSON text: already text when a file holds
 /// it so, and written back out when an older file holds the parsed object, which
 /// is what the request is sent.
@@ -1721,23 +1681,6 @@ test "setCheckedId rejects names that could escape the session directory" {
     try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, &@as([max_id_len + 1]u8, @splat('x'))));
     try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, &@as([max_id_len]u8, @splat('x'))));
     _ = try setCheckedId(&buf, &@as([max_id_len - 1]u8, @splat('x')));
-}
-
-test "defaultDir is the sessions directory under the data directory" {
-    const gpa = std.testing.allocator;
-    var environ: std.process.Environ.Map = .init(gpa);
-    defer environ.deinit();
-    try environ.put("HOME", "/home/user");
-
-    // The rules themselves are `xdg.dir`'s; this only pins the base and the
-    // subdirectory the sessions sit in.
-    const data = try dataDir(gpa, &environ);
-    defer gpa.free(data);
-    try std.testing.expectEqualStrings("/home/user/.local/share/billy", data);
-
-    const sessions = try defaultDir(gpa, &environ);
-    defer gpa.free(sessions);
-    try std.testing.expectEqualStrings("/home/user/.local/share/billy/sessions", sessions);
 }
 
 test "a session survives a save and resume" {

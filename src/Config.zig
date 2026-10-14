@@ -10,7 +10,6 @@
 const std = @import("std");
 const models = @import("models.zig");
 const toolset = @import("Tools.zig");
-const xdg = @import("xdg.zig");
 
 const Config = @This();
 
@@ -462,24 +461,19 @@ fn isSettableValue(comptime T: type) bool {
 
 /// Runs the `config` command: sets the option named by `path` to `value` and
 /// writes the configuration back, so a setting can be changed without opening
-/// the file by hand. The file is found the way a run finds it, under the
-/// directory `defaultDir` names, and `gpa` backs the configuration's own arena
-/// while it is read and written.
+/// the file by hand. The file lives in `dir`, which `dir_path` names and the
+/// caller owns; `gpa` backs the configuration's own arena while it is read and
+/// written.
 pub fn run(
     io: std.Io,
     out: *std.Io.Writer,
-    arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
-    environ: *const std.process.Environ.Map,
+    dir: std.Io.Dir,
     path: []const u8,
     value: []const u8,
 ) !void {
-    const dir_path = try defaultDir(arena, environ);
-    var dir = try openDefaultDir(io, arena, environ);
-    defer dir.close(io);
-
     var opened = open(io, dir, gpa) catch |err| {
-        std.log.err("cannot read the configuration in {s}: {s}", .{ dir_path, @errorName(err) });
+        std.log.err("cannot read the configuration: {s}", .{@errorName(err)});
         return err;
     };
     defer opened.config.deinit();
@@ -500,44 +494,10 @@ pub fn run(
         else => |other| return other,
     };
     opened.config.save(io, dir) catch |err| {
-        std.log.err("cannot write the configuration in {s}: {s}", .{ dir_path, @errorName(err) });
+        std.log.err("cannot write the configuration: {s}", .{@errorName(err)});
         return err;
     };
-    try out.print("set {s} to {s} in {s}\n", .{
-        path,
-        value,
-        try std.fs.path.join(arena, &.{ dir_path, file_name }),
-    });
-}
-
-/// The directory holding the configuration: `$XDG_CONFIG_HOME/billy`, or
-/// `$HOME/.config/billy` when that is unset, as the XDG base directory
-/// specification prescribes.
-pub fn defaultDir(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
-    return xdg.dir(gpa, environ, "XDG_CONFIG_HOME", &.{".config"});
-}
-
-/// The configuration directory, made if it is not there yet. Building the path
-/// and making it is one intention, so the two error reports are written here
-/// rather than at every caller that needs the directory.
-pub fn openDefaultDir(
-    io: std.Io,
-    gpa: std.mem.Allocator,
-    environ: *const std.process.Environ.Map,
-) !std.Io.Dir {
-    return xdg.openDirBuilt(io, defaultDir(gpa, environ), "the configuration");
-}
-
-test "defaultDir is billy's directory under the configuration base" {
-    const gpa = std.testing.allocator;
-    var environ: std.process.Environ.Map = .init(gpa);
-    defer environ.deinit();
-    try environ.put("HOME", "/home/user");
-
-    // The rules themselves are `xdg.dir`'s; this only pins which base it uses.
-    const path = try defaultDir(gpa, &environ);
-    defer gpa.free(path);
-    try std.testing.expectEqualStrings("/home/user/.config/billy", path);
+    try out.print("set {s} to {s}\n", .{ path, value });
 }
 
 /// Writes `json` as the configuration file and opens it, so a test reads as the
@@ -966,30 +926,20 @@ test "a setting set by path is written and read back" {
 
 test "run sets a setting in the file, creating it when it is missing" {
     const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // The configuration is found under XDG_CONFIG_HOME, which is pointed at the
-    // temporary directory so the run writes there rather than at the user's own.
-    const cwd = try std.process.currentPathAlloc(std.testing.io, arena);
-    const base = try std.fs.path.join(arena, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
-    var environ: std.process.Environ.Map = .init(arena);
-    defer environ.deinit();
-    try environ.put("XDG_CONFIG_HOME", base);
+    // The directory the file lives in is the caller's, so a run writes where it
+    // is told rather than at the user's own configuration.
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
+    defer gpa.free(dir_path);
 
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try run(std.testing.io, &sink.writer, arena, gpa, &environ, "tools.bash.format", "shfmt");
+    try run(std.testing.io, &sink.writer, gpa, tmp.dir, "tools.bash.format", "shfmt");
 
-    const dir_path = try std.fs.path.join(arena, &.{ base, app_dir });
-    var dir = try std.Io.Dir.cwd().createDirPathOpen(std.testing.io, dir_path, .{});
-    defer dir.close(std.testing.io);
-
-    var opened = try Config.open(std.testing.io, dir, gpa);
+    var opened = try Config.open(std.testing.io, tmp.dir, gpa);
     defer opened.config.deinit();
 
     try std.testing.expectEqualStrings("shfmt", opened.config.stored.tools.bash.format.?);
@@ -997,5 +947,4 @@ test "run sets a setting in the file, creating it when it is missing" {
     try std.testing.expectEqual(Stored.default.max_turns, opened.config.stored.max_turns);
     // The message names the setting and the file it was written to.
     try std.testing.expect(std.mem.indexOf(u8, sink.written(), "tools.bash.format") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sink.written(), file_name) != null);
 }
