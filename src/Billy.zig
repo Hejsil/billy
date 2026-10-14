@@ -15,6 +15,7 @@ const Endpoints = @import("Endpoints.zig");
 const Health = @import("Health.zig");
 const Session = @import("Session.zig");
 const Server = @import("Server.zig");
+const settings = @import("Terminal/settings.zig");
 const Terminal = @import("Terminal.zig");
 
 const Billy = @This();
@@ -104,18 +105,83 @@ pub fn login(billy: *Billy, out: *std.Io.Writer, service: ?[]const u8) !void {
         try provider_names.append(billy.arena, entry.name);
     }
 
-    if (service) |name| {
-        return Credentials.login(
-            billy.io,
-            out,
-            billy.arena,
-            billy.dirs.data,
-            &billy.credentials,
-            provider_names.items,
-            name,
+    const name = service orelse return Credentials.list(out, &billy.credentials, provider_names.items);
+    if (!Credentials.acceptable(name, provider_names.items)) {
+        std.log.err(
+            "'{s}' is neither a service billy knows nor a provider the configuration names;" ++
+                " run `billy login` to list them, or name it under `providers` in the configuration",
+            .{name},
         );
+        return error.UnknownService;
     }
-    return Credentials.list(out, &billy.credentials, provider_names.items);
+
+    const purpose = Credentials.purposeOf(name) orelse name;
+    const prompt = try std.fmt.allocPrint(billy.arena, "Enter {s}: ", .{purpose});
+    const key = (try billy.readSecret(out, prompt)) orelse {
+        std.log.err("no key read", .{});
+        return error.MissingCredential;
+    };
+    // An empty key would be stored as a credential that cannot work, which is
+    // worse than having none: the service would be offered and always fail.
+    if (key.len == 0) {
+        std.log.err("no key given, nothing stored", .{});
+        return error.MissingCredential;
+    }
+
+    try billy.credentials.put(billy.arena, name, key);
+    Credentials.save(&billy.credentials, billy.io, billy.dirs.data) catch |err| {
+        std.log.err("cannot write the credentials: {s}", .{@errorName(err)});
+        return err;
+    };
+    try out.print("stored the {s} key\n", .{name});
+}
+
+/// Reads one line from the terminal, with echo off so a key is not left on the
+/// screen or in the scrollback. `prompt` is shown only when there is a terminal
+/// to type at; without one the line is read as it comes, which is what lets a
+/// key be piped in.
+///
+/// Returns null at end of input, before anything was typed.
+fn readSecret(billy: *Billy, out: *std.Io.Writer, prompt: []const u8) !?[]const u8 {
+    const arena = billy.arena;
+    const interactive = try std.Io.File.stdin().isTty(billy.io);
+    const saved = if (interactive) saved: {
+        try out.writeAll(prompt);
+        try out.flush();
+        const saved = try settings.get(std.posix.STDIN_FILENO);
+        var quiet = saved;
+        quiet.lflag.ECHO = false;
+        try settings.set(std.posix.STDIN_FILENO, quiet);
+        break :saved saved;
+    } else null;
+    defer if (saved) |term| {
+        settings.set(std.posix.STDIN_FILENO, term) catch {};
+        // The Enter the user pressed was not echoed, so the line is ended here
+        // rather than left for the next thing printed to start on.
+        out.writeAll("\n") catch {};
+        out.flush() catch {};
+    };
+
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(arena);
+    var buffer: [256]u8 = undefined;
+    while (true) {
+        const len = try std.posix.read(std.posix.STDIN_FILENO, &buffer);
+        if (len == 0) {
+            // End of input: a key piped in without a trailing newline is still
+            // the key, so only a read that got nothing at all is no key.
+            if (line.items.len == 0) return null;
+            break;
+        }
+        if (std.mem.indexOfScalar(u8, buffer[0..len], '\n')) |newline| {
+            try line.appendSlice(arena, buffer[0..newline]);
+            break;
+        }
+        try line.appendSlice(arena, buffer[0..len]);
+    }
+    // A key is a token: the carriage return a terminal ends the line with, and
+    // any space a paste brought along, are not part of it.
+    return try arena.dupe(u8, std.mem.trim(u8, line.items, &std.ascii.whitespace));
 }
 
 /// Sets the configuration setting `path` to `value` and writes the file back, so
