@@ -87,14 +87,15 @@ const Options = struct {
     resume_id: ?[]const u8 = null,
     /// Whether the user asked for usage instead of a run.
     help: bool = false,
-    /// Set when the `login` subcommand was asked for. The service is the one to
-    /// store a key for, or null to list the services and the keys they have.
-    login: ?Login = null,
-    /// Set when the `config` subcommand was asked for: the setting to change,
-    /// named by its dotted path, and the text to set it to.
-    config: ?Config = null,
-    /// Set when the `serve` subcommand was asked for: where it listens.
-    serve: ?Serve = null,
+
+    command: Command = .none,
+
+    const Command = union(enum) {
+        none,
+        login: Login,
+        config: Config,
+        serve: Serve,
+    };
 
     const Login = struct {
         service: ?[]const u8 = null,
@@ -145,54 +146,47 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // A subcommand asked for its usage is answered before billy's own files are
-    // reached for, so its help works even when nothing else can be read. None of
-    // them has subcommands of its own, so none lists any.
-    if (options.login) |login| {
-        if (login.help) return printHelp(out, "billy login [<service>]", login_about, null, command_options);
-    }
-    if (options.config) |setting| {
-        if (setting.help) return printHelp(out, "billy config <setting> <value>", config_about, null, command_options);
-    }
-    if (options.serve) |serve| {
-        if (serve.help) return printHelp(out, "billy serve [--port <port>] [--host <addr>]", serve_about, null, serve_options);
-    }
+    switch (options.command) {
+        .none => {
+            var setup = try billy.Setup.open(init, out);
+            defer setup.deinit(io);
 
-    // The config subcommand only touches the configuration file, so it runs
-    // before billy's own files and credentials are reached for.
-    if (options.config) |setting| {
-        try billy.Config.run(
-            io,
-            out,
-            arena,
-            init.gpa,
-            init.environ_map,
-            setting.path.?,
-            setting.value.?,
-        );
-        return;
+            return runSession(init, out, &setup, options.resume_id);
+        },
+        .serve => |serve| {
+            if (serve.help)
+                return printHelp(out, "billy serve [--port <port>] [--host <addr>]", serve_about, null, serve_options);
+
+            var setup = try billy.Setup.open(init, out);
+            defer setup.deinit(io);
+
+            const server = billy.Server{
+                .io = io,
+                .gpa = init.gpa,
+                .session_dir = setup.sessions,
+                .setup = &setup,
+            };
+            return server.serve(serve.host, serve.port);
+        },
+        .config => |config| {
+            if (config.help)
+                return printHelp(out, "billy config <setting> <value>", config_about, null, command_options);
+            return billy.Config.run(
+                io,
+                out,
+                arena,
+                init.gpa,
+                init.environ_map,
+                config.path.?,
+                config.value.?,
+            );
+        },
+        .login => |login| {
+            if (login.help)
+                return printHelp(out, "billy login [<service>]", login_about, null, command_options);
+            return runLogin(init, out, login.service);
+        },
     }
-
-    // The login subcommand needs the credentials and nothing else, so it is
-    // handled on its own rather than through the setup a run needs.
-    if (options.login) |login| return runLogin(init, out, login.service);
-
-    // Everything else needs the whole of what billy reads in: the configuration,
-    // the credentials and the directories it keeps its files in.
-    var setup = try billy.Setup.open(init, out);
-    defer setup.deinit(io);
-
-    if (options.serve) |serve| {
-        const server = billy.Server{
-            .io = io,
-            .gpa = init.gpa,
-            .session_dir = setup.sessions,
-            .setup = &setup,
-        };
-        return server.serve(serve.host, serve.port);
-    }
-
-    return runSession(init, out, &setup, options.resume_id);
 }
 
 /// Reads a key for a service, or lists the services, so a run need not have the
@@ -292,9 +286,18 @@ fn runSession(
     try billy.agent.run(io, init.gpa, out, config, &session, target);
 }
 
+const ParseError = error{InvalidArgument};
+
+/// Parses `slice`, which is the arguments of one command line with the program
+/// name left off, the way `main` parses the ones it is given.
+fn parseArgsSlice(slice: []const []const u8) ParseError!Options {
+    var args = spaghet.Args.initSlice(slice);
+    return parseArgs(&args);
+}
+
 /// Reads billy's arguments: what to run, and the options of whichever part of
 /// it was asked for.
-fn parseArgs(args: *spaghet.Args) error{ InvalidArgument, MissingValue }!Options {
+fn parseArgs(args: *spaghet.Args) ParseError!Options {
     var options: Options = .{};
     while (args.next()) {
         if (args.flag(&.{ "-h", "--help" }))
@@ -302,13 +305,13 @@ fn parseArgs(args: *spaghet.Args) error{ InvalidArgument, MissingValue }!Options
         if (args.option(&.{ "-r", "--resume" })) |id|
             options.resume_id = id;
         if (args.positional()) |command|
-            return parseCommand(args, command);
+            options.command = try parseCommand(args, command);
     }
     return options;
 }
 
 /// Reads the subcommand `command`, which is the first argument of the line.
-fn parseCommand(args: *spaghet.Args, command: []const u8) error{ InvalidArgument, MissingValue }!Options {
+fn parseCommand(args: *spaghet.Args, command: []const u8) ParseError!Options.Command {
     if (std.mem.eql(u8, command, "login"))
         return .{ .login = try parseLogin(args) };
     if (std.mem.eql(u8, command, "config"))
@@ -320,7 +323,7 @@ fn parseCommand(args: *spaghet.Args, command: []const u8) error{ InvalidArgument
 
 /// Reads the arguments of the `login` subcommand: nothing, or the service to
 /// store a key for, and its own usage.
-fn parseLogin(args: *spaghet.Args) error{InvalidArgument}!Options.Login {
+fn parseLogin(args: *spaghet.Args) ParseError!Options.Login {
     var login: Options.Login = .{};
     while (args.next()) {
         if (args.flag(&.{ "-h", "--help" }))
@@ -336,7 +339,7 @@ fn parseLogin(args: *spaghet.Args) error{InvalidArgument}!Options.Login {
 /// Reads the arguments of the `config` subcommand: a setting and the value to
 /// give it, and its own usage. Neither is optional: a setting with nothing to
 /// set it to names no change to make.
-fn parseConfig(args: *spaghet.Args) error{InvalidArgument}!Options.Config {
+fn parseConfig(args: *spaghet.Args) ParseError!Options.Config {
     var setting: Options.Config = .{};
     while (args.next()) {
         if (args.flag(&.{ "-h", "--help" }))
@@ -356,7 +359,7 @@ fn parseConfig(args: *spaghet.Args) error{InvalidArgument}!Options.Config {
 
 /// Reads the arguments of the `serve` subcommand: where it listens, and its own
 /// usage.
-fn parseServe(args: *spaghet.Args) error{ InvalidArgument, MissingValue }!Options.Serve {
+fn parseServe(args: *spaghet.Args) ParseError!Options.Serve {
     var serve: Options.Serve = .{};
     while (args.next()) {
         if (args.flag(&.{ "-h", "--help" }))
@@ -369,13 +372,6 @@ fn parseServe(args: *spaghet.Args) error{ InvalidArgument, MissingValue }!Option
             return error.InvalidArgument;
     }
     return serve;
-}
-
-/// Parses `line`, which is the arguments of one command line with the program
-/// name left off, the way `main` parses the ones it is given.
-fn parseArgsSlice(line: []const []const u8) error{ InvalidArgument, MissingValue }!Options {
-    var args = spaghet.Args.initSlice(line);
-    return parseArgs(&args);
 }
 
 test "parseArgs" {
@@ -397,15 +393,21 @@ test "parseArgs" {
 }
 
 test "parseArgs reads the login subcommand on its own" {
-    try expectOptions(.{ .login = .{} }, try parseArgsSlice(&.{"login"}));
+    try expectOptions(.{ .command = .{ .login = .{} } }, try parseArgsSlice(&.{"login"}));
     try expectOptions(
-        .{ .login = .{ .service = "tavily" } },
+        .{ .command = .{ .login = .{ .service = "tavily" } } },
         try parseArgsSlice(&.{ "login", "tavily" }),
     );
     // The subcommand has its own usage, so `-h` after it is not read as a run
     // option.
-    try expectOptions(.{ .login = .{ .help = true } }, try parseArgsSlice(&.{ "login", "-h" }));
-    try expectOptions(.{ .login = .{ .help = true } }, try parseArgsSlice(&.{ "login", "--help" }));
+    try expectOptions(
+        .{ .command = .{ .login = .{ .help = true } } },
+        try parseArgsSlice(&.{ "login", "-h" }),
+    );
+    try expectOptions(
+        .{ .command = .{ .login = .{ .help = true } } },
+        try parseArgsSlice(&.{ "login", "--help" }),
+    );
     // The subcommand owns the rest of the line, so a run option after it is not
     // a run option, a second service is not an argument it takes, and a service
     // beside the usage is not read.
@@ -414,7 +416,7 @@ test "parseArgs reads the login subcommand on its own" {
 
 test "parseArgs reads the serve subcommand on its own" {
     // No port: the default, and no help.
-    try expectOptions(.{ .serve = .{} }, try parseArgsSlice(&.{"serve"}));
+    try expectOptions(.{ .command = .{ .serve = .{} } }, try parseArgsSlice(&.{"serve"}));
 
     // The port is read, however it is written.
     try expectServe(9000, try parseArgsSlice(&.{ "serve", "--port", "9000" }));
@@ -433,8 +435,8 @@ test "parseArgs reads the serve subcommand on its own" {
     try expectHost(billy.Server.default_host, try parseArgsSlice(&.{"serve"}));
 
     // The subcommand has its own usage.
-    try expectOptions(.{ .serve = .{ .help = true } }, try parseArgsSlice(&.{ "serve", "-h" }));
-    try expectOptions(.{ .serve = .{ .help = true } }, try parseArgsSlice(&.{ "serve", "--help" }));
+    try expectOptions(.{ .command = .{ .serve = .{ .help = true } } }, try parseArgsSlice(&.{ "serve", "-h" }));
+    try expectOptions(.{ .command = .{ .serve = .{ .help = true } } }, try parseArgsSlice(&.{ "serve", "--help" }));
 
     // A port that is missing, or not a number, or out of range, is refused.
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "serve", "--port" }));
@@ -449,33 +451,31 @@ test "parseArgs reads the serve subcommand on its own" {
 
 /// Checks the port a serve parse read, since `expectOptions` cannot compare it.
 fn expectServe(expected: u16, actual: Options) !void {
-    try std.testing.expect(actual.serve != null);
-    try std.testing.expectEqual(expected, actual.serve.?.port);
+    try std.testing.expectEqual(expected, actual.command.serve.port);
 }
 
 /// Checks the address a serve parse read.
 fn expectHost(expected: []const u8, actual: Options) !void {
-    try std.testing.expect(actual.serve != null);
-    try std.testing.expectEqualStrings(expected, actual.serve.?.host);
+    try std.testing.expectEqualStrings(expected, actual.command.serve.host);
 }
 
 test "parseArgs reads the config subcommand on its own" {
     try expectOptions(
-        .{ .config = .{ .path = "tools.bash.format", .value = "shfmt | bat -l bash" } },
+        .{ .command = .{ .config = .{ .path = "tools.bash.format", .value = "shfmt | bat -l bash" } } },
         try parseArgsSlice(&.{ "config", "tools.bash.format", "shfmt | bat -l bash" }),
     );
     // A value may look like an option or be empty; the path may not.
     try expectOptions(
-        .{ .config = .{ .path = "tools.bash.format", .value = "--nope" } },
+        .{ .command = .{ .config = .{ .path = "tools.bash.format", .value = "--nope" } } },
         try parseArgsSlice(&.{ "config", "tools.bash.format", "--nope" }),
     );
     try expectOptions(
-        .{ .config = .{ .path = "tools.edit.format", .value = "" } },
+        .{ .command = .{ .config = .{ .path = "tools.edit.format", .value = "" } } },
         try parseArgsSlice(&.{ "config", "tools.edit.format", "" }),
     );
     // The subcommand has its own usage.
-    try expectOptions(.{ .config = .{ .help = true } }, try parseArgsSlice(&.{ "config", "-h" }));
-    try expectOptions(.{ .config = .{ .help = true } }, try parseArgsSlice(&.{ "config", "--help" }));
+    try expectOptions(.{ .command = .{ .config = .{ .help = true } } }, try parseArgsSlice(&.{ "config", "-h" }));
+    try expectOptions(.{ .command = .{ .config = .{ .help = true } } }, try parseArgsSlice(&.{ "config", "--help" }));
     // A setting without a value, a value without a setting, an option-shaped
     // setting, and trailing arguments are all refused.
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{"config"}));
@@ -491,40 +491,38 @@ fn expectOptions(expected: Options, actual: Options) !void {
     } else {
         try std.testing.expect(actual.resume_id == null);
     }
-    if (expected.login) |login| {
-        const actual_login = actual.login.?;
-        try std.testing.expectEqual(login.help, actual_login.help);
-        if (login.service) |service| {
-            try std.testing.expectEqualStrings(service, actual_login.service.?);
-        } else {
-            try std.testing.expect(actual_login.service == null);
-        }
-    } else {
-        try std.testing.expect(actual.login == null);
-    }
-    if (expected.serve) |serve| {
-        const actual_serve = actual.serve.?;
-        try std.testing.expectEqual(serve.help, actual_serve.help);
-        try std.testing.expectEqual(serve.port, actual_serve.port);
-        try std.testing.expectEqualStrings(serve.host, actual_serve.host);
-    } else {
-        try std.testing.expect(actual.serve == null);
-    }
-    if (expected.config) |setting| {
-        const actual_setting = actual.config.?;
-        try std.testing.expectEqual(setting.help, actual_setting.help);
-        if (setting.path) |path| {
-            try std.testing.expectEqualStrings(path, actual_setting.path.?);
-        } else {
-            try std.testing.expect(actual_setting.path == null);
-        }
-        if (setting.value) |value| {
-            try std.testing.expectEqualStrings(value, actual_setting.value.?);
-        } else {
-            try std.testing.expect(actual_setting.value == null);
-        }
-    } else {
-        try std.testing.expect(actual.config == null);
+
+    switch (expected.command) {
+        .none => try std.testing.expect(actual.command == .none),
+        .login => |login| {
+            const actual_login = actual.command.login;
+            try std.testing.expectEqual(login.help, actual_login.help);
+            if (login.service) |service| {
+                try std.testing.expectEqualStrings(service, actual_login.service.?);
+            } else {
+                try std.testing.expect(actual_login.service == null);
+            }
+        },
+        .serve => |serve| {
+            const actual_serve = actual.command.serve;
+            try std.testing.expectEqual(serve.help, actual_serve.help);
+            try std.testing.expectEqual(serve.port, actual_serve.port);
+            try std.testing.expectEqualStrings(serve.host, actual_serve.host);
+        },
+        .config => |config| {
+            const actual_config = actual.command.config;
+            try std.testing.expectEqual(config.help, actual_config.help);
+            if (config.path) |path| {
+                try std.testing.expectEqualStrings(path, actual_config.path.?);
+            } else {
+                try std.testing.expect(actual_config.path == null);
+            }
+            if (config.value) |value| {
+                try std.testing.expectEqualStrings(value, actual_config.value.?);
+            } else {
+                try std.testing.expect(actual_config.value == null);
+            }
+        },
     }
 }
 
