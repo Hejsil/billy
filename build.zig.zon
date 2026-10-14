@@ -12,6 +12,10 @@
             .url = "git+https://codeberg.org/ziglang/translate-c?ref=2.0.0#0da7a16c3235b935b82421646076e0657cda21f6",
             .hash = "translate_c-2.0.0-Q_BUWltOBwA0229IE8wwSxxGzOxyRso3hvcb1nN8oJX_",
         },
+        .spaghet = .{
+            .url = "git+https://github.com/Hejsil/spaghet#6b553c1f0e3e5d9073746ee21c1d8d99a030932e",
+            .hash = "spaghet-0.0.0-qAWgUcgsAAA4Gq6pVEzCVoTKGVkkimB_V_e88TxaZkLf",
+        },
     },
     .paths = .{
         "build.zig",

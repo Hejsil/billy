@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const billy = @import("billy");
+const spaghet = @import("spaghet");
 
 /// What billy is, shown at the top of its own help.
 const billy_about = "A small fast AI agent that works in your terminal.";
@@ -134,8 +135,8 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout_file_writer.interface;
     defer out.flush() catch {};
 
-    const args = try std.process.Args.toSlice(init.minimal.args, arena);
-    const options = parseArgs(args) catch |err| {
+    const argv = try std.process.Args.toSlice(init.minimal.args, arena);
+    const options = parseArgsSlice(argv[1..]) catch |err| {
         std.log.err("invalid arguments, try --help", .{});
         return err;
     };
@@ -291,151 +292,159 @@ fn runSession(
     try billy.agent.run(io, init.gpa, out, config, &session, target);
 }
 
-/// Reads the command line, whose first entry is the executable name. The `login`
-/// subcommand takes the rest of the line, so it is read on its own rather than
-/// mixed with the run options.
-fn parseArgs(args: []const [:0]const u8) error{ InvalidArgument, MissingValue }!Options {
-    if (args.len > 1 and std.mem.eql(u8, args[1], "login")) {
-        if (args.len == 2) return .{ .login = .{} };
-        if (args.len == 3 and isHelp(args[2])) return .{ .login = .{ .help = true } };
-        if (args.len == 3 and args[2].len > 0 and args[2][0] != '-') {
-            return .{ .login = .{ .service = args[2] } };
-        }
-        return error.InvalidArgument;
-    }
-
-    // `config` takes exactly a setting and the value to give it, and owns the
-    // rest of the line, so neither is read as a run option.
-    if (args.len > 1 and std.mem.eql(u8, args[1], "config")) {
-        if (args.len == 3 and isHelp(args[2])) return .{ .config = .{ .help = true } };
-        if (args.len == 4 and args[2].len > 0 and args[2][0] != '-') {
-            return .{ .config = .{ .path = args[2], .value = args[3] } };
-        }
-        return error.InvalidArgument;
-    }
-
-    // `serve` takes an optional port and nothing else, and owns the rest of the
-    // line, so an option that follows it is not read as a run option.
-    if (args.len > 1 and std.mem.eql(u8, args[1], "serve")) {
-        return parseServe(args[2..]);
-    }
-
+/// Reads billy's arguments: what to run, and the options of whichever part of
+/// it was asked for.
+fn parseArgs(args: *spaghet.Args) error{ InvalidArgument, MissingValue }!Options {
     var options: Options = .{};
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (isHelp(arg)) {
+    while (args.next()) {
+        if (args.flag(&.{ "-h", "--help" }))
             options.help = true;
-        } else if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "--resume")) {
-            i += 1;
-            if (i == args.len) return error.MissingValue;
-            options.resume_id = args[i];
-        } else if (std.mem.startsWith(u8, arg, "--resume=")) {
-            options.resume_id = arg["--resume=".len..];
-        } else {
-            return error.InvalidArgument;
-        }
+        if (args.option(&.{ "-r", "--resume" })) |id|
+            options.resume_id = id;
+        if (args.positional()) |command|
+            return parseCommand(args, command);
     }
     return options;
 }
 
-/// Reads the arguments of the `serve` subcommand: nothing, a usage, an address,
-/// or a port.
-fn parseServe(rest: []const [:0]const u8) error{ InvalidArgument, MissingValue }!Options {
-    var serve: Options.Serve = .{};
-    var i: usize = 0;
-    while (i < rest.len) : (i += 1) {
-        const arg = rest[i];
-        if (isHelp(arg)) {
-            serve.help = true;
-        } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--port")) {
-            i += 1;
-            if (i == rest.len) return error.MissingValue;
-            serve.port = std.fmt.parseInt(u16, rest[i], 10) catch return error.InvalidArgument;
-        } else if (std.mem.startsWith(u8, arg, "--port=")) {
-            serve.port = std.fmt.parseInt(u16, arg["--port=".len..], 10) catch return error.InvalidArgument;
-        } else if (std.mem.eql(u8, arg, "--host")) {
-            i += 1;
-            if (i == rest.len) return error.MissingValue;
-            serve.host = rest[i];
-        } else if (std.mem.startsWith(u8, arg, "--host=")) {
-            serve.host = arg["--host=".len..];
-        } else {
+/// Reads the subcommand `command`, which is the first argument of the line.
+fn parseCommand(args: *spaghet.Args, command: []const u8) error{ InvalidArgument, MissingValue }!Options {
+    if (std.mem.eql(u8, command, "login"))
+        return .{ .login = try parseLogin(args) };
+    if (std.mem.eql(u8, command, "config"))
+        return .{ .config = try parseConfig(args) };
+    if (std.mem.eql(u8, command, "serve"))
+        return .{ .serve = try parseServe(args) };
+    return error.InvalidArgument;
+}
+
+/// Reads the arguments of the `login` subcommand: nothing, or the service to
+/// store a key for, and its own usage.
+fn parseLogin(args: *spaghet.Args) error{InvalidArgument}!Options.Login {
+    var login: Options.Login = .{};
+    while (args.next()) {
+        if (args.flag(&.{ "-h", "--help" }))
+            login.help = true;
+        if (login.service == null)
+            login.service = args.positional();
+        if (args.positional()) |_|
             return error.InvalidArgument;
-        }
     }
-    return .{ .serve = serve };
+    return login;
+}
+
+/// Reads the arguments of the `config` subcommand: a setting and the value to
+/// give it, and its own usage. Neither is optional: a setting with nothing to
+/// set it to names no change to make.
+fn parseConfig(args: *spaghet.Args) error{InvalidArgument}!Options.Config {
+    var setting: Options.Config = .{};
+    while (args.next()) {
+        if (args.flag(&.{ "-h", "--help" }))
+            setting.help = true;
+        if (setting.path == null)
+            setting.path = args.positional();
+        if (setting.value == null)
+            setting.value = args.positional();
+        if (args.positional()) |_|
+            return error.InvalidArgument;
+    }
+    if (!setting.help and (setting.path == null or setting.value == null)) {
+        return error.InvalidArgument;
+    }
+    return setting;
+}
+
+/// Reads the arguments of the `serve` subcommand: where it listens, and its own
+/// usage.
+fn parseServe(args: *spaghet.Args) error{ InvalidArgument, MissingValue }!Options.Serve {
+    var serve: Options.Serve = .{};
+    while (args.next()) {
+        if (args.flag(&.{ "-h", "--help" }))
+            serve.help = true;
+        if (args.option(&.{ "-p", "--port" })) |port|
+            serve.port = std.fmt.parseInt(u16, port, 10) catch return error.InvalidArgument;
+        if (args.option(&.{"--host"})) |host|
+            serve.host = host;
+        if (args.positional()) |_|
+            return error.InvalidArgument;
+    }
+    return serve;
+}
+
+/// Parses `line`, which is the arguments of one command line with the program
+/// name left off, the way `main` parses the ones it is given.
+fn parseArgsSlice(line: []const []const u8) error{ InvalidArgument, MissingValue }!Options {
+    var args = spaghet.Args.initSlice(line);
+    return parseArgs(&args);
 }
 
 test "parseArgs" {
-    try expectOptions(.{}, try parseArgs(&.{"billy"}));
-    try expectOptions(.{ .help = true }, try parseArgs(&.{ "billy", "--help" }));
+    try expectOptions(.{}, try parseArgsSlice(&.{}));
+    try expectOptions(.{ .help = true }, try parseArgsSlice(&.{"--help"}));
     try expectOptions(
         .{ .resume_id = "20250131-120000" },
-        try parseArgs(&.{ "billy", "--resume", "20250131-120000" }),
+        try parseArgsSlice(&.{ "--resume", "20250131-120000" }),
     );
-    try expectOptions(.{ .resume_id = "dev" }, try parseArgs(&.{ "billy", "-r", "dev" }));
-    try expectOptions(.{ .resume_id = "dev" }, try parseArgs(&.{ "billy", "--resume=dev" }));
+    try expectOptions(.{ .resume_id = "dev" }, try parseArgsSlice(&.{ "-r", "dev" }));
+    try expectOptions(.{ .resume_id = "dev" }, try parseArgsSlice(&.{"--resume=dev"}));
     try expectOptions(
         .{ .help = true, .resume_id = "both" },
-        try parseArgs(&.{ "billy", "--help", "--resume=both" }),
+        try parseArgsSlice(&.{ "--help", "--resume=both" }),
     );
-    try std.testing.expectError(error.MissingValue, parseArgs(&.{ "billy", "--resume" }));
-    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "--nope" }));
-    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "extra" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{"--resume"}));
+    try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{"--nope"}));
+    try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{"extra"}));
 }
 
 test "parseArgs reads the login subcommand on its own" {
-    try expectOptions(.{ .login = .{} }, try parseArgs(&.{ "billy", "login" }));
+    try expectOptions(.{ .login = .{} }, try parseArgsSlice(&.{"login"}));
     try expectOptions(
         .{ .login = .{ .service = "tavily" } },
-        try parseArgs(&.{ "billy", "login", "tavily" }),
+        try parseArgsSlice(&.{ "login", "tavily" }),
     );
     // The subcommand has its own usage, so `-h` after it is not read as a run
     // option.
-    try expectOptions(.{ .login = .{ .help = true } }, try parseArgs(&.{ "billy", "login", "-h" }));
-    try expectOptions(.{ .login = .{ .help = true } }, try parseArgs(&.{ "billy", "login", "--help" }));
+    try expectOptions(.{ .login = .{ .help = true } }, try parseArgsSlice(&.{ "login", "-h" }));
+    try expectOptions(.{ .login = .{ .help = true } }, try parseArgsSlice(&.{ "login", "--help" }));
     // The subcommand owns the rest of the line, so a run option after it is not
     // a run option, a second service is not an argument it takes, and a service
     // beside the usage is not read.
-    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "login", "--resume" }));
-    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "login", "tavily", "extra" }));
-    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "login", "" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "login", "tavily", "extra" }));
 }
 
 test "parseArgs reads the serve subcommand on its own" {
     // No port: the default, and no help.
-    try expectOptions(.{ .serve = .{} }, try parseArgs(&.{ "billy", "serve" }));
+    try expectOptions(.{ .serve = .{} }, try parseArgsSlice(&.{"serve"}));
 
     // The port is read, however it is written.
-    try expectServe(9000, try parseArgs(&.{ "billy", "serve", "--port", "9000" }));
-    try expectServe(9000, try parseArgs(&.{ "billy", "serve", "-p", "9000" }));
-    try expectServe(9000, try parseArgs(&.{ "billy", "serve", "--port=9000" }));
-    try expectServe(0, try parseArgs(&.{ "billy", "serve", "--port", "0" }));
+    try expectServe(9000, try parseArgsSlice(&.{ "serve", "--port", "9000" }));
+    try expectServe(9000, try parseArgsSlice(&.{ "serve", "-p", "9000" }));
+    try expectServe(9000, try parseArgsSlice(&.{ "serve", "--port=9000" }));
+    try expectServe(0, try parseArgsSlice(&.{ "serve", "--port", "0" }));
 
     // The address is read too, and both may be given in either order.
-    try expectHost("0.0.0.0", try parseArgs(&.{ "billy", "serve", "--host", "0.0.0.0" }));
-    try expectHost("192.168.1.5", try parseArgs(&.{ "billy", "serve", "--host=192.168.1.5" }));
-    try expectHost("::1", try parseArgs(&.{ "billy", "serve", "--host", "::1", "--port", "9" }));
-    try expectHost("::1", try parseArgs(&.{ "billy", "serve", "--port", "9", "--host", "::1" }));
+    try expectHost("0.0.0.0", try parseArgsSlice(&.{ "serve", "--host", "0.0.0.0" }));
+    try expectHost("192.168.1.5", try parseArgsSlice(&.{ "serve", "--host=192.168.1.5" }));
+    try expectHost("::1", try parseArgsSlice(&.{ "serve", "--host", "::1", "--port", "9" }));
+    try expectHost("::1", try parseArgsSlice(&.{ "serve", "--port", "9", "--host", "::1" }));
     // An address that is not given a value is refused, like a port.
-    try std.testing.expectError(error.MissingValue, parseArgs(&.{ "billy", "serve", "--host" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "serve", "--host" }));
     // The default is to listen where only this machine can reach.
-    try expectHost(billy.Server.default_host, try parseArgs(&.{ "billy", "serve" }));
+    try expectHost(billy.Server.default_host, try parseArgsSlice(&.{"serve"}));
 
     // The subcommand has its own usage.
-    try expectOptions(.{ .serve = .{ .help = true } }, try parseArgs(&.{ "billy", "serve", "-h" }));
-    try expectOptions(.{ .serve = .{ .help = true } }, try parseArgs(&.{ "billy", "serve", "--help" }));
+    try expectOptions(.{ .serve = .{ .help = true } }, try parseArgsSlice(&.{ "serve", "-h" }));
+    try expectOptions(.{ .serve = .{ .help = true } }, try parseArgsSlice(&.{ "serve", "--help" }));
 
     // A port that is missing, or not a number, or out of range, is refused.
-    try std.testing.expectError(error.MissingValue, parseArgs(&.{ "billy", "serve", "--port" }));
-    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "serve", "--port", "abc" }));
-    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "serve", "--port", "70000" }));
-    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "serve", "--port=-1" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "serve", "--port" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "serve", "--port", "abc" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "serve", "--port", "70000" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "serve", "--port=-1" }));
     // The subcommand owns the rest of the line, so a run option after it is not
     // a run option.
-    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "serve", "--resume", "x" }));
-    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "serve", "extra" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "serve", "--resume", "x" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "serve", "extra" }));
 }
 
 /// Checks the port a serve parse read, since `expectOptions` cannot compare it.
@@ -453,26 +462,25 @@ fn expectHost(expected: []const u8, actual: Options) !void {
 test "parseArgs reads the config subcommand on its own" {
     try expectOptions(
         .{ .config = .{ .path = "tools.bash.format", .value = "shfmt | bat -l bash" } },
-        try parseArgs(&.{ "billy", "config", "tools.bash.format", "shfmt | bat -l bash" }),
+        try parseArgsSlice(&.{ "config", "tools.bash.format", "shfmt | bat -l bash" }),
     );
     // A value may look like an option or be empty; the path may not.
     try expectOptions(
         .{ .config = .{ .path = "tools.bash.format", .value = "--nope" } },
-        try parseArgs(&.{ "billy", "config", "tools.bash.format", "--nope" }),
+        try parseArgsSlice(&.{ "config", "tools.bash.format", "--nope" }),
     );
     try expectOptions(
         .{ .config = .{ .path = "tools.edit.format", .value = "" } },
-        try parseArgs(&.{ "billy", "config", "tools.edit.format", "" }),
+        try parseArgsSlice(&.{ "config", "tools.edit.format", "" }),
     );
     // The subcommand has its own usage.
-    try expectOptions(.{ .config = .{ .help = true } }, try parseArgs(&.{ "billy", "config", "-h" }));
-    try expectOptions(.{ .config = .{ .help = true } }, try parseArgs(&.{ "billy", "config", "--help" }));
+    try expectOptions(.{ .config = .{ .help = true } }, try parseArgsSlice(&.{ "config", "-h" }));
+    try expectOptions(.{ .config = .{ .help = true } }, try parseArgsSlice(&.{ "config", "--help" }));
     // A setting without a value, a value without a setting, an option-shaped
     // setting, and trailing arguments are all refused.
-    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "config" }));
-    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "config", "max_turns" }));
-    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "config", "--nope", "1" }));
-    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "billy", "config", "max_turns", "1", "extra" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{"config"}));
+    try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "config", "max_turns" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "config", "max_turns", "1", "extra" }));
 }
 
 /// The slices in `Options` are compared by content rather than by pointer.

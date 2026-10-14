@@ -7,6 +7,10 @@ pub fn build(b: *std.Build) void {
     const filters = b.option([]const []const u8, "filter", "Run only tests whose names contain this substring") orelse &.{};
 
     const md4c = b.dependency("md4c", .{});
+    const spaghet = b.dependency("spaghet", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
     // The md4c binding is translated from its headers at build time, since
     // `@cImport` was removed in Zig 0.17 and translate-c is now a package of its
@@ -47,6 +51,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "billy", .module = mod },
+                .{ .name = "spaghet", .module = spaghet.module("spaghet") },
             },
         }),
     });
