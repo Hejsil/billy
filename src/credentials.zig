@@ -202,32 +202,6 @@ fn writeStored(store: *const Store, json: *std.json.Stringify) !void {
     try json.endObject();
 }
 
-/// Runs the `login` command: with no service, lists the services and where each
-/// key comes from; with one, reads a key for it and stores it. `dir_path` is the
-/// directory the credentials are kept in, named in what is printed.
-///
-/// `providers` are the names the configuration defines, which are the other
-/// services a key may be stored for: a name billy does not ship is one only the
-/// file that names it can make sense of, so a key stored under any other is one
-/// nothing will ever read.
-///
-/// `arena` is the store's own allocator: the one `load` read it with, so a key
-/// added here is owned the same way the ones already there are. It must be the
-/// same one, or the store would hold keys two allocators own.
-pub fn run(
-    io: std.Io,
-    out: *std.Io.Writer,
-    arena: std.mem.Allocator,
-    dir: std.Io.Dir,
-    store: *Store,
-    providers: []const []const u8,
-    service_name: ?[]const u8,
-) !void {
-    if (service_name) |name|
-        return login(io, out, arena, dir, store, providers, name);
-    try list(out, store, providers);
-}
-
 /// Whether a key can be stored for `name`: a service billy ships, or one the
 /// configuration names. Any other name is one no request will ever ask for, so
 /// storing a key under it would only look like it worked.
@@ -239,8 +213,13 @@ fn acceptable(name: []const u8, providers: []const []const u8) bool {
     return false;
 }
 
-/// Reads a key for the named service and stores it, so the next run uses it.
-fn login(
+/// Reads a key for `name` and stores it, so the next run uses it.
+///
+/// `providers` are the names the configuration defines, which are the other
+/// services a key may be stored for: a name billy does not ship is one only the
+/// file that names it can make sense of, so a key stored under any other is one
+/// nothing will ever read.
+pub fn login(
     io: std.Io,
     out: *std.Io.Writer,
     arena: std.mem.Allocator,
@@ -291,7 +270,7 @@ const dangling_purpose = "a service billy does not know";
 /// billy ships, the providers the configuration names, and any other name a key
 /// is stored under. The last are listed rather than hidden, so a file written by
 /// hand or by a billy whose configuration has since changed is not a mystery.
-fn list(out: *std.Io.Writer, store: *const Store, providers: []const []const u8) !void {
+pub fn list(out: *std.Io.Writer, store: *const Store, providers: []const []const u8) !void {
     // Every row that will be printed decides the columns, so a long name of the
     // user's own widens them all rather than running past the end.
     var name_width: usize = 0;

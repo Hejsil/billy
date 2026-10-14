@@ -459,47 +459,6 @@ fn isSettableValue(comptime T: type) bool {
     };
 }
 
-/// Runs the `config` command: sets the option named by `path` to `value` and
-/// writes the configuration back, so a setting can be changed without opening
-/// the file by hand. The file lives in `dir`, which `dir_path` names and the
-/// caller owns; `gpa` backs the configuration's own arena while it is read and
-/// written.
-pub fn run(
-    io: std.Io,
-    out: *std.Io.Writer,
-    gpa: std.mem.Allocator,
-    dir: std.Io.Dir,
-    path: []const u8,
-    value: []const u8,
-) !void {
-    var opened = open(io, dir, gpa) catch |err| {
-        std.log.err("cannot read the configuration: {s}", .{@errorName(err)});
-        return err;
-    };
-    defer opened.config.deinit();
-
-    set(&opened.config, path, value) catch |err| switch (err) {
-        error.UnknownOption => {
-            std.log.err("'{s}' is not a configuration setting", .{path});
-            return err;
-        },
-        error.NotASection => {
-            std.log.err("'{s}' names a section, not a setting", .{path});
-            return err;
-        },
-        error.InvalidValue => {
-            std.log.err("'{s}' is not something {s} takes", .{ value, path });
-            return err;
-        },
-        else => |other| return other,
-    };
-    opened.config.save(io, dir) catch |err| {
-        std.log.err("cannot write the configuration: {s}", .{@errorName(err)});
-        return err;
-    };
-    try out.print("set {s} to {s}\n", .{ path, value });
-}
-
 /// Writes `json` as the configuration file and opens it, so a test reads as the
 /// file it wrote and the setting it read back. The caller frees what comes back
 /// with `opened.config.deinit()`.
@@ -922,29 +881,4 @@ test "a setting set by path is written and read back" {
     try std.testing.expectEqualStrings("shfmt", opened.config.stored.tools.bash.format.?);
     try std.testing.expectEqual(45, opened.config.stored.tools.bash.timeout_s);
     try std.testing.expectEqualStrings("https://searx.example.org", opened.config.stored.tools.web_search.searxng.url.?);
-}
-
-test "run sets a setting in the file, creating it when it is missing" {
-    const gpa = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    // The directory the file lives in is the caller's, so a run writes where it
-    // is told rather than at the user's own configuration.
-    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
-    defer gpa.free(dir_path);
-
-    var sink: std.Io.Writer.Allocating = .init(gpa);
-    defer sink.deinit();
-    try run(std.testing.io, &sink.writer, gpa, tmp.dir, "tools.bash.format", "shfmt");
-
-    var opened = try Config.open(std.testing.io, tmp.dir, gpa);
-    defer opened.config.deinit();
-
-    try std.testing.expectEqualStrings("shfmt", opened.config.stored.tools.bash.format.?);
-    // The other settings keep their defaults, so the file is a whole one.
-    try std.testing.expectEqual(Stored.default.max_turns, opened.config.stored.max_turns);
-    // The message names the setting and the file it was written to.
-    try std.testing.expect(std.mem.indexOf(u8, sink.written(), "tools.bash.format") != null);
 }

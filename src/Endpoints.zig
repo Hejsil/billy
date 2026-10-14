@@ -37,6 +37,31 @@ pub const Endpoint = struct {
 pub const Backends = struct {
     search: ?tools.web.Search.Config,
     fetch: ?tools.web.Fetch.Config,
+
+    /// The backends the configuration names, reporting the one at fault when a
+    /// backend it names cannot be built: the configuration asked for the tool,
+    /// so leaving it out without a word would look like a bug.
+    pub fn build(
+        arena: std.mem.Allocator,
+        config: Config,
+        store: *const credentials.Store,
+    ) !Backends {
+        // Which backend each set is built from, remembered so the report can
+        // name it: only the builder knows which provider it was on.
+        var search_failed: tools.web.Search.Provider = .tavily;
+        const search_config = searchConfig(arena, store, config, &search_failed) catch |err| {
+            reportSearchFailure(err, search_failed);
+            return err;
+        };
+
+        var fetch_failed: tools.web.Fetch.Provider = .raw;
+        const fetch_config = fetchConfig(arena, store, config, &fetch_failed) catch |err| {
+            reportFetchFailure(err, fetch_failed);
+            return err;
+        };
+
+        return .{ .search = search_config, .fetch = fetch_config };
+    }
 };
 
 /// Where the configuration sends its requests: the provider and model it names,
@@ -79,7 +104,7 @@ pub fn sessionTarget(
 
 /// Where `choice` is sent, which is the four things a request needs that follow
 /// from it rather than from the configured endpoint.
-pub fn targetFor(
+fn targetFor(
     config: Config,
     store: *const credentials.Store,
     arena: std.mem.Allocator,
@@ -233,7 +258,7 @@ fn reasoningOf(setting: []const u8) llm.Reasoning {
 /// The report of what went wrong is written here rather than by the caller, so
 /// naming the backend that is at fault does not need an out-parameter: only this
 /// function knows which provider it was on.
-pub fn searchConfig(
+fn searchConfig(
     arena: std.mem.Allocator,
     store: *const credentials.Store,
     config: Config,
@@ -300,7 +325,7 @@ pub fn fetchConfig(
 ///
 /// A failure here is one the configuration asked for -- it named the backend --
 /// so leaving the tool out quietly would look like a bug rather than a choice.
-pub fn reportSearchFailure(err: anyerror, provider: tools.web.Search.Provider) void {
+fn reportSearchFailure(err: anyerror, provider: tools.web.Search.Provider) void {
     switch (err) {
         error.MissingApiKey => {
             // A backend reached with a key is one of the services, since the one
@@ -321,7 +346,7 @@ pub fn reportSearchFailure(err: anyerror, provider: tools.web.Search.Provider) v
 
 /// Tells the user what to fix about the fetch backend that could not be built,
 /// on the same terms as `reportSearchFailure`.
-pub fn reportFetchFailure(err: anyerror, provider: tools.web.Fetch.Provider) void {
+fn reportFetchFailure(err: anyerror, provider: tools.web.Fetch.Provider) void {
     switch (err) {
         error.MissingApiKey => {
             const service = credentials.fetchService(provider).?;

@@ -18,11 +18,12 @@
 const std = @import("std");
 const Agent = @import("Agent.zig");
 const Config = @import("Config.zig");
+const credentials = @import("credentials.zig");
+const Endpoints = @import("Endpoints.zig");
 const Health = @import("Health.zig");
 const html = @import("html.zig");
 const models = @import("models.zig");
 const Session = @import("Session.zig");
-const Setup = @import("Setup.zig");
 
 const Server = @This();
 
@@ -72,8 +73,38 @@ const max_connections = 64;
 
 io: std.Io,
 gpa: std.mem.Allocator,
+/// The session files, and the directory the user's own instructions live in,
+/// which joins every session's prompt. Both are billy's and outlive the server.
 session_dir: std.Io.Dir,
-setup: *Setup,
+config_dir: std.Io.Dir,
+/// The configuration, the keys and the waits every request is built from.
+config: Config,
+store: credentials.Store,
+health: *Health,
+/// Where billy was started, and the environment it was started in: the home
+/// directory shown in the header, and what the model is told about itself.
+cwd: []const u8,
+environ: *const std.process.Environ.Map,
+/// Where the configuration sends its requests, and the backends its web tools
+/// ask, resolved before anything was served so a key that is missing is
+/// reported then rather than on the first thing asked.
+endpoint: Endpoints.Endpoint,
+backends: Endpoints.Backends,
+
+/// The configuration a turn is built from: the same as a terminal run's, laid
+/// out plainly rather than decorated for a terminal.
+fn agentConfig(server: *const Server, cwd: []const u8) Agent.Config {
+    return Endpoints.agentConfig(
+        server.config,
+        server.endpoint,
+        server.backends,
+        server.health,
+        server.environ,
+        cwd,
+        .plain,
+        server.config_dir,
+    );
+}
 
 /// Serves the frontend on the address `host` at `port`, until the process is
 /// stopped. Zero asks the system for a free port, which is what a test uses.
@@ -274,7 +305,7 @@ const Request = struct {
     /// so the caller has nothing more to do. Which status an id deserves is
     /// decided here, once, rather than by every route that opens one.
     fn openSession(r: *Request, id: []const u8) !?Session {
-        return Session.open(r.server.io, r.server.session_dir, r.server.gpa, id, r.server.setup.cwd) catch |err| switch (err) {
+        return Session.open(r.server.io, r.server.session_dir, r.server.gpa, id, r.server.cwd) catch |err| switch (err) {
             // An id that could not be a session name is a bad request rather than
             // a missing session: what was asked for could never exist.
             error.InvalidSessionId => {
@@ -505,7 +536,7 @@ fn writeSession(
     id: []const u8,
     out: *std.Io.Writer,
 ) !bool {
-    var session = Session.open(server.io, server.session_dir, gpa, id, server.setup.cwd) catch |err| switch (err) {
+    var session = Session.open(server.io, server.session_dir, gpa, id, server.cwd) catch |err| switch (err) {
         error.SessionNotFound => return false,
         else => return err,
     };
@@ -517,7 +548,7 @@ fn writeSession(
 
     var blocks: std.Io.Writer.Allocating = .init(gpa);
     defer blocks.deinit();
-    try html.conversation(gpa, &session, server.setup.config.stored.web_blocks, &blocks.writer);
+    try html.conversation(gpa, &session, server.config.stored.web_blocks, &blocks.writer);
 
     try writeOpened(out, header.written(), blocks.written(), @tagName(session.mode));
     return true;
@@ -735,7 +766,7 @@ fn createSession(r: *Request, registry: *Registry, http_client: *std.http.Client
     defer parsed.deinit();
 
     // A fresh session with a new id and no file: the first message writes it.
-    var session = try Session.open(r.server.io, r.server.session_dir, gpa, null, r.server.setup.cwd);
+    var session = try Session.open(r.server.io, r.server.session_dir, gpa, null, r.server.cwd);
     defer session.deinit();
     if (!try r.claim(registry, session.id())) return;
     defer registry.release(session.id());
@@ -747,7 +778,7 @@ fn createSession(r: *Request, registry: *Registry, http_client: *std.http.Client
     const choice = Agent.Mode.start(parsed.value.text, parsed.value.mode orelse default_mode);
     if (choice.text.len == 0)
         return r.reply(.text, "the prompt is empty\n", .bad_request);
-    var config = r.server.setup.agentConfig(session.cwd(), .plain);
+    var config = r.server.agentConfig(session.cwd());
     config.mode = choice.mode;
 
     try serveTurn(r, http_client, &session, config, choice.text, session.id());
@@ -773,7 +804,7 @@ fn askSession(r: *Request, registry: *Registry, http_client: *std.http.Client, i
     var session = (try r.openSession(id)) orelse return;
     defer session.deinit();
 
-    try serveTurn(r, http_client, &session, r.server.setup.agentConfig(session.cwd(), .plain), parsed.value.text, null);
+    try serveTurn(r, http_client, &session, r.server.agentConfig(session.cwd()), parsed.value.text, null);
 }
 
 /// Answers one prompt as the run happens: the run's blocks as the events of a
@@ -803,7 +834,12 @@ fn serveTurn(
     // The session is prepared from the mode the caller settled, which is the
     // session's own once it has been asked something. It is sent where its own
     // recorded provider lives, which may not be where the server is configured.
-    try agent.prepare(session, try r.server.setup.sessionTarget(target_state.allocator(), session));
+    try agent.prepare(session, try Endpoints.sessionTarget(
+        r.server.config,
+        &r.server.store,
+        target_state.allocator(),
+        session,
+    ));
 
     // The head of the reply goes out before the run starts, so the page can read
     // the stream while the model is working. From here on a failure is part of
@@ -873,11 +909,11 @@ fn serveTurn(
 fn writeHeader(server: *const Server, session: *const Session, out: *std.Io.Writer) !void {
     try html.header(.{
         .id = session.id(),
-        .model = server.setup.endpoint.model,
+        .model = server.endpoint.model,
         .cwd = session.cwd(),
-        .home = server.setup.environ.get("HOME"),
+        .home = server.environ.get("HOME"),
         .context_tokens = session.context_tokens,
-        .model_info = models.lookup(server.setup.endpoint.provider, server.setup.endpoint.model),
+        .model_info = models.lookup(server.endpoint.provider, server.endpoint.model),
     }, out);
 }
 
@@ -970,24 +1006,26 @@ const Stream = struct {
     }
 };
 
-/// A `Setup` over a temporary directory, for a test that drives a route.
+/// A server over a temporary directory, for a test that drives a route.
 ///
 /// The real one reads the environment, the configuration file and the
 /// credentials; a route needs none of that, only somewhere to keep sessions and
 /// a model to name. What it does not read is left empty, and nothing in the
 /// routes reaches for it.
 const TestServer = struct {
-    setup: Setup,
+    /// The server the routes are asked through: the same fields a served
+    /// connection has, built once so a test drives what is really there.
+    server: Server,
     tmp: std.testing.TmpDir,
-    /// The configuration the setup points at, freed with it.
+    /// The configuration the server points at, freed with it.
     config: Config,
-    /// The environment the setup reads, which a route asks for `HOME`. It is
-    /// held by pointer and allocated, so the address the setup was given stays
+    /// The environment the server reads, which a route asks for `HOME`. It is
+    /// held by pointer and allocated, so the address the server was given stays
     /// the map's when this value is moved out of `init`.
     environ: *std.process.Environ.Map,
-    /// Which search backends are set aside, so the search settings the setup
-    /// carries point at a table that is really there.
-    health: Health,
+    /// Which search backends are set aside. Allocated for the same reason as the
+    /// environment: the server points at it, and it must not move.
+    health: *Health,
     /// What the server knows beyond the session files, and the client its routes
     /// borrow, which outlive every request made through this.
     registry: Registry,
@@ -1005,8 +1043,11 @@ const TestServer = struct {
         environ.* = .init(gpa);
         errdefer environ.deinit();
         try environ.put("HOME", "/home/tester");
-        const health = try Health.load(std.testing.io, gpa, tmp.dir);
+        const health = try gpa.create(Health);
+        errdefer gpa.destroy(health);
+        health.* = try Health.load(std.testing.io, gpa, tmp.dir);
         errdefer health.deinit();
+
         return .{
             .tmp = tmp,
             .config = config,
@@ -1014,14 +1055,16 @@ const TestServer = struct {
             .health = health,
             .registry = .{ .io = std.testing.io, .gpa = gpa },
             .http = .{ .allocator = gpa, .io = std.testing.io },
-            .setup = .{
-                .environ = environ,
-                .config = config,
-                .sessions = sessions,
-                .data_dir = tmp.dir,
+            .server = .{
+                .io = std.testing.io,
+                .gpa = gpa,
+                .session_dir = sessions,
                 .config_dir = tmp.dir,
-                .cwd = ".",
+                .config = config,
                 .store = .{},
+                .health = health,
+                .cwd = ".",
+                .environ = environ,
                 .endpoint = .{
                     .base_url = "https://api.deepseek.com",
                     .url = "https://api.deepseek.com/chat/completions",
@@ -1030,7 +1073,6 @@ const TestServer = struct {
                     .provider = .deepseek,
                 },
                 .backends = .{ .search = null, .fetch = null },
-                .health = health,
             },
         };
     }
@@ -1038,8 +1080,9 @@ const TestServer = struct {
     fn deinit(server: *TestServer) void {
         server.http.deinit();
         server.registry.deinit();
+        server.server.session_dir.close(std.testing.io);
         server.health.deinit();
-        server.setup.sessions.close(std.testing.io);
+        std.testing.allocator.destroy(server.health);
         server.config.deinit();
         server.environ.deinit();
         std.testing.allocator.destroy(server.environ);
@@ -1048,14 +1091,14 @@ const TestServer = struct {
 
     /// Answers `method path` with `body`, through the real `route`.
     fn exchange(server: *TestServer, method: std.http.Method, path: []const u8, body: ?[]const u8) !Exchange {
-        return Exchange.run(&server.setup, &server.registry, &server.http, method, path, body);
+        return Exchange.run(&server.server, &server.registry, &server.http, method, path, body);
     }
 
     /// A session holding one prompt and its reply, written to disk and named as
     /// `title` when there is one, so a route has something to serve. Its id is
     /// returned, owned by the caller.
     fn session(server: *TestServer, title: ?[]const u8) ![]const u8 {
-        var opened = try Session.open(std.testing.io, server.setup.sessions, std.testing.allocator, null, ".");
+        var opened = try Session.open(std.testing.io, server.server.session_dir, std.testing.allocator, null, ".");
         defer opened.deinit();
 
         if (title) |name|
@@ -1088,7 +1131,7 @@ const Exchange = struct {
 
     /// Answers `method path` with `body`, exactly as the server would.
     fn run(
-        setup: *Setup,
+        server: *const Server,
         registry: *Registry,
         http_client: *std.http.Client,
         method: std.http.Method,
@@ -1118,13 +1161,7 @@ const Exchange = struct {
         var http_server: std.http.Server = .init(&reader, &writer);
         var request = try http_server.receiveHead();
 
-        const server = Server{
-            .io = std.testing.io,
-            .gpa = gpa,
-            .session_dir = setup.sessions,
-            .setup = setup,
-        };
-        var r = Request{ .server = &server, .request = &request };
+        var r = Request{ .server = server, .request = &request };
         try route(&r, registry, http_client);
 
         exchange.answered = r.answered;
@@ -1245,7 +1282,7 @@ test "a session is renamed, and the name is on disk" {
     try std.testing.expectEqualStrings("HTTP/1.1 200 OK", renamed.statusLine());
 
     // The new name is on disk, not only in the answer.
-    var reread = try Session.open(std.testing.io, server.setup.sessions, std.testing.allocator, id, ".");
+    var reread = try Session.open(std.testing.io, server.server.session_dir, std.testing.allocator, id, ".");
     defer reread.deinit();
 
     try std.testing.expectEqualStrings("renamed by the test", reread.title().?);
@@ -1272,7 +1309,7 @@ test "a rename that says nothing usable is refused" {
     try std.testing.expectEqualStrings("HTTP/1.1 400 Bad Request", not_json.statusLine());
 
     // And the session is left unnamed rather than holding either of them.
-    var reread = try Session.open(std.testing.io, server.setup.sessions, std.testing.allocator, id, ".");
+    var reread = try Session.open(std.testing.io, server.server.session_dir, std.testing.allocator, id, ".");
     defer reread.deinit();
 
     try std.testing.expect(reread.title() == null);
@@ -1294,7 +1331,7 @@ test "a session is deleted, and deleting it again is a 404" {
     // Gone from disk, so nothing can be opened by that id again.
     try std.testing.expectError(error.SessionNotFound, Session.open(
         std.testing.io,
-        server.setup.sessions,
+        server.server.session_dir,
         std.testing.allocator,
         id,
         ".",

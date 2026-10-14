@@ -35,9 +35,9 @@ const Command = enum {
 /// that the configuration's own endpoint cannot supply, since a session may name
 /// a provider other than the configured one.
 ///
-/// It lives here rather than in `Setup`, which resolves it, because `Setup`
-/// imports this module; the resolver is handed in as a function, so neither has
-/// to know the other's type.
+/// It lives here rather than beside the module that resolves it, because that
+/// module imports this one; the two are kept apart by naming only what a request
+/// needs, which both can.
 pub const Target = struct {
     base_url: []const u8,
     /// Full URL of the chat completions endpoint under `base_url`.

@@ -1,6 +1,7 @@
 const std = @import("std");
 
-const billy = @import("billy");
+const Billy = @import("billy").Billy;
+const Server = @import("billy").Server;
 const spaghet = @import("spaghet");
 
 /// What billy is, shown at the top of its own help.
@@ -117,9 +118,9 @@ const Options = struct {
     const Serve = struct {
         /// The address to listen on. Loopback unless asked otherwise, since the
         /// server has no authentication and its routes run commands as the user.
-        host: []const u8 = billy.Server.default_host,
+        host: []const u8 = Server.default_host,
         /// The port to listen on. Zero asks the system for a free one.
-        port: u16 = billy.Server.default_port,
+        port: u16 = Server.default_port,
         /// Whether the user asked for this subcommand's usage.
         help: bool = false,
     };
@@ -141,54 +142,48 @@ pub fn main(init: std.process.Init) !void {
         std.log.err("invalid arguments, try --help", .{});
         return err;
     };
-    if (options.help) {
-        try printHelp(out, "billy [command] [options]", billy_about, billy_commands, run_options);
-        return;
-    }
+    // A usage is answered before anything is read, so it works even when billy's
+    // own files cannot be: which of them asked is the command's own business, so
+    // it is printed here rather than in each arm below.
+    if (try printAskedHelp(options, out)) return;
+
+    // Everything else needs billy's files, so they are read in once and each way
+    // of running billy is a method on what came back.
+    var billy = try Billy.open(init, out);
+    defer billy.deinit();
 
     switch (options.command) {
-        .none => {
-            var setup = try billy.Setup.open(init, out);
-            defer setup.deinit(io);
+        .none => return billy.run(out, options.resume_id),
+        .serve => |serve| return billy.serve(serve.host, serve.port),
+        .config => |config| return billy.configSet(out, config.path.?, config.value.?),
+        .login => |login| return billy.login(out, login.service),
+    }
+}
 
-            return runSession(init, out, &setup, options.resume_id);
+/// Prints the usage `options` asked for, and says whether it asked for one. A
+/// subcommand's usage is its own, so `billy serve --help` prints that rather
+/// than billy's.
+fn printAskedHelp(options: Options, out: *std.Io.Writer) !bool {
+    if (options.help) {
+        try printHelp(out, "billy [command] [options]", billy_about, billy_commands, run_options);
+        return true;
+    }
+    switch (options.command) {
+        .none => {},
+        .login => |login| if (login.help) {
+            try printHelp(out, "billy login [<service>]", login_about, null, command_options);
+            return true;
         },
-        .serve => |serve| {
-            if (serve.help)
-                return printHelp(out, "billy serve [--port <port>] [--host <addr>]", serve_about, null, serve_options);
-
-            var setup = try billy.Setup.open(init, out);
-            defer setup.deinit(io);
-
-            const server = billy.Server{
-                .io = io,
-                .gpa = init.gpa,
-                .session_dir = setup.sessions,
-                .setup = &setup,
-            };
-            return server.serve(serve.host, serve.port);
+        .config => |config| if (config.help) {
+            try printHelp(out, "billy config <setting> <value>", config_about, null, command_options);
+            return true;
         },
-        .config => |config| {
-            if (config.help)
-                return printHelp(out, "billy config <setting> <value>", config_about, null, command_options);
-            var dirs = try billy.Dirs.open(io, arena, init.environ_map);
-            defer dirs.deinit(io);
-
-            return billy.Config.run(
-                io,
-                out,
-                init.gpa,
-                dirs.config,
-                config.path.?,
-                config.value.?,
-            );
-        },
-        .login => |login| {
-            if (login.help)
-                return printHelp(out, "billy login [<service>]", login_about, null, command_options);
-            return runLogin(init, out, login.service);
+        .serve => |serve| if (serve.help) {
+            try printHelp(out, "billy serve [--port <port>] [--host <addr>]", serve_about, null, serve_options);
+            return true;
         },
     }
+    return false;
 }
 
 /// Reads a key for a service, or lists the services, so a run need not have the
@@ -197,93 +192,7 @@ pub fn main(init: std.process.Init) !void {
 /// The configuration is read for the names of the providers it defines, which
 /// are the only names beside billy's own that a key can be stored for. Nothing
 /// else of it is used.
-fn runLogin(init: std.process.Init, out: *std.Io.Writer, service: ?[]const u8) !void {
-    const io = init.io;
-    const arena = init.arena.allocator();
-    const environ = init.environ_map;
-
-    var dirs = try billy.Dirs.open(io, arena, environ);
-    defer dirs.deinit(io);
-
-    var opened = try billy.Config.open(io, dirs.config, init.gpa);
-    defer opened.config.deinit();
-
-    var provider_names: std.ArrayList([]const u8) = .empty;
-    for (opened.config.stored.providers.entries) |entry| {
-        try provider_names.append(arena, entry.name);
-    }
-
-    var credentials = billy.credentials.load(io, dirs.data, arena) catch |err| {
-        std.log.err("cannot read the credentials: {s}", .{@errorName(err)});
-        return err;
-    };
-    try billy.credentials.run(
-        io,
-        out,
-        arena,
-        dirs.data,
-        &credentials,
-        provider_names.items,
-        service,
-    );
-}
-
 /// Runs one session in the terminal, resuming `resume_id` or starting a new one.
-fn runSession(
-    init: std.process.Init,
-    out: *std.Io.Writer,
-    setup: *billy.Setup,
-    resume_id: ?[]const u8,
-) !void {
-    const io = init.io;
-
-    // A resumed session keeps the directory it was saved with, so a session
-    // continues where it was started rather than wherever it is picked up.
-    var session = billy.Session.open(
-        io,
-        setup.sessions,
-        init.gpa,
-        resume_id,
-        setup.cwd,
-    ) catch |err| switch (err) {
-        error.SessionNotFound => {
-            std.log.err("no session '{s}'", .{resume_id.?});
-            return err;
-        },
-        error.InvalidSessionId => {
-            std.log.err("'{s}' cannot be used as a session name", .{resume_id.?});
-            return err;
-        },
-        else => return err,
-    };
-    defer session.deinit();
-
-    // The terminal lays its blocks out for the terminal it is on, which the
-    // escape codes of a pipe or a redirection would only be noise in.
-    const config = setup.agentConfig(session.cwd(), billy.Terminal.Style.detect(io, .stdout()));
-
-    if (resume_id != null) {
-        // Replay the conversation as a transcript, so the context does not
-        // have to be remembered from the previous run. Only the last few blocks
-        // are shown, so resuming a long one is quick.
-        try billy.agent.printTranscript(
-            io,
-            init.gpa,
-            out,
-            &session,
-            config.display,
-            setup.config.stored.resume_blocks,
-        );
-    }
-    // Where the session is sent is resolved into a buffer of its own, so the
-    // run frees every string it made for it when the session is over: the URL
-    // and the model are built per session, and nothing else holds them.
-    var target_state = std.heap.ArenaAllocator.init(init.gpa);
-    defer target_state.deinit();
-    const target = try setup.sessionTarget(target_state.allocator(), &session);
-    try billy.agent.run(io, init.gpa, out, config, &session, target);
-}
-
 const ParseError = error{InvalidArgument};
 
 /// Parses `slice`, which is the arguments of one command line with the program
@@ -430,7 +339,7 @@ test "parseArgs reads the serve subcommand on its own" {
     // An address that is not given a value is refused, like a port.
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "serve", "--host" }));
     // The default is to listen where only this machine can reach.
-    try expectHost(billy.Server.default_host, try parseArgsSlice(&.{"serve"}));
+    try expectHost(Server.default_host, try parseArgsSlice(&.{"serve"}));
 
     // The subcommand has its own usage.
     try expectOptions(.{ .command = .{ .serve = .{ .help = true } } }, try parseArgsSlice(&.{ "serve", "-h" }));
