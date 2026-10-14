@@ -5,6 +5,7 @@
 //! without editing, which keeps the harness usable from a pipe.
 
 const std = @import("std");
+const settings = @import("Terminal/settings.zig");
 const terminal_width = @import("Terminal/width.zig");
 
 const LineEditor = @This();
@@ -137,7 +138,7 @@ pub fn readLine(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]con
 
     const saved = try ed.enterRaw();
     defer {
-        std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, saved) catch {};
+        settings.set(std.posix.STDIN_FILENO, saved) catch {};
         // Bracketed paste is a property of the terminal rather than of this
         // process, so it is turned back off when the line is done; left on, it
         // would wrap pastes in whatever the user runs next.
@@ -675,7 +676,7 @@ fn nextByte(ed: *LineEditor) !?u8 {
 fn enterRaw(ed: *LineEditor) !std.posix.termios {
     _ = ed;
     const fd = std.posix.STDIN_FILENO;
-    const saved = try std.posix.tcgetattr(fd);
+    const saved = try settings.get(fd);
     var raw = saved;
     raw.lflag.ECHO = false;
     raw.lflag.ICANON = false;
@@ -685,7 +686,7 @@ fn enterRaw(ed: *LineEditor) !std.posix.termios {
     raw.iflag.IXON = false;
     raw.cc[@backingInt(std.posix.V.MIN)] = 0;
     raw.cc[@backingInt(std.posix.V.TIME)] = 1;
-    try std.posix.tcsetattr(fd, .NOW, raw);
+    try settings.set(fd, raw);
     return saved;
 }
 

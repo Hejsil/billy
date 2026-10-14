@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const models = @import("models.zig");
+const settings = @import("Terminal/settings.zig");
 const Tools = @import("Tools.zig");
 
 /// Name of the file the credentials are kept in, in the billy data directory.
@@ -372,14 +373,14 @@ fn readSecret(
     const saved = if (interactive) saved: {
         try out.writeAll(prompt);
         try out.flush();
-        const saved = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
+        const saved = try settings.get(std.posix.STDIN_FILENO);
         var quiet = saved;
         quiet.lflag.ECHO = false;
-        try std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, quiet);
+        try settings.set(std.posix.STDIN_FILENO, quiet);
         break :saved saved;
     } else null;
     defer if (saved) |term| {
-        std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, term) catch {};
+        settings.set(std.posix.STDIN_FILENO, term) catch {};
         // The Enter the user pressed was not echoed, so the line is ended here
         // rather than left for the next thing printed to start on.
         out.writeAll("\n") catch {};
