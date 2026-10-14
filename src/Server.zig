@@ -873,11 +873,11 @@ fn serveTurn(
 fn writeHeader(server: *const Server, session: *const Session, out: *std.Io.Writer) !void {
     try html.header(.{
         .id = session.id(),
-        .model = server.setup.model,
+        .model = server.setup.endpoint.model,
         .cwd = session.cwd(),
         .home = server.setup.environ.get("HOME"),
         .context_tokens = session.context_tokens,
-        .model_info = models.lookup(server.setup.provider, server.setup.model),
+        .model_info = models.lookup(server.setup.endpoint.provider, server.setup.endpoint.model),
     }, out);
 }
 
@@ -1021,15 +1021,15 @@ const TestServer = struct {
                 .data_dir = tmp.dir,
                 .config_dir = tmp.dir,
                 .cwd = ".",
-                .api_key = "k",
-                .base_url = "https://api.deepseek.com",
-                .url = "https://api.deepseek.com/chat/completions",
-                .model = "m",
-                .model_choice = "deepseek/m",
                 .store = .{},
-                .provider = .deepseek,
-                .search = null,
-                .fetch = null,
+                .endpoint = .{
+                    .base_url = "https://api.deepseek.com",
+                    .url = "https://api.deepseek.com/chat/completions",
+                    .api_key = "k",
+                    .model = "m",
+                    .provider = .deepseek,
+                },
+                .backends = .{ .search = null, .fetch = null },
                 .health = health,
             },
         };
