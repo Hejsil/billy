@@ -183,7 +183,7 @@ fn read(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
     ed.painted_width = ed.width;
     // The text on each row fits the same number of columns, since the prompt
     // and the continuation indent are the same width.
-    var content_width = ed.contentWidth(visibleWidth(prompt));
+    var content_width = ed.contentWidth(columns(prompt));
 
     var line: std.ArrayList(u8) = .empty;
     defer line.deinit(ed.gpa);
@@ -204,7 +204,7 @@ fn read(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
         // the region it is about to erase at the new width.
         ed.width = ed.terminalWidth();
         if (ed.width != ed.painted_width) {
-            content_width = ed.contentWidth(visibleWidth(prompt));
+            content_width = ed.contentWidth(columns(prompt));
             dirty = true;
         }
         // A run of up/down presses aims for one column; any other key ends it.
@@ -395,7 +395,7 @@ fn redraw(
     // Continuation rows are indented to line up under the first row, so the
     // prompt and the indent are the same width and every row holds the same
     // number of columns of text.
-    const prompt_width = visibleWidth(prompt);
+    const prompt_width = columns(prompt);
     var spaces: [max_indent]u8 = @splat(' ');
     const indent = spaces[0..@min(prompt_width, spaces.len)];
 
@@ -541,7 +541,7 @@ fn contentWidth(ed: *const LineEditor, prompt_width: usize) usize {
 /// unindented, so it folds at the full width.
 fn headerRows(ed: *const LineEditor, header: []const u8) usize {
     if (header.len == 0) return 0;
-    const columns_wide = visibleWidth(header);
+    const columns_wide = columns(header);
     if (ed.width == 0 or columns_wide == 0) return 1;
     return (columns_wide + ed.width - 1) / ed.width;
 }
@@ -795,26 +795,17 @@ fn wordStart(line: []const u8, cursor: usize) usize {
 }
 
 /// Where the character before `cursor` starts, so a cursor on a character
-/// boundary stays on one.
+/// boundary stays on one. A character is a grapheme cluster, so the cursor steps
+/// over a whole emoji rather than one of its codepoints.
 fn prevChar(line: []const u8, cursor: usize) usize {
-    var start = cursor;
-    while (start > 0) {
-        start -= 1;
-        if (!isContinuation(line[start])) break;
-    }
-    return start;
+    if (cursor == 0) return 0;
+    return cursor - terminal_width.prevLen(line[0..cursor]);
 }
 
-/// Where the character at `cursor` ends.
+/// Where the character at `cursor` ends, one grapheme cluster along.
 fn nextChar(line: []const u8, cursor: usize) usize {
     if (cursor >= line.len) return line.len;
-    return @min(line.len, cursor + seqLen(line[cursor]));
-}
-
-/// Bytes in the character `first` begins; a byte that begins none is a character
-/// of its own, so stepping over bad input still moves.
-fn seqLen(first: u8) usize {
-    return std.unicode.utf8ByteSequenceLength(first) catch 1;
+    return @min(line.len, cursor + terminal_width.charLen(line[cursor..]));
 }
 
 /// A visual row of the rendered line: a run of the line that fits on one
@@ -920,43 +911,11 @@ fn rowsFor(cols: usize, content_width: usize) usize {
     return (cols + content_width - 1) / content_width;
 }
 
-/// Whether `byte` continues a multi-byte character, and so takes no column of
-/// its own.
-fn isContinuation(byte: u8) bool {
-    return byte & 0xc0 == 0x80;
-}
-
+/// The columns `text` takes, and the byte offset of a column into it, both from
+/// `Terminal/width.zig`: a wide character is two columns, a grapheme cluster is
+/// one character, and the two walks skip the same escapes.
 const columns = terminal_width.columns;
-
-/// Byte offset of the character `count` characters into `text`, clamped to its
-/// end, so that a slice never splits a character.
-fn columnOffset(text: []const u8, count: usize) usize {
-    var i: usize = 0;
-    var seen: usize = 0;
-    while (i < text.len and seen < count) : (seen += 1) i = nextChar(text, i);
-    return i;
-}
-
-/// Number of terminal columns `text` occupies: one per character, ignoring ANSI
-/// escape sequences and the continuation bytes of multi-byte characters.
-fn visibleWidth(text: []const u8) usize {
-    var width: usize = 0;
-    var i: usize = 0;
-    while (i < text.len) {
-        if (text[i] == 0x1b and i + 1 < text.len) {
-            i += 1;
-            if (text[i] == '[') {
-                i += 1;
-                while (i < text.len and !(text[i] >= 0x40 and text[i] <= 0x7e)) i += 1;
-            }
-            i += 1;
-            continue;
-        }
-        width += 1;
-        i += seqLen(text[i]);
-    }
-    return width;
-}
+const columnOffset = terminal_width.columnOffset;
 
 test "wordStart skips trailing whitespace then the word" {
     try std.testing.expectEqual(0, wordStart("hello", 5));
@@ -1070,6 +1029,23 @@ test "columns and offsets count characters, and stay safe on malformed text" {
     try std.testing.expectEqual(1, nextChar("\xff\xff", 0));
 }
 
+test "a wide character is two columns and one step, and a grapheme steps whole" {
+    // A wide character folds and is walked over as the two columns it takes.
+    const wide = "a漢b";
+    try std.testing.expectEqual(4, columns(wide));
+    try std.testing.expectEqual(4, columnOffset(wide, 3));
+    try std.testing.expectEqual(4, nextChar(wide, 1));
+    try std.testing.expectEqual(1, prevChar(wide, 4));
+
+    // An emoji joined by zero-width joiners is one character: one step over it,
+    // not one per codepoint.
+    const family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+    const line = family ++ "!";
+    try std.testing.expectEqual(@as(usize, family.len), nextChar(line, 0));
+    try std.testing.expectEqual(@as(usize, 0), prevChar(line, family.len));
+    try std.testing.expectEqual(@as(usize, family.len), prevChar(line, line.len));
+}
+
 test "the history keeps the submitted lines in one pool" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -1138,14 +1114,14 @@ test "recall walks the history, keeping the line it started from" {
     try std.testing.expect(!try ed.recall(&line, &cursor, &draft, &recalled, 1));
 }
 
-test "visibleWidth ignores ANSI escapes" {
-    try std.testing.expectEqual(2, visibleWidth("> "));
-    try std.testing.expectEqual(0, visibleWidth("\x1b[31m\x1b[0m"));
-    try std.testing.expectEqual(5, visibleWidth("\x1b[1mbilly\x1b[0m"));
+test "columns ignore ANSI escapes" {
+    try std.testing.expectEqual(2, columns("> "));
+    try std.testing.expectEqual(0, columns("\x1b[31m\x1b[0m"));
+    try std.testing.expectEqual(5, columns("\x1b[1mbilly\x1b[0m"));
     // A multi-byte character is one column, not one per byte. The header uses
     // the middle dot between its parts, so this is the width it is measured by.
-    try std.testing.expectEqual(1, visibleWidth("·"));
-    try std.testing.expectEqual(3, visibleWidth("a·b"));
+    try std.testing.expectEqual(1, columns("·"));
+    try std.testing.expectEqual(3, columns("a·b"));
 }
 
 test "endPrompt erases the header and the line it heads" {
