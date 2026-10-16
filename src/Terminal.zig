@@ -21,6 +21,11 @@ pub fn emitter(self: *Terminal) agent.Emitter {
     return .{ .context = self, .vtable = &.{ .block = show } };
 }
 
+/// Shows one block. Each whole block ends with a blank line that sets it off
+/// from whatever follows, so the block after reads as its own unit and the line
+/// editor's prompt has a row between it and the block above. A tool call is two
+/// blocks: the head ends with its own line alone, since the result continues
+/// it, and the result ends the call with the blank line.
 fn show(context: *anyopaque, block: agent.Block) anyerror!void {
     const self = selfOf(context);
     switch (block) {
@@ -50,7 +55,7 @@ fn show(context: *anyopaque, block: agent.Block) anyerror!void {
         // them, which is what a compaction has always looked like here.
         .compacted => try printCompacted(self.out, self.display.style),
         .notice => |text| {
-            try self.out.print("{s}\n", .{text});
+            try self.out.print("{s}\n\n", .{text});
             try self.out.flush();
         },
         .elided => |count| try printElided(count, self.display.style, self.out),
@@ -61,24 +66,19 @@ fn selfOf(context: *anyopaque) *Terminal {
     return @ptrCast(@alignCast(context));
 }
 
-/// Prints a prompt as its own block: the blank line that sets it off from what
-/// came before, the `» prompt` header, the text laid out by `markdown` when one
-/// is set, and a blank line after it. A live prompt and a replayed one are both
-/// printed by this, so the two read the same. The `> ` the line is typed behind
-/// is not part of the prompt and is not printed.
-///
-/// The blank line before keeps a prompt from reading as part of the block above
-/// it; the one after keeps it from reading as the label of the answer or the
-/// tool block that follows, which begin on the very next row otherwise.
+/// Prints a prompt as its own block: the `» prompt` header, the text laid out by
+/// `markdown` when one is set, and the blank line after it. A live prompt and a
+/// replayed one are both printed by this, so the two read the same. The `> ` the
+/// line is typed behind is not part of the prompt and is not printed.
 fn printPrompt(gpa: std.mem.Allocator, out: *std.Io.Writer, text: []const u8, display: agent.Display) !void {
-    try out.writeAll("\n");
     try marks.prompt.header("prompt", "", display.style, out);
     try Markdown.write(gpa, text, display.style, out);
     try out.writeAll("\n\n");
 }
 
-/// Prints a reply under its own header, laid out as markdown. Only the display
-/// changes; the session and the model keep the text itself.
+/// Prints a reply under its own header, laid out as markdown, and the blank
+/// line that ends the block. Only the display changes; the session and the model
+/// keep the text itself.
 fn printAnswer(gpa: std.mem.Allocator, out: *std.Io.Writer, content: ?[]const u8, display: agent.Display) !void {
     try marks.answer.header("answer", "", display.style, out);
     const text = content orelse "";
@@ -87,26 +87,27 @@ fn printAnswer(gpa: std.mem.Allocator, out: *std.Io.Writer, content: ?[]const u8
     } else {
         try Markdown.write(gpa, text, display.style, out);
     }
-    try out.writeAll("\n");
+    try out.writeAll("\n\n");
     try out.flush();
 }
 
 /// Prints the one line that stands in for a compaction: the prompt that asked
 /// for it and the summary it produced are both kept in the session, so a run
 /// that compacts shows the event rather than the two messages. It is headed like
-/// every other block, with its own mark, and opens with the blank line that
-/// separates it from the block before it.
+/// every other block, with its own mark, and ends with the blank line that sets
+/// it off from the block after it.
 fn printCompacted(out: *std.Io.Writer, style: Style) !void {
-    try out.writeAll("\n");
     try marks.compacted.header("compacted", "", style, out);
+    try out.writeAll("\n");
     try out.flush();
 }
 
 /// Prints how many blocks a trimmed transcript left out, dimmed, so a resume does
 /// not read as the whole session. It is the count a short block gives of the
-/// lines it cut, standing where the blocks it names would have been.
+/// lines it cut, standing where the blocks it names would have been, with the
+/// blank line that sets off the blocks that follow.
 fn printElided(count: usize, style: Style, out: *std.Io.Writer) !void {
-    try out.print("{s}… {d} earlier blocks{s}\n", .{ style.on("2"), count, style.off() });
+    try out.print("{s}… {d} earlier blocks{s}\n\n", .{ style.on("2"), count, style.off() });
 }
 
 /// The marks the blocks of a run are headed by, which is the vocabulary both
@@ -125,16 +126,15 @@ test "a prompt is headed by the same block live and replayed" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    // The block opens with the blank line that sets it off from what came
-    // before and closes with the one that sets it off from what follows.
+    // The block is the header, the text and the blank line that ends it.
     try printPrompt(gpa, &out.writer, "hello", .{ .style = .plain });
-    try std.testing.expectEqualStrings("\n» prompt\nhello\n\n", out.written());
+    try std.testing.expectEqualStrings("» prompt\nhello\n\n", out.written());
     out.clearRetainingCapacity();
 
     // A prompt is markdown, so it is laid out by the same renderer as a reply.
     try printPrompt(gpa, &out.writer, "**hello**", .{ .style = .ansi });
     try std.testing.expectEqualStrings(
-        "\n\x1b[34m»\x1b[0m \x1b[1mprompt\x1b[0m\n\x1b[1mhello\x1b[0m\n\n",
+        "\x1b[34m»\x1b[0m \x1b[1mprompt\x1b[0m\n\x1b[1mhello\x1b[0m\n\n",
         out.written(),
     );
 }

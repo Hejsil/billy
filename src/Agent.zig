@@ -1221,9 +1221,9 @@ test "printTranscript shows only the last blocks and counts the rest" {
     // counted, and only its second call shows.
     try printTranscript(io, gpa, &out.writer, &session, .{}, 2);
     try std.testing.expectEqualStrings(
-        "… 2 earlier blocks\n" ++
+        "… 2 earlier blocks\n\n" ++
             "▸ read b.zig\n▾ output\ncontents b\n\n" ++
-            "◆ answer\ndone\n",
+            "◆ answer\ndone\n\n",
         out.written(),
     );
     out.clearRetainingCapacity();
@@ -1232,22 +1232,22 @@ test "printTranscript shows only the last blocks and counts the rest" {
     // counted and the whole session shows.
     try printTranscript(io, gpa, &out.writer, &session, .{}, 10);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "earlier blocks") == null);
-    try std.testing.expect(std.mem.startsWith(u8, out.written(), "\n» prompt\none\n\n"));
+    try std.testing.expect(std.mem.startsWith(u8, out.written(), "» prompt\none\n\n"));
     out.clearRetainingCapacity();
 
     // Zero shows the whole session too.
     try printTranscript(io, gpa, &out.writer, &session, .{}, 0);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "earlier blocks") == null);
-    try std.testing.expect(std.mem.startsWith(u8, out.written(), "\n» prompt\none\n\n"));
+    try std.testing.expect(std.mem.startsWith(u8, out.written(), "» prompt\none\n\n"));
 }
 
 test "printTranscript replays a conversation as the blocks it was made of" {
     // The system prompt is never shown while running, the tool result only as
     // the output of the call it belongs to.
     try expectTranscript(
-        "\n» prompt\nhello\n\n" ++
+        "» prompt\nhello\n\n" ++
             "▸ read a.zig\n▾ output\n1\tconst x = 1;\n\n" ++
-            "◆ answer\ndone\n",
+            "◆ answer\ndone\n\n",
         &.{
             .{ .role = .system, .content = "ignore me" },
             .{ .role = .user, .content = "hello" },
@@ -1279,14 +1279,14 @@ test "a reply is headed by its own header, and its markdown laid out" {
     // A reply is markdown, laid out by the built-in renderer: the marks are taken
     // off and the text is set as a terminal shows it.
     try expectTranscript(
-        "◆ answer\nhi\n",
+        "◆ answer\nhi\n\n",
         &.{.{ .role = .assistant, .content = "**hi**" }},
         .plain,
     );
 
     // An empty reply is said to be empty rather than shown blank.
     try expectTranscript(
-        "◆ answer\n(empty reply)\n",
+        "◆ answer\n(empty reply)\n\n",
         &.{.{ .role = .assistant, .content = "" }},
         .plain,
     );
@@ -1295,7 +1295,7 @@ test "a reply is headed by its own header, and its markdown laid out" {
 test "a prompt from the session is headed and laid out like a reply" {
     // A prompt is markdown too, so it is laid out by the same renderer.
     try expectTranscript(
-        "\n» prompt\nhi\n\n",
+        "» prompt\nhi\n\n",
         &.{.{ .role = .user, .content = "**hi**" }},
         .plain,
     );
@@ -1303,7 +1303,7 @@ test "a prompt from the session is headed and laid out like a reply" {
 
 test "an empty reply is shown under its header, in place of the text" {
     try expectTranscript(
-        "◆ answer\n(empty reply)\n",
+        "◆ answer\n(empty reply)\n\n",
         &.{.{ .role = .assistant, .content = "" }},
         .plain,
     );
@@ -1313,8 +1313,8 @@ test "a prompt and a reply are headed alike, in the colours of the display" {
     // The user's block opens with the prompt mark and the reply with the answer
     // mark, each bold, and neither carries the `> ` the live input uses.
     try expectTranscript(
-        "\n\x1b[34m»\x1b[0m \x1b[1mprompt\x1b[0m\nhello\n\n" ++
-            "\x1b[32m◆\x1b[0m \x1b[1manswer\x1b[0m\nhi\n",
+        "\x1b[34m»\x1b[0m \x1b[1mprompt\x1b[0m\nhello\n\n" ++
+            "\x1b[32m◆\x1b[0m \x1b[1manswer\x1b[0m\nhi\n\n",
         &.{
             .{ .role = .user, .content = "hello" },
             .{ .role = .assistant, .content = "hi" },
@@ -1347,11 +1347,11 @@ test "printTranscript shows a compaction as a single line" {
     // shows as it always did.
     try printTranscript(io, gpa, &out.writer, &session, .{}, 0);
     try std.testing.expectEqualStrings(
-        "\n» prompt\none\n\n" ++
-            "◆ answer\na1\n" ++
-            "\n⊟ compacted\n" ++
-            "\n» prompt\ntwo\n\n" ++
-            "◆ answer\na2\n",
+        "» prompt\none\n\n" ++
+            "◆ answer\na1\n\n" ++
+            "⊟ compacted\n\n" ++
+            "» prompt\ntwo\n\n" ++
+            "◆ answer\na2\n\n",
         out.written(),
     );
     out.clearRetainingCapacity();
@@ -1360,10 +1360,10 @@ test "printTranscript shows a compaction as a single line" {
     // starts at the compaction and counts what came before it.
     try printTranscript(io, gpa, &out.writer, &session, .{}, 3);
     try std.testing.expectEqualStrings(
-        "… 2 earlier blocks\n" ++
-            "\n⊟ compacted\n" ++
-            "\n» prompt\ntwo\n\n" ++
-            "◆ answer\na2\n",
+        "… 2 earlier blocks\n\n" ++
+            "⊟ compacted\n\n" ++
+            "» prompt\ntwo\n\n" ++
+            "◆ answer\na2\n\n",
         out.written(),
     );
 }
@@ -1948,7 +1948,7 @@ test "maybeCompact folds the conversation once it has filled the window" {
     try std.testing.expectEqual(0, session.context_tokens);
 
     // The user is told, in one line, that the conversation was compacted.
-    try std.testing.expectEqualStrings("\n⊟ compacted\n", out.written());
+    try std.testing.expectEqualStrings("⊟ compacted\n\n", out.written());
 }
 
 test "maybeCompact does nothing below the threshold, off, or with nothing new" {

@@ -107,7 +107,7 @@ fn historyLine(ed: *const LineEditor, index: usize) []const u8 {
 /// edited. Both it and the `prompt` in front of the line belong to the editing
 /// alone: on submit the whole region is erased and the cursor is left on the
 /// row it began on, so nothing of the input is left in the output. The caller
-/// prints what the line was in its place, a block that opens with a blank line.
+/// prints what the line was in its place, a block that ends with a blank line.
 /// Neither may contain a newline. When stdin is not a terminal there is no line
 /// being typed, so neither is shown, and it is left to the caller to write the
 /// line out.
@@ -120,11 +120,11 @@ pub fn readLine(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]con
     // The width is only wanted to fold a line being edited, which cannot
     // happen without a terminal.
     ed.width = if (interactive) ed.terminalWidth() else 0;
-    // The caller leaves the cursor at the start of a fresh line, since every
-    // block it shows ends with a newline, so the header and the prompt the user
-    // types behind are drawn there. With no terminal there is no line being
-    // typed, so neither is shown: the caller prints the line it read as the
-    // block the emitter would.
+    // The caller leaves the cursor below the blank line every block it shows
+    // ends with, so the header and the prompt the user types behind are drawn
+    // there, a row below the block above them. With no terminal there is no
+    // line being typed, so neither is shown: the caller prints the line it read
+    // as the block the emitter would.
     if (interactive) {
         if (header.len > 0) {
             try ed.out.writeAll(header);
