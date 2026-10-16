@@ -187,6 +187,11 @@ fn read(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
 
     var line: std.ArrayList(u8) = .empty;
     defer line.deinit(ed.gpa);
+    // The line being edited, kept aside while a history walk is on a stored
+    // entry, so stepping back to the start returns to it rather than an empty
+    // line.
+    var draft: std.ArrayList(u8) = .empty;
+    defer draft.deinit(ed.gpa);
     var cursor: usize = 0;
     var recalled: ?usize = null;
     var dirty = false;
@@ -214,13 +219,11 @@ fn read(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
                 const text = std.mem.sliceTo(&char, 0);
                 try line.insertSlice(ed.gpa, cursor, text);
                 cursor += text.len;
-                recalled = null;
                 dirty = true;
             },
             .newline => {
                 try line.insert(ed.gpa, cursor, '\n');
                 cursor += 1;
-                recalled = null;
                 dirty = true;
             },
             .enter => {
@@ -245,12 +248,10 @@ fn read(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
                 const start = prevChar(line.items, cursor);
                 try line.replaceRange(ed.gpa, start, cursor - start, "");
                 cursor = start;
-                recalled = null;
                 dirty = true;
             },
             .delete => if (cursor < line.items.len) {
                 try line.replaceRange(ed.gpa, cursor, nextChar(line.items, cursor) - cursor, "");
-                recalled = null;
                 dirty = true;
             },
             .left => if (cursor > 0) {
@@ -272,12 +273,10 @@ fn read(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
             .kill_to_start => if (cursor > 0) {
                 try line.replaceRange(ed.gpa, 0, cursor, "");
                 cursor = 0;
-                recalled = null;
                 dirty = true;
             },
             .kill_to_end => if (cursor < line.items.len) {
                 line.shrinkRetainingCapacity(cursor);
-                recalled = null;
                 dirty = true;
             },
             .kill_word => {
@@ -285,7 +284,6 @@ fn read(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
                 if (start < cursor) {
                     try line.replaceRange(ed.gpa, start, cursor - start, "");
                     cursor = start;
-                    recalled = null;
                     dirty = true;
                 }
             },
@@ -298,14 +296,14 @@ fn read(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
             .up => {
                 if (moveCursorVertical(&ed.goal_col, line.items, content_width, &cursor, -1)) {
                     dirty = true;
-                } else if (try ed.recall(&line, &cursor, &recalled, -1)) {
+                } else if (try ed.recall(&line, &cursor, &draft, &recalled, -1)) {
                     dirty = true;
                 }
             },
             .down => {
                 if (moveCursorVertical(&ed.goal_col, line.items, content_width, &cursor, 1)) {
                     dirty = true;
-                } else if (try ed.recall(&line, &cursor, &recalled, 1)) {
+                } else if (try ed.recall(&line, &cursor, &draft, &recalled, 1)) {
                     dirty = true;
                 }
             },
@@ -337,7 +335,6 @@ fn read(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
                 return null;
             } else if (cursor < line.items.len) {
                 try line.replaceRange(ed.gpa, cursor, nextChar(line.items, cursor) - cursor, "");
-                recalled = null;
                 dirty = true;
             },
         }
@@ -549,26 +546,49 @@ fn headerRows(ed: *const LineEditor, header: []const u8) usize {
     return (columns_wide + ed.width - 1) / ed.width;
 }
 
-/// Replaces the line with a history entry. `direction` is -1 for older, 1
-/// for newer. Returns whether the line changed.
+/// Walks the history by one entry: `direction` is -1 for older, 1 for newer, and
+/// true is returned when the walk moved. The position is what `recalled` holds,
+/// `null` meaning the line being edited; the walk is not reset by editing, so it
+/// carries on from where it was after a recalled line is changed.
+///
+/// The line being edited is kept in `draft` when the walk steps off it, so
+/// walking back to the start returns to it rather than an empty line. A stored
+/// entry is copied into the line, so editing one does not change what the history
+/// holds, and stepping off it drops the edit.
 fn recall(
     ed: *LineEditor,
     line: *std.ArrayList(u8),
     cursor: *usize,
+    draft: *std.ArrayList(u8),
     recalled: *?usize,
     direction: i8,
 ) !bool {
     const history = ed.history.items;
     if (history.len == 0) return false;
-    const next: ?usize = if (recalled.*) |i|
-        if (direction < 0) (if (i > 0) i - 1 else 0) else (if (i + 1 < history.len) i + 1 else null)
-    else if (direction < 0) history.len - 1 else null;
-    if (next == null and recalled.* == null) return false;
 
-    recalled.* = next;
+    // Where the walk lands: a stored entry, or `null` for the line being edited.
+    const landing: ?usize = land: {
+        if (recalled.*) |here| {
+            if (direction < 0) {
+                if (here == 0) return false;
+                break :land here - 1;
+            }
+            break :land if (here + 1 < history.len) here + 1 else null;
+        }
+        if (direction > 0) return false;
+        break :land history.len - 1;
+    };
+
+    // Stepping off the line being edited: keep it, so the walk can return to it.
+    if (recalled.* == null) {
+        draft.clearRetainingCapacity();
+        try draft.appendSlice(ed.gpa, line.items);
+    }
+
     line.clearRetainingCapacity();
-    if (next) |i| try line.appendSlice(ed.gpa, ed.historyLine(i));
+    try line.appendSlice(ed.gpa, if (landing) |i| ed.historyLine(i) else draft.items);
     cursor.* = line.items.len;
+    recalled.* = landing;
     ed.goal_col = null;
     return true;
 }
@@ -1070,7 +1090,7 @@ test "the history keeps the submitted lines in one pool" {
     try std.testing.expectEqual(@as(usize, 2), ed.history.items.len);
 }
 
-test "recall walks the history and puts a line back" {
+test "recall walks the history, keeping the line it started from" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -1081,18 +1101,41 @@ test "recall walks the history and puts a line back" {
 
     var line: std.ArrayList(u8) = .empty;
     defer line.deinit(gpa);
+    var draft: std.ArrayList(u8) = .empty;
+    defer draft.deinit(gpa);
     var cursor: usize = 0;
     var recalled: ?usize = null;
 
-    // Up recalls the most recent line, then the older one.
-    try std.testing.expect(try ed.recall(&line, &cursor, &recalled, -1));
+    // A line is being edited when the walk starts; it is what the walk returns to.
+    try line.appendSlice(gpa, "half typed");
+    cursor = line.items.len;
+
+    // Up recalls the most recent line, then the older one; the oldest is the end.
+    try std.testing.expect(try ed.recall(&line, &cursor, &draft, &recalled, -1));
     try std.testing.expectEqualStrings("two", line.items);
     try std.testing.expectEqual(@as(usize, 3), cursor);
-    try std.testing.expect(try ed.recall(&line, &cursor, &recalled, -1));
+    try std.testing.expect(try ed.recall(&line, &cursor, &draft, &recalled, -1));
     try std.testing.expectEqualStrings("one", line.items);
+    try std.testing.expect(!try ed.recall(&line, &cursor, &draft, &recalled, -1));
+    try std.testing.expectEqualStrings("one", line.items);
+
     // Down comes back to the newer one.
-    try std.testing.expect(try ed.recall(&line, &cursor, &recalled, 1));
+    try std.testing.expect(try ed.recall(&line, &cursor, &draft, &recalled, 1));
     try std.testing.expectEqualStrings("two", line.items);
+
+    // Editing a recalled line does not reset the walk: Up still reaches the line
+    // older than the one shown, and the edit is not written into the history.
+    try line.appendSlice(gpa, "!");
+    try std.testing.expect(try ed.recall(&line, &cursor, &draft, &recalled, -1));
+    try std.testing.expectEqualStrings("one", line.items);
+    try std.testing.expect(try ed.recall(&line, &cursor, &draft, &recalled, 1));
+    try std.testing.expectEqualStrings("two", line.items);
+
+    // Down past the newest returns to the line being edited, which was kept.
+    try std.testing.expect(try ed.recall(&line, &cursor, &draft, &recalled, 1));
+    try std.testing.expectEqualStrings("half typed", line.items);
+    try std.testing.expectEqual(@as(usize, 10), cursor);
+    try std.testing.expect(!try ed.recall(&line, &cursor, &draft, &recalled, 1));
 }
 
 test "visibleWidth ignores ANSI escapes" {
