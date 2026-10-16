@@ -90,8 +90,6 @@ pub const Choice = struct {
 /// The model metadata the API does not report.
 pub const Metadata = struct {
     provider: Provider,
-    /// The model id as the API names it.
-    model: []const u8,
     /// Tokens the context window holds.
     context_window: usize,
 };
@@ -204,7 +202,6 @@ fn matches(entry: Entry, model: []const u8) bool {
 fn metadataOf(provider: Provider, entry: Entry) Metadata {
     return .{
         .provider = provider,
-        .model = entry.id,
         .context_window = entry.context_window,
     };
 }
@@ -223,7 +220,7 @@ test "lookup finds a model by name, alias and without a provider" {
 
     // An alias resolves to the model it names.
     const aliased = lookup(.deepseek, "deepseek-v4-flash").?;
-    try std.testing.expectEqualStrings("deepseek-flash", aliased.model);
+    try std.testing.expectEqual(flash.context_window, aliased.context_window);
 
     // Without a provider, the model is still found.
     const discovered = lookup(null, "deepseek-v4-pro").?;

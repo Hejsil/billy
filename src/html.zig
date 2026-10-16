@@ -1561,7 +1561,6 @@ test "the header carries the model, the directory and the gauge" {
         .context_tokens = 16_000,
         .model_info = .{
             .provider = .deepseek,
-            .model = "deepseek-flash",
             .context_window = 128_000,
         },
     }, &out.writer);

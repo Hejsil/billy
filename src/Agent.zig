@@ -1541,7 +1541,6 @@ test "header shows how full the context window is" {
     var config = testConfig("m", "/work", null);
     config.model_info = .{
         .provider = .deepseek,
-        .model = "m",
         .context_window = 128_000,
     };
 
@@ -1852,7 +1851,6 @@ test "the compaction threshold is the configured share of the window, or off" {
 
     agent.config.model_info = .{
         .provider = .deepseek,
-        .model = "m",
         .context_window = 1000,
     };
 
@@ -1891,7 +1889,6 @@ test "maybeCompact folds the conversation once it has filled the window" {
     var config = testConfig("m", "/work", null);
     config.model_info = .{
         .provider = .deepseek,
-        .model = "m",
         .context_window = 1000,
     };
     config.compact_at = 80;
@@ -1964,7 +1961,7 @@ test "maybeCompact does nothing below the threshold, off, or with nothing new" {
     try session.append(.{ .role = .user, .content = "hello" });
 
     var config = testConfig("m", "/work", null);
-    config.model_info = .{ .provider = .deepseek, .model = "m", .context_window = 1000 };
+    config.model_info = .{ .provider = .deepseek, .context_window = 1000 };
 
     // Nothing is listening on this address, so a request made where the function
     // should have returned first would fail the test rather than pass it.
@@ -2009,7 +2006,7 @@ test "a compaction asked for now folds the conversation in whatever its size" {
     try session.append(.{ .role = .assistant, .content = "hi" });
 
     var config = testConfig("m", "/work", null);
-    config.model_info = .{ .provider = .deepseek, .model = "m", .context_window = 1000 };
+    config.model_info = .{ .provider = .deepseek, .context_window = 1000 };
     // Compaction is off, so only a manual one runs.
     config.compact_at = 0;
 
@@ -2072,7 +2069,7 @@ test "maybeCompact does not compact a summary that stands alone" {
     try session.appendCompaction("p", "a summary");
 
     var config = testConfig("m", "/work", null);
-    config.model_info = .{ .provider = .deepseek, .model = "m", .context_window = 1000 };
+    config.model_info = .{ .provider = .deepseek, .context_window = 1000 };
 
     // Over the threshold, but the last message is the summary itself, so there is
     // nothing new to fold in and a request would only re-summarize it.
@@ -2599,7 +2596,7 @@ test "a session is sent where the choice it recorded points, not the configurati
         .model = "the-chosen-model",
         // A window of its own, so the gauge is the session's and not the
         // configured model's.
-        .info = .{ .provider = .opencode_go, .model = "the-chosen-model", .context_window = 42 },
+        .info = .{ .provider = .opencode_go, .context_window = 42 },
     });
 
     // The client was pointed at the endpoint the session named rather than the
