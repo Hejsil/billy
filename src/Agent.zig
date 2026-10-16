@@ -2395,7 +2395,7 @@ test "the terminal shows a tool call the way a replay does" {
     // A replay renders the stored call on its own.
     var replayed: std.Io.Writer.Allocating = .init(gpa);
     defer replayed.deinit();
-    try Tools.describe(io, gpa, parsed, result.written(), .{}, .plain, &replayed.writer);
+    try Terminal.tool.describe(io, gpa, parsed, result.written(), .{}, .plain, &replayed.writer);
 
     // The two paths show the same bytes, which is what keeps a run and a resume
     // of it reading alike. The header before the result is what a slow command

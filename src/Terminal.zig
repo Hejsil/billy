@@ -3,7 +3,8 @@
 //! their format scripts.
 const std = @import("std");
 const agent = @import("Agent.zig");
-const Tools = @import("Tools.zig");
+
+pub const tool = @import("Terminal/tool.zig");
 
 pub const Style = @import("Terminal/style.zig").Style;
 pub const Markdown = @import("Terminal/Markdown.zig");
@@ -41,13 +42,13 @@ fn show(context: *anyopaque, block: agent.Block) anyerror!void {
         // The header goes out as the call begins, so a command that runs
         // long has it on screen while it runs.
         .tool_begin => |call| {
-            try Tools.printHead(self.io, self.scratch, call, self.display.formats, self.display.style, self.out);
+            try tool.printHead(self.io, self.scratch, call, self.display.formats, self.display.style, self.out);
             try self.out.flush();
         },
         // The header is out already, so only the result is left; the blank
         // line ends the block as it always has.
-        .tool_end => |tool| {
-            try Tools.printResult(tool.call, tool.result, self.display.style, self.out);
+        .tool_end => |ended| {
+            try tool.printResult(ended.call, ended.result, self.display.style, self.out);
             try self.out.writeAll("\n");
             try self.out.flush();
         },
