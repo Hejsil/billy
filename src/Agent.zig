@@ -39,7 +39,6 @@ const Command = enum {
 /// module imports this one; the two are kept apart by naming only what a request
 /// needs, which both can.
 pub const Target = struct {
-    base_url: []const u8,
     /// Full URL of the chat completions endpoint under `base_url`.
     url: []const u8,
     api_key: []const u8,
@@ -2595,7 +2594,6 @@ test "a session is sent where the choice it recorded points, not the configurati
     // endpoint it names, the key for it, and the model id with the provider
     // stripped off.
     try agent.prepare(&session, .{
-        .base_url = chosen.url,
         .url = chosen.url,
         .api_key = "k",
         .model = "the-chosen-model",
@@ -2642,7 +2640,6 @@ test "a session with no recorded model takes the choice it is prepared with" {
     try std.testing.expect(!session.hasModel());
 
     try agent.prepare(&session, .{
-        .base_url = "https://api.deepseek.com",
         .url = "https://api.deepseek.com/chat/completions",
         .api_key = "k",
         .model = "deepseek-flash",

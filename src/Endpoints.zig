@@ -118,7 +118,6 @@ fn targetFor(
     // naming freed bytes. The URL is allocated here for the same reason.
     const model = try arena.dupe(u8, modelOf(choice));
     return .{
-        .base_url = base_url,
         .url = try completionsUrl(arena, base_url),
         .api_key = store.get(name) orelse return missingKey(name),
         .model = model,
