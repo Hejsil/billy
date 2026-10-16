@@ -65,8 +65,6 @@ pub const Config = struct {
     /// configuration. The tools are given it so a runaway command cannot hang
     /// the agent forever.
     bash_timeout_s: usize,
-    /// Working directory, shown in the header.
-    cwd: []const u8,
     /// Home directory, so the header can shorten a path inside it; null when unset.
     home: ?[]const u8,
     /// Directory holding the user's own instructions file, read into every
@@ -315,11 +313,12 @@ const prompt = "> ";
 pub fn sessionHeader(
     out: *std.Io.Writer,
     config: Config,
+    cwd: []const u8,
     session_id: []const u8,
     context_tokens: usize,
 ) !void {
     try out.print("billy · {s} · {s} · {s} · ", .{ @tagName(config.mode), session_id, config.model });
-    try displayPath(out, config.cwd, config.home);
+    try displayPath(out, cwd, config.home);
     if (config.model_info) |info| {
         try out.writeAll(" · ");
         try formatTokens(out, context_tokens);
@@ -671,7 +670,7 @@ pub fn run(
         header.clearRetainingCapacity();
         // The header is built from the agent's config, so the mode it shows is
         // the one the session is running in, which the first prompt may have set.
-        try sessionHeader(&header.writer, agent.config, session.id(), session.context_tokens);
+        try sessionHeader(&header.writer, agent.config, session.cwd(), session.id(), session.context_tokens);
         const line = (try editor.readLine(header.written(), prompt)) orelse break;
         if (line.len == 0) continue;
         // What the line came to is the agent's to decide: a command is run and
@@ -1462,14 +1461,13 @@ fn testAgentIn(
     return Agent.init(io, gpa, config, work_dir, &unused);
 }
 
-fn testConfig(model: []const u8, cwd: []const u8, home: ?[]const u8) Config {
+fn testConfig(model: []const u8, home: ?[]const u8) Config {
     return .{
         .api_key = "k",
         .url = "u",
         .model = model,
         .max_turns = 10,
         .bash_timeout_s = 120,
-        .cwd = cwd,
         .home = home,
         .model_info = null,
     };
@@ -1488,10 +1486,10 @@ const test_session_id = "01HF7YAT000000000000000000";
 
 /// Writes the header for `config` and compares it to `expected`, so a header
 /// test reads as the line it produces rather than as the buffer around it.
-fn expectHeader(expected: []const u8, config: Config, context_tokens: usize) !void {
+fn expectHeader(expected: []const u8, config: Config, cwd: []const u8, context_tokens: usize) !void {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try sessionHeader(&out.writer, config, test_session_id, context_tokens);
+    try sessionHeader(&out.writer, config, cwd, test_session_id, context_tokens);
     try std.testing.expectEqualStrings(expected, out.written());
 }
 
@@ -1506,53 +1504,57 @@ fn expectTokens(expected: []const u8, count: usize) !void {
 test "header names the session, the model and the working directory" {
     try expectHeader(
         "billy · general · 01HF7YAT000000000000000000 · deepseek-flash · /work",
-        testConfig("deepseek-flash", "/work", null),
+        testConfig("deepseek-flash", null),
+        "/work",
         0,
     );
 }
 
 test "header names the mode the session runs in" {
-    var config = testConfig("m", "/work", null);
+    var config = testConfig("m", null);
     config.mode = .chat;
-    try expectHeader("billy · chat · 01HF7YAT000000000000000000 · m · /work", config, 0);
+    try expectHeader("billy · chat · 01HF7YAT000000000000000000 · m · /work", config, "/work", 0);
 }
 
 test "header shortens a path inside the home directory" {
     try expectHeader(
         "billy · general · 01HF7YAT000000000000000000 · m · ~/repo/billy",
-        testConfig("m", "/home/user/repo/billy", "/home/user"),
+        testConfig("m", "/home/user"),
+        "/home/user/repo/billy",
         0,
     );
     // The home directory itself becomes just `~`.
     try expectHeader(
         "billy · general · 01HF7YAT000000000000000000 · m · ~",
-        testConfig("m", "/home/user", "/home/user"),
+        testConfig("m", "/home/user"),
+        "/home/user",
         0,
     );
     // A sibling that merely shares the prefix is left alone.
     try expectHeader(
         "billy · general · 01HF7YAT000000000000000000 · m · /home/user2",
-        testConfig("m", "/home/user2", "/home/user"),
+        testConfig("m", "/home/user"),
+        "/home/user2",
         0,
     );
 }
 
 test "header shows how full the context window is" {
     // A model with a small window, so the numbers are easy to read.
-    var config = testConfig("m", "/work", null);
+    var config = testConfig("m", null);
     config.model_info = .{
         .provider = .deepseek,
         .context_window = 128_000,
     };
 
     // A fresh session has used nothing.
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 0/128k (0%)", config, 0);
+    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 0/128k (0%)", config, "/work", 0);
     // A rounded-to-zero percentage still shows the conversation is not empty.
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 500/128k (<1%)", config, 500);
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 16k/128k (12%)", config, 16_000);
+    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 500/128k (<1%)", config, "/work", 500);
+    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 16k/128k (12%)", config, "/work", 16_000);
     // A full window, and a count that rounds to a whole thousand.
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 128k/128k (100%)", config, 128_000);
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 13k/128k (9%)", config, 12_500);
+    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 128k/128k (100%)", config, "/work", 128_000);
+    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 13k/128k (9%)", config, "/work", 12_500);
 }
 
 test "token counts are whole" {
@@ -1569,9 +1571,9 @@ test "token counts are whole" {
 }
 
 test "header leaves out the gauge for an unknown model" {
-    const config = testConfig("who-knows", "/work", null);
+    const config = testConfig("who-knows", null);
     try std.testing.expect(config.model_info == null);
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · who-knows · /work", config, 5000);
+    try expectHeader("billy · general · 01HF7YAT000000000000000000 · who-knows · /work", config, "/work", 5000);
 }
 
 /// Writes the section an instruction reader (`globalInstructions` or
@@ -1846,7 +1848,7 @@ test "the compaction threshold is the configured share of the window, or off" {
 
     // A model without a known window has nothing to measure a conversation
     // against, so there is no threshold even with compaction on.
-    var agent = try testAgent(io, gpa, testConfig("m", "/work", null), null);
+    var agent = try testAgent(io, gpa, testConfig("m", null), null);
     defer agent.deinit();
     try std.testing.expectEqual(0, agent.compactThreshold());
 
@@ -1887,7 +1889,7 @@ test "maybeCompact folds the conversation once it has filled the window" {
     try session.append(.{ .role = .tool, .tool_call_id = "call_x", .content = "OLDTOOLOUTPUT" });
     try session.append(.{ .role = .assistant, .content = "OLDANSWER" });
 
-    var config = testConfig("m", "/work", null);
+    var config = testConfig("m", null);
     config.model_info = .{
         .provider = .deepseek,
         .context_window = 1000,
@@ -1961,7 +1963,7 @@ test "maybeCompact does nothing below the threshold, off, or with nothing new" {
     try session.setSystemPrompt("s");
     try session.append(.{ .role = .user, .content = "hello" });
 
-    var config = testConfig("m", "/work", null);
+    var config = testConfig("m", null);
     config.model_info = .{ .provider = .deepseek, .context_window = 1000 };
 
     // Nothing is listening on this address, so a request made where the function
@@ -2006,7 +2008,7 @@ test "a compaction asked for now folds the conversation in whatever its size" {
     try session.append(.{ .role = .user, .content = "hello" });
     try session.append(.{ .role = .assistant, .content = "hi" });
 
-    var config = testConfig("m", "/work", null);
+    var config = testConfig("m", null);
     config.model_info = .{ .provider = .deepseek, .context_window = 1000 };
     // Compaction is off, so only a manual one runs.
     config.compact_at = 0;
@@ -2069,7 +2071,7 @@ test "maybeCompact does not compact a summary that stands alone" {
     try session.setSystemPrompt("s");
     try session.appendCompaction("p", "a summary");
 
-    var config = testConfig("m", "/work", null);
+    var config = testConfig("m", null);
     config.model_info = .{ .provider = .deepseek, .context_window = 1000 };
 
     // Over the threshold, but the last message is the summary itself, so there is
@@ -2125,7 +2127,7 @@ test "refreshLead replaces the prompt, the project instructions and the tools" {
     // them. No client is given, since this reads no model.
     const work_dir = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(work_dir);
-    var agent = try testAgentIn(io, gpa, testConfig("m", "/work", null), work_dir, null);
+    var agent = try testAgentIn(io, gpa, testConfig("m", null), work_dir, null);
     defer agent.deinit();
 
     try refreshLead(&agent, .general, &new_tools, &session);
@@ -2167,7 +2169,7 @@ test "prepare gives a fresh session the user's instructions from the configurati
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
 
-    var config = testConfig("m", "/work", null);
+    var config = testConfig("m", null);
     config.user_instructions_dir = config_dir.dir;
     // `Agent.init` opens the directory it works in, so it has to be one that
     // exists; the session's recorded directory is separate.
@@ -2197,7 +2199,7 @@ test "prepare gives a chat session no prompt and only the tools it allows" {
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
 
-    var config = testConfig("m", "/work", null);
+    var config = testConfig("m", null);
     config.mode = .chat;
     config.user_instructions_dir = config_dir.dir;
     var agent = try testAgent(io, gpa, config, null);
@@ -2228,7 +2230,7 @@ test "a first prompt names the mode and says what to ask" {
     // asked as it was typed.
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
-    var agent = try testAgent(io, gpa, testConfig("m", "/work", null), null);
+    var agent = try testAgent(io, gpa, testConfig("m", null), null);
     defer agent.deinit();
 
     const plain = try agent.start(&session, "do the thing", .general);
@@ -2256,7 +2258,7 @@ test "a first prompt that names only a mode asks nothing" {
 
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
-    var agent = try testAgent(io, gpa, testConfig("m", "/work", null), null);
+    var agent = try testAgent(io, gpa, testConfig("m", null), null);
     defer agent.deinit();
 
     // `/chat` on its own opens that mode: the session is set up and ready, and
@@ -2277,7 +2279,7 @@ test "a prompt after the first leaves the session as it was set up" {
 
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
-    var agent = try testAgent(io, gpa, testConfig("m", "/work", null), null);
+    var agent = try testAgent(io, gpa, testConfig("m", null), null);
     defer agent.deinit();
 
     _ = try agent.start(&session, "the first thing", .general);
@@ -2432,7 +2434,7 @@ test "a turn shows the tool it runs and then the answer" {
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    var config = testConfig("m", "/work", null);
+    var config = testConfig("m", null);
     config.url = mock.url;
     config.api_key = "k";
     var agent = try testAgent(io, gpa, config, &http_client);
@@ -2491,7 +2493,7 @@ test "the first turn names the session, and the naming is not part of it" {
     defer mock.deinit();
     try mock.serve();
 
-    var config = testConfig("m", "/work", null);
+    var config = testConfig("m", null);
     config.title = true;
     // The agent builds the model client from the config, so the config carries
     // the address of the mock.
@@ -2578,7 +2580,7 @@ test "a session is sent where the choice it recorded points, not the configurati
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    var config = testConfig("m", "/work", null);
+    var config = testConfig("m", null);
     config.url = "http://127.0.0.1:1/chat/completions";
     var agent = try testAgent(io, gpa, config, &http_client);
     defer agent.deinit();
@@ -2627,7 +2629,7 @@ test "a session with no recorded model takes the choice it is prepared with" {
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    var agent = try testAgent(io, gpa, testConfig("m", "/work", null), &http_client);
+    var agent = try testAgent(io, gpa, testConfig("m", null), &http_client);
     defer agent.deinit();
 
     var tmp = std.testing.tmpDir(.{});

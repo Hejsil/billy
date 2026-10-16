@@ -93,14 +93,13 @@ backends: Endpoints.Backends,
 
 /// The configuration a turn is built from: the same as a terminal run's, laid
 /// out plainly rather than decorated for a terminal.
-fn agentConfig(server: *const Server, cwd: []const u8) Agent.Config {
+fn agentConfig(server: *const Server) Agent.Config {
     return Endpoints.agentConfig(
         server.config,
         server.endpoint,
         server.backends,
         server.health,
         server.environ,
-        cwd,
         .plain,
         server.config_dir,
     );
@@ -778,7 +777,7 @@ fn createSession(r: *Request, registry: *Registry, http_client: *std.http.Client
     const choice = Agent.Mode.start(parsed.value.text, parsed.value.mode orelse default_mode);
     if (choice.text.len == 0)
         return r.reply(.text, "the prompt is empty\n", .bad_request);
-    var config = r.server.agentConfig(session.cwd());
+    var config = r.server.agentConfig();
     config.mode = choice.mode;
 
     try serveTurn(r, http_client, &session, config, choice.text, session.id());
@@ -804,7 +803,7 @@ fn askSession(r: *Request, registry: *Registry, http_client: *std.http.Client, i
     var session = (try r.openSession(id)) orelse return;
     defer session.deinit();
 
-    try serveTurn(r, http_client, &session, r.server.agentConfig(session.cwd()), parsed.value.text, null);
+    try serveTurn(r, http_client, &session, r.server.agentConfig(), parsed.value.text, null);
 }
 
 /// Answers one prompt as the run happens: the run's blocks as the events of a

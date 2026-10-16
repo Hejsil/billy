@@ -133,7 +133,6 @@ pub fn agentConfig(
     backends: Backends,
     health: *Health,
     environ: *const std.process.Environ.Map,
-    cwd: []const u8,
     style: Terminal.Style,
     user_instructions_dir: ?std.Io.Dir,
 ) agent.Config {
@@ -144,7 +143,6 @@ pub fn agentConfig(
         .model = endpoint.model,
         .max_turns = stored.max_turns,
         .bash_timeout_s = stored.tools.bash.timeout_s,
-        .cwd = cwd,
         .home = environ.get("HOME"),
         // The user's own instructions, which live beside the configuration and
         // join every session's prompt. The caller owns the directory and outlives
