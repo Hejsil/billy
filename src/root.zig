@@ -2,7 +2,7 @@
 
 pub const agent = @import("Agent.zig");
 pub const Config = @import("Config.zig");
-pub const credentials = @import("credentials.zig");
+pub const Credentials = @import("Credentials.zig");
 pub const diff = @import("diff.zig");
 pub const Dirs = @import("Dirs.zig");
 pub const Endpoints = @import("Endpoints.zig");

@@ -17,6 +17,8 @@ const std = @import("std");
 const models = @import("models.zig");
 const Tools = @import("Tools.zig");
 
+const Credentials = @This();
+
 /// Name of the file the credentials are kept in, in the billy data directory.
 pub const file_name = "credentials.json";
 
@@ -77,34 +79,25 @@ pub fn fetchService(provider: Tools.web.Fetch.Provider) ?[]const u8 {
     };
 }
 
-/// The credentials billy holds, one key per service name: the model provider a
-/// request is sent to, and the web backends a tool asks.
-///
-/// The names come from the configuration rather than a fixed set, so the store
-/// holds whatever has been stored under whatever name. The keys are allocated
-/// from the arena the process runs in, which owns them along with the store, so
-/// there is nothing to free.
-pub const Store = struct {
-    keys: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
+keys: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
 
-    /// The key stored for `name`, or null when none is.
-    pub fn get(store: *const Store, name: []const u8) ?[]const u8 {
-        return store.keys.get(name);
-    }
+/// The key stored for `name`, or null when none is.
+pub fn get(store: *const Credentials, name: []const u8) ?[]const u8 {
+    return store.keys.get(name);
+}
 
-    /// Stores `key` under `name`, replacing the one already there. The arena
-    /// owns both strings, which outlive the file being written.
-    pub fn put(store: *Store, arena: std.mem.Allocator, name: []const u8, key: []const u8) !void {
-        const owned_name = try arena.dupe(u8, name);
-        const owned_key = try arena.dupe(u8, key);
-        try store.keys.put(arena, owned_name, owned_key);
-    }
+/// Stores `key` under `name`, replacing the one already there. The arena
+/// owns both strings, which outlive the file being written.
+pub fn put(store: *Credentials, arena: std.mem.Allocator, name: []const u8, key: []const u8) !void {
+    const owned_name = try arena.dupe(u8, name);
+    const owned_key = try arena.dupe(u8, key);
+    try store.keys.put(arena, owned_name, owned_key);
+}
 
-    /// Every name a key is stored under, in the order the file holds them.
-    pub fn names(store: *const Store) []const []const u8 {
-        return store.keys.keys();
-    }
-};
+/// Every name a key is stored under, in the order the file holds them.
+pub fn names(store: *const Credentials) []const []const u8 {
+    return store.keys.keys();
+}
 
 /// The version of the file this billy writes. Bumped when its shape changes, so
 /// a file from a newer billy is refused rather than read as a shape it is not.
@@ -116,7 +109,7 @@ const format_version: u32 = 1;
 /// The file is read as the JSON it is rather than into a type of fields, because
 /// the names are the user's: a provider the configuration named has its key
 /// stored under that name, which no fixed set of fields could hold.
-pub fn load(io: std.Io, dir: std.Io.Dir, arena: std.mem.Allocator) !Store {
+pub fn load(io: std.Io, dir: std.Io.Dir, arena: std.mem.Allocator) !Credentials {
     const text = dir.readFileAlloc(io, file_name, arena, .unlimited) catch |err| switch (err) {
         error.FileNotFound => return .{},
         else => return err,
@@ -143,7 +136,7 @@ pub fn load(io: std.Io, dir: std.Io.Dir, arena: std.mem.Allocator) !Store {
         .object => |stored| stored,
         else => return error.CorruptCredentials,
     };
-    var result: Store = .{};
+    var result: Credentials = .{};
     var it = stored.iterator();
     while (it.next()) |entry| {
         // A key is text; anything else under a name is a shape billy never
@@ -165,7 +158,7 @@ pub fn load(io: std.Io, dir: std.Io.Dir, arena: std.mem.Allocator) !Store {
 /// It is written indented rather than compact, like the configuration and unlike
 /// a session file, since a file a user may open to look at is worth reading. The
 /// JSON is streamed straight onto the file, so writing it allocates nothing.
-pub fn save(store: *const Store, io: std.Io, dir: std.Io.Dir) !void {
+pub fn save(store: *const Credentials, io: std.Io, dir: std.Io.Dir) !void {
     var atomic = try dir.createFileAtomic(io, file_name, .{
         .replace = true,
         .permissions = secret_mode,
@@ -178,7 +171,7 @@ pub fn save(store: *const Store, io: std.Io, dir: std.Io.Dir) !void {
         .writer = &file.interface,
         .options = .{ .whitespace = .indent_2 },
     };
-    try writeStored(store, &json);
+    try write(store, &json);
     try file.flush();
     try atomic.replace(io);
 }
@@ -187,7 +180,7 @@ pub fn save(store: *const Store, io: std.Io, dir: std.Io.Dir) !void {
 /// keys of an object and the keys as its values. Written by hand rather than
 /// through a value, since the store's names are the user's and are not a set of
 /// fields anything could be built from.
-fn writeStored(store: *const Store, json: *std.json.Stringify) !void {
+fn write(store: *const Credentials, json: *std.json.Stringify) !void {
     try json.beginObject();
     try json.objectField("version");
     try json.write(format_version);
@@ -224,7 +217,7 @@ const dangling_purpose = "a service billy does not know";
 /// billy ships, the providers the configuration names, and any other name a key
 /// is stored under. The last are listed rather than hidden, so a file written by
 /// hand or by a billy whose configuration has since changed is not a mystery.
-pub fn list(out: *std.Io.Writer, store: *const Store, providers: []const []const u8) !void {
+pub fn list(store: *const Credentials, out: *std.Io.Writer, providers: []const []const u8) !void {
     // Every row that will be printed decides the columns, so a long name of the
     // user's own widens them all rather than running past the end.
     var name_width: usize = 0;
@@ -314,7 +307,7 @@ test "a key is stored under its own name, known to billy or not" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
 
-    var store: Store = .{};
+    var store: Credentials = .{};
     for (known) |service| {
         try std.testing.expect(store.get(service.name) == null);
         // The name is the key, so two services never read alike.
@@ -341,7 +334,7 @@ test "a stored key survives a save and a load" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var store: Store = .{};
+    var store: Credentials = .{};
     try store.put(allocator, "tavily", "tvly-secret");
     try store.put(allocator, "deepseek", "sk-secret");
     try store.put(allocator, "mock", "mock-secret");
@@ -365,7 +358,7 @@ test "the file holds a key per name that has one, and nothing else" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var store: Store = .{};
+    var store: Credentials = .{};
     try store.put(allocator, "tavily", "tvly-secret");
     try save(&store, std.testing.io, tmp.dir);
 
@@ -388,7 +381,7 @@ test "put replaces the key already stored for a name" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
 
-    var store: Store = .{};
+    var store: Credentials = .{};
     try store.put(allocator, "tavily", "old");
     try store.put(allocator, "tavily", "new");
 
@@ -404,7 +397,7 @@ test "the credentials file is written for the owner alone" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var store: Store = .{};
+    var store: Credentials = .{};
     try store.put(arena_state.allocator(), "tavily", "secret");
     try save(&store, std.testing.io, tmp.dir);
 
@@ -439,12 +432,12 @@ test "the listing shows each service billy knows and whether a key is stored" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
 
-    var store: Store = .{};
+    var store: Credentials = .{};
     try store.put(allocator, "deepseek", "sk-secret");
 
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try list(&sink.writer, &store, &.{});
+    try store.list(&sink.writer, &.{});
 
     try std.testing.expectEqualStrings(
         \\deepseek     DeepSeek API key           stored
@@ -464,10 +457,10 @@ test "the listing names a service that has no key of any kind" {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
 
-    const store: Store = .{};
+    const store: Credentials = .{};
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try list(&sink.writer, &store, &.{});
+    try store.list(&sink.writer, &.{});
 
     try std.testing.expectEqualStrings(
         \\deepseek     DeepSeek API key           not set
@@ -490,12 +483,12 @@ test "the listing shows a stored name billy does not know" {
 
     // A provider the configuration named has its key stored under that name, so
     // the listing has to show it or the user cannot tell it is set.
-    var store: Store = .{};
+    var store: Credentials = .{};
     try store.put(allocator, "a-very-long-provider-name", "k");
 
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try list(&sink.writer, &store, &.{});
+    try store.list(&sink.writer, &.{});
 
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -539,10 +532,10 @@ test "the listing names the providers the configuration defines" {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
 
-    const store: Store = .{};
+    const store: Credentials = .{};
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try list(&sink.writer, &store, &.{"mock"});
+    try store.list(&sink.writer, &.{"mock"});
 
     // A provider the configuration names is one a key can be stored for, so the
     // listing shows it: `billy login` with no service is where a user looks to
@@ -566,12 +559,12 @@ test "the listing shows a key under a name nothing names any more" {
 
     // A key stored by hand, or by a billy whose configuration has since changed,
     // is still in the file; showing it says why nothing uses it.
-    var store: Store = .{};
+    var store: Credentials = .{};
     try store.put(allocator, "gone", "k");
 
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try list(&sink.writer, &store, &.{"mock"});
+    try store.list(&sink.writer, &.{"mock"});
 
     try std.testing.expect(std.mem.indexOf(u8, sink.written(), "gone") != null);
     try std.testing.expect(std.mem.indexOf(u8, sink.written(), "a service billy does not know") != null);

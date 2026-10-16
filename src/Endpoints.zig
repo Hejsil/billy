@@ -10,7 +10,7 @@
 const std = @import("std");
 const agent = @import("Agent.zig");
 const Config = @import("Config.zig");
-const credentials = @import("credentials.zig");
+const Credentials = @import("Credentials.zig");
 const Health = @import("Health.zig");
 const llm = @import("llm.zig");
 const models = @import("models.zig");
@@ -41,11 +41,7 @@ pub const Backends = struct {
     /// The backends the configuration names, reporting the one at fault when a
     /// backend it names cannot be built: the configuration asked for the tool,
     /// so leaving it out without a word would look like a bug.
-    pub fn build(
-        arena: std.mem.Allocator,
-        config: Config,
-        store: *const credentials.Store,
-    ) !Backends {
+    pub fn build(arena: std.mem.Allocator, config: Config, store: *const Credentials) !Backends {
         // Which backend each set is built from, remembered so the report can
         // name it: only the builder knows which provider it was on.
         var search_failed: tools.web.Search.Provider = .tavily;
@@ -66,7 +62,7 @@ pub const Backends = struct {
 
 /// Where the configuration sends its requests: the provider and model it names,
 /// resolved to an endpoint and the key stored for it.
-pub fn open(arena: std.mem.Allocator, config: Config, store: *const credentials.Store) !Endpoint {
+pub fn open(arena: std.mem.Allocator, config: Config, store: *const Credentials) !Endpoint {
     const choice = config.stored.choice();
     const name = providerName(choice.text);
     const base_url = try resolveBaseUrl(config.stored.providers, choice.text);
@@ -93,7 +89,7 @@ pub fn open(arena: std.mem.Allocator, config: Config, store: *const credentials.
 /// the configured choice and keeps it from here on.
 pub fn sessionTarget(
     config: Config,
-    store: *const credentials.Store,
+    store: *const Credentials,
     arena: std.mem.Allocator,
     session: *Session,
 ) !agent.Target {
@@ -106,7 +102,7 @@ pub fn sessionTarget(
 /// from it rather than from the configured endpoint.
 fn targetFor(
     config: Config,
-    store: *const credentials.Store,
+    store: *const Credentials,
     arena: std.mem.Allocator,
     choice: []const u8,
 ) !agent.Target {
@@ -260,7 +256,7 @@ fn reasoningOf(setting: []const u8) llm.Reasoning {
 /// function knows which provider it was on.
 fn searchConfig(
     arena: std.mem.Allocator,
-    store: *const credentials.Store,
+    store: *const Credentials,
     config: Config,
     failed: *tools.web.Search.Provider,
 ) !?tools.web.Search.Config {
@@ -272,7 +268,7 @@ fn searchConfig(
     const backends = try arena.alloc(tools.web.Search.Backend, web_config.providers.len);
     for (web_config.providers, backends) |provider, *backend| {
         failed.* = provider;
-        const service = credentials.searchService(provider);
+        const service = Credentials.searchService(provider);
         backend.* = .{
             .provider = provider,
             .api_key = if (service) |name|
@@ -297,7 +293,7 @@ fn searchConfig(
 /// fetches without a service.
 pub fn fetchConfig(
     arena: std.mem.Allocator,
-    store: *const credentials.Store,
+    store: *const Credentials,
     config: Config,
     failed: *tools.web.Fetch.Provider,
 ) !?tools.web.Fetch.Config {
@@ -307,7 +303,7 @@ pub fn fetchConfig(
     const backends = try arena.alloc(tools.web.Fetch.Backend, web_config.providers.len);
     for (web_config.providers, backends) |provider, *backend| {
         failed.* = provider;
-        const service = credentials.fetchService(provider);
+        const service = Credentials.fetchService(provider);
         backend.* = .{
             .provider = provider,
             .api_key = if (service) |name|
@@ -330,7 +326,7 @@ fn reportSearchFailure(err: anyerror, provider: tools.web.Search.Provider) void 
         error.MissingApiKey => {
             // A backend reached with a key is one of the services, since the one
             // billy hosts itself is reached without one.
-            const service = credentials.searchService(provider).?;
+            const service = Credentials.searchService(provider).?;
             std.log.err(
                 "run `billy login {s}` to use {s}, or clear tools.web_search in the configuration",
                 .{ service, @tagName(provider) },
@@ -349,7 +345,7 @@ fn reportSearchFailure(err: anyerror, provider: tools.web.Search.Provider) void 
 fn reportFetchFailure(err: anyerror, provider: tools.web.Fetch.Provider) void {
     switch (err) {
         error.MissingApiKey => {
-            const service = credentials.fetchService(provider).?;
+            const service = Credentials.fetchService(provider).?;
             std.log.err(
                 "run `billy login {s}` to use {s}, or clear tools.web_fetch in the configuration",
                 .{ service, @tagName(provider) },
@@ -368,7 +364,7 @@ test "each backend resolves its own key, and SearXNG its instance" {
 
     var environ: std.process.Environ.Map = .init(gpa);
     defer environ.deinit();
-    const store: credentials.Store = .{};
+    const store: Credentials = .{};
 
     // Nothing named is no search at all.
     var off = Config.init(gpa);
@@ -410,7 +406,7 @@ test "a fetch backend is asked for its key, and raw for none" {
 
     var environ: std.process.Environ.Map = .init(gpa);
     defer environ.deinit();
-    const store: credentials.Store = .{};
+    const store: Credentials = .{};
 
     // The default holds only `raw`, which asks no service, so it resolves with
     // no key stored at all.
@@ -471,7 +467,7 @@ test "a target names bytes of its own, not a slice of the session's pool" {
     defer opened.config.deinit();
     // The key a request is sent with is the one stored under the provider's
     // name, so the store has to hold it for the target to resolve at all.
-    var store: credentials.Store = .{};
+    var store: Credentials = .{};
     try store.put(arena, "opencode_go", "k");
 
     var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");

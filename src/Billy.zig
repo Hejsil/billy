@@ -9,7 +9,7 @@
 const std = @import("std");
 const agent = @import("Agent.zig");
 const Config = @import("Config.zig");
-const Credentials = @import("credentials.zig");
+const Credentials = @import("Credentials.zig");
 const Dirs = @import("Dirs.zig");
 const Endpoints = @import("Endpoints.zig");
 const Health = @import("Health.zig");
@@ -31,7 +31,7 @@ environ: *const std.process.Environ.Map,
 /// Every directory billy keeps its files in.
 dirs: Dirs,
 /// The keys stored for the services billy talks to.
-credentials: Credentials.Store,
+credentials: Credentials,
 /// The configuration, which owns an arena of its own for the strings read out
 /// of the file, freed by `deinit`.
 config: Config,
@@ -105,7 +105,7 @@ pub fn login(billy: *Billy, out: *std.Io.Writer, service: ?[]const u8) !void {
         try provider_names.append(billy.arena, entry.name);
     }
 
-    const name = service orelse return Credentials.list(out, &billy.credentials, provider_names.items);
+    const name = service orelse return billy.credentials.list(out, provider_names.items);
     if (!Credentials.acceptable(name, provider_names.items)) {
         std.log.err(
             "'{s}' is neither a service billy knows nor a provider the configuration names;" ++
@@ -129,7 +129,7 @@ pub fn login(billy: *Billy, out: *std.Io.Writer, service: ?[]const u8) !void {
     }
 
     try billy.credentials.put(billy.arena, name, key);
-    Credentials.save(&billy.credentials, billy.io, billy.dirs.data) catch |err| {
+    billy.credentials.save(billy.io, billy.dirs.data) catch |err| {
         std.log.err("cannot write the credentials: {s}", .{@errorName(err)});
         return err;
     };

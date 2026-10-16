@@ -18,7 +18,7 @@
 const std = @import("std");
 const Agent = @import("Agent.zig");
 const Config = @import("Config.zig");
-const credentials = @import("credentials.zig");
+const Credentials = @import("Credentials.zig");
 const Endpoints = @import("Endpoints.zig");
 const Health = @import("Health.zig");
 const html = @import("html.zig");
@@ -79,7 +79,7 @@ session_dir: std.Io.Dir,
 config_dir: std.Io.Dir,
 /// The configuration, the keys and the waits every request is built from.
 config: Config,
-store: credentials.Store,
+store: Credentials,
 health: *Health,
 /// Where billy was started, and the environment it was started in: the home
 /// directory shown in the header, and what the model is told about itself.
