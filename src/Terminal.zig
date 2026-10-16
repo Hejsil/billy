@@ -16,10 +16,6 @@ display: agent.Display,
 /// For what showing a block builds, such as an edit's diff. Each block frees
 /// what it takes, so nothing is kept between them.
 scratch: std.mem.Allocator,
-/// Whether a prompt opens with the blank line that sets it off from what came
-/// before. Replaying a stored conversation wants it; a live prompt does not,
-/// since the line editor has already ended the line the prompt is typed on.
-replay: bool = false,
 
 pub fn emitter(self: *Terminal) agent.Emitter {
     return .{ .context = self, .vtable = &.{ .block = show } };
@@ -29,7 +25,6 @@ fn show(context: *anyopaque, block: agent.Block) anyerror!void {
     const self = selfOf(context);
     switch (block) {
         .prompt => |text| {
-            if (self.replay) try self.out.writeAll("\n");
             try printPrompt(self.scratch, self.out, text, self.display);
             // The prompt goes out as it is typed, before the request that
             // answers it, so what was sent is on screen while the model
@@ -66,14 +61,17 @@ fn selfOf(context: *anyopaque) *Terminal {
     return @ptrCast(@alignCast(context));
 }
 
-/// Prints a prompt as its own block: the `» prompt` header, then the text, laid
-/// out by `markdown` when one is set, and a blank line after it. A live prompt
-/// and a replayed one are both printed by this, so the two read the same. The
-/// `> ` the line is typed behind is not part of the prompt and is not printed.
+/// Prints a prompt as its own block: the blank line that sets it off from what
+/// came before, the `» prompt` header, the text laid out by `markdown` when one
+/// is set, and a blank line after it. A live prompt and a replayed one are both
+/// printed by this, so the two read the same. The `> ` the line is typed behind
+/// is not part of the prompt and is not printed.
 ///
-/// The blank line keeps the prompt from reading as the label of the answer or
-/// the tool block that follows it, which begin on the very next row otherwise.
+/// The blank line before keeps a prompt from reading as part of the block above
+/// it; the one after keeps it from reading as the label of the answer or the
+/// tool block that follows, which begin on the very next row otherwise.
 fn printPrompt(gpa: std.mem.Allocator, out: *std.Io.Writer, text: []const u8, display: agent.Display) !void {
+    try out.writeAll("\n");
     try marks.prompt.header("prompt", "", display.style, out);
     try Markdown.write(gpa, text, display.style, out);
     try out.writeAll("\n\n");
@@ -127,16 +125,16 @@ test "a prompt is headed by the same block live and replayed" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    // The block a replay shows, but with no blank line in front: it is printed
-    // where the line editor left the cursor, on the row the header stood on.
+    // The block opens with the blank line that sets it off from what came
+    // before and closes with the one that sets it off from what follows.
     try printPrompt(gpa, &out.writer, "hello", .{ .style = .plain });
-    try std.testing.expectEqualStrings("» prompt\nhello\n\n", out.written());
+    try std.testing.expectEqualStrings("\n» prompt\nhello\n\n", out.written());
     out.clearRetainingCapacity();
 
     // A prompt is markdown, so it is laid out by the same renderer as a reply.
     try printPrompt(gpa, &out.writer, "**hello**", .{ .style = .ansi });
     try std.testing.expectEqualStrings(
-        "\x1b[34m»\x1b[0m \x1b[1mprompt\x1b[0m\n\x1b[1mhello\x1b[0m\n\n",
+        "\n\x1b[34m»\x1b[0m \x1b[1mprompt\x1b[0m\n\x1b[1mhello\x1b[0m\n\n",
         out.written(),
     );
 }

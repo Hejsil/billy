@@ -105,11 +105,12 @@ fn historyLine(ed: *const LineEditor, index: usize) []const u8 {
 
 /// `header` is shown on its own line above the prompt while the line is being
 /// edited. Both it and the `prompt` in front of the line belong to the editing
-/// alone: on submit the whole region is erased, leaving the cursor where it
-/// stood, so nothing of the input is left in the output. The caller prints
-/// what the line was in its place. Neither may contain a newline. When stdin
-/// is not a terminal there is no line being typed, so neither is shown, and it
-/// is left to the caller to write the line out.
+/// alone: on submit the whole region is erased and the cursor is left on the
+/// row it began on, so nothing of the input is left in the output. The caller
+/// prints what the line was in its place, a block that opens with a blank line.
+/// Neither may contain a newline. When stdin is not a terminal there is no line
+/// being typed, so neither is shown, and it is left to the caller to write the
+/// line out.
 ///
 /// Returns null when stdin is exhausted: end of a piped stdin, or Ctrl-D on
 /// an empty line. The returned slice is kept in the editor's pool, so it is
@@ -119,12 +120,11 @@ pub fn readLine(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]con
     // The width is only wanted to fold a line being edited, which cannot
     // happen without a terminal.
     ed.width = if (interactive) ed.terminalWidth() else 0;
-    // Start on a fresh line, then the header and the prompt the user types
-    // behind. The leading newline also ends the previous line after a piped
-    // read, which has no echo to do that. With no terminal there is no line
-    // being typed, so neither the header nor the prompt is shown: the caller
-    // prints the line it read as the block a replay would.
-    try ed.out.writeAll("\n");
+    // The caller leaves the cursor at the start of a fresh line, since every
+    // block it shows ends with a newline, so the header and the prompt the user
+    // types behind are drawn there. With no terminal there is no line being
+    // typed, so neither is shown: the caller prints the line it read as the
+    // block the emitter would.
     if (interactive) {
         if (header.len > 0) {
             try ed.out.writeAll(header);
@@ -204,12 +204,11 @@ pub fn readLine(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]con
             .enter => {
                 // The whole prompt is erased, and no newline is written: the
                 // caller prints the prompt's own block in its place, and that
-                // block ends the line.
+                // block ends the line. An empty line is not printed at all, and
+                // the cursor is already back on the row the prompt stood on, so
+                // the next prompt draws over the same place rather than leaving
+                // a blank line behind.
                 try ed.endPrompt(header);
-                // An empty line says nothing, so the row the prompt stood on is
-                // given back too and the next prompt draws over the same place,
-                // rather than leaving a blank line behind.
-                if (line.items.len == 0) try ed.out.print("\x1b[1A", .{});
                 try ed.out.flush();
                 return @as(?[]const u8, try ed.submit(line.items));
             },

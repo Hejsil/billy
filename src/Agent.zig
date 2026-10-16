@@ -715,8 +715,9 @@ pub fn printTranscript(
     blocks: usize,
 ) !void {
     // A replay is what the terminal is shown when a session is picked up again,
-    // so a prompt opens with the blank line a live one does not need.
-    var terminal = Terminal{ .out = out, .io = io, .display = display, .scratch = gpa, .replay = true };
+    // and it goes through the same emitter a live run does, so a prompt reads
+    // the same whether it was just typed or stored.
+    var terminal = Terminal{ .out = out, .io = io, .display = display, .scratch = gpa };
     try walk(gpa, session, blocks, terminal.emitter());
     try out.flush();
 }
