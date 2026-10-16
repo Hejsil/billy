@@ -94,7 +94,7 @@ pub fn sessionTarget(
     session: *Session,
 ) !agent.Target {
     const choice = config.stored.model;
-    if (!session.hasModel()) try session.setModel(choice);
+    if (session.model() == null) try session.setModel(choice);
     return targetFor(config, store, arena, session.modelChoice(choice));
 }
 

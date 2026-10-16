@@ -116,6 +116,26 @@ const Stored = struct {
 
 const StringIndex = Pool.Index;
 
+/// The strings a session owns: its id and file name, the directory it started
+/// in, its system prompt, its title and the model it is sent to. Each is an
+/// index into the pool rather than a slice, so a field can be named for what it
+/// holds -- `interned.cwd` -- without colliding with the method that reads it.
+/// Reading one hands back a slice into the pool, which the next intern moves.
+const Interned = struct {
+    /// The id: the session's name among the files in its directory.
+    id: StringIndex = .none,
+    /// The id with the file extension: the name of the session file.
+    name: StringIndex = .none,
+    /// The directory the session was started in.
+    cwd: StringIndex = .none,
+    /// The system prompt sent at the front of every request.
+    system_prompt: StringIndex = .none,
+    /// A short name for the session, for a frontend to show in a list.
+    title: StringIndex = .none,
+    /// The provider and model the session was started on.
+    model: StringIndex = .none,
+};
+
 const ToolCallIndex = struct {
     start: u32,
     len: u32,
@@ -210,44 +230,24 @@ dir: std.Io.Dir,
 /// `deinit`.
 gpa: std.mem.Allocator,
 
-/// The id, in a fixed buffer written once from the front. The buffer is
-/// zero-filled, so what is written ends in NUL and the id is a NUL-terminated
-/// string with no length kept beside it. A generated id is a ULID; a resume
-/// takes one from the command line.
-id_buf: [max_id_len]u8 = @splat(0),
-
-/// The id with the file extension: the name of the session file, in a fixed
-/// buffer beside the id and zero-filled past the name for the same reason.
-name_buf: [max_id_len + extension.len]u8 = @splat(0),
-
 /// All string data. The pool keeps text as it comes and does not look for
 /// strings it already holds; see `Pool`.
 pool: Pool = .{},
 
+/// The strings the session owns, each an index into `pool`: its id and file
+/// name, the directory it was started in, its prompt, its title and its model.
+interned: Interned = .{},
+
 tool_calls: std.ArrayList(ToolCall) = .empty,
 
 /// The conversation, oldest first. The system prompt is not part of it: it is
-/// sent at the front of every request, from `system_prompt`, and kept out of the
-/// conversation so the two can be replaced apart from each other.
+/// sent at the front of every request, from `interned.system_prompt`, and kept
+/// out of the conversation so the two can be replaced apart from each other.
 messages: std.ArrayList(Message) = .empty,
-
-/// The system prompt sent at the front of every request, interned in the pool
-/// like every other string. `.none` for a session that has none.
-system_prompt: StringIndex = .none,
-
-/// A short name for the session, for a frontend to show in a list, interned in
-/// the pool like every other string. `.none` until the session is named, which
-/// happens on the first turn.
-title_index: StringIndex = .none,
 
 /// What the session may do and what its prompt says. Kept so a resume keeps the
 /// mode it started in rather than the default.
 mode: agent.Mode = .general,
-
-/// The provider and model this session was started on, interned in the pool like
-/// every other string. `.none` for a session saved before it was recorded, which
-/// is read as the choice billy is configured with.
-interned_model: StringIndex = .none,
 
 /// Indices into `messages` of the summaries a compaction produced
 compactions: std.ArrayList(u32) = .empty,
@@ -259,12 +259,6 @@ tools: []const Tool = &.{},
 
 /// Tokens in the conversation as of the last request.
 context_tokens: usize = 0,
-
-/// The directory the session was started in. A resumed session keeps it, so
-/// billy works where the session did rather than wherever it is run from now;
-/// a session saved before it was recorded has none, and the run's own directory
-/// is used instead.
-interned_cwd: StringIndex = .none,
 
 /// Opens the session called `resume_id`, or starts a new one when it is null.
 ///
@@ -306,20 +300,25 @@ fn named(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: ?[]const
     var session: Session = .{ .io = io, .dir = dir, .gpa = gpa };
     errdefer session.deinit();
 
-    // The id is written into its buffer; the file name is the id with the
-    // extension, built from it once so every read and write goes through one
-    // place. Both buffers are zero-filled, so both end in NUL, which is what
-    // says where an id ends.
-    if (named_id) |given| {
-        _ = try setCheckedId(&session.id_buf, given);
-    } else {
-        ulid.generate(io, session.id_buf[0..ulid.length]);
-    }
-    _ = try std.fmt.bufPrint(&session.name_buf, "{s}{s}", .{ session.id(), extension });
+    // The id is checked or made, then interned with the file name built from it,
+    // so both live in the pool and every read and write goes through one place.
+    // A generated id is a ULID; a resume takes one from the command line.
+    var id_buf: [max_id_len]u8 = @splat(0);
+    const id_text = if (named_id) |given|
+        try setCheckedId(&id_buf, given)
+    else made: {
+        ulid.generate(io, id_buf[0..ulid.length]);
+        break :made id_buf[0..ulid.length];
+    };
+    session.interned.id = try session.pool.intern(gpa, id_text);
+
+    var name_buf: [max_id_len + extension.len]u8 = undefined;
+    const file_name = try std.fmt.bufPrint(&name_buf, "{s}{s}", .{ id_text, extension });
+    session.interned.name = try session.pool.intern(gpa, file_name);
 
     // The session owns its directory rather than pointing into the caller's
     // memory, which it may outlive.
-    session.interned_cwd = try session.pool.intern(session.gpa, arg_cwd);
+    session.interned.cwd = try session.pool.intern(gpa, arg_cwd);
     return session;
 }
 
@@ -331,19 +330,18 @@ pub fn deinit(session: *Session) void {
     session.gpa.free(session.tools);
 }
 
-/// Names the session; also its file name without the extension. The buffer ends
-/// in NUL, which is what says where the id does.
+/// Names the session; also its file name without the extension.
 pub fn id(session: *const Session) []const u8 {
-    return std.mem.sliceTo(&session.id_buf, 0);
+    return session.pool.get(session.interned.id) orelse "";
 }
 
 /// Name of the session file inside `dir`.
 pub fn name(session: *const Session) []const u8 {
-    return std.mem.sliceTo(&session.name_buf, 0);
+    return session.pool.get(session.interned.name) orelse "";
 }
 
 pub fn cwd(session: *const Session) []const u8 {
-    return session.pool.get(session.interned_cwd) orelse "";
+    return session.pool.get(session.interned.cwd) orelse "";
 }
 
 /// The conversation as a completion request carries it: the `messages` array of
@@ -369,7 +367,7 @@ pub const Conversation = struct {
         try json.beginArray();
         // The system prompt leads every request, and is the one message that is
         // not part of the conversation.
-        if (session.pool.get(session.system_prompt)) |prompt| {
+        if (session.systemPrompt()) |prompt| {
             try json.beginObject();
             try json.objectField("role");
             try json.write("system");
@@ -464,29 +462,23 @@ pub fn isCompaction(session: *const Session, index: usize) bool {
     return std.mem.indexOfScalar(u32, session.compactions.items, target) != null;
 }
 
-/// Whether the session has a system prompt of its own, which every request
-/// carries at its front. False for a session saved before the prompt was kept
-/// apart from the conversation and for one opened but not yet prepared.
-pub fn hasSystemPrompt(session: *const Session) bool {
-    return session.system_prompt != .none;
-}
-
 /// The system prompt sent at the front of every request, or null when the
-/// session has none.
+/// session has none. That is the case for a session saved before the prompt was
+/// kept apart from the conversation and for one opened but not yet prepared.
 pub fn systemPrompt(session: *const Session) ?[]const u8 {
-    return session.pool.get(session.system_prompt);
+    return session.pool.get(session.interned.system_prompt);
 }
 
 /// The session's title, a short name for it, or null when it has none.
 pub fn title(session: *const Session) ?[]const u8 {
-    return session.pool.get(session.title_index);
+    return session.pool.get(session.interned.title);
 }
 
 /// Names the session, replacing any title it had. The whitespace around it is
 /// trimmed and the title has no length limit. It is held in the pool and
 /// reaches the file with the next save.
 pub fn setTitle(session: *Session, text: []const u8) !void {
-    session.title_index = try session.pool.intern(session.gpa, std.mem.trim(u8, text, " \t\r\n"));
+    session.interned.title = try session.pool.intern(session.gpa, std.mem.trim(u8, text, " \t\r\n"));
 }
 
 /// A tool call as the transcript reads it: the id that names the result which
@@ -554,10 +546,10 @@ pub fn toolResult(session: *const Session, from: usize, call: []const u8) []cons
 /// time. It is for a caller that wants the conversation as messages, which is
 /// what comparing two of them takes.
 pub fn resolvedMessages(session: *const Session, allocator: std.mem.Allocator) ![]const llm.Message {
-    const lead: usize = if (session.hasSystemPrompt()) 1 else 0;
+    const lead: usize = if (session.systemPrompt() != null) 1 else 0;
     const messages = try allocator.alloc(llm.Message, lead + session.messages.items.len);
     var out: usize = 0;
-    if (session.pool.get(session.system_prompt)) |prompt| {
+    if (session.systemPrompt()) |prompt| {
         messages[0] = .{ .role = .system, .content = prompt };
         out = 1;
     }
@@ -631,7 +623,7 @@ fn appendMessage(session: *Session, message: llm.Message) !void {
 /// saved with and hits its prompt cache. The prompt is held in the pool and
 /// reaches the file with the next save, like the tools.
 pub fn setSystemPrompt(session: *Session, system_prompt: []const u8) !void {
-    session.system_prompt = try session.pool.intern(session.gpa, system_prompt);
+    session.interned.system_prompt = try session.pool.intern(session.gpa, system_prompt);
 }
 
 /// Records the mode the session runs in. Set once, when the session starts; the
@@ -645,27 +637,27 @@ pub fn setMode(session: *Session, mode: agent.Mode) void {
 /// one is left alone, since the conversation belongs to the model that produced
 /// it.
 pub fn setModel(session: *Session, choice: []const u8) !void {
-    session.interned_model = try session.pool.intern(session.gpa, choice);
+    session.interned.model = try session.pool.intern(session.gpa, choice);
 }
 
-/// The provider and model this session is sent to, or null for one saved before
-/// either was recorded. `fallback` is what such a session is read as: the choice
-/// billy is configured with, which is where it was being sent anyway.
+/// The provider and model the session was started on, or null for one saved
+/// before either was recorded.
+pub fn model(session: *const Session) ?[]const u8 {
+    return session.pool.get(session.interned.model);
+}
+
+/// The choice to send the session to: its own model, or `fallback` for a session
+/// saved before one was recorded -- the choice billy is configured with, which
+/// is where it was being sent anyway.
 pub fn modelChoice(session: *const Session, fallback: []const u8) []const u8 {
-    return session.pool.get(session.interned_model) orelse fallback;
-}
-
-/// Whether the session records a choice of its own, which every session started
-/// since it was recorded does.
-pub fn hasModel(session: *const Session) bool {
-    return session.interned_model != .none;
+    return session.model() orelse fallback;
 }
 
 /// Records `system_prompt` unless the session already has one. A resumed session
 /// carries the prompt it was saved with, which is kept so the request it sends
 /// matches the earlier run byte for byte; a new session gets the current one.
 pub fn ensureSystemPrompt(session: *Session, system_prompt: []const u8) !void {
-    if (session.hasSystemPrompt()) return;
+    if (session.systemPrompt() != null) return;
     try session.setSystemPrompt(system_prompt);
 }
 
@@ -736,12 +728,12 @@ pub fn write(session: *const Session, writer: *std.Io.Writer) !void {
     try json.objectField("version");
     try json.write(Stored.default.version);
 
-    if (session.pool.get(session.title_index)) |stored_title| {
+    if (session.title()) |stored_title| {
         try json.objectField("title");
         try json.write(stored_title);
     }
 
-    if (session.pool.get(session.system_prompt)) |prompt| {
+    if (session.systemPrompt()) |prompt| {
         try json.objectField("system_prompt");
         try json.write(prompt);
     }
@@ -749,11 +741,14 @@ pub fn write(session: *const Session, writer: *std.Io.Writer) !void {
     try json.objectField("mode");
     try json.write(session.mode);
 
-    // Written whether or not the session has one, so a file always says which
-    // model it is for; a session that was resumed from an older file takes the
+    // Written only when the session has one: a session that records no model is
+    // sent to the configured choice, and a file without the field is what says
+    // it recorded none. A session resumed from an older file takes the
     // configured choice and is saved with it from here on.
-    try json.objectField("model");
-    try json.write(session.pool.get(session.interned_model) orelse "");
+    if (session.model()) |recorded| {
+        try json.objectField("model");
+        try json.write(recorded);
+    }
 
     try json.objectField("messages");
     try json.beginArray();
@@ -816,7 +811,7 @@ fn load(session: *Session) !void {
     }
     session.context_tokens = stored.context_tokens;
     if (stored.cwd) |stored_cwd|
-        session.interned_cwd = try session.pool.intern(session.gpa, stored_cwd);
+        session.interned.cwd = try session.pool.intern(session.gpa, stored_cwd);
 }
 
 fn loadPromptAndMessages(
@@ -1381,8 +1376,8 @@ test "a new session is written out by its first message" {
     try std.testing.expectEqual(1, resumed.tools.len);
     // The prompt is its own field, apart from the conversation, which is the
     // message alone.
-    try std.testing.expect(resumed.hasSystemPrompt());
-    try std.testing.expectEqualStrings("be terse", resumed.pool.get(resumed.system_prompt).?);
+    try std.testing.expect(resumed.systemPrompt() != null);
+    try std.testing.expectEqualStrings("be terse", resumed.systemPrompt().?);
     try std.testing.expectEqual(1, resumed.messages.items.len);
     try std.testing.expectEqualStrings("user", resumed.roleOf(resumed.messages.items[0]));
     try std.testing.expectEqualStrings("hello", resumed.contentOf(resumed.messages.items[0]).?);
@@ -2026,13 +2021,18 @@ test "every string is kept as it was written, and reads back as its own" {
         },
     });
 
-    // Every string as it came, in the order it was added, with a role among
-    // them: a role is the enum, so no copy of "user" or "assistant" is kept.
-    try std.testing.expectEqualStrings(
-        "/work\x00hello\x00hello\x00call_1\x00function\x00read\x00{}\x00" ++
+    // The pool opens with the strings the session owns -- its id and file name,
+    // and the directory it was started in -- then every string as it came, in
+    // the order it was added, with a role among them: a role is the enum, so no
+    // copy of "user" or "assistant" is kept.
+    var expected: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer expected.deinit();
+    try expected.writer.print("{s}\x00{s}\x00/work\x00", .{ session.id(), session.name() });
+    try expected.writer.writeAll(
+        "hello\x00hello\x00call_1\x00function\x00read\x00{}\x00" ++
             "call_1\x00function\x00read\x00[]\x00",
-        session.pool.strings.items,
     );
+    try std.testing.expectEqualStrings(expected.written(), session.pool.strings.items);
     // Two equal contents are two entries in the pool, and each message reads
     // back the text that was written for it.
     try std.testing.expectEqualStrings("hello", session.contentOf(session.messages.items[0]).?);
@@ -2060,14 +2060,14 @@ test "a version 2 file's system prompt is lifted into its own field" {
 
     // The prompt comes back as its own field and is no longer a message, so the
     // conversation is the user message alone.
-    try std.testing.expectEqualStrings("old prompt", resumed.pool.get(resumed.system_prompt).?);
+    try std.testing.expectEqualStrings("old prompt", resumed.systemPrompt().?);
     try std.testing.expectEqual(1, resumed.messages.items.len);
     try std.testing.expectEqualStrings("user", resumed.roleOf(resumed.messages.items[0]));
     try std.testing.expectEqualStrings("hi", resumed.contentOf(resumed.messages.items[0]).?);
 
     // A resume keeps it rather than taking a newer one.
     try resumed.ensureSystemPrompt("new prompt");
-    try std.testing.expectEqualStrings("old prompt", resumed.pool.get(resumed.system_prompt).?);
+    try std.testing.expectEqualStrings("old prompt", resumed.systemPrompt().?);
 }
 
 test "a compaction is appended and a request starts at its summary" {
@@ -2123,7 +2123,7 @@ test "a compaction survives a save and resume" {
     defer resumed.deinit();
 
     // Everything comes back, and the request still starts at the summary.
-    try std.testing.expectEqualStrings("be terse", resumed.pool.get(resumed.system_prompt).?);
+    try std.testing.expectEqualStrings("be terse", resumed.systemPrompt().?);
     try std.testing.expectEqual(4, resumed.messages.items.len);
     try std.testing.expectEqual(2, resumed.sentFrom());
     try std.testing.expectEqualStrings("the summary", resumed.pool.get(resumed.messages.items[2].content).?);
@@ -2150,7 +2150,7 @@ test "the compaction list is sorted and clamped when a session is read" {
     var session = try reopenTestSession(&tmp, "odd");
     defer session.deinit();
 
-    try std.testing.expectEqualStrings("s", session.pool.get(session.system_prompt).?);
+    try std.testing.expectEqualStrings("s", session.systemPrompt().?);
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 1, 2 }, session.compactions.items);
     try std.testing.expectEqual(2, session.sentFrom());
     try std.testing.expect(session.isCompaction(1));
@@ -2226,19 +2226,19 @@ test "the system prompt is kept apart from the conversation and is not replaced"
     // Setting the prompt does not put a message in the conversation: it is its own
     // field, sent at the front of every request.
     try session.setSystemPrompt("current prompt");
-    try std.testing.expect(session.hasSystemPrompt());
-    try std.testing.expectEqualStrings("current prompt", session.pool.get(session.system_prompt).?);
+    try std.testing.expect(session.systemPrompt() != null);
+    try std.testing.expectEqualStrings("current prompt", session.systemPrompt().?);
     try std.testing.expectEqual(0, session.messages.items.len);
 
     // A session that already has one keeps it, which is what a resume relies on.
     try session.append(.{ .role = .user, .content = "hi" });
     try session.ensureSystemPrompt("a different prompt");
-    try std.testing.expectEqualStrings("current prompt", session.pool.get(session.system_prompt).?);
+    try std.testing.expectEqualStrings("current prompt", session.systemPrompt().?);
     try std.testing.expectEqual(1, session.messages.items.len);
 
     // Setting it outright replaces it, which is what a compaction does.
     try session.setSystemPrompt("a different prompt");
-    try std.testing.expectEqualStrings("a different prompt", session.pool.get(session.system_prompt).?);
+    try std.testing.expectEqualStrings("a different prompt", session.systemPrompt().?);
 }
 
 test "the tools are written out with the schema as the JSON it is" {
@@ -2356,7 +2356,7 @@ test "the provider and model a session was started on are saved and resumed" {
     var session = try newTestSession(&tmp);
     defer session.deinit();
     // A fresh session records nothing, so a caller has to say where it is sent.
-    try std.testing.expect(!session.hasModel());
+    try std.testing.expect(session.model() == null);
     try session.setModel("opencode_go/glm-5.3-flash");
     try session.append(.{ .role = .user, .content = "hello" });
     try session.append(.{ .role = .assistant, .content = "hi" });
@@ -2367,7 +2367,7 @@ test "the provider and model a session was started on are saved and resumed" {
     // The resumed session keeps the provider and model it was started on rather
     // than following whatever the configuration now says, since the conversation
     // belongs to the model that produced it.
-    try std.testing.expect(resumed.hasModel());
+    try std.testing.expect(resumed.model() != null);
     try std.testing.expectEqualStrings("opencode_go/glm-5.3-flash", resumed.modelChoice("deepseek/deepseek-flash"));
 }
 
@@ -2386,9 +2386,9 @@ test "a session with no recorded model is read as the configured one" {
     try session.append(.{ .role = .user, .content = "hi" });
     const file = try tmp.dir.readFileAlloc(std.testing.io, session.name(), std.testing.allocator, .unlimited);
     defer std.testing.allocator.free(file);
-    // The file itself says which model it is for, so a session is never written
-    // without an answer to where it is sent.
-    try std.testing.expect(std.mem.indexOf(u8, file, "\"model\"") != null);
+    // A session that recorded no model writes no model field, which is what
+    // reads back as the configured choice.
+    try std.testing.expect(std.mem.indexOf(u8, file, "\"model\"") == null);
 }
 
 test "a session file written with an empty model reads as the configured one" {
@@ -2408,7 +2408,7 @@ test "a session file written with an empty model reads as the configured one" {
 
     var resumed = try reopenTestSession(&tmp, session_id);
     defer resumed.deinit();
-    try std.testing.expect(!resumed.hasModel());
+    try std.testing.expect(resumed.model() == null);
     try std.testing.expectEqualStrings(
         "opencode_go/glm-5.3-flash",
         resumed.modelChoice("opencode_go/glm-5.3-flash"),

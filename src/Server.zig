@@ -780,7 +780,7 @@ fn createSession(r: *Request, registry: *Registry, http_client: *std.http.Client
     var config = r.server.agentConfig();
     config.mode = choice.mode;
 
-    try serveTurn(r, http_client, &session, config, choice.text, session.id());
+    try serveTurn(r, http_client, &session, config, choice.text, true);
 }
 
 /// `POST /api/sessions/{id}/message`: asks the session `text`, answering with the
@@ -803,7 +803,7 @@ fn askSession(r: *Request, registry: *Registry, http_client: *std.http.Client, i
     var session = (try r.openSession(id)) orelse return;
     defer session.deinit();
 
-    try serveTurn(r, http_client, &session, r.server.agentConfig(), parsed.value.text, null);
+    try serveTurn(r, http_client, &session, r.server.agentConfig(), parsed.value.text, false);
 }
 
 /// Answers one prompt as the run happens: the run's blocks as the events of a
@@ -811,16 +811,17 @@ fn askSession(r: *Request, registry: *Registry, http_client: *std.http.Client, i
 /// each block the moment it is done and a slow tool call start long before it
 /// finishes.
 ///
-/// A session created by this request has no id on the page yet, so its id is sent
-/// as the first event, before anything else; `announce_id` is null for a session
-/// the page already has.
+/// A session created by this request has no id on the page yet, so with
+/// `announce` its id is sent as the first event, before anything else. The id
+/// is read from the session here rather than handed in, since preparing the
+/// session interns its prompt and moves the pool a slice of it would name.
 fn serveTurn(
     r: *Request,
     http_client: *std.http.Client,
     session: *Session,
     config: Agent.Config,
     text: []const u8,
-    announce_id: ?[]const u8,
+    announce: bool,
 ) !void {
     const gpa = r.server.gpa;
     var agent = try Agent.init(r.server.io, gpa, config, session.cwd(), http_client);
@@ -871,7 +872,7 @@ fn serveTurn(
         return;
     }
 
-    if (announce_id) |id| try stream.send("session", SessionEvent{ .id = id });
+    if (announce) try stream.send("session", SessionEvent{ .id = session.id() });
 
     // A session asked for the first time is named at once, from what was asked,
     // so the page's list shows a name before the model has answered; the model's

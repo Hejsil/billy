@@ -2211,7 +2211,7 @@ test "prepare gives a chat session no prompt and only the tools it allows" {
     // conversation alone, so the instructions never reach it), and the tools
     // stored are the ones chat allows.
     try std.testing.expectEqual(Mode.chat, session.mode);
-    try std.testing.expect(!session.hasSystemPrompt());
+    try std.testing.expect(session.systemPrompt() == null);
 
     const defs = agent.tool_set.definitions(.chat);
     try std.testing.expectEqual(@as(usize, 1), defs.len);
@@ -2637,7 +2637,7 @@ test "a session with no recorded model takes the choice it is prepared with" {
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
     // What an older session file reads back as.
-    try std.testing.expect(!session.hasModel());
+    try std.testing.expect(session.model() == null);
 
     try agent.prepare(&session, .{
         .url = "https://api.deepseek.com/chat/completions",
