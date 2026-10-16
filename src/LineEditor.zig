@@ -85,6 +85,10 @@ pasting: bool = false,
 /// one is a single line break. A terminal that sends `\r\n` for a pasted line
 /// ending would otherwise open a blank line after every line.
 paste_cr: bool = false,
+/// Whether the line is a secret: the prompt is shown but what is typed behind it
+/// is not, so a key is not left on the screen or in the scrollback. Set by
+/// `readSecret` and cleared by `readLine`.
+quiet: bool = false,
 
 /// `gpa` backs the line pool and the history the editor keeps; both are the
 /// editor's own and are freed by `deinit`.
@@ -103,19 +107,37 @@ fn historyLine(ed: *const LineEditor, index: usize) []const u8 {
     return std.mem.sliceTo(ed.strings.items[ed.history.items[index]..], 0);
 }
 
-/// `header` is shown on its own line above the prompt while the line is being
-/// edited. Both it and the `prompt` in front of the line belong to the editing
-/// alone: on submit the whole region is erased and the cursor is left on the
-/// row it began on, so nothing of the input is left in the output. The caller
-/// prints what the line was in its place, a block that ends with a blank line.
-/// Neither may contain a newline. When stdin is not a terminal there is no line
-/// being typed, so neither is shown, and it is left to the caller to write the
-/// line out.
+/// Reads one line for the caller to act on, above the run's `header` and behind
+/// `prompt`: the header is shown on its own line while the line is being edited.
+/// Both it and the prompt belong to the editing alone: on submit the whole region
+/// is erased and the cursor is left on the row it began on, so nothing of the
+/// input is left in the output. The caller prints what the line was in its place,
+/// a block that ends with a blank line. Neither may contain a newline. When stdin
+/// is not a terminal there is no line being typed, so neither is shown, and it is
+/// left to the caller to write the line out.
 ///
 /// Returns null when stdin is exhausted: end of a piped stdin, or Ctrl-D on
 /// an empty line. The returned slice is kept in the editor's pool, so it is
 /// valid until the next line is submitted.
 pub fn readLine(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
+    ed.quiet = false;
+    return ed.read(header, prompt);
+}
+
+/// Reads a secret behind `prompt`: what is typed is not shown, so a key is not
+/// left on the screen or in the scrollback. Only the prompt is drawn, and it is
+/// left standing when the line is submitted, since there is no block to replace
+/// it with. No header is shown, a secret being read on its own rather than under
+/// the run's; otherwise this reads as `readLine` does, returning null when stdin
+/// is exhausted and a slice of the editor's pool.
+pub fn readSecret(ed: *LineEditor, prompt: []const u8) !?[]const u8 {
+    ed.quiet = true;
+    return ed.read("", prompt);
+}
+
+/// The one reader behind `readLine` and `readSecret`, which differ only in
+/// `ed.quiet`.
+fn read(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
     const interactive = try std.Io.File.stdin().isTty(ed.io);
     // The width is only wanted to fold a line being edited, which cannot
     // happen without a terminal.
@@ -208,7 +230,14 @@ pub fn readLine(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]con
                 // the cursor is already back on the row the prompt stood on, so
                 // the next prompt draws over the same place rather than leaving
                 // a blank line behind.
-                try ed.endPrompt(header);
+                //
+                // A secret has no block to replace the region with, so its
+                // prompt is left standing and the line is ended here instead.
+                if (ed.quiet) {
+                    try ed.out.writeAll("\n");
+                } else {
+                    try ed.endPrompt(header);
+                }
                 try ed.out.flush();
                 return @as(?[]const u8, try ed.submit(line.items));
             },
@@ -313,9 +342,11 @@ pub fn readLine(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]con
             },
         }
         // Redraw only once the typed-ahead bytes are consumed, so pasting a
-        // long line does not repaint the terminal for every byte.
+        // long line does not repaint the terminal for every byte. A secret is
+        // painted as an empty line, so only the prompt is drawn and nothing
+        // typed is left on the screen.
         if (dirty and ed.drained()) {
-            try ed.redraw(prompt, content_width, line.items, cursor);
+            try ed.redraw(prompt, content_width, if (ed.quiet) "" else line.items, if (ed.quiet) 0 else cursor);
             dirty = false;
         }
     }
