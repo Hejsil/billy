@@ -49,6 +49,8 @@ pub const Answer = struct {
     body: []const u8,
     status: std.http.Status = .ok,
     keep_alive: bool = false,
+    /// The `Content-Type` to send the body with, or none.
+    content_type: ?[]const u8 = null,
 };
 
 /// Starts a mock listening on a free port, at `path` -- `/chat/completions` for
@@ -160,9 +162,16 @@ fn serveConnection(mock: *Mock, io: std.Io, stream: std.Io.net.Stream) !void {
 
         const answer = mock.answer(mock.served + 1, body);
         mock.served += 1;
+        var content_type: [1]std.http.Header = undefined;
+        var extra_headers: []const std.http.Header = &.{};
+        if (answer.content_type) |value| {
+            content_type[0] = .{ .name = "content-type", .value = value };
+            extra_headers = &content_type;
+        }
         try request.respond(answer.body, .{
             .status = answer.status,
             .keep_alive = answer.keep_alive,
+            .extra_headers = extra_headers,
         });
         if (!answer.keep_alive) return;
     }
@@ -185,6 +194,16 @@ pub fn completion(comptime content: []const u8) *const fn (usize, []const u8) An
         fn answer(_: usize, _: []const u8) Answer {
             return .{ .body = comptime "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"" ++
                 content ++ "\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}" };
+        }
+    }.answer;
+}
+
+/// The answer of a mock that sends `reply` as a stream of events, the shape a
+/// provider answers with when it was asked to stream.
+pub fn eventStream(comptime reply: []const u8) *const fn (usize, []const u8) Answer {
+    return struct {
+        fn answer(_: usize, _: []const u8) Answer {
+            return .{ .body = reply, .content_type = "text/event-stream" };
         }
     }.answer;
 }

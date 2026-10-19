@@ -91,6 +91,11 @@ pub const Reasoning = union(enum) {
 /// The thinking toggle, in the shape the API takes it: `{"type": "..."}`.
 pub const Thinking = struct { type: []const u8 };
 
+/// `stream_options`: what a streamed reply should carry beside the deltas. The
+/// usage count is only sent when it is asked for, and without it the context
+/// gauge has nothing to show.
+const StreamOptions = struct { include_usage: bool = true };
+
 /// The body of one completion request.
 ///
 /// `Messages` and `Tools` are whatever the conversation and the tool
@@ -103,7 +108,12 @@ fn Request(comptime Messages: type, comptime Tools: type) type {
         model: []const u8,
         messages: Messages,
         tools: Tools,
-        stream: bool = false,
+        /// Ask for the reply as a stream of deltas, which is added back up into the
+        /// message a plain reply would be, so a caller need not know which it got.
+        stream: bool = true,
+        /// Ask for a usage count in the stream, which a provider sends only when
+        /// asked for.
+        stream_options: ?StreamOptions = .{},
         /// The thinking toggle. Null sends none, which is what leaves the model
         /// on its own default.
         thinking: ?Thinking = null,
@@ -260,12 +270,16 @@ pub const Client = struct {
         var response = try req.receiveHead(&.{});
         const status = response.head.status;
         const retry_after_ms = Health.retryAfterMs(response.head.bytes);
+        // Read before the body, whose reader is what invalidates the head's
+        // strings.
+        const streamed = isEventStream(response.head.content_type);
 
         const answer_body = try http.readBody(client.gpa, &response);
 
         return .{
             .status = status,
             .retry_after_ms = retry_after_ms,
+            .streamed = streamed,
             .body = answer_body,
         };
     }
@@ -317,6 +331,9 @@ const Answer = struct {
     /// Milliseconds the server asked to wait before another try, from a
     /// `Retry-After` header, or null when it sent none.
     retry_after_ms: ?u64 = null,
+    /// Whether the body is a stream of events, from the `Content-Type` the server
+    /// sent it with.
+    streamed: bool = false,
     body: []u8,
 
     fn deinit(answer: Answer, gpa: std.mem.Allocator) void {
@@ -338,11 +355,30 @@ fn interpret(gpa: std.mem.Allocator, answer: Answer) !Completion {
         std.log.warn("HTTP {d}: {s}", .{ @backingInt(answer.status), answer.body });
         return error.HttpStatus;
     }
-    const parsed = std.json.parseFromSlice(Response, gpa, answer.body, .{
+    // A reply asked for as a stream comes as event-stream frames; a plain one is
+    // a single JSON object. The server says which it sent, so neither the body nor
+    // its leading bytes are guessed at. Either is read into the same `Response`,
+    // so the rest of billy sees one shape.
+    if (answer.streamed) return interpretStream(gpa, answer.body);
+    return interpretJson(gpa, answer.status, answer.body);
+}
+
+/// Whether a response's `Content-Type` names a stream of events, which is what a
+/// provider answers with when it was asked to stream. The type may carry
+/// parameters, such as `; charset=utf-8`, which are not part of it.
+fn isEventStream(content_type: ?[]const u8) bool {
+    const value = content_type orelse return false;
+    const end = std.mem.indexOfScalar(u8, value, ';') orelse value.len;
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value[0..end], " \t"), "text/event-stream");
+}
+
+/// Reads a reply sent as one JSON object.
+fn interpretJson(gpa: std.mem.Allocator, status: std.http.Status, body: []const u8) !Completion {
+    const parsed = std.json.parseFromSlice(Response, gpa, body, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     }) catch |err| {
-        std.log.warn("HTTP {d}: {s}", .{ @backingInt(answer.status), answer.body });
+        std.log.warn("HTTP {d}: {s}", .{ @backingInt(status), body });
         return err;
     };
     errdefer parsed.deinit();
@@ -352,7 +388,7 @@ fn interpret(gpa: std.mem.Allocator, answer: Answer) !Completion {
         return error.ApiError;
     }
     if (parsed.value.choices.len == 0) {
-        std.log.warn("HTTP {d} without choices: {s}", .{ @backingInt(answer.status), answer.body });
+        std.log.warn("HTTP {d} without choices: {s}", .{ @backingInt(status), body });
         return error.NoChoices;
     }
     // A provider that omits usage leaves the counts at zero, so the context gauge
@@ -362,6 +398,161 @@ fn interpret(gpa: std.mem.Allocator, answer: Answer) !Completion {
         .usage = parsed.value.usage orelse .{},
         .response = parsed,
     };
+}
+
+/// Reads a reply sent as a stream: the `data:` frames are added up into the
+/// message they spell out, then written back out in the shape a plain reply has,
+/// so the one reader above takes both. Nothing here shows a delta to the caller
+/// yet: the reply is assembled whole, and bubbling the deltas up is what comes
+/// next.
+fn interpretStream(gpa: std.mem.Allocator, body: []const u8) !Completion {
+    var assembled: Assembled = .{ .gpa = gpa };
+    defer assembled.deinit();
+    try assembled.feed(body);
+
+    var json: std.Io.Writer.Allocating = .init(gpa);
+    defer json.deinit();
+    try json.writer.writeAll("{\"choices\":[{\"message\":");
+    try std.json.Stringify.value(try assembled.message(), .{}, &json.writer);
+    try json.writer.writeAll("}],\"usage\":");
+    try std.json.Stringify.value(assembled.usage, .{}, &json.writer);
+    try json.writer.writeAll("}");
+    return interpretJson(gpa, .ok, json.written());
+}
+
+/// One delta of a streamed reply, as the API sends it. Unknown fields are
+/// ignored, and a field a delta leaves out keeps the default, since a delta only
+/// carries what changed.
+const Chunk = struct {
+    choices: []const Choice = &.{},
+    usage: ?Usage = null,
+
+    const Choice = struct {
+        delta: Delta = .{},
+        finish_reason: ?[]const u8 = null,
+    };
+    const Delta = struct {
+        content: ?[]const u8 = null,
+        reasoning_content: ?[]const u8 = null,
+        tool_calls: []const ToolCallDelta = &.{},
+    };
+    /// A piece of a tool call. The first piece carries the `id` and the name, and
+    /// the arguments follow a fragment at a time; `index` says which call of the
+    /// message they belong to.
+    const ToolCallDelta = struct {
+        index: u32 = 0,
+        id: ?[]const u8 = null,
+        function: Function = .{},
+        const Function = struct {
+            name: ?[]const u8 = null,
+            arguments: ?[]const u8 = null,
+        };
+    };
+};
+
+/// The deltas of one streamed reply, added up into the message and usage they
+/// spell out.
+const Assembled = struct {
+    gpa: std.mem.Allocator,
+    /// The answer, the model's thinking, and one set of pieces per tool call.
+    content: std.ArrayList(u8) = .empty,
+    reasoning: std.ArrayList(u8) = .empty,
+    calls: std.ArrayList(Pieces) = .empty,
+    tool_calls: std.ArrayList(ToolCall) = .empty,
+    usage: Usage = .{},
+
+    const Pieces = struct {
+        id: std.ArrayList(u8) = .empty,
+        name: std.ArrayList(u8) = .empty,
+        arguments: std.ArrayList(u8) = .empty,
+
+        fn deinit(pieces: *Pieces, gpa: std.mem.Allocator) void {
+            pieces.id.deinit(gpa);
+            pieces.name.deinit(gpa);
+            pieces.arguments.deinit(gpa);
+        }
+    };
+
+    fn deinit(self: *Assembled) void {
+        self.content.deinit(self.gpa);
+        self.reasoning.deinit(self.gpa);
+        for (self.calls.items) |*pieces| pieces.deinit(self.gpa);
+        self.calls.deinit(self.gpa);
+        self.tool_calls.deinit(self.gpa);
+    }
+
+    /// Reads the `data:` frames of `body` into the reply, until the frame that
+    /// ends the stream.
+    fn feed(self: *Assembled, body: []const u8) !void {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        var data: std.ArrayList(u8) = .empty;
+        defer data.deinit(self.gpa);
+
+        var frames = std.mem.splitSequence(u8, body, "\n\n");
+        while (frames.next()) |frame| {
+            data.clearRetainingCapacity();
+            // A frame is lines; only `data:` carries the JSON, and a payload that
+            // runs over more than one line is joined back with newlines.
+            var lines = std.mem.splitScalar(u8, frame, '\n');
+            while (lines.next()) |line| {
+                const payload = std.mem.trimStart(u8, line, " ");
+                if (!std.mem.startsWith(u8, payload, "data:")) continue;
+                if (data.items.len > 0) try data.append(self.gpa, '\n');
+                try data.appendSlice(self.gpa, std.mem.trim(u8, payload["data:".len..], " \t\r"));
+            }
+            if (data.items.len == 0) continue;
+            if (std.mem.eql(u8, data.items, "[DONE]")) return;
+            _ = arena_state.reset(.retain_capacity);
+            self.apply(arena_state.allocator(), data.items) catch |err|
+                std.log.warn("a streamed delta could not be read: {s}", .{@errorName(err)});
+        }
+    }
+
+    /// Adds one delta to the reply.
+    fn apply(self: *Assembled, arena: std.mem.Allocator, json_text: []const u8) !void {
+        const chunk = try std.json.parseFromSliceLeaky(Chunk, arena, json_text, .{
+            .ignore_unknown_fields = true,
+        });
+        if (chunk.usage) |usage| self.usage = usage;
+        for (chunk.choices) |choice| {
+            if (choice.delta.content) |text| try self.content.appendSlice(self.gpa, text);
+            if (choice.delta.reasoning_content) |text| try self.reasoning.appendSlice(self.gpa, text);
+            for (choice.delta.tool_calls) |fragment| try self.addCall(fragment);
+        }
+    }
+
+    /// Adds a piece of a tool call to the call its `index` names, making that call
+    /// on the first piece.
+    fn addCall(self: *Assembled, fragment: Chunk.ToolCallDelta) !void {
+        while (self.calls.items.len <= fragment.index) try self.calls.append(self.gpa, .{});
+        const pieces = &self.calls.items[fragment.index];
+        if (fragment.id) |id| try replace(&pieces.id, self.gpa, id);
+        if (fragment.function.name) |name| try replace(&pieces.name, self.gpa, name);
+        if (fragment.function.arguments) |arguments| try pieces.arguments.appendSlice(self.gpa, arguments);
+    }
+
+    /// The message the reply adds up to, its strings pointing into this.
+    fn message(self: *Assembled) !Message {
+        self.tool_calls.clearRetainingCapacity();
+        for (self.calls.items) |pieces|
+            try self.tool_calls.append(self.gpa, .{
+                .id = pieces.id.items,
+                .function = .{ .name = pieces.name.items, .arguments = pieces.arguments.items },
+            });
+        return .{
+            .role = .assistant,
+            .content = if (self.content.items.len > 0) self.content.items else null,
+            .reasoning_content = if (self.reasoning.items.len > 0) self.reasoning.items else null,
+            .tool_calls = if (self.tool_calls.items.len > 0) self.tool_calls.items else null,
+        };
+    }
+};
+
+/// Sets `list` to `text`, keeping what it already allocated.
+fn replace(list: *std.ArrayList(u8), gpa: std.mem.Allocator, text: []const u8) !void {
+    list.clearRetainingCapacity();
+    try list.appendSlice(gpa, text);
 }
 
 /// Whether a status says to try the request again: a rate limit, or a server
@@ -561,6 +752,100 @@ test "a request names billy and carries the session it belongs to" {
     for (mock.headers.items) |header| try found.put(header.name, header.value);
     try std.testing.expectEqualStrings(user_agent, found.get("user-agent").?);
     try std.testing.expectEqualStrings("01ABC", found.get("x-opencode-session").?);
+}
+
+test "a streamed reply is added up into the message and usage" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const messages = [_]Message{.{ .role = .user, .content = "hi" }};
+    var mock = try Mock.start("/chat/completions", 1, Mock.eventStream(
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n" ++
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n" ++
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n" ++
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"a thought\"}}]}\n\n" ++
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n" ++
+            "data: [DONE]\n\n",
+    ));
+    defer mock.deinit();
+    try mock.serve();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+    var client: Client = .{
+        .gpa = gpa,
+        .io = io,
+        .api_key = "k",
+        .url = mock.url,
+        .model = "m",
+        .http = &http_client,
+    };
+
+    const completion = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
+    defer completion.deinit();
+
+    try mock.group.await(io);
+    if (mock.err) |err| return err;
+
+    // The deltas are folded into one message, the same shape a whole reply has.
+    try std.testing.expectEqualStrings("hello", completion.message.content.?);
+    try std.testing.expectEqualStrings("a thought", completion.message.reasoning_content.?);
+    try std.testing.expect(completion.message.tool_calls == null);
+    try std.testing.expectEqual(5, completion.usage.total_tokens);
+}
+
+test "a tool call streamed in pieces is put back together" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const messages = [_]Message{.{ .role = .user, .content = "run it" }};
+    var mock = try Mock.start("/chat/completions", 1, Mock.eventStream(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\"," ++
+            "\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]}}]}\n\n" ++
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0," ++
+            "\"function\":{\"arguments\":\"{\\\"command\\\":\"}}]}}]}\n\n" ++
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0," ++
+            "\"function\":{\"arguments\":\"\\\"echo hi\\\"}\"}}]}}]}\n\n" ++
+            "data: [DONE]\n\n",
+    ));
+    defer mock.deinit();
+    try mock.serve();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+    var client: Client = .{
+        .gpa = gpa,
+        .io = io,
+        .api_key = "k",
+        .url = mock.url,
+        .model = "m",
+        .http = &http_client,
+    };
+
+    const completion = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
+    defer completion.deinit();
+
+    try mock.group.await(io);
+    if (mock.err) |err| return err;
+
+    // The id and name arrive once and the arguments a fragment at a time; they
+    // are put back into the one call the model meant.
+    const calls = completion.message.tool_calls.?;
+    try std.testing.expectEqual(1, calls.len);
+    try std.testing.expectEqualStrings("call_1", calls[0].id);
+    try std.testing.expectEqualStrings("bash", calls[0].function.name);
+    try std.testing.expectEqualStrings("{\"command\":\"echo hi\"}", calls[0].function.arguments);
+}
+
+test "a body is read by the content type it was sent with" {
+    // The type may carry parameters, and the case does not matter; anything but a
+    // stream, or nothing at all, is a plain reply.
+    try std.testing.expect(isEventStream("text/event-stream"));
+    try std.testing.expect(isEventStream("text/event-stream; charset=utf-8"));
+    try std.testing.expect(isEventStream("Text/Event-Stream"));
+    try std.testing.expect(!isEventStream("application/json"));
+    try std.testing.expect(!isEventStream(null));
 }
 
 test "worthRetrying is a rate limit or a server error" {
