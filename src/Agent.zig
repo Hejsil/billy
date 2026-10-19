@@ -124,6 +124,9 @@ pub const Display = struct {
 /// A tool call is two blocks, the call as it begins and the call with its result
 /// as it ends, so a frontend can show a slow command while it runs. A frontend
 /// that shows only finished work ignores the first.
+///
+/// A reply's text also arrives in fragments through `Emitter.delta` while it is
+/// written, before the `answer` block that carries the whole of it.
 pub const Block = union(enum) {
     /// What the user typed.
     prompt: []const u8,
@@ -163,6 +166,17 @@ pub const Block = union(enum) {
     };
 };
 
+/// A fragment of an answer as the model writes it, on its way to the `answer`
+/// block that carries the whole of it. A frontend that streams shows the
+/// fragments as they arrive; one that shows a reply whole ignores them and shows
+/// the block. At least one field is set.
+pub const Delta = struct {
+    /// More of the reply's text.
+    content: ?[]const u8 = null,
+    /// More of what the model thought before it answered.
+    reasoning: ?[]const u8 = null,
+};
+
 /// Where a run's blocks go. The run says what happened and the emitter decides
 /// how it looks, which is what lets the same run be shown in a terminal or over
 /// the web without the run knowing which it is talking to.
@@ -174,11 +188,21 @@ pub const Emitter = struct {
         /// Shows one block. Blocks arrive in the order they happened, and a
         /// frontend gets each one whole; nothing is half-shown.
         block: *const fn (context: *anyopaque, block: Block) anyerror!void,
+        /// Shows a fragment of the answer as the model writes it. Optional: a
+        /// frontend that shows only whole blocks leaves it null, and the
+        /// `answer` block that follows carries the whole reply.
+        delta: ?*const fn (context: *anyopaque, delta: Delta) anyerror!void = null,
     };
 
     /// Shows one block.
     pub fn show(emitter: Emitter, block: Block) !void {
         return emitter.vtable.block(emitter.context, block);
+    }
+
+    /// Shows one fragment of the answer. A frontend with no delta handler drops
+    /// it, since the whole answer follows as a block.
+    pub fn showDelta(emitter: Emitter, delta: Delta) !void {
+        if (emitter.vtable.delta) |show_delta| return show_delta(emitter.context, delta);
     }
 };
 
@@ -892,6 +916,84 @@ fn blocksIn(session: *const Session, messages: []const Session.Message, index: u
     return if (calls == 0) 1 else calls;
 }
 
+/// Adds the deltas of a streamed reply up into the message they spell out. The
+/// message points into this, so it outlives the message's use and is freed with
+/// `deinit`.
+const Reply = struct {
+    gpa: std.mem.Allocator,
+    /// The answer, the model's thinking, and one set of pieces per tool call.
+    content: std.ArrayList(u8) = .empty,
+    reasoning: std.ArrayList(u8) = .empty,
+    calls: std.ArrayList(Call) = .empty,
+    tool_calls: std.ArrayList(llm.ToolCall) = .empty,
+
+    const Call = struct {
+        id: std.ArrayList(u8) = .empty,
+        name: std.ArrayList(u8) = .empty,
+        arguments: std.ArrayList(u8) = .empty,
+
+        fn deinit(call: *Call, gpa: std.mem.Allocator) void {
+            call.id.deinit(gpa);
+            call.name.deinit(gpa);
+            call.arguments.deinit(gpa);
+        }
+    };
+
+    fn deinit(self: *Reply) void {
+        self.content.deinit(self.gpa);
+        self.reasoning.deinit(self.gpa);
+        for (self.calls.items) |*call| call.deinit(self.gpa);
+        self.calls.deinit(self.gpa);
+        self.tool_calls.deinit(self.gpa);
+    }
+
+    /// Adds one delta of a streamed reply.
+    fn add(self: *Reply, delta: llm.Delta) !void {
+        if (delta.content) |text| try self.content.appendSlice(self.gpa, text);
+        if (delta.reasoning) |text| try self.reasoning.appendSlice(self.gpa, text);
+        for (delta.tool_calls) |fragment| try self.addCall(fragment);
+    }
+
+    /// Adds a piece of a tool call to the call its `index` names, making that call
+    /// on the first piece.
+    fn addCall(self: *Reply, fragment: llm.ToolCallDelta) !void {
+        while (self.calls.items.len <= fragment.index) try self.calls.append(self.gpa, .{});
+        const call = &self.calls.items[fragment.index];
+        if (fragment.id) |id| try set(&call.id, self.gpa, id);
+        if (fragment.name) |name| try set(&call.name, self.gpa, name);
+        if (fragment.arguments) |arguments| try call.arguments.appendSlice(self.gpa, arguments);
+    }
+
+    /// The message the reply adds up to, its strings pointing into this.
+    fn message(self: *Reply) !llm.Message {
+        self.tool_calls.clearRetainingCapacity();
+        for (self.calls.items) |call|
+            try self.tool_calls.append(self.gpa, .{
+                .id = call.id.items,
+                .function = .{ .name = call.name.items, .arguments = call.arguments.items },
+            });
+        return .{
+            .role = .assistant,
+            .content = if (self.content.items.len > 0) self.content.items else null,
+            .reasoning_content = if (self.reasoning.items.len > 0) self.reasoning.items else null,
+            .tool_calls = if (self.tool_calls.items.len > 0) self.tool_calls.items else null,
+        };
+    }
+};
+
+/// Sets `list` to `text`, keeping what it already allocated.
+fn set(list: *std.ArrayList(u8), gpa: std.mem.Allocator, text: []const u8) !void {
+    list.clearRetainingCapacity();
+    try list.appendSlice(gpa, text);
+}
+
+/// Shows the text of a streamed delta to the frontend. Tool call pieces are not
+/// shown: a call is shown whole when it has been parsed, just before it runs.
+fn showDeltaText(emitter: Emitter, delta: llm.Delta) !void {
+    if (delta.content) |text| try emitter.showDelta(.{ .content = text });
+    if (delta.reasoning) |text| try emitter.showDelta(.{ .reasoning = text });
+}
+
 /// Runs the model until it replies with text instead of tool calls, showing what
 /// happens as blocks as it goes.
 fn turn(agent: *Agent, emitter: Emitter, session: *Session) !void {
@@ -910,25 +1012,32 @@ fn turn(agent: *Agent, emitter: Emitter, session: *Session) !void {
         // A failure to compact is not the turn's, and is not retried within it.
         if (!compact_failed) compact_failed = agent.compact(emitter, session, .when_needed) == .failed;
 
-        // The completion owns its parsed reply, and each tool result lives in the
-        // tool set's scratch, so the turn allocates nothing of its own: the
-        // conversation is written straight onto the connection out of the pool,
-        // the reply is freed when the turn ends, and the session interns what it
-        // keeps.
-        const completion = try agent.client.complete(
+        // The stream hands the reply over a delta at a time. It is added up here,
+        // because the session keeps the whole message, and each delta is shown as
+        // it arrives so a frontend that streams can show the answer while it is
+        // written. Nothing of the conversation or the reply is copied on the way
+        // to the wire: the request is written out of the session's pool.
+        var stream = try agent.client.complete(
             agent.gpa,
             session.id(),
             session.conversation(&.{}),
             session.toolSet(),
         );
-        defer completion.deinit();
+        defer stream.deinit();
 
-        // Recorded first, so the save inside `append` stores the size along with
-        // the message.
-        session.recordUsage(completion.usage);
-        try session.append(completion.message);
+        var reply: Reply = .{ .gpa = agent.gpa };
+        defer reply.deinit();
+        while (try stream.next()) |delta| {
+            try reply.add(delta);
+            try showDeltaText(emitter, delta);
+        }
 
-        const message = completion.message;
+        // Recorded before the message is appended, so the save inside `append`
+        // stores the size along with it.
+        session.recordUsage(stream.usage());
+        const message = try reply.message();
+        try session.append(message);
+
         const calls = message.tool_calls orelse &.{};
         // No calls means the model answered, which ends the turn.
         if (calls.len == 0) return emitter.show(.{ .answer = message.content orelse "" });
@@ -1184,15 +1293,19 @@ fn fold(agent: *Agent, emitter: Emitter, session: *Session) !bool {
 /// carries.
 fn askWith(agent: *Agent, session: *Session, question: []const u8) !?[]u8 {
     const extra = [_]llm.Message{.{ .role = .user, .content = question }};
-    const completion = try agent.client.complete(
+    var stream = try agent.client.complete(
         agent.gpa,
         session.id(),
         session.conversation(&extra),
         session.toolSet(),
     );
-    defer completion.deinit();
+    defer stream.deinit();
 
-    const content = completion.message.content orelse return null;
+    var reply: Reply = .{ .gpa = agent.gpa };
+    defer reply.deinit();
+    while (try stream.next()) |delta| try reply.add(delta);
+
+    const content = reply.content.items;
     if (content.len == 0) return null;
     return try agent.gpa.dupe(u8, content);
 }
@@ -1960,10 +2073,7 @@ test "maybeCompact folds the conversation once it has filled the window" {
 
     // A server standing in for the model, answering the compaction request with a
     // fixed summary and recording the body it was sent.
-    var mock = try Mock.start("/chat/completions", 1, Mock.fixed(
-        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"the summary\"}}]," ++
-            "\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"total_tokens\":105}}",
-    ));
+    var mock = try Mock.start("/chat/completions", 1, Mock.completion("the summary"));
     defer mock.deinit();
     try mock.serve();
 
@@ -2073,10 +2183,7 @@ test "a compaction asked for now folds the conversation in whatever its size" {
     // Compaction is off, so only a manual one runs.
     config.compact_at = 0;
 
-    var mock = try Mock.start("/chat/completions", 1, Mock.fixed(
-        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"the summary\"}}]," ++
-            "\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"total_tokens\":105}}",
-    ));
+    var mock = try Mock.start("/chat/completions", 1, Mock.completion("the summary"));
     defer mock.deinit();
     try mock.serve();
 
@@ -2413,6 +2520,10 @@ const Recorder = struct {
     /// scratch and the caller's buffers, neither of which outlives the run.
     gpa: std.mem.Allocator,
     seen: std.ArrayList(Seen) = .empty,
+    /// The answer's fragments as they arrived, kept apart from the blocks: a
+    /// frontend that streams shows them, and the `answer` block still follows
+    /// with the whole text.
+    deltas: std.ArrayList(Fragment) = .empty,
 
     const Seen = union(enum) {
         prompt: []const u8,
@@ -2424,8 +2535,10 @@ const Recorder = struct {
         elided: usize,
     };
 
+    const Fragment = struct { reasoning: bool, text: []const u8 };
+
     fn emitter(self: *Recorder) Emitter {
-        return .{ .context = self, .vtable = &.{ .block = show } };
+        return .{ .context = self, .vtable = &.{ .block = show, .delta = showDelta } };
     }
 
     fn show(context: *anyopaque, block: Block) anyerror!void {
@@ -2446,6 +2559,18 @@ const Recorder = struct {
             .elided => |count| .{ .elided = count },
         };
         try self.seen.append(self.gpa, seen);
+    }
+
+    fn showDelta(context: *anyopaque, delta: Delta) anyerror!void {
+        const self = selfOf(context);
+        if (delta.content) |text| try self.deltas.append(self.gpa, .{
+            .reasoning = false,
+            .text = try self.keeper(text),
+        });
+        if (delta.reasoning) |text| try self.deltas.append(self.gpa, .{
+            .reasoning = true,
+            .text = try self.keeper(text),
+        });
     }
 
     /// A copy of `text` in the recorder's gpa, so what it records lasts as long
@@ -2478,13 +2603,23 @@ test "a turn shows the tool it runs and then the answer" {
     const answering = struct {
         fn answer(_: usize, body: []const u8) Mock.Answer {
             if (std.mem.indexOf(u8, body, "\"tool\"") != null) {
-                return .{ .body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"all done\"}}]," ++
-                    "\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":2,\"total_tokens\":22}}" };
+                return .{
+                    .body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n" ++
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"all \"}}]}\n\n" ++
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n" ++
+                        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":2,\"total_tokens\":22}}\n\n" ++
+                        "data: [DONE]\n\n",
+                    .content_type = "text/event-stream",
+                };
             }
-            return .{ .body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"call_1\"," ++
-                "\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":" ++
-                "\"{\\\"command\\\":\\\"echo hi\\\"}\"}}]}}]," ++
-                "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}" };
+            return .{
+                .body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\"," ++
+                    "\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":" ++
+                    "\"{\\\"command\\\":\\\"echo hi\\\"}\"}}]}}]," ++
+                    "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}\n\n" ++
+                    "data: [DONE]\n\n",
+                .content_type = "text/event-stream",
+            };
         }
     }.answer;
     var mock = try Mock.start("/chat/completions", 2, answering);
@@ -2515,6 +2650,15 @@ test "a turn shows the tool it runs and then the answer" {
     try std.testing.expectEqualStrings("exit code: 0\nhi\n", tool.result);
     try std.testing.expectEqualStrings("all done", recorder.seen.items[2].answer);
 
+    // The answer reached the frontend while it was still being written, as the
+    // pieces the model sent, before the block that carries the whole of it.
+    try std.testing.expectEqual(3, recorder.deltas.items.len);
+    try std.testing.expect(recorder.deltas.items[0].reasoning);
+    try std.testing.expectEqualStrings("thinking", recorder.deltas.items[0].text);
+    try std.testing.expect(!recorder.deltas.items[1].reasoning);
+    try std.testing.expectEqualStrings("all ", recorder.deltas.items[1].text);
+    try std.testing.expectEqualStrings("done", recorder.deltas.items[2].text);
+
     // What was shown is what the session kept, so a resume replays the turn.
     try std.testing.expectEqualStrings(
         "exit code: 0\nhi\n",
@@ -2542,11 +2686,19 @@ test "the first turn names the session, and the naming is not part of it" {
     const answering = struct {
         fn answer(_: usize, body: []const u8) Mock.Answer {
             if (std.mem.indexOf(u8, body, "short title") != null) {
-                return .{ .body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Fix the flaky test\"}}]," ++
-                    "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}" };
+                return .{
+                    .body = "data: {\"choices\":[{\"delta\":{\"content\":\"Fix the flaky test\"}}]," ++
+                        "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}\n\n" ++
+                        "data: [DONE]\n\n",
+                    .content_type = "text/event-stream",
+                };
             }
-            return .{ .body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"all done\"}}]," ++
-                "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}" };
+            return .{
+                .body = "data: {\"choices\":[{\"delta\":{\"content\":\"all done\"}}]," ++
+                    "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}\n\n" ++
+                    "data: [DONE]\n\n",
+                .content_type = "text/event-stream",
+            };
         }
     }.answer;
     var mock = try Mock.start("/chat/completions", 2, answering);
@@ -2631,9 +2783,7 @@ test "a session is sent where the choice it recorded points, not the configurati
 
     // The configuration names an endpoint nothing listens on, so a request that
     // went there would fail rather than quietly answering.
-    var chosen = try Mock.start("/chat/completions", 1, Mock.fixed(
-        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"chosen\"}}]}",
-    ));
+    var chosen = try Mock.start("/chat/completions", 1, Mock.completion("chosen"));
     defer chosen.deinit();
     try chosen.serve();
 
@@ -2674,12 +2824,15 @@ test "a session is sent where the choice it recorded points, not the configurati
 
     // And the request goes there rather than to the configured endpoint, which
     // nothing is listening on.
-    const completion = try agent.client.complete(gpa, "01SESSION", session.conversation(&.{}), session.toolSet());
-    defer completion.deinit();
+    var stream = try agent.client.complete(gpa, "01SESSION", session.conversation(&.{}), session.toolSet());
+    defer stream.deinit();
+    var reply: Reply = .{ .gpa = gpa };
+    defer reply.deinit();
+    while (try stream.next()) |delta| try reply.add(delta);
     try chosen.group.await(io);
     if (chosen.err) |err| return err;
     try std.testing.expectEqual(@as(usize, 1), chosen.served);
-    try std.testing.expectEqualStrings("chosen", completion.message.content.?);
+    try std.testing.expectEqualStrings("chosen", reply.content.items);
 }
 
 test "a session with no recorded model takes the choice it is prepared with" {

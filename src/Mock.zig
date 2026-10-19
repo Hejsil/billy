@@ -188,12 +188,18 @@ pub fn fixed(comptime reply: []const u8) *const fn (usize, []const u8) Answer {
 }
 
 /// The answer of a mock whose reply is a completion carrying `content`: the
-/// shape a model provider sends back.
+/// shape a model provider sends back when it was asked to stream. The whole
+/// content arrives as one delta and the usage with it, which is enough for a test
+/// that is not about the stream itself.
 pub fn completion(comptime content: []const u8) *const fn (usize, []const u8) Answer {
     return struct {
         fn answer(_: usize, _: []const u8) Answer {
-            return .{ .body = comptime "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"" ++
-                content ++ "\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}" };
+            return .{
+                .body = comptime "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"" ++
+                    content ++ "\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}\n\n" ++
+                    "data: [DONE]\n\n",
+                .content_type = "text/event-stream",
+            };
         }
     }.answer;
 }
