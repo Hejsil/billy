@@ -31,11 +31,19 @@ const serve_about =
     \\so only listen where that is meant.
 ;
 
+/// What the `sessions` subcommand is for, shown in its help.
+const sessions_about =
+    \\List the sessions billy has kept, the one written to most recently first,
+    \\one to a line: the id to resume it by, and the title it was given. A
+    \\session that has not been named yet is listed by its id alone.
+;
+
 /// The subcommands billy itself has, and what each is for, shown in billy's own
 /// help.
 const billy_commands =
     \\  login [<service>]         store an API key, or list the services
     \\  config <setting> <value>  set a configuration setting by its path
+    \\  sessions                  list the sessions, newest first
     \\  serve                     run the web frontend
 ;
 
@@ -96,6 +104,7 @@ const Options = struct {
         login: Login,
         config: Config,
         serve: Serve,
+        sessions: Sessions,
     };
 
     const Login = struct {
@@ -121,6 +130,12 @@ const Options = struct {
         host: []const u8 = Server.default_host,
         /// The port to listen on. Zero asks the system for a free one.
         port: u16 = Server.default_port,
+        /// Whether the user asked for this subcommand's usage.
+        help: bool = false,
+    };
+
+    /// The `sessions` subcommand takes nothing but its own usage.
+    const Sessions = struct {
         /// Whether the user asked for this subcommand's usage.
         help: bool = false,
     };
@@ -157,6 +172,7 @@ pub fn main(init: std.process.Init) !void {
         .serve => |serve| return billy.serve(serve.host, serve.port),
         .config => |config| return billy.configSet(out, config.path.?, config.value.?),
         .login => |login| return billy.login(out, login.service),
+        .sessions => return billy.listSessions(out),
     }
 }
 
@@ -180,6 +196,10 @@ fn printAskedHelp(options: Options, out: *std.Io.Writer) !bool {
         },
         .serve => |serve| if (serve.help) {
             try printHelp(out, "billy serve [--port <port>] [--host <addr>]", serve_about, null, serve_options);
+            return true;
+        },
+        .sessions => |sessions| if (sessions.help) {
+            try printHelp(out, "billy sessions", sessions_about, null, command_options);
             return true;
         },
     }
@@ -225,6 +245,8 @@ fn parseCommand(args: *spaghet.Args, command: []const u8) ParseError!Options.Com
         return .{ .config = try parseConfig(args) };
     if (std.mem.eql(u8, command, "serve"))
         return .{ .serve = try parseServe(args) };
+    if (std.mem.eql(u8, command, "sessions"))
+        return .{ .sessions = try parseSessions(args) };
     return error.InvalidArgument;
 }
 
@@ -279,6 +301,18 @@ fn parseServe(args: *spaghet.Args) ParseError!Options.Serve {
             return error.InvalidArgument;
     }
     return serve;
+}
+
+/// Reads the arguments of the `sessions` subcommand: nothing but its own usage.
+fn parseSessions(args: *spaghet.Args) ParseError!Options.Sessions {
+    var sessions: Options.Sessions = .{};
+    while (args.next()) {
+        if (args.flag(&.{ "-h", "--help" }))
+            sessions.help = true;
+        if (args.positional()) |_|
+            return error.InvalidArgument;
+    }
+    return sessions;
 }
 
 test "parseArgs" {
@@ -390,6 +424,20 @@ test "parseArgs reads the config subcommand on its own" {
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "config", "max_turns", "1", "extra" }));
 }
 
+test "parseArgs reads the sessions subcommand on its own" {
+    // It takes nothing, so the line is just the command.
+    try expectOptions(.{ .command = .{ .sessions = .{} } }, try parseArgsSlice(&.{"sessions"}));
+
+    // The subcommand has its own usage.
+    try expectOptions(.{ .command = .{ .sessions = .{ .help = true } } }, try parseArgsSlice(&.{ "sessions", "-h" }));
+    try expectOptions(.{ .command = .{ .sessions = .{ .help = true } } }, try parseArgsSlice(&.{ "sessions", "--help" }));
+
+    // The subcommand owns the rest of the line, so an argument after it is not
+    // one it takes, and a run option after it is not a run option.
+    try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "sessions", "extra" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "sessions", "--resume", "x" }));
+}
+
 /// The slices in `Options` are compared by content rather than by pointer.
 fn expectOptions(expected: Options, actual: Options) !void {
     try std.testing.expectEqual(expected.help, actual.help);
@@ -430,6 +478,7 @@ fn expectOptions(expected: Options, actual: Options) !void {
                 try std.testing.expect(actual_config.value == null);
             }
         },
+        .sessions => |sessions| try std.testing.expectEqual(sessions.help, actual.command.sessions.help),
     }
 }
 
@@ -456,6 +505,12 @@ const help_messages = [_]struct {
     .{
         .invocation = "billy config <setting> <value>",
         .description = config_about,
+        .commands = null,
+        .options = command_options,
+    },
+    .{
+        .invocation = "billy sessions",
+        .description = sessions_about,
         .commands = null,
         .options = command_options,
     },

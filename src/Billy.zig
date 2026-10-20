@@ -230,6 +230,36 @@ pub fn run(billy: *Billy, out: *std.Io.Writer, resume_id: ?[]const u8) !void {
     try agent.run(billy.io, billy.gpa, out, config, &session, target);
 }
 
+/// Lists the sessions billy has kept, the one written to most recently first,
+/// one to a line: the id a session is resumed by, and the title it was given.
+///
+/// A session that has not been named -- one that has not been asked anything
+/// yet, and one saved before titles were kept -- is listed by its id alone,
+/// rather than as an id with a space after it that a shell would split off.
+pub fn listSessions(billy: *Billy, out: *std.Io.Writer) !void {
+    const listed = Session.list(billy.io, billy.dirs.sessions, billy.gpa) catch |err| {
+        std.log.err("cannot list the sessions: {s}", .{@errorName(err)});
+        return err;
+    };
+    defer {
+        for (listed) |named| {
+            billy.gpa.free(named.id);
+            billy.gpa.free(named.title);
+        }
+        billy.gpa.free(listed);
+    }
+
+    try printSessions(out, listed);
+}
+
+/// Writes `listed` as the listing reads: each session's id, then its title.
+fn printSessions(out: *std.Io.Writer, listed: []const Session.Named) !void {
+    for (listed) |named| {
+        const space = if (named.title.len != 0) " " else "";
+        try out.print("{s}{s}{s}\n", .{ named.id, space, named.title });
+    }
+}
+
 /// Runs billy as a server with a web frontend, on `host` at `port`, until the
 /// process is stopped.
 pub fn serve(billy: *Billy, host: []const u8, port: u16) !void {
@@ -269,5 +299,26 @@ fn agentConfig(billy: *Billy, arena: std.mem.Allocator, style: Terminal.Style) !
         billy.environ,
         style,
         billy.dirs.config,
+    );
+}
+
+test "the listing writes each session's id and title on one line" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    try printSessions(&out.writer, &.{
+        .{ .id = "01M3AAAAAAAAAAAAAAAAAAAAAA", .title = "Fix the flaky test" },
+        .{ .id = "01M3BBBBBBBBBBBBBBBBBBBBBB", .title = "Two words" },
+        // A session with no title is written as its id alone, leaving no space
+        // behind it for a shell to split on.
+        .{ .id = "legacy", .title = "" },
+    });
+
+    try std.testing.expectEqualStrings(
+        "01M3AAAAAAAAAAAAAAAAAAAAAA Fix the flaky test\n" ++
+            "01M3BBBBBBBBBBBBBBBBBBBBBB Two words\n" ++
+            "legacy\n",
+        out.written(),
     );
 }
