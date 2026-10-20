@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
+<title>billy (mock)</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<aside id="sidebar">
+  <header>
+    <h1>billy</h1>
+    <button id="new" title="new session">&plus;</button>
+  </header>
+  <ul id="list"></ul>
+</aside>
+
+<main>
+  <div id="topbar">
+    <button id="menu" title="sessions">&#9776;</button>
+    <div id="header"></div>
+  </div>
+  <div id="view">
+    <div id="conversation"></div>
+    <button id="latest" title="go to the newest">&#8595; new messages</button>
+  </div>
+  <form id="prompt">
+    <textarea id="text" rows="1" placeholder="ask billy something (shift+enter for a newline)" autocomplete="off"></textarea>
+    <select id="mode" title="what a new session may do">
+      <option value="chat">chat</option>
+      <option value="general">general</option>
+    </select>
+  </form>
+</main>
+<div id="backdrop"></div>
+
+<script>
+(() => {
+// Stands in for the server: replaces fetch before script.js runs, so the page
+// can be opened straight from disk.
+const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const json = (body, status = 200) =>
+  new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+
+const header = (id) =>
+  '<div class="header"><span class="id">' + id + '</span><span class="sep">·</span>' +
+  '<span class="model">deepseek-flash</span><span class="sep">·</span>' +
+  '<span class="cwd">~/repo/billy</span><span class="sep">·</span>' +
+  '<span class="gauge">16k/128k (12%)</span></div>\n';
+
+const prompt_ = (text) =>
+  '<div class="block prompt"><div class="head"><span class="glyph">»</span> <span class="name">prompt</span></div>\n<p>' +
+  esc(text) + '</p>\n</div>\n';
+
+const answer = (html) =>
+  '<div class="block answer"><div class="head"><span class="glyph">◆</span> <span class="name">answer</span></div>\n' +
+  html + '</div>\n';
+
+const call = (name, target, produced, body) =>
+  '<details class="tool"><summary class="tool-head"><span class="name">' + name + '</span> ' +
+  '<span class="target">' + esc(target) + '</span>' + (produced ? '<span class="produced">' + produced + '</span>' : '') +
+  '</summary>\n<div class="tool-body">' + body + '</div></details>\n';
+
+const running = '<span class="exit running" title="running"><span class="dots"><i></i><i></i><i></i></span></span>';
+const ok = '<span class="exit ok" title="exit code 0">✓ 0</span>';
+const failed = '<span class="exit failed" title="exit code 2">✗ 2</span>';
+const fav = (host, letter) =>
+  '<a class="fav" href="https://' + host + '" title="' + host + '"><span class="letter">' + letter + '</span></a>';
+
+const history = [
+  prompt_('what does main.zig do?'),
+  call('read', 'src/main.zig', '', '<pre class="result">1\tconst std = @import("std");\n2\tpub fn main() !void {}</pre>\n'),
+  call('bash', 'zig build test', failed,
+    '<pre class="command">zig build test</pre>\n<pre class="stdout">built</pre>\n<pre class="stderr">boom &lt;x&gt;</pre>\n'),
+  call('web_search', 'zig lang', fav('ziglang.org', 'z') + fav('github.com', 'g') + fav('example.org', 'e'),
+    '<pre class="result">1. Zig\n   https://ziglang.org\n   A language.</pre>\n'),
+  answer('<p>It starts billy. See <a href="#">the docs</a> and <code>inline code</code>.</p>\n' +
+    '<ul>\n<li>one</li>\n<li>two</li>\n</ul>\n' +
+    '<pre><code class="language-zig">const x = 1;\n</code></pre>\n' +
+    '<table><tr><th>a</th><th>b</th></tr><tr><td>1</td><td>2</td></tr></table>\n' +
+    '<blockquote><p>quoted</p></blockquote>\n' +
+    '<p>' + 'a-very-long-unbroken-string-'.repeat(8) + '</p>\n'),
+  call('edit', 'a.zig', '',
+    '<pre class="diff"><span class="context"> a</span>\n<span class="removed">-old</span>\n<span class="added">+new</span>\n<span class="context"> c</span>\n</pre>\n'),
+  '<div class="compacted">⊟ compacted</div>\n',
+  '<div class="notice">stopped after 3 turns</div>\n',
+].join('');
+
+const sessions = [
+  { id: '01HF7YAT000000000000000001', title: 'explain main.zig', blocks: history, mode: 'general' },
+  { id: '01HF7YAT000000000000000002', title: 'a very long session title that has to be cut off at the edge', blocks: prompt_('hi'), mode: 'chat' },
+  { id: '01HF7YAT000000000000000003', title: '', blocks: '', mode: 'chat' },
+];
+
+// Frames of one turn: [delay in ms, event, data].
+const turn = (text, creating, id) => [
+  ...(creating ? [[0, 'session', { id }]] : []),
+  [0, 'header', { html: header(id) }],
+  [200, 'block', { html: prompt_(text) }],
+  [600, 'tool_begin', { html: call('read', 'src/main.zig', '', '') }],
+  [900, 'tool_end', { html: call('read', 'src/main.zig', '', '<pre class="result">1\tconst x = 1;</pre>\n') }],
+  [300, 'tool_begin', { html: call('bash', 'make', running, '<pre class="command">make</pre>\n') }],
+  [1500, 'tool_end', { html: call('bash', 'make', ok, '<pre class="command">make</pre>\n<pre class="stdout">done</pre>\n') }],
+  [500, 'block', { html: answer('<p>You said: <code>' + esc(text) + '</code></p>\n') }],
+  ...(creating ? [[0, 'title', { title: text.slice(0, 40) }]] : []),
+];
+
+function stream(frames) {
+  const enc = new TextEncoder();
+  return new Response(new ReadableStream({
+    async start(controller) {
+      for (const [delay, event, data] of frames) {
+        await sleep(delay);
+        controller.enqueue(enc.encode('event: ' + event + '\ndata: ' + JSON.stringify(data) + '\n\n'));
+      }
+      controller.close();
+    },
+  }), { headers: { 'content-type': 'text/event-stream' } });
+}
+
+window.fetch = async (url, opts = {}) => {
+  const method = opts.method || 'GET';
+  const parts = url.split('/'); // '', 'api', 'sessions', id, 'message'
+  await sleep(80);
+  if (url === '/api/sessions' && method === 'GET') {
+    return json({ sessions: sessions.map(({ id, title }) => ({ id, title })) });
+  }
+  if (url === '/api/sessions' && method === 'POST') {
+    const body = JSON.parse(opts.body);
+    const id = '01HF7YAT' + String(Date.now()).padStart(18, '0');
+    sessions.unshift({ id, title: '', blocks: '', mode: body.mode });
+    return stream(turn(body.text, true, id));
+  }
+  const session = sessions.find((s) => s.id === decodeURIComponent(parts[3] || ''));
+  if (!session) return json({}, 404);
+  if (parts[4] === 'message' && method === 'POST') return stream(turn(JSON.parse(opts.body).text, false, session.id));
+  if (method === 'GET') return json({ header: header(session.id), blocks: session.blocks, mode: session.mode });
+  if (method === 'PATCH') { session.title = JSON.parse(opts.body).title; return json({}); }
+  if (method === 'DELETE') { sessions.splice(sessions.indexOf(session), 1); return json({}); }
+  return json({}, 405);
+};
+})();
+</script>
+<script src="script.js"></script>
+</body>
+</html>
