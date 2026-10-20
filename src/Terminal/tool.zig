@@ -379,8 +379,8 @@ test "a bash block shows only the streams the command filled" {
         .io = io,
         .dir = std.Io.Dir.cwd(),
         .gpa = gpa,
-        .bash_timeout_s = 120,
         .http = &http_client,
+        .settings = .{ .bash_timeout_s = 120 },
     });
     const cases = [_]struct { command: []const u8, expected: []const u8 }{
         // Nothing printed: the status is all there is.
@@ -601,8 +601,8 @@ test "run logs exactly what describe prints" {
         .io = io,
         .dir = std.Io.Dir.cwd(),
         .gpa = gpa,
-        .bash_timeout_s = 120,
         .http = &http_client,
+        .settings = .{ .bash_timeout_s = 120 },
     });
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
@@ -639,9 +639,8 @@ test "the format changes what is shown and nothing else" {
         .io = io,
         .dir = std.Io.Dir.cwd(),
         .gpa = gpa,
-        .formats = .{ .bash = format },
-        .bash_timeout_s = 120,
         .http = &http_client,
+        .settings = .{ .formats = .{ .bash = format }, .bash_timeout_s = 120 },
     });
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",

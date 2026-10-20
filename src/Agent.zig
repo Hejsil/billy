@@ -5,7 +5,6 @@ const llm = @import("llm.zig");
 const models = @import("models.zig");
 const Tools = @import("Tools.zig");
 const Mock = @import("Mock.zig");
-const Health = @import("Health.zig");
 const LineEditor = @import("LineEditor.zig");
 const Session = @import("Session.zig");
 const Terminal = @import("Terminal.zig");
@@ -73,10 +72,6 @@ pub const Endpoint = struct {
 pub const Config = struct {
     /// Model turns allowed for one request before the harness gives up on it.
     max_turns: usize,
-    /// Longest a bash command may run before it is killed, in seconds, from the
-    /// configuration. The tools are given it so a runaway command cannot hang
-    /// the agent forever.
-    bash_timeout_s: usize,
     /// Home directory, so the header can shorten a path inside it; null when unset.
     home: ?[]const u8,
     /// Directory holding the user's own instructions file, read into every
@@ -95,13 +90,6 @@ pub const Config = struct {
     title: bool = true,
     /// How what billy shows is laid out and decorated, from the configuration.
     display: Display = .{},
-    /// Web search, when the configuration names a backend and its key is set.
-    /// Null leaves `web_search` out of the tools the model is offered.
-    search: ?Tools.web.Search.Config = null,
-    /// Web fetch, on the same terms, with its own backends.
-    fetch: ?Tools.web.Fetch.Config = null,
-    /// The waits of every web backend, so one that just failed is skipped.
-    health: ?*Health = null,
 };
 
 /// How billy lays out and decorates what it shows: the formatter scripts for a
@@ -453,12 +441,14 @@ tool_set: Tools,
 client: llm.Client,
 
 /// Opens a session for asking things, working in `cwd`, sending its requests to
-/// `endpoint` and sharing `http_client`.
+/// `endpoint`, offering the tools `tool_settings` build, and sharing
+/// `http_client`.
 pub fn init(
     io: std.Io,
     gpa: std.mem.Allocator,
     endpoint: Endpoint,
     config: Config,
+    tool_settings: Tools.Settings,
     cwd: []const u8,
     http_client: *std.http.Client,
 ) !Agent {
@@ -472,13 +462,8 @@ pub fn init(
         .io = io,
         .dir = work_dir,
         .gpa = gpa,
-        .formats = config.display.formats,
-        .bash_timeout_s = config.bash_timeout_s,
-        .style = config.display.style,
-        .search = config.search,
-        .fetch = config.fetch,
         .http = http_client,
-        .health = config.health,
+        .settings = tool_settings,
     });
 
     return .{
@@ -708,6 +693,7 @@ pub fn run(
     out: *std.Io.Writer,
     endpoint: Endpoint,
     config: Config,
+    tool_settings: Tools.Settings,
     session: *Session,
     target: ?Target,
 ) !void {
@@ -717,7 +703,7 @@ pub fn run(
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    var agent = try Agent.init(io, gpa, endpoint, config, session.cwd(), &http_client);
+    var agent = try Agent.init(io, gpa, endpoint, config, tool_settings, session.cwd(), &http_client);
     defer agent.deinit();
     // A resumed session keeps the prompt and tools it was saved with, so it is
     // prepared here; a new one gets them from its first prompt, through `start`.
@@ -1553,14 +1539,23 @@ fn testAgentIn(
     // A test that only drives the loop is given a client it never reads, which is
     // left undefined rather than built: nothing touches it unless a tool does.
     var unused: std.http.Client = undefined;
-    var agent = try Agent.init(io, gpa, setup.endpoint, setup.config, work_dir, http_client orelse &unused);
+    var agent = try Agent.init(
+        io,
+        gpa,
+        setup.endpoint,
+        setup.config,
+        setup.tools,
+        work_dir,
+        http_client orelse &unused,
+    );
     // The mode a frontend would have chosen, which `init` leaves at its default.
     agent.mode = setup.mode;
     return agent;
 }
 
 /// What a test builds an agent from: where its requests would be sent, the
-/// settings it runs with, and the mode the frontend would have chosen.
+/// settings it runs with, the settings its tools run with, and the mode the
+/// frontend would have chosen.
 ///
 /// The URL is one nothing listens on until a test points it at a mock, so a
 /// request made where a test expected none fails it rather than passing. Neither
@@ -1571,6 +1566,7 @@ fn testAgentIn(
 const TestSetup = struct {
     endpoint: Endpoint,
     config: Config,
+    tools: Tools.Settings = .{ .bash_timeout_s = 120 },
     /// The mode the run starts in, which is what a frontend passes before the
     /// session's first prompt settles it.
     mode: Mode = .general,
@@ -1582,7 +1578,6 @@ const TestSetup = struct {
             .endpoint = .{ .url = "u", .api_key = "k", .model = model },
             .config = .{
                 .max_turns = 10,
-                .bash_timeout_s = 120,
                 .home = null,
             },
         };
@@ -2440,8 +2435,8 @@ test "the terminal shows a tool call the way a replay does" {
         .io = io,
         .dir = std.Io.Dir.cwd(),
         .gpa = gpa,
-        .bash_timeout_s = 120,
         .http = &http_client,
+        .settings = .{ .bash_timeout_s = 120 },
     });
 
     const call: llm.ToolCall = .{ .id = "1", .function = .{

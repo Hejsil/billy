@@ -91,13 +91,11 @@ environ: *const std.process.Environ.Map,
 endpoint: Endpoints.Endpoint,
 backends: Endpoints.Backends,
 
-/// The configuration a turn is built from: the same as a terminal run's, laid
-/// out plainly rather than decorated for a terminal.
+/// The settings a turn is built from: the same as a terminal run's, laid out
+/// plainly rather than decorated for a terminal.
 fn agentConfig(server: *const Server) Agent.Config {
     return Endpoints.agentConfig(
         server.config,
-        server.backends,
-        server.health,
         server.environ,
         .plain,
         server.config_dir,
@@ -827,6 +825,7 @@ fn serveTurn(
         gpa,
         Endpoints.agentEndpoint(r.server.config, r.server.endpoint),
         config,
+        Endpoints.toolSettings(r.server.config, r.server.backends, r.server.health, .plain),
         session.cwd(),
         http_client,
     );

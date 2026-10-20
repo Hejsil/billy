@@ -75,33 +75,56 @@ http: *std.http.Client,
 /// Null runs without backend waits, which is what a test wants.
 health: ?*Health,
 
-/// What a tool set is built from. The fields are those of `Tools`.
-pub const Options = struct {
-    io: std.Io,
-    dir: std.Io.Dir,
-    gpa: std.mem.Allocator,
+/// What a tool set runs with, beyond the plumbing of the run it belongs to: the
+/// limits it runs under, how its blocks are laid out, and the backends it asks.
+/// A frontend resolves these from the configuration and the credentials, so
+/// neither frontend drifts from the other and the agent builds the set from what
+/// they agree on rather than from the configuration file itself.
+pub const Settings = struct {
+    /// How a tool's block is laid out before it is shown, shared with the
+    /// transcript so a replay shows a call the way the run did.
     formats: Formats = .{},
     /// No default: a missing timeout is worth catching at the call site.
     bash_timeout_s: usize,
+    /// How billy decorates the lines it prints itself, shared with the transcript
+    /// so a replay looks like the run.
     style: Terminal.Style = .plain,
+    /// Null leaves `web_search` out of the tools offered, so the model is never
+    /// given one that could not run.
     search: ?web.Search.Config = null,
+    /// As `search`, for `web_fetch`.
     fetch: ?web.Fetch.Config = null,
-    http: *std.http.Client,
+    /// Null runs without backend waits, which is what a test wants.
     health: ?*Health = null,
 };
 
+/// What a tool set is built from: the plumbing of the run it belongs to, and the
+/// settings it runs with. The fields of the set are those of both.
+pub const Options = struct {
+    io: std.Io,
+    /// The session's own directory, so a resumed session works where it started.
+    /// Every path a tool is given is relative to it.
+    dir: std.Io.Dir,
+    gpa: std.mem.Allocator,
+    /// The run's one HTTP client, shared with the model requests so connections
+    /// and scanned certificates are reused.
+    http: *std.http.Client,
+    settings: Settings,
+};
+
 pub fn init(options: Options) !Tools {
+    const settings = options.settings;
     return .{
         .io = options.io,
         .dir = options.dir,
         .gpa = options.gpa,
-        .formats = options.formats,
-        .bash_timeout_s = options.bash_timeout_s,
-        .style = options.style,
-        .search = options.search,
-        .fetch = options.fetch,
+        .formats = settings.formats,
+        .bash_timeout_s = settings.bash_timeout_s,
+        .style = settings.style,
+        .search = settings.search,
+        .fetch = settings.fetch,
         .http = options.http,
-        .health = options.health,
+        .health = settings.health,
     };
 }
 
@@ -586,8 +609,8 @@ test "a bash command that outlives the timeout is killed and reported" {
         .io = io,
         .dir = std.Io.Dir.cwd(),
         .gpa = gpa,
-        .bash_timeout_s = 1,
         .http = &http_client,
+        .settings = .{ .bash_timeout_s = 1 },
     });
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
@@ -652,16 +675,17 @@ fn testTools(with_search: bool) !Tools {
         .io = std.testing.io,
         .gpa = std.testing.allocator,
         .dir = .cwd(),
-        .bash_timeout_s = 120,
-        .search = if (with_search) .{
-            .backends = &.{.{ .provider = .tavily, .api_key = "key" }},
-            .max_results = 3,
-        } else null,
-
         // A web tool that actually makes a request needs a live client; the
         // tests here only exercise the ones that refuse before any request, so
         // this is never reached.
         .http = undefined,
+        .settings = .{
+            .bash_timeout_s = 120,
+            .search = if (with_search) .{
+                .backends = &.{.{ .provider = .tavily, .api_key = "key" }},
+                .max_results = 3,
+            } else null,
+        },
     });
 }
 
@@ -773,8 +797,8 @@ test "the tools work in the directory they are given, wherever billy runs" {
         .io = io,
         .dir = work,
         .gpa = gpa,
-        .bash_timeout_s = 120,
         .http = &http_client,
+        .settings = .{ .bash_timeout_s = 120 },
     });
 
     // A file written by the tool lands in that directory. The result is not
@@ -933,8 +957,8 @@ test "a result longer than the cap is cut and says what it lost" {
         .io = io,
         .dir = tmp.dir,
         .gpa = gpa,
-        .bash_timeout_s = 120,
         .http = &http_client,
+        .settings = .{ .bash_timeout_s = 120 },
     });
 
     var result: std.Io.Writer.Allocating = .init(gpa);

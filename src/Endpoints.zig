@@ -150,13 +150,11 @@ pub fn agentEndpoint(config: Config, endpoint: Endpoint) agent.Endpoint {
     };
 }
 
-/// What a run is configured from: the backends its web tools ask, and the
-/// settings that decide what the agent does. Where its requests go is resolved
-/// separately, as `agentEndpoint`.
+/// What a run is configured from: the settings that decide what the agent does.
+/// Where its requests go is resolved separately, as `agentEndpoint`, and what its
+/// tools run with as `toolSettings`.
 pub fn agentConfig(
     config: Config,
-    backends: Backends,
-    health: *Health,
     environ: *const std.process.Environ.Map,
     style: Terminal.Style,
     user_instructions_dir: ?std.Io.Dir,
@@ -164,7 +162,6 @@ pub fn agentConfig(
     const stored = &config.stored;
     return .{
         .max_turns = stored.max_turns,
-        .bash_timeout_s = stored.tools.bash.timeout_s,
         .home = environ.get("HOME"),
         // The user's own instructions, which live beside the configuration and
         // join every session's prompt. The caller owns the directory and outlives
@@ -172,13 +169,11 @@ pub fn agentConfig(
         .user_instructions_dir = user_instructions_dir,
         .compact_at = stored.compact_at,
         .title = stored.title,
-        // How billy lays out and decorates what it shows. A bash command is laid
-        // out by its format script, so the user reads the command the way it
-        // runs; an edit is shown as a diff, laid out by its own script when one
-        // is set; and the block headers are decorated for `style`. Only the
-        // display changes: the command that runs, the file that is written, the
-        // session and the model keep the text as it was written. A reply and a
-        // prompt are markdown, laid out by billy's own renderer.
+        // How what billy shows is laid out and decorated. A reply and a prompt
+        // are markdown, laid out by billy's own renderer, and the blocks are
+        // decorated for `style`. Only the display changes: the command that runs,
+        // the file that is written, the session and the model keep the text as it
+        // was written.
         .display = .{
             .formats = .{
                 .bash = if (stored.tools.bash.format) |script| .{ .script = script } else null,
@@ -186,6 +181,32 @@ pub fn agentConfig(
             },
             .style = style,
         },
+    };
+}
+
+/// How a run's tools are built: how their blocks are laid out, the limits they
+/// run under, and the backends its web tools ask.
+///
+/// The run adds its own plumbing -- its I/O, the directory it works in, its
+/// allocator and its HTTP client -- when it builds the set, so neither frontend
+/// handles those and neither can offer a tool the others do not.
+pub fn toolSettings(
+    config: Config,
+    backends: Backends,
+    health: ?*Health,
+    style: Terminal.Style,
+) tools.Settings {
+    const stored = &config.stored;
+    return .{
+        // A bash command is laid out by its format script, so the user reads the
+        // command the way it runs; an edit is shown as a diff, laid out by its
+        // own script when one is set.
+        .formats = .{
+            .bash = if (stored.tools.bash.format) |script| .{ .script = script } else null,
+            .edit = if (stored.tools.edit.format) |script| .{ .script = script } else null,
+        },
+        .bash_timeout_s = stored.tools.bash.timeout_s,
+        .style = style,
         // A web tool is offered only when the configuration names a backend for
         // it and its key is set; the tool is left out of the request otherwise.
         // The waits travel with the run, so a backend that just failed is
