@@ -777,10 +777,8 @@ fn createSession(r: *Request, registry: *Registry, http_client: *std.http.Client
     const choice = Agent.Mode.start(parsed.value.text, parsed.value.mode orelse default_mode);
     if (choice.text.len == 0)
         return r.reply(.text, "the prompt is empty\n", .bad_request);
-    var config = r.server.agentConfig();
-    config.mode = choice.mode;
 
-    try serveTurn(r, http_client, &session, config, choice.text, true);
+    try serveTurn(r, http_client, &session, r.server.agentConfig(), choice.mode, choice.text, true);
 }
 
 /// `POST /api/sessions/{id}/message`: asks the session `text`, answering with the
@@ -803,7 +801,7 @@ fn askSession(r: *Request, registry: *Registry, http_client: *std.http.Client, i
     var session = (try r.openSession(id)) orelse return;
     defer session.deinit();
 
-    try serveTurn(r, http_client, &session, r.server.agentConfig(), parsed.value.text, false);
+    try serveTurn(r, http_client, &session, r.server.agentConfig(), session.mode, parsed.value.text, false);
 }
 
 /// Answers one prompt as the run happens: the run's blocks as the events of a
@@ -820,6 +818,7 @@ fn serveTurn(
     http_client: *std.http.Client,
     session: *Session,
     config: Agent.Config,
+    mode: Agent.Mode,
     text: []const u8,
     announce: bool,
 ) !void {
@@ -833,6 +832,9 @@ fn serveTurn(
         http_client,
     );
     defer agent.deinit();
+    // The mode the caller settled, which the run starts in. A session asked
+    // before keeps its own, which `prepare` reads back out of it.
+    agent.mode = mode;
     // Where the session is sent is resolved into a buffer of its own, freed
     // when the turn is over: it is built per turn, and holding it in the
     // server's own allocator would grow with every request the page makes.
@@ -869,10 +871,10 @@ fn serveTurn(
     // on a page with a session that has nothing to fold must leave the page with
     // no new session to show. Anything that is not a command is a turn, and the
     // page is told the session's id first so it can add it to the list.
-    // The line as it was typed, with the mode the caller settled: a mode command
+    // The line as it was typed, in the mode the caller settled: a mode command
     // was already taken off the text by `createSession`, so `take` sees none and
     // the mode stands. A session that has been asked something keeps its own.
-    const waiting = try agent.take(emitter, session, text, config.mode);
+    const waiting = try agent.take(emitter, session, text);
     if (waiting == .ran) {
         try r.server.sendHeader(gpa, session, &stream);
         try stream.done();

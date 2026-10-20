@@ -94,9 +94,6 @@ pub const Config = struct {
     /// Whether the model is asked for a short title for a session, after its
     /// first turn, so a frontend can list it by name. Mirrors the configuration.
     title: bool = true,
-    /// What the session may do and what its prompt says, decided when it starts.
-    /// See `mode.zig`.
-    mode: Mode = .general,
     /// How what billy shows is laid out and decorated, from the configuration.
     display: Display = .{},
     /// Web search, when the configuration names a backend and its key is set.
@@ -439,6 +436,10 @@ pub fn displayPath(out: *std.Io.Writer, cwd: []const u8, home: ?[]const u8) !voi
 io: std.Io,
 gpa: std.mem.Allocator,
 config: Config,
+/// What the session may do and what its prompt says, which is the frontend's
+/// choice until the session's first prompt settles it and the session's own
+/// from then on. See `mode.zig`.
+mode: Mode = .general,
 /// The directory the session works in. For a resumed session it is the one the
 /// session was started in.
 work_dir: std.Io.Dir,
@@ -517,21 +518,21 @@ pub fn prepare(agent: *Agent, session: *Session, target: ?Target) !void {
     // a new one takes the mode the frontend chose. Either way the agent's mode
     // ends up the session's own.
     if (session.messages.items.len > 0) {
-        agent.config.mode = session.mode;
+        agent.mode = session.mode;
     } else {
-        session.setMode(agent.config.mode);
+        session.setMode(agent.mode);
         const prompt_text = try leadPrompt(
             agent.io,
             agent.gpa,
             agent.work_dir,
             agent.config.user_instructions_dir,
-            agent.config.mode,
+            agent.mode,
         );
         defer agent.gpa.free(prompt_text);
         // A mode with no prompt sends no system message.
         if (prompt_text.len > 0) try session.setSystemPrompt(prompt_text);
     }
-    try session.ensureTools(agent.tool_set.definitions(agent.config.mode));
+    try session.ensureTools(agent.tool_set.definitions(agent.mode));
 }
 
 /// Points the client at where the session is sent.
@@ -571,7 +572,7 @@ pub const Waiting = union(enum) {
 /// Takes a line typed into `session` and does what it asks for, except asking the
 /// model, which is left to `ask`. A frontend need know nothing more of a line:
 /// commands, the first-prompt rules and compaction are all handled here.
-pub fn take(agent: *Agent, emitter: Emitter, session: *Session, line: []const u8, default: Mode) !Waiting {
+pub fn take(agent: *Agent, emitter: Emitter, session: *Session, line: []const u8) !Waiting {
     // A command is run rather than asked.
     if (Command.of(line)) |cmd| {
         switch (cmd) {
@@ -587,7 +588,7 @@ pub fn take(agent: *Agent, emitter: Emitter, session: *Session, line: []const u8
     // it triggers.
     _ = agent.compact(emitter, session, .when_needed);
 
-    const started = try agent.start(session, line, default);
+    const started = try agent.start(session, line);
     return switch (started) {
         .prompt => |text| .{ .ask = text },
         .mode_only => .ready,
@@ -598,14 +599,14 @@ pub fn take(agent: *Agent, emitter: Emitter, session: *Session, line: []const u8
 /// Settles the mode from a session's first prompt and gives a new session its
 /// system prompt and tools. This is the one place the first-prompt rules live:
 /// `/chat` and `/general` name the mode and the rest of the line is asked; a
-/// prompt naming only a mode asks nothing; anything else gets the frontend's
-/// `default` (see `Mode.start`). A session asked before keeps what it was saved
-/// with.
-pub fn start(agent: *Agent, session: *Session, text: []const u8, default: Mode) !Started {
+/// prompt naming only a mode asks nothing; anything else keeps the mode the run
+/// is in, which is the frontend's choice until now (see `Mode.start`). A session
+/// asked before keeps what it was saved with.
+pub fn start(agent: *Agent, session: *Session, text: []const u8) !Started {
     if (session.messages.items.len > 0) return .asked_before;
 
-    const choice = Mode.start(text, default);
-    agent.config.mode = choice.mode;
+    const choice = Mode.start(text, agent.mode);
+    agent.mode = choice.mode;
     try agent.prepare(session, null);
     if (choice.text.len == 0) return .mode_only;
     return .{ .prompt = choice.text };
@@ -637,7 +638,7 @@ fn compact(agent: *Agent, emitter: Emitter, session: *Session, when: enum { when
 /// that was not already being thrown away. A failure is logged and the session
 /// keeps what it had.
 fn refresh(agent: *Agent, session: *Session) void {
-    const mode = agent.config.mode;
+    const mode = agent.mode;
     refreshLead(agent, mode, agent.tool_set.definitions(mode), session) catch |err|
         std.log.warn("could not refresh the prompt and tools: {s}", .{@errorName(err)});
 }
@@ -741,7 +742,7 @@ pub fn run(
         // What the line came to is the agent's to decide: a command is run and
         // reported through the emitter, a first prompt settles the mode, and
         // anything else is what is asked.
-        const waiting = try agent.take(emitter, session, line, .general);
+        const waiting = try agent.take(emitter, session, line);
         if (waiting == .ran) {
             try out.flush();
             continue;
@@ -980,7 +981,7 @@ fn turn(agent: *Agent, emitter: Emitter, session: *Session) !void {
         // No calls means the model answered, which ends the turn.
         if (calls.len == 0) return emitter.show(.{ .answer = message.content orelse "" });
 
-        try runCalls(&agent.tool_set, emitter, &scratch_state, session, agent.config.mode, calls);
+        try runCalls(&agent.tool_set, emitter, &scratch_state, session, agent.mode, calls);
     }
     var buffer: [96]u8 = undefined;
     const stopped = std.fmt.bufPrint(
@@ -1536,14 +1537,17 @@ fn testAgentIn(
     work_dir: []const u8,
     http_client: ?*std.http.Client,
 ) !Agent {
-    if (http_client) |client| return Agent.init(io, gpa, setup.endpoint, setup.config, work_dir, client);
-
+    // A test that only drives the loop is given a client it never reads, which is
+    // left undefined rather than built: nothing touches it unless a tool does.
     var unused: std.http.Client = undefined;
-    return Agent.init(io, gpa, setup.endpoint, setup.config, work_dir, &unused);
+    var agent = try Agent.init(io, gpa, setup.endpoint, setup.config, work_dir, http_client orelse &unused);
+    // The mode a frontend would have chosen, which `init` leaves at its default.
+    agent.mode = setup.mode;
+    return agent;
 }
 
-/// What a test builds an agent from: where its requests would be sent and the
-/// settings it runs with.
+/// What a test builds an agent from: where its requests would be sent, the
+/// settings it runs with, and the mode the frontend would have chosen.
 ///
 /// The URL is one nothing listens on until a test points it at a mock, so a
 /// request made where a test expected none fails it rather than passing. The
@@ -1554,6 +1558,9 @@ fn testAgentIn(
 const TestSetup = struct {
     endpoint: Endpoint,
     config: Config,
+    /// The mode the run starts in, which is what a frontend passes before the
+    /// session's first prompt settles it.
+    mode: Mode = .general,
 
     /// A setup for `model`, which is the one thing every test names, since it is
     /// what the session records and the header shows.
@@ -2316,7 +2323,7 @@ test "prepare gives a chat session no prompt and only the tools it allows" {
     defer session.deinit();
 
     var setup = TestSetup.init("m");
-    setup.config.mode = .chat;
+    setup.mode = .chat;
     setup.config.user_instructions_dir = config_dir.dir;
     var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
@@ -2349,9 +2356,9 @@ test "a first prompt names the mode and says what to ask" {
     var agent = try testAgent(io, gpa, TestSetup.init("m"), null);
     defer agent.deinit();
 
-    const plain = try agent.start(&session, "do the thing", .general);
+    const plain = try agent.start(&session, "do the thing");
     try std.testing.expectEqualStrings("do the thing", plain.prompt);
-    try std.testing.expectEqual(Mode.general, agent.config.mode);
+    try std.testing.expectEqual(Mode.general, agent.mode);
     // The session was prepared, so it now carries the tools it will offer.
     try std.testing.expect(session.tools.len > 0);
 
@@ -2359,9 +2366,9 @@ test "a first prompt names the mode and says what to ask" {
     // asked for, and the rest of the line is what is asked.
     var named = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer named.deinit();
-    const chat = try agent.start(&named, "/chat what is a hash map?", .general);
+    const chat = try agent.start(&named, "/chat what is a hash map?");
     try std.testing.expectEqualStrings("what is a hash map?", chat.prompt);
-    try std.testing.expectEqual(Mode.chat, agent.config.mode);
+    try std.testing.expectEqual(Mode.chat, agent.mode);
     try std.testing.expectEqual(Mode.chat, named.mode);
 }
 
@@ -2379,7 +2386,7 @@ test "a first prompt that names only a mode asks nothing" {
 
     // `/chat` on its own opens that mode: the session is set up and ready, and
     // there is nothing to send to the model yet.
-    const started = try agent.start(&session, "/chat", .general);
+    const started = try agent.start(&session, "/chat");
     try std.testing.expectEqual(Started.mode_only, started);
     try std.testing.expectEqual(Mode.chat, session.mode);
     // Set up anyway, so the next prompt is asked without being looked at again.
@@ -2398,14 +2405,14 @@ test "a prompt after the first leaves the session as it was set up" {
     var agent = try testAgent(io, gpa, TestSetup.init("m"), null);
     defer agent.deinit();
 
-    _ = try agent.start(&session, "the first thing", .general);
+    _ = try agent.start(&session, "the first thing");
     try session.append(.{ .role = .assistant, .content = "done" });
 
     // A session that has been asked something is not started again: its mode is
     // the one it was saved with, and a mode command in a later prompt is part of
     // what is asked rather than a command, since only the first prompt can name
     // one.
-    const later = try agent.start(&session, "/chat is this a command?", .general);
+    const later = try agent.start(&session, "/chat is this a command?");
     try std.testing.expectEqual(Started.asked_before, later);
 }
 
