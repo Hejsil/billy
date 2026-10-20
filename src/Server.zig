@@ -824,7 +824,14 @@ fn serveTurn(
     announce: bool,
 ) !void {
     const gpa = r.server.gpa;
-    var agent = try Agent.init(r.server.io, gpa, config, session.cwd(), http_client);
+    var agent = try Agent.init(
+        r.server.io,
+        gpa,
+        Endpoints.agentEndpoint(r.server.config, r.server.endpoint),
+        config,
+        session.cwd(),
+        http_client,
+    );
     defer agent.deinit();
     // Where the session is sent is resolved into a buffer of its own, freed
     // when the turn is over: it is built per turn, and holding it in the

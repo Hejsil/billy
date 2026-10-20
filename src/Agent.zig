@@ -49,16 +49,25 @@ pub const Target = struct {
     info: ?models.Metadata,
 };
 
-pub const Config = struct {
-    api_key: []const u8,
+/// Where a run's requests are sent: the endpoint the configuration resolves to,
+/// with what a request needs to be sent at all.
+///
+/// A run starts pointed here. A session that recorded a provider of its own is
+/// re-pointed at it instead, through a `Target`, which is the same three things
+/// without the thinking rule the configuration settled.
+pub const Endpoint = struct {
     /// Full URL of the chat completions endpoint.
     url: []const u8,
+    api_key: []const u8,
     model: []const u8,
-    /// The provider and model a new session starts on, as `provider/model`.
-    /// A session keeps the choice it was started with, so this is read once per
-    /// session: for a new one to record, and for an older one that recorded
-    /// none.
-    model_choice: []const u8 = "deepseek/deepseek-flash",
+    /// What the request asks of the model's thinking, from the configuration and
+    /// settled against the provider's own rules before the run starts.
+    reasoning: llm.Reasoning = .provider_default,
+};
+
+/// What a run is told beyond where it sends its requests: the settings the agent
+/// reads while it runs, and what it builds its tools and its blocks from.
+pub const Config = struct {
     /// Model turns allowed for one request before the harness gives up on it.
     max_turns: usize,
     /// Longest a bash command may run before it is killed, in seconds, from the
@@ -85,8 +94,6 @@ pub const Config = struct {
     /// Whether the model is asked for a short title for a session, after its
     /// first turn, so a frontend can list it by name. Mirrors the configuration.
     title: bool = true,
-    /// What the request asks of the model's thinking, from the configuration.
-    reasoning: llm.Reasoning = .provider_default,
     /// What the session may do and what its prompt says, decided when it starts.
     /// See `mode.zig`.
     mode: Mode = .general,
@@ -437,13 +444,15 @@ config: Config,
 work_dir: std.Io.Dir,
 /// The tools, working in `work_dir`.
 tool_set: Tools,
-/// The model client, sending the conversation to `config.url`.
+/// The model client, sending the conversation to `endpoint.url`.
 client: llm.Client,
 
-/// Opens a session for asking things, working in `cwd` and sharing `http_client`.
+/// Opens a session for asking things, working in `cwd`, sending its requests to
+/// `endpoint` and sharing `http_client`.
 pub fn init(
     io: std.Io,
     gpa: std.mem.Allocator,
+    endpoint: Endpoint,
     config: Config,
     cwd: []const u8,
     http_client: *std.http.Client,
@@ -476,11 +485,11 @@ pub fn init(
         .client = .{
             .gpa = gpa,
             .io = io,
-            .api_key = config.api_key,
-            .url = config.url,
-            .model = config.model,
+            .api_key = endpoint.api_key,
+            .url = endpoint.url,
+            .model = endpoint.model,
             .http = http_client,
-            .reasoning = config.reasoning,
+            .reasoning = endpoint.reasoning,
         },
     };
 }
@@ -531,11 +540,10 @@ pub fn prepare(agent: *Agent, session: *Session, target: ?Target) !void {
 fn useTarget(agent: *Agent, resolved: Target) void {
     agent.client.url = resolved.url;
     agent.client.api_key = resolved.api_key;
-    agent.client.model = resolved.model;
-    // The config's model is the id the header shows, so it is the resolved one
+    // The client's model is the id the header shows, so it is the resolved one
     // rather than the configured choice: a session sent to its own provider
     // would otherwise be headed with a model it is not asking.
-    agent.config.model = resolved.model;
+    agent.client.model = resolved.model;
     agent.config.model_info = resolved.info;
 }
 
@@ -684,6 +692,7 @@ pub fn run(
     io: std.Io,
     gpa: std.mem.Allocator,
     out: *std.Io.Writer,
+    endpoint: Endpoint,
     config: Config,
     session: *Session,
     target: ?Target,
@@ -694,7 +703,7 @@ pub fn run(
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    var agent = try Agent.init(io, gpa, config, session.cwd(), &http_client);
+    var agent = try Agent.init(io, gpa, endpoint, config, session.cwd(), &http_client);
     defer agent.deinit();
     // A resumed session keeps the prompt and tools it was saved with, so it is
     // prepared here; a new one gets them from its first prompt, through `start`.
@@ -1504,8 +1513,6 @@ test "printTranscript rebuilds an edit's diff from the stored call" {
     );
 }
 
-/// A config with no model metadata, so the header is just the model and the
-/// directory. Tests that need a gauge fill `model_info` in.
 /// An agent for a test, working in a directory that exists.
 ///
 /// The HTTP client is borrowed by the agent and by the tools that make requests,
@@ -1513,10 +1520,10 @@ test "printTranscript rebuilds an edit's diff from the stored call" {
 /// only drives the loop passes null, and the client it is given is never read.
 /// That is what keeps the setup of an unused client out of every test: the field
 /// is a pointer, so a null is only a null until a web tool is called.
-fn testAgent(io: std.Io, gpa: std.mem.Allocator, config: Config, http_client: ?*std.http.Client) !Agent {
+fn testAgent(io: std.Io, gpa: std.mem.Allocator, setup: TestSetup, http_client: ?*std.http.Client) !Agent {
     const work_dir = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(work_dir);
-    return testAgentIn(io, gpa, config, work_dir, http_client);
+    return testAgentIn(io, gpa, setup, work_dir, http_client);
 }
 
 /// An agent for a test working in `work_dir`, which is where the project's
@@ -1525,30 +1532,43 @@ fn testAgent(io: std.Io, gpa: std.mem.Allocator, config: Config, http_client: ?*
 fn testAgentIn(
     io: std.Io,
     gpa: std.mem.Allocator,
-    config: Config,
+    setup: TestSetup,
     work_dir: []const u8,
     http_client: ?*std.http.Client,
 ) !Agent {
-    if (http_client) |client| return Agent.init(io, gpa, config, work_dir, client);
+    if (http_client) |client| return Agent.init(io, gpa, setup.endpoint, setup.config, work_dir, client);
 
     var unused: std.http.Client = undefined;
-    return Agent.init(io, gpa, config, work_dir, &unused);
+    return Agent.init(io, gpa, setup.endpoint, setup.config, work_dir, &unused);
 }
 
-/// The configuration a test builds an agent from. It carries the one model it is
-/// about, and no home directory, which only the header used and now takes as a
-/// value of its own.
-fn testConfig(model: []const u8) Config {
-    return .{
-        .api_key = "k",
-        .url = "u",
-        .model = model,
-        .max_turns = 10,
-        .bash_timeout_s = 120,
-        .home = null,
-        .model_info = null,
-    };
-}
+/// What a test builds an agent from: where its requests would be sent and the
+/// settings it runs with.
+///
+/// The URL is one nothing listens on until a test points it at a mock, so a
+/// request made where a test expected none fails it rather than passing. The
+/// settings are the numbers the loop needs and no model metadata, so the header
+/// is just the model and the directory; a test that needs a gauge fills its
+/// `config.model_info` in. No home directory either, which only the header used
+/// and now takes as a value of its own.
+const TestSetup = struct {
+    endpoint: Endpoint,
+    config: Config,
+
+    /// A setup for `model`, which is the one thing every test names, since it is
+    /// what the session records and the header shows.
+    fn init(model: []const u8) TestSetup {
+        return .{
+            .endpoint = .{ .url = "u", .api_key = "k", .model = model },
+            .config = .{
+                .max_turns = 10,
+                .bash_timeout_s = 120,
+                .home = null,
+                .model_info = null,
+            },
+        };
+    }
+};
 
 /// A terminal a test can show blocks through and read back from `out`. The
 /// returned value has to outlive the emitter taken from it, since the emitter
@@ -1950,7 +1970,7 @@ test "the compaction threshold is the configured share of the window, or off" {
 
     // A model without a known window has nothing to measure a conversation
     // against, so there is no threshold even with compaction on.
-    var agent = try testAgent(io, gpa, testConfig("m"), null);
+    var agent = try testAgent(io, gpa, TestSetup.init("m"), null);
     defer agent.deinit();
     try std.testing.expectEqual(0, agent.compactThreshold());
 
@@ -1991,12 +2011,12 @@ test "maybeCompact folds the conversation once it has filled the window" {
     try session.append(.{ .role = .tool, .tool_call_id = "call_x", .content = "OLDTOOLOUTPUT" });
     try session.append(.{ .role = .assistant, .content = "OLDANSWER" });
 
-    var config = testConfig("m");
-    config.model_info = .{
+    var setup = TestSetup.init("m");
+    setup.config.model_info = .{
         .provider = .deepseek,
         .context_window = 1000,
     };
-    config.compact_at = 80;
+    setup.config.compact_at = 80;
     // A conversation that has filled the window past the threshold.
     session.context_tokens = 900;
 
@@ -2008,10 +2028,10 @@ test "maybeCompact folds the conversation once it has filled the window" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    config.url = mock.url;
-    config.api_key = "k";
+    setup.endpoint.url = mock.url;
+    setup.endpoint.api_key = "k";
 
-    var agent = try testAgent(io, gpa, config, &http_client);
+    var agent = try testAgent(io, gpa, setup, &http_client);
     defer agent.deinit();
 
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -2062,14 +2082,14 @@ test "maybeCompact does nothing below the threshold, off, or with nothing new" {
     try session.setSystemPrompt("s");
     try session.append(.{ .role = .user, .content = "hello" });
 
-    var config = testConfig("m");
-    config.model_info = .{ .provider = .deepseek, .context_window = 1000 };
+    var setup = TestSetup.init("m");
+    setup.config.model_info = .{ .provider = .deepseek, .context_window = 1000 };
 
     // Nothing is listening on this address, so a request made where the function
     // should have returned first would fail the test rather than pass it.
-    config.url = "http://127.0.0.1:1/chat/completions";
+    setup.endpoint.url = "http://127.0.0.1:1/chat/completions";
 
-    var agent = try testAgent(io, gpa, config, null);
+    var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
 
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -2107,10 +2127,10 @@ test "a compaction asked for now folds the conversation in whatever its size" {
     try session.append(.{ .role = .user, .content = "hello" });
     try session.append(.{ .role = .assistant, .content = "hi" });
 
-    var config = testConfig("m");
-    config.model_info = .{ .provider = .deepseek, .context_window = 1000 };
+    var setup = TestSetup.init("m");
+    setup.config.model_info = .{ .provider = .deepseek, .context_window = 1000 };
     // Compaction is off, so only a manual one runs.
-    config.compact_at = 0;
+    setup.config.compact_at = 0;
 
     var mock = try Mock.start("/chat/completions", 1, Mock.completion("the summary"));
     defer mock.deinit();
@@ -2118,10 +2138,10 @@ test "a compaction asked for now folds the conversation in whatever its size" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    config.url = mock.url;
-    config.api_key = "k";
+    setup.endpoint.url = mock.url;
+    setup.endpoint.api_key = "k";
 
-    var agent = try testAgent(io, gpa, config, &http_client);
+    var agent = try testAgent(io, gpa, setup, &http_client);
     defer agent.deinit();
 
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -2167,16 +2187,16 @@ test "maybeCompact does not compact a summary that stands alone" {
     try session.setSystemPrompt("s");
     try session.appendCompaction("p", "a summary");
 
-    var config = testConfig("m");
-    config.model_info = .{ .provider = .deepseek, .context_window = 1000 };
+    var setup = TestSetup.init("m");
+    setup.config.model_info = .{ .provider = .deepseek, .context_window = 1000 };
 
     // Over the threshold, but the last message is the summary itself, so there is
     // nothing new to fold in and a request would only re-summarize it.
     session.context_tokens = 999;
     // Nothing is listening there, so a request made where this should have
     // returned first would fail the test.
-    config.url = "http://127.0.0.1:1/chat/completions";
-    var agent = try testAgent(io, gpa, config, null);
+    setup.endpoint.url = "http://127.0.0.1:1/chat/completions";
+    var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
 
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -2223,7 +2243,7 @@ test "refreshLead replaces the prompt, the project instructions and the tools" {
     // them. No client is given, since this reads no model.
     const work_dir = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(work_dir);
-    var agent = try testAgentIn(io, gpa, testConfig("m"), work_dir, null);
+    var agent = try testAgentIn(io, gpa, TestSetup.init("m"), work_dir, null);
     defer agent.deinit();
 
     try refreshLead(&agent, .general, &new_tools, &session);
@@ -2265,11 +2285,11 @@ test "prepare gives a fresh session the user's instructions from the configurati
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
 
-    var config = testConfig("m");
-    config.user_instructions_dir = config_dir.dir;
+    var setup = TestSetup.init("m");
+    setup.config.user_instructions_dir = config_dir.dir;
     // `Agent.init` opens the directory it works in, so it has to be one that
     // exists; the session's recorded directory is separate.
-    var agent = try testAgent(io, gpa, config, null);
+    var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
 
     try agent.prepare(&session, null);
@@ -2295,10 +2315,10 @@ test "prepare gives a chat session no prompt and only the tools it allows" {
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
 
-    var config = testConfig("m");
-    config.mode = .chat;
-    config.user_instructions_dir = config_dir.dir;
-    var agent = try testAgent(io, gpa, config, null);
+    var setup = TestSetup.init("m");
+    setup.config.mode = .chat;
+    setup.config.user_instructions_dir = config_dir.dir;
+    var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
 
     try agent.prepare(&session, null);
@@ -2326,7 +2346,7 @@ test "a first prompt names the mode and says what to ask" {
     // asked as it was typed.
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
-    var agent = try testAgent(io, gpa, testConfig("m"), null);
+    var agent = try testAgent(io, gpa, TestSetup.init("m"), null);
     defer agent.deinit();
 
     const plain = try agent.start(&session, "do the thing", .general);
@@ -2354,7 +2374,7 @@ test "a first prompt that names only a mode asks nothing" {
 
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
-    var agent = try testAgent(io, gpa, testConfig("m"), null);
+    var agent = try testAgent(io, gpa, TestSetup.init("m"), null);
     defer agent.deinit();
 
     // `/chat` on its own opens that mode: the session is set up and ready, and
@@ -2375,7 +2395,7 @@ test "a prompt after the first leaves the session as it was set up" {
 
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
-    var agent = try testAgent(io, gpa, testConfig("m"), null);
+    var agent = try testAgent(io, gpa, TestSetup.init("m"), null);
     defer agent.deinit();
 
     _ = try agent.start(&session, "the first thing", .general);
@@ -2558,10 +2578,10 @@ test "a turn shows the tool it runs and then the answer" {
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    var config = testConfig("m");
-    config.url = mock.url;
-    config.api_key = "k";
-    var agent = try testAgent(io, gpa, config, &http_client);
+    var setup = TestSetup.init("m");
+    setup.endpoint.url = mock.url;
+    setup.endpoint.api_key = "k";
+    var agent = try testAgent(io, gpa, setup, &http_client);
     defer agent.deinit();
 
     var recorder = Recorder{ .gpa = arena_state.allocator() };
@@ -2634,16 +2654,16 @@ test "the first turn names the session, and the naming is not part of it" {
     defer mock.deinit();
     try mock.serve();
 
-    var config = testConfig("m");
-    config.title = true;
-    // The agent builds the model client from the config, so the config carries
-    // the address of the mock.
-    config.url = mock.url;
+    var setup = TestSetup.init("m");
+    setup.config.title = true;
+    // The agent builds the model client from the endpoint, so it carries the
+    // address of the mock.
+    setup.endpoint.url = mock.url;
     // `Agent.init` opens the directory it works in, so it has to be one that
     // exists; the session's recorded directory is separate and stays "/work".
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var agent = try testAgent(io, gpa, config, &http_client);
+    var agent = try testAgent(io, gpa, setup, &http_client);
     defer agent.deinit();
 
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -2719,9 +2739,9 @@ test "a session is sent where the choice it recorded points, not the configurati
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    var config = testConfig("m");
-    config.url = "http://127.0.0.1:1/chat/completions";
-    var agent = try testAgent(io, gpa, config, &http_client);
+    var setup = TestSetup.init("m");
+    setup.endpoint.url = "http://127.0.0.1:1/chat/completions";
+    var agent = try testAgent(io, gpa, setup, &http_client);
     defer agent.deinit();
 
     var tmp = std.testing.tmpDir(.{});
@@ -2745,9 +2765,8 @@ test "a session is sent where the choice it recorded points, not the configurati
     // configured one, the model id it was given is sent, and the header reads
     // the window of that model.
     try std.testing.expectEqualStrings(chosen.url, agent.client.url);
-    try std.testing.expect(!std.mem.eql(u8, config.url, agent.client.url));
+    try std.testing.expect(!std.mem.eql(u8, setup.endpoint.url, agent.client.url));
     try std.testing.expectEqualStrings("the-chosen-model", agent.client.model);
-    try std.testing.expectEqualStrings("the-chosen-model", agent.config.model);
     try std.testing.expectEqual(@as(usize, 42), agent.config.model_info.?.context_window);
     try std.testing.expectEqual(models.Provider.opencode_go, agent.config.model_info.?.provider);
 
@@ -2771,7 +2790,7 @@ test "a session with no recorded model takes the choice it is prepared with" {
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    var agent = try testAgent(io, gpa, testConfig("m"), &http_client);
+    var agent = try testAgent(io, gpa, TestSetup.init("m"), &http_client);
     defer agent.deinit();
 
     var tmp = std.testing.tmpDir(.{});

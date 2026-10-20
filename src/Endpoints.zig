@@ -125,8 +125,27 @@ fn targetFor(
     };
 }
 
-/// What a run is configured from: the endpoint it talks to, the backends its web
-/// tools ask, and the settings that decide what the agent does.
+/// Where a run's requests are sent, as the agent takes it: the endpoint the
+/// configuration resolved to, asked for the model's thinking as the configuration
+/// says and the provider allows.
+pub fn agentEndpoint(config: Config, endpoint: Endpoint) agent.Endpoint {
+    return .{
+        .url = endpoint.url,
+        .api_key = endpoint.api_key,
+        .model = endpoint.model,
+        // The thinking fields are one provider's own, so they are sent only to a
+        // provider that takes them: a model whose provider billy does not know,
+        // or one whose endpoint does not accept them, is left alone.
+        .reasoning = if (endpoint.provider) |provider|
+            if (provider.takesThinking()) reasoningOf(config.stored.reasoning) else .provider_default
+        else
+            .provider_default,
+    };
+}
+
+/// What a run is configured from: the backends its web tools ask, and the
+/// settings that decide what the agent does. Where its requests go is resolved
+/// separately, as `agentEndpoint`.
 pub fn agentConfig(
     config: Config,
     endpoint: Endpoint,
@@ -138,9 +157,6 @@ pub fn agentConfig(
 ) agent.Config {
     const stored = &config.stored;
     return .{
-        .api_key = endpoint.api_key,
-        .url = endpoint.url,
-        .model = endpoint.model,
         .max_turns = stored.max_turns,
         .bash_timeout_s = stored.tools.bash.timeout_s,
         .home = environ.get("HOME"),
@@ -151,13 +167,6 @@ pub fn agentConfig(
         .model_info = models.lookup(endpoint.provider, endpoint.model),
         .compact_at = stored.compact_at,
         .title = stored.title,
-        // The thinking fields are one provider's own, so they are sent only to a
-        // provider that takes them: a model whose provider billy does not know,
-        // or one whose endpoint does not accept them, is left alone.
-        .reasoning = if (endpoint.provider) |provider|
-            if (provider.takesThinking()) reasoningOf(stored.reasoning) else .provider_default
-        else
-            .provider_default,
         // How billy lays out and decorates what it shows. A bash command is laid
         // out by its format script, so the user reads the command the way it
         // runs; an edit is shown as a diff, laid out by its own script when one
@@ -562,4 +571,38 @@ test "the reasoning setting names what billy asks of the model's thinking" {
     try std.testing.expectEqual(llm.Reasoning.provider_default, reasoningOf("default"));
     try std.testing.expectEqualStrings("high", reasoningOf("high").effort);
     try std.testing.expectEqualStrings("low", reasoningOf("low").effort);
+}
+
+test "a run's endpoint carries the address and only the thinking its provider takes" {
+    const gpa = std.testing.allocator;
+    var config = Config.init(gpa);
+    defer config.deinit();
+    config.stored.reasoning = "high";
+
+    const endpoint: Endpoint = .{
+        .base_url = "https://api.deepseek.com",
+        .url = "https://api.deepseek.com/chat/completions",
+        .api_key = "k",
+        .model = "deepseek-flash",
+        .provider = .deepseek,
+    };
+
+    // Where the request goes is taken as it was resolved, and a provider that
+    // takes the thinking fields is asked for what the configuration says.
+    const asked = agentEndpoint(config, endpoint);
+    try std.testing.expectEqualStrings(endpoint.url, asked.url);
+    try std.testing.expectEqualStrings("k", asked.api_key);
+    try std.testing.expectEqualStrings("deepseek-flash", asked.model);
+    try std.testing.expectEqualStrings("high", asked.reasoning.effort);
+
+    // A provider that does not take them, and one billy does not know, are left
+    // on whatever they do by themselves: a request carrying fields an endpoint
+    // does not expect may be refused.
+    var untaken = endpoint;
+    untaken.provider = .opencode_go;
+    try std.testing.expectEqual(llm.Reasoning.provider_default, agentEndpoint(config, untaken).reasoning);
+
+    var unknown = endpoint;
+    unknown.provider = null;
+    try std.testing.expectEqual(llm.Reasoning.provider_default, agentEndpoint(config, unknown).reasoning);
 }
