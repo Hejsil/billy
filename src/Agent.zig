@@ -916,77 +916,6 @@ fn blocksIn(session: *const Session, messages: []const Session.Message, index: u
     return if (calls == 0) 1 else calls;
 }
 
-/// Adds the deltas of a streamed reply up into the message they spell out. The
-/// message points into this, so it outlives the message's use and is freed with
-/// `deinit`.
-const Reply = struct {
-    gpa: std.mem.Allocator,
-    /// The answer, the model's thinking, and one set of pieces per tool call.
-    content: std.ArrayList(u8) = .empty,
-    reasoning: std.ArrayList(u8) = .empty,
-    calls: std.ArrayList(Call) = .empty,
-    tool_calls: std.ArrayList(llm.ToolCall) = .empty,
-
-    const Call = struct {
-        id: std.ArrayList(u8) = .empty,
-        name: std.ArrayList(u8) = .empty,
-        arguments: std.ArrayList(u8) = .empty,
-
-        fn deinit(call: *Call, gpa: std.mem.Allocator) void {
-            call.id.deinit(gpa);
-            call.name.deinit(gpa);
-            call.arguments.deinit(gpa);
-        }
-    };
-
-    fn deinit(self: *Reply) void {
-        self.content.deinit(self.gpa);
-        self.reasoning.deinit(self.gpa);
-        for (self.calls.items) |*call| call.deinit(self.gpa);
-        self.calls.deinit(self.gpa);
-        self.tool_calls.deinit(self.gpa);
-    }
-
-    /// Adds one delta of a streamed reply.
-    fn add(self: *Reply, delta: llm.Delta) !void {
-        if (delta.content) |text| try self.content.appendSlice(self.gpa, text);
-        if (delta.reasoning) |text| try self.reasoning.appendSlice(self.gpa, text);
-        for (delta.tool_calls) |fragment| try self.addCall(fragment);
-    }
-
-    /// Adds a piece of a tool call to the call its `index` names, making that call
-    /// on the first piece.
-    fn addCall(self: *Reply, fragment: llm.ToolCallDelta) !void {
-        while (self.calls.items.len <= fragment.index) try self.calls.append(self.gpa, .{});
-        const call = &self.calls.items[fragment.index];
-        if (fragment.id) |id| try set(&call.id, self.gpa, id);
-        if (fragment.name) |name| try set(&call.name, self.gpa, name);
-        if (fragment.arguments) |arguments| try call.arguments.appendSlice(self.gpa, arguments);
-    }
-
-    /// The message the reply adds up to, its strings pointing into this.
-    fn message(self: *Reply) !llm.Message {
-        self.tool_calls.clearRetainingCapacity();
-        for (self.calls.items) |call|
-            try self.tool_calls.append(self.gpa, .{
-                .id = call.id.items,
-                .function = .{ .name = call.name.items, .arguments = call.arguments.items },
-            });
-        return .{
-            .role = .assistant,
-            .content = if (self.content.items.len > 0) self.content.items else null,
-            .reasoning_content = if (self.reasoning.items.len > 0) self.reasoning.items else null,
-            .tool_calls = if (self.tool_calls.items.len > 0) self.tool_calls.items else null,
-        };
-    }
-};
-
-/// Sets `list` to `text`, keeping what it already allocated.
-fn set(list: *std.ArrayList(u8), gpa: std.mem.Allocator, text: []const u8) !void {
-    list.clearRetainingCapacity();
-    try list.appendSlice(gpa, text);
-}
-
 /// Shows the text of a streamed delta to the frontend. Tool call pieces are not
 /// shown: a call is shown whole when it has been parsed, just before it runs.
 fn showDeltaText(emitter: Emitter, delta: llm.Delta) !void {
@@ -1025,7 +954,7 @@ fn turn(agent: *Agent, emitter: Emitter, session: *Session) !void {
         );
         defer stream.deinit();
 
-        var reply: Reply = .{ .gpa = agent.gpa };
+        var reply: llm.Reply = .{ .gpa = agent.gpa };
         defer reply.deinit();
         while (try stream.next()) |delta| {
             try reply.add(delta);
@@ -1301,9 +1230,9 @@ fn askWith(agent: *Agent, session: *Session, question: []const u8) !?[]u8 {
     );
     defer stream.deinit();
 
-    var reply: Reply = .{ .gpa = agent.gpa };
+    var reply: llm.Reply = .{ .gpa = agent.gpa };
     defer reply.deinit();
-    while (try stream.next()) |delta| try reply.add(delta);
+    try reply.collect(stream);
 
     const content = reply.content.items;
     if (content.len == 0) return null;
@@ -2826,9 +2755,9 @@ test "a session is sent where the choice it recorded points, not the configurati
     // nothing is listening on.
     var stream = try agent.client.complete(gpa, "01SESSION", session.conversation(&.{}), session.toolSet());
     defer stream.deinit();
-    var reply: Reply = .{ .gpa = gpa };
+    var reply: llm.Reply = .{ .gpa = gpa };
     defer reply.deinit();
-    while (try stream.next()) |delta| try reply.add(delta);
+    try reply.collect(stream);
     try chosen.group.await(io);
     if (chosen.err) |err| return err;
     try std.testing.expectEqual(@as(usize, 1), chosen.served);

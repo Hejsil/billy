@@ -592,6 +592,82 @@ pub const Stream = struct {
     }
 };
 
+/// Adds the deltas of a streamed reply up into the message they spell out. The
+/// message points into this, so it outlives the message's use and is freed with
+/// `deinit`.
+pub const Reply = struct {
+    gpa: std.mem.Allocator,
+    /// The answer, the model's thinking, and one set of pieces per tool call.
+    content: std.ArrayList(u8) = .empty,
+    reasoning: std.ArrayList(u8) = .empty,
+    calls: std.ArrayList(Call) = .empty,
+    tool_calls: std.ArrayList(ToolCall) = .empty,
+
+    const Call = struct {
+        id: std.ArrayList(u8) = .empty,
+        name: std.ArrayList(u8) = .empty,
+        arguments: std.ArrayList(u8) = .empty,
+
+        fn deinit(call: *Call, gpa: std.mem.Allocator) void {
+            call.id.deinit(gpa);
+            call.name.deinit(gpa);
+            call.arguments.deinit(gpa);
+        }
+    };
+
+    pub fn deinit(self: *Reply) void {
+        self.content.deinit(self.gpa);
+        self.reasoning.deinit(self.gpa);
+        for (self.calls.items) |*call| call.deinit(self.gpa);
+        self.calls.deinit(self.gpa);
+        self.tool_calls.deinit(self.gpa);
+    }
+
+    /// Reads `stream` to its end, adding every delta to the reply.
+    pub fn collect(self: *Reply, stream: *Stream) !void {
+        while (try stream.next()) |delta| try self.add(delta);
+    }
+
+    /// Adds one delta of a streamed reply.
+    pub fn add(self: *Reply, delta: Delta) !void {
+        if (delta.content) |text| try self.content.appendSlice(self.gpa, text);
+        if (delta.reasoning) |text| try self.reasoning.appendSlice(self.gpa, text);
+        for (delta.tool_calls) |fragment| try self.addCall(fragment);
+    }
+
+    /// Adds a piece of a tool call to the call its `index` names, making that call
+    /// on the first piece.
+    fn addCall(self: *Reply, fragment: ToolCallDelta) !void {
+        while (self.calls.items.len <= fragment.index) try self.calls.append(self.gpa, .{});
+        const call = &self.calls.items[fragment.index];
+        if (fragment.id) |id| try set(&call.id, self.gpa, id);
+        if (fragment.name) |name| try set(&call.name, self.gpa, name);
+        if (fragment.arguments) |arguments| try call.arguments.appendSlice(self.gpa, arguments);
+    }
+
+    /// The message the reply adds up to, its strings pointing into this.
+    pub fn message(self: *Reply) !Message {
+        self.tool_calls.clearRetainingCapacity();
+        for (self.calls.items) |call|
+            try self.tool_calls.append(self.gpa, .{
+                .id = call.id.items,
+                .function = .{ .name = call.name.items, .arguments = call.arguments.items },
+            });
+        return .{
+            .role = .assistant,
+            .content = if (self.content.items.len > 0) self.content.items else null,
+            .reasoning_content = if (self.reasoning.items.len > 0) self.reasoning.items else null,
+            .tool_calls = if (self.tool_calls.items.len > 0) self.tool_calls.items else null,
+        };
+    }
+};
+
+/// Sets `list` to `text`, keeping what it already allocated.
+fn set(list: *std.ArrayList(u8), gpa: std.mem.Allocator, text: []const u8) !void {
+    list.clearRetainingCapacity();
+    try list.appendSlice(gpa, text);
+}
+
 /// One chunk of a streamed reply, as the API sends it. Unknown fields are
 /// ignored, and a field a chunk leaves out keeps the default, since a chunk only
 /// carries what changed.
@@ -673,58 +749,6 @@ fn writeBody(writer: *std.Io.Writer, request: anytype) !void {
 /// Stands for the tools of a request that has none. The request is generic over
 /// the tools, so a test that sends none still names a type for them.
 const NoTools = struct {};
-
-/// Collects a streamed reply the way a caller does: the text is joined and the
-/// tool call pieces are put back into the calls their index names. A test uses it
-/// in place of the agent's own reply building.
-const Collected = struct {
-    gpa: std.mem.Allocator,
-    content: std.ArrayList(u8) = .empty,
-    reasoning: std.ArrayList(u8) = .empty,
-    calls: std.ArrayList(Call) = .empty,
-
-    const Call = struct {
-        id: std.ArrayList(u8) = .empty,
-        name: std.ArrayList(u8) = .empty,
-        arguments: std.ArrayList(u8) = .empty,
-
-        fn deinit(call: *Call, gpa: std.mem.Allocator) void {
-            call.id.deinit(gpa);
-            call.name.deinit(gpa);
-            call.arguments.deinit(gpa);
-        }
-    };
-
-    fn deinit(self: *Collected) void {
-        self.content.deinit(self.gpa);
-        self.reasoning.deinit(self.gpa);
-        for (self.calls.items) |*call| call.deinit(self.gpa);
-        self.calls.deinit(self.gpa);
-    }
-
-    /// Reads `stream` to its end, adding every delta to the reply.
-    fn collect(self: *Collected, stream: *Stream) !void {
-        while (try stream.next()) |delta| {
-            if (delta.content) |text| try self.content.appendSlice(self.gpa, text);
-            if (delta.reasoning) |text| try self.reasoning.appendSlice(self.gpa, text);
-            for (delta.tool_calls) |fragment| try self.addCall(fragment);
-        }
-    }
-
-    fn addCall(self: *Collected, fragment: ToolCallDelta) !void {
-        while (self.calls.items.len <= fragment.index) try self.calls.append(self.gpa, .{});
-        const call = &self.calls.items[fragment.index];
-        if (fragment.id) |id| try set(&call.id, self.gpa, id);
-        if (fragment.name) |name| try set(&call.name, self.gpa, name);
-        if (fragment.arguments) |arguments| try call.arguments.appendSlice(self.gpa, arguments);
-    }
-};
-
-/// Sets `list` to `text`, keeping what it already allocated.
-fn set(list: *std.ArrayList(u8), gpa: std.mem.Allocator, text: []const u8) !void {
-    list.clearRetainingCapacity();
-    try list.appendSlice(gpa, text);
-}
 
 test "what a request asks of the model's thinking, by setting" {
     const gpa = std.testing.allocator;
@@ -835,7 +859,7 @@ test "a request reaches the wire with the body the head promised" {
 
     var stream = try client.complete(gpa, "01SESSION", &messages, @as([]const NoTools, &.{}));
     defer stream.deinit();
-    var collected: Collected = .{ .gpa = gpa };
+    var collected: Reply = .{ .gpa = gpa };
     defer collected.deinit();
     try collected.collect(stream);
 
@@ -920,7 +944,7 @@ test "a streamed reply is read a delta at a time" {
 
     var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
     defer stream.deinit();
-    var collected: Collected = .{ .gpa = gpa };
+    var collected: Reply = .{ .gpa = gpa };
     defer collected.deinit();
     try collected.collect(stream);
 
@@ -1028,7 +1052,7 @@ test "a tool call streamed in pieces is put back together" {
 
     var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
     defer stream.deinit();
-    var collected: Collected = .{ .gpa = gpa };
+    var collected: Reply = .{ .gpa = gpa };
     defer collected.deinit();
     try collected.collect(stream);
 
@@ -1171,7 +1195,7 @@ test "a request that is rate limited is tried again and succeeds" {
 
     var stream = try client.complete(gpa, "01SESSION", &messages, @as([]const NoTools, &.{}));
     defer stream.deinit();
-    var collected: Collected = .{ .gpa = gpa };
+    var collected: Reply = .{ .gpa = gpa };
     defer collected.deinit();
     try collected.collect(stream);
 
@@ -1245,7 +1269,7 @@ test "the HTTP client is kept, so requests reuse one connection" {
     for (0..2) |_| {
         var stream = try client.complete(gpa, "01SESSION", &messages, @as([]const NoTools, &.{}));
         defer stream.deinit();
-        var collected: Collected = .{ .gpa = gpa };
+        var collected: Reply = .{ .gpa = gpa };
         defer collected.deinit();
         try collected.collect(stream);
         try std.testing.expectEqualStrings("hi", collected.content.items);
