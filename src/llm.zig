@@ -463,17 +463,21 @@ pub const Stream = struct {
             var buffer: [4096]u8 = undefined;
             var slices = [_][]u8{&buffer};
             const n = reader.readVec(&slices) catch |err| switch (err) {
-                error.EndOfStream => 0,
+                // The body is over. Every complete frame was taken off the
+                // front of `pending` above, so what is left is a frame cut off
+                // mid-way, which is not the reply's and is dropped.
+                error.EndOfStream => {
+                    self.done = true;
+                    continue;
+                },
                 else => return err,
             };
-            // The end of the body ends the stream; a read that hands over no
-            // bytes without the body being over is simply waited past by the
-            // next one.
-            if (n == 0) {
-                self.done = true;
-            } else {
-                try self.pending.appendSlice(self.gpa, buffer[0..n]);
-            }
+            // A read may hand over no bytes without the stream being over: a
+            // reader is allowed to put them in its own buffer and return zero,
+            // and the next read hands them on. Reading reaches the end only as
+            // `error.EndOfStream`, so zero is waited past rather than taken for
+            // the end, which would cut the reply off where it stood.
+            if (n > 0) try self.pending.appendSlice(self.gpa, buffer[0..n]);
         }
         if (!self.saw_choice) return error.NoChoices;
         return null;
