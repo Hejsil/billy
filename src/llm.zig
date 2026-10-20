@@ -441,19 +441,17 @@ pub const Stream = struct {
     /// Whether any chunk carried a choice, so a stream that carried none can be
     /// told from a reply that is simply empty.
     saw_choice: bool = false,
-    /// Whether the frame that ends the stream has been read, after which
-    /// anything that follows is not the reply's.
+    /// Whether the stream has ended: its `[DONE]` frame was read, or the body
+    /// ran out. Anything after that is not the reply's.
     done: bool = false,
 
     /// Reads until the next piece of the reply, or null when the stream has
-    /// ended. A provider that sent no choices at all is reported as
-    /// `error.NoChoices` rather than as an empty reply.
+    /// ended. The stream ends at its `[DONE]` frame or at the end of the body;
+    /// anything left then is a frame cut off mid-way, which is not the reply's.
+    /// A provider that sent no choices at all is reported as `error.NoChoices`
+    /// rather than as an empty reply.
     pub fn next(self: *Stream) !?Delta {
-        while (true) {
-            if (self.done) {
-                if (!self.saw_choice) return error.NoChoices;
-                return null;
-            }
+        while (!self.done) {
             if (frameEnd(self.pending.items)) |end| {
                 const delta = try self.parseFrame(self.pending.items[0..end.body]);
                 self.consume(end.consumed);
@@ -465,13 +463,20 @@ pub const Stream = struct {
             var buffer: [4096]u8 = undefined;
             var slices = [_][]u8{&buffer};
             const n = reader.readVec(&slices) catch |err| switch (err) {
-                error.EndOfStream => return self.finish(),
+                error.EndOfStream => 0,
                 else => return err,
             };
-            // A read may hand over no bytes without the stream being over; the
-            // next one waits for more.
-            if (n > 0) try self.pending.appendSlice(self.gpa, buffer[0..n]);
+            // The end of the body ends the stream; a read that hands over no
+            // bytes without the body being over is simply waited past by the
+            // next one.
+            if (n == 0) {
+                self.done = true;
+            } else {
+                try self.pending.appendSlice(self.gpa, buffer[0..n]);
+            }
         }
+        if (!self.saw_choice) return error.NoChoices;
+        return null;
     }
 
     /// The token counts the provider sent with the reply, which it sends at the
@@ -506,21 +511,6 @@ pub const Stream = struct {
             self.decompress_buffer,
         );
         return self.reader.?;
-    }
-
-    /// Reads what is left after the last read as the final frame, for a provider
-    /// that ends its stream without the blank line a frame is meant to have.
-    fn finish(self: *Stream) !?Delta {
-        self.done = true;
-        if (self.pending.items.len == 0) {
-            if (!self.saw_choice) return error.NoChoices;
-            return null;
-        }
-        const delta = try self.parseFrame(self.pending.items);
-        self.pending.clearRetainingCapacity();
-        if (delta) |d| return d;
-        if (!self.saw_choice) return error.NoChoices;
-        return null;
     }
 
     fn consume(self: *Stream, n: usize) void {
