@@ -44,22 +44,25 @@ pub const Target = struct {
     api_key: []const u8,
     /// The model id to send, which is the half of the choice after the provider.
     model: []const u8,
-    /// What is known about the model: its window, for the gauge and the
-    /// compaction threshold. Null for a model billy has no numbers for.
-    info: ?models.Metadata,
+    /// The provider the endpoint belongs to, or null for one billy does not
+    /// know, such as a proxy. It is what the model's window is looked up by.
+    provider: ?models.Provider,
 };
 
 /// Where a run's requests are sent: the endpoint the configuration resolves to,
 /// with what a request needs to be sent at all.
 ///
 /// A run starts pointed here. A session that recorded a provider of its own is
-/// re-pointed at it instead, through a `Target`, which is the same three things
+/// re-pointed at it instead, through a `Target`, which is the same destination
 /// without the thinking rule the configuration settled.
 pub const Endpoint = struct {
     /// Full URL of the chat completions endpoint.
     url: []const u8,
     api_key: []const u8,
     model: []const u8,
+    /// The provider the endpoint belongs to, or null for one billy does not
+    /// know, such as a proxy. It is what the model's window is looked up by.
+    provider: ?models.Provider = null,
     /// What the request asks of the model's thinking, from the configuration and
     /// settled against the provider's own rules before the run starts.
     reasoning: llm.Reasoning = .provider_default,
@@ -81,10 +84,6 @@ pub const Config = struct {
     /// no such file. Borrowed from the setup, which owns it and outlives the
     /// agent, so nothing here closes it.
     user_instructions_dir: ?std.Io.Dir = null,
-    /// What is known about the provider and model: the context window. Null for
-    /// a model billy does not know, in which case the header leaves out the
-    /// context gauge.
-    model_info: ?models.Metadata,
     /// How full the context window must be, as a whole percentage, before the
     /// conversation is compacted into a summary. Zero turns compaction off.
     /// Nothing is compacted for a model whose window is unknown, since there is
@@ -440,6 +439,11 @@ config: Config,
 /// choice until the session's first prompt settles it and the session's own
 /// from then on. See `mode.zig`.
 mode: Mode = .general,
+/// The provider the session is sent to, or null for one billy does not know,
+/// such as a proxy. The model's window is looked up from it rather than kept
+/// beside it, since a copy would be a second thing to keep in step with the
+/// model id the client sends.
+provider: ?models.Provider = null,
 /// The directory the session works in. For a resumed session it is the one the
 /// session was started in.
 work_dir: std.Io.Dir,
@@ -492,6 +496,7 @@ pub fn init(
             .http = http_client,
             .reasoning = endpoint.reasoning,
         },
+        .provider = endpoint.provider,
     };
 }
 
@@ -545,7 +550,15 @@ fn useTarget(agent: *Agent, resolved: Target) void {
     // rather than the configured choice: a session sent to its own provider
     // would otherwise be headed with a model it is not asking.
     agent.client.model = resolved.model;
-    agent.config.model_info = resolved.info;
+    agent.provider = resolved.provider;
+}
+
+/// What is known about the model the run is sent to: its window, for the header's
+/// gauge and the compaction threshold. Looked up from the provider and the model
+/// id the client sends, which are the run's own state, rather than kept as a copy
+/// that would have to be updated with them.
+fn modelInfo(agent: *const Agent) ?models.Metadata {
+    return models.lookup(agent.provider, agent.client.model);
 }
 
 /// What asking `agent` to start a session with a first prompt came to.
@@ -734,7 +747,7 @@ pub fn run(
         // the turn and moved every string taken from it before.
         try header.writer.print("{f}", .{SessionHeader.of(
             session,
-            agent.config.model_info,
+            agent.modelInfo(),
             agent.config.home,
         )});
         const line = (try editor.readLine(header.written(), prompt)) orelse break;
@@ -1171,7 +1184,7 @@ const compact_prompt =
 /// then no threshold to measure a conversation against.
 fn compactThreshold(agent: *const Agent) usize {
     if (agent.config.compact_at == 0) return 0;
-    const info = agent.config.model_info orelse return 0;
+    const info = agent.modelInfo() orelse return 0;
     return info.context_window * agent.config.compact_at / 100;
 }
 
@@ -1550,11 +1563,11 @@ fn testAgentIn(
 /// settings it runs with, and the mode the frontend would have chosen.
 ///
 /// The URL is one nothing listens on until a test points it at a mock, so a
-/// request made where a test expected none fails it rather than passing. The
-/// settings are the numbers the loop needs and no model metadata, so the header
-/// is just the model and the directory; a test that needs a gauge fills its
-/// `config.model_info` in. No home directory either, which only the header used
-/// and now takes as a value of its own.
+/// request made where a test expected none fails it rather than passing. Neither
+/// the endpoint nor the settings say anything about the model, so the header is
+/// just the model and the directory; a test that needs a gauge names a model
+/// billy knows. No home directory either, which only the header used and now
+/// takes as a value of its own.
 const TestSetup = struct {
     endpoint: Endpoint,
     config: Config,
@@ -1571,7 +1584,6 @@ const TestSetup = struct {
                 .max_turns = 10,
                 .bash_timeout_s = 120,
                 .home = null,
-                .model_info = null,
             },
         };
     }
@@ -1977,17 +1989,17 @@ test "the compaction threshold is the configured share of the window, or off" {
 
     // A model without a known window has nothing to measure a conversation
     // against, so there is no threshold even with compaction on.
-    var agent = try testAgent(io, gpa, TestSetup.init("m"), null);
-    defer agent.deinit();
-    try std.testing.expectEqual(0, agent.compactThreshold());
+    var unknown = try testAgent(io, gpa, TestSetup.init("m"), null);
+    defer unknown.deinit();
+    try std.testing.expectEqual(0, unknown.compactThreshold());
 
-    agent.config.model_info = .{
-        .provider = .deepseek,
-        .context_window = 1000,
-    };
+    // A model billy knows is measured against the window of the provider it is
+    // sent to.
+    var agent = try testAgent(io, gpa, TestSetup.init("deepseek-flash"), null);
+    defer agent.deinit();
 
     // The default is a share of the window, not the whole of it.
-    try std.testing.expectEqual(800, agent.compactThreshold());
+    try std.testing.expectEqual(800_000, agent.compactThreshold());
 
     // Zero turns it off.
     agent.config.compact_at = 0;
@@ -1995,9 +2007,9 @@ test "the compaction threshold is the configured share of the window, or off" {
 
     // Any share the file names, whether or not it divides the window evenly.
     agent.config.compact_at = 50;
-    try std.testing.expectEqual(500, agent.compactThreshold());
+    try std.testing.expectEqual(500_000, agent.compactThreshold());
     agent.config.compact_at = 33;
-    try std.testing.expectEqual(330, agent.compactThreshold());
+    try std.testing.expectEqual(330_000, agent.compactThreshold());
 }
 
 test "maybeCompact folds the conversation once it has filled the window" {
@@ -2018,14 +2030,10 @@ test "maybeCompact folds the conversation once it has filled the window" {
     try session.append(.{ .role = .tool, .tool_call_id = "call_x", .content = "OLDTOOLOUTPUT" });
     try session.append(.{ .role = .assistant, .content = "OLDANSWER" });
 
-    var setup = TestSetup.init("m");
-    setup.config.model_info = .{
-        .provider = .deepseek,
-        .context_window = 1000,
-    };
+    var setup = TestSetup.init("deepseek-flash");
     setup.config.compact_at = 80;
     // A conversation that has filled the window past the threshold.
-    session.context_tokens = 900;
+    session.context_tokens = 900_000;
 
     // A server standing in for the model, answering the compaction request with a
     // fixed summary and recording the body it was sent.
@@ -2089,8 +2097,7 @@ test "maybeCompact does nothing below the threshold, off, or with nothing new" {
     try session.setSystemPrompt("s");
     try session.append(.{ .role = .user, .content = "hello" });
 
-    var setup = TestSetup.init("m");
-    setup.config.model_info = .{ .provider = .deepseek, .context_window = 1000 };
+    var setup = TestSetup.init("deepseek-flash");
 
     // Nothing is listening on this address, so a request made where the function
     // should have returned first would fail the test rather than pass it.
@@ -2108,13 +2115,16 @@ test "maybeCompact does nothing below the threshold, off, or with nothing new" {
     session.context_tokens = 100;
     try std.testing.expect(!try agent.maybeCompact(emitter, &session));
     // Turned off.
-    session.context_tokens = 999;
+    session.context_tokens = 999_900;
     agent.config.compact_at = 0;
     try std.testing.expect(!try agent.maybeCompact(emitter, &session));
-    // A model with no known window has no threshold to measure against.
-    agent.config.compact_at = 80;
-    agent.config.model_info = null;
-    try std.testing.expect(!try agent.maybeCompact(emitter, &session));
+
+    // A model with no known window has no threshold to measure against, which is
+    // a run of its own: the window follows the model it is sent to.
+    var unknown = try testAgent(io, gpa, TestSetup.init("m"), null);
+    defer unknown.deinit();
+    session.context_tokens = 999_900;
+    try std.testing.expect(!try unknown.maybeCompact(emitter, &session));
 
     // Nothing was added, and nothing was printed.
     try std.testing.expectEqual(1, session.messages.items.len);
@@ -2135,7 +2145,6 @@ test "a compaction asked for now folds the conversation in whatever its size" {
     try session.append(.{ .role = .assistant, .content = "hi" });
 
     var setup = TestSetup.init("m");
-    setup.config.model_info = .{ .provider = .deepseek, .context_window = 1000 };
     // Compaction is off, so only a manual one runs.
     setup.config.compact_at = 0;
 
@@ -2194,12 +2203,11 @@ test "maybeCompact does not compact a summary that stands alone" {
     try session.setSystemPrompt("s");
     try session.appendCompaction("p", "a summary");
 
-    var setup = TestSetup.init("m");
-    setup.config.model_info = .{ .provider = .deepseek, .context_window = 1000 };
+    var setup = TestSetup.init("deepseek-flash");
 
     // Over the threshold, but the last message is the summary itself, so there is
     // nothing new to fold in and a request would only re-summarize it.
-    session.context_tokens = 999;
+    session.context_tokens = 900_000;
     // Nothing is listening there, so a request made where this should have
     // returned first would fail the test.
     setup.endpoint.url = "http://127.0.0.1:1/chat/completions";
@@ -2762,10 +2770,10 @@ test "a session is sent where the choice it recorded points, not the configurati
     try agent.prepare(&session, .{
         .url = chosen.url,
         .api_key = "k",
-        .model = "the-chosen-model",
-        // A window of its own, so the gauge is the session's and not the
-        // configured model's.
-        .info = .{ .provider = .opencode_go, .context_window = 42 },
+        .model = "kimi-k2.7-code",
+        // The provider that answers it, which is what the window the header
+        // gauges against is looked up by.
+        .provider = .opencode_go,
     });
 
     // The client was pointed at the endpoint the session named rather than the
@@ -2773,9 +2781,11 @@ test "a session is sent where the choice it recorded points, not the configurati
     // the window of that model.
     try std.testing.expectEqualStrings(chosen.url, agent.client.url);
     try std.testing.expect(!std.mem.eql(u8, setup.endpoint.url, agent.client.url));
-    try std.testing.expectEqualStrings("the-chosen-model", agent.client.model);
-    try std.testing.expectEqual(@as(usize, 42), agent.config.model_info.?.context_window);
-    try std.testing.expectEqual(models.Provider.opencode_go, agent.config.model_info.?.provider);
+    try std.testing.expectEqualStrings("kimi-k2.7-code", agent.client.model);
+    // The window is the one of the model the session named rather than of the
+    // configured one, which billy knows nothing of.
+    try std.testing.expectEqual(@as(usize, 262_144), agent.modelInfo().?.context_window);
+    try std.testing.expectEqual(models.Provider.opencode_go, agent.modelInfo().?.provider);
 
     // And the request goes there rather than to the configured endpoint, which
     // nothing is listening on.
@@ -2811,7 +2821,7 @@ test "a session with no recorded model takes the choice it is prepared with" {
         .url = "https://api.deepseek.com/chat/completions",
         .api_key = "k",
         .model = "deepseek-flash",
-        .info = null,
+        .provider = .deepseek,
     });
 
     // The session was sent to the configured model, which is recorded by the

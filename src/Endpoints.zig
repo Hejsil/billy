@@ -121,18 +121,25 @@ fn targetFor(
         .url = try completionsUrl(arena, base_url),
         .api_key = store.get(name) orelse return missingKey(name),
         .model = model,
-        .info = models.lookup(models.Provider.fromName(name), model),
+        // Which provider answers, which is what the agent looks the model's
+        // window up by. Null for a proxy, which leaves the model to be found
+        // among the providers billy ships.
+        .provider = models.Provider.fromName(name),
     };
 }
 
 /// Where a run's requests are sent, as the agent takes it: the endpoint the
-/// configuration resolved to, asked for the model's thinking as the configuration
-/// says and the provider allows.
+/// configuration resolved to, and which provider answers it, asked for the
+/// model's thinking as the configuration says and that provider allows.
 pub fn agentEndpoint(config: Config, endpoint: Endpoint) agent.Endpoint {
     return .{
         .url = endpoint.url,
         .api_key = endpoint.api_key,
         .model = endpoint.model,
+        // Which provider answers, so the window the header gauges against is the
+        // one of the model actually being sent. A provider billy does not know
+        // leaves the model to be found among the ones it ships.
+        .provider = endpoint.provider,
         // The thinking fields are one provider's own, so they are sent only to a
         // provider that takes them: a model whose provider billy does not know,
         // or one whose endpoint does not accept them, is left alone.
@@ -148,7 +155,6 @@ pub fn agentEndpoint(config: Config, endpoint: Endpoint) agent.Endpoint {
 /// separately, as `agentEndpoint`.
 pub fn agentConfig(
     config: Config,
-    endpoint: Endpoint,
     backends: Backends,
     health: *Health,
     environ: *const std.process.Environ.Map,
@@ -164,7 +170,6 @@ pub fn agentConfig(
         // join every session's prompt. The caller owns the directory and outlives
         // every runner built from this.
         .user_instructions_dir = user_instructions_dir,
-        .model_info = models.lookup(endpoint.provider, endpoint.model),
         .compact_at = stored.compact_at,
         .title = stored.title,
         // How billy lays out and decorates what it shows. A bash command is laid
@@ -573,7 +578,7 @@ test "the reasoning setting names what billy asks of the model's thinking" {
     try std.testing.expectEqualStrings("low", reasoningOf("low").effort);
 }
 
-test "a run's endpoint carries the address and only the thinking its provider takes" {
+test "a run's endpoint carries the address and the provider, and only the thinking it takes" {
     const gpa = std.testing.allocator;
     var config = Config.init(gpa);
     defer config.deinit();
@@ -587,22 +592,27 @@ test "a run's endpoint carries the address and only the thinking its provider ta
         .provider = .deepseek,
     };
 
-    // Where the request goes is taken as it was resolved, and a provider that
-    // takes the thinking fields is asked for what the configuration says.
+    // Where the request goes, and which provider answers it, are taken as they
+    // were resolved; a provider that takes the thinking fields is asked for what
+    // the configuration says.
     const asked = agentEndpoint(config, endpoint);
     try std.testing.expectEqualStrings(endpoint.url, asked.url);
     try std.testing.expectEqualStrings("k", asked.api_key);
     try std.testing.expectEqualStrings("deepseek-flash", asked.model);
+    try std.testing.expectEqual(models.Provider.deepseek, asked.provider.?);
     try std.testing.expectEqualStrings("high", asked.reasoning.effort);
 
-    // A provider that does not take them, and one billy does not know, are left
-    // on whatever they do by themselves: a request carrying fields an endpoint
-    // does not expect may be refused.
+    // A provider that does not take them is left on whatever it does by itself:
+    // a request carrying fields an endpoint does not expect may be refused.
     var untaken = endpoint;
     untaken.provider = .opencode_go;
     try std.testing.expectEqual(llm.Reasoning.provider_default, agentEndpoint(config, untaken).reasoning);
 
+    // An endpoint billy knows no provider of keeps that unknown, so the agent
+    // finds the model it names among the ones billy ships.
     var unknown = endpoint;
     unknown.provider = null;
-    try std.testing.expectEqual(llm.Reasoning.provider_default, agentEndpoint(config, unknown).reasoning);
+    const unattributed = agentEndpoint(config, unknown);
+    try std.testing.expectEqual(llm.Reasoning.provider_default, unattributed.reasoning);
+    try std.testing.expect(unattributed.provider == null);
 }

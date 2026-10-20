@@ -96,7 +96,6 @@ backends: Endpoints.Backends,
 fn agentConfig(server: *const Server) Agent.Config {
     return Endpoints.agentConfig(
         server.config,
-        server.endpoint,
         server.backends,
         server.health,
         server.environ,

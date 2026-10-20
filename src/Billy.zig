@@ -214,7 +214,7 @@ pub fn run(billy: *Billy, out: *std.Io.Writer, resume_id: ?[]const u8) !void {
     const endpoint = try Endpoints.open(arena, billy.config, &billy.credentials);
     // The terminal lays its blocks out for the terminal it is on, which the
     // escape codes of a pipe or a redirection would only be noise in.
-    const config = try billy.agentConfig(arena, endpoint, Terminal.Style.detect(billy.io, .stdout()));
+    const config = try billy.agentConfig(arena, Terminal.Style.detect(billy.io, .stdout()));
 
     if (resume_id != null) {
         // Replay the conversation as a transcript, so the context does not
@@ -301,15 +301,9 @@ pub fn serve(billy: *Billy, host: []const u8, port: u16) !void {
 
 /// The settings a run is built from, with the web backends resolved into `arena`.
 /// Where its requests go is `Endpoints.agentEndpoint`, resolved beside this.
-fn agentConfig(
-    billy: *Billy,
-    arena: std.mem.Allocator,
-    endpoint: Endpoints.Endpoint,
-    style: Terminal.Style,
-) !agent.Config {
+fn agentConfig(billy: *Billy, arena: std.mem.Allocator, style: Terminal.Style) !agent.Config {
     return Endpoints.agentConfig(
         billy.config,
-        endpoint,
         try Endpoints.Backends.build(arena, billy.config, &billy.credentials),
         &billy.health,
         billy.environ,
