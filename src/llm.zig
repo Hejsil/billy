@@ -255,11 +255,11 @@ pub const Client = struct {
         const status = response.head.status;
         const retry_after_ms = Health.retryAfterMs(response.head.bytes);
         // Read before the body, whose reader is what invalidates the head's
-        // strings.
+        // strings. The transfer encoding and the length are the request's own
+        // from here on; the content encoding is not kept there, so the stream
+        // takes it.
         const streamed = isEventStream(response.head.content_type);
         const content_encoding = response.head.content_encoding;
-        const transfer_encoding = response.head.transfer_encoding;
-        const content_length = response.head.content_length;
 
         if (status.class() != .success) return .{ .failure = .{
             .status = status,
@@ -283,8 +283,6 @@ pub const Client = struct {
         stream.* = .{
             .gpa = gpa,
             .request = req,
-            .transfer_encoding = transfer_encoding,
-            .content_length = content_length,
             .content_encoding = content_encoding,
             .decompress_buffer = decompress_buffer,
             .arena = .init(gpa),
@@ -377,8 +375,9 @@ pub const Stream = struct {
     /// The request whose body is the stream. Its body reader is made on the
     /// first read, so the request does not move after the head is received.
     request: std.http.Client.Request,
-    transfer_encoding: std.http.TransferEncoding,
-    content_length: ?u64,
+    /// The encoding the body was compressed with, which the request does not
+    /// keep: the other two the body reader needs, its transfer encoding and its
+    /// length, are read back off the request, which holds them for its own use.
     content_encoding: std.http.ContentEncoding,
     decompress_buffer: []u8,
     /// The decompressor and the buffer the body is read through, which the body
@@ -466,8 +465,8 @@ pub const Stream = struct {
         if (self.reader) |reader| return reader;
         self.reader = self.request.reader.bodyReaderDecompressing(
             &self.transfer_buffer,
-            self.transfer_encoding,
-            self.content_length,
+            self.request.response_transfer_encoding,
+            self.request.response_content_length,
             self.content_encoding,
             &self.decompress,
             self.decompress_buffer,
