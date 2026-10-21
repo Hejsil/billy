@@ -255,9 +255,7 @@ pub const Client = struct {
         const status = response.head.status;
         const retry_after_ms = Health.retryAfterMs(response.head.bytes);
         // Read before the body, whose reader is what invalidates the head's
-        // strings. The transfer encoding and the length are the request's own
-        // from here on; the content encoding is not kept there, so the stream
-        // takes it.
+        // strings: the stream wires its body reader up from them below.
         const streamed = isEventStream(response.head.content_type);
         const content_encoding = response.head.content_encoding;
 
@@ -268,25 +266,34 @@ pub const Client = struct {
         } };
         if (!streamed) return .{ .not_streamed = try http.readBody(client.gpa, &response) };
 
-        // What the body reader decompresses with, which the stream owns for as
-        // long as it reads.
-        const decompress_buffer: []u8 = switch (content_encoding) {
-            .identity => &.{},
-            .zstd => try gpa.alloc(u8, std.compress.zstd.default_window_len),
-            .deflate, .gzip => try gpa.alloc(u8, std.compress.flate.max_window_len),
-            .compress => return error.UnsupportedCompressionMethod,
-        };
-        errdefer gpa.free(decompress_buffer);
+        // What the reply's body is read through, which the stream owns for as
+        // long as it reads: the window is only allocated for a body that arrived
+        // compressed.
+        const buffers = try Stream.Buffers.init(gpa, content_encoding);
+        errdefer gpa.free(buffers.decompress_buffer);
 
         const stream = try gpa.create(Stream);
         errdefer gpa.destroy(stream);
         stream.* = .{
             .gpa = gpa,
             .request = req,
-            .content_encoding = content_encoding,
-            .decompress_buffer = decompress_buffer,
+            .buffers = buffers,
             .arena = .init(gpa),
+            // Set below: the reader points into the stream, so it cannot be made
+            // before the fields it points at exist.
+            .reader = undefined,
         };
+        // Wired up now that the stream is where it will stay. The room it reads
+        // into is the stream's own, and the transfer encoding and the length are
+        // read off the request, which holds them for its own use.
+        stream.reader = stream.request.reader.bodyReaderDecompressing(
+            &stream.buffers.transfer_buffer,
+            stream.request.response_transfer_encoding,
+            stream.request.response_content_length,
+            content_encoding,
+            &stream.buffers.decompress,
+            stream.buffers.decompress_buffer,
+        );
         kept = true;
         return .{ .stream = stream };
     }
@@ -364,6 +371,11 @@ fn isEventStream(content_type: ?[]const u8) bool {
     return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value[0..end], " \t"), "text/event-stream");
 }
 
+/// zstd's window with the block it decodes into on top of it, which is what its
+/// decompressor asserts it was given room for. Flate's window is smaller, and it
+/// is the whole of what that one asks for.
+const zstd_window_len = std.compress.zstd.default_window_len + std.compress.zstd.block_size_max;
+
 /// A reply as it streams in. The caller keeps calling `next` until it returns
 /// null, adding each delta up into the message it keeps; `usage` has the token
 /// counts once the stream has ended.
@@ -372,19 +384,16 @@ fn isEventStream(content_type: ?[]const u8) bool {
 /// until the next call. A caller that keeps one copies it.
 pub const Stream = struct {
     gpa: std.mem.Allocator,
-    /// The request whose body is the stream. Its body reader is made on the
-    /// first read, so the request does not move after the head is received.
+    /// The request whose body is the stream, which stays where it is put: the
+    /// body reader points into it.
     request: std.http.Client.Request,
-    /// The encoding the body was compressed with, which the request does not
-    /// keep: the other two the body reader needs, its transfer encoding and its
-    /// length, are read back off the request, which holds them for its own use.
-    content_encoding: std.http.ContentEncoding,
-    decompress_buffer: []u8,
-    /// The decompressor and the buffer the body is read through, which the body
-    /// reader points into. Both live for as long as the request does.
-    decompress: std.http.Decompress = undefined,
-    transfer_buffer: [4096]u8 = undefined,
-    reader: ?*std.Io.Reader = null,
+    /// What the reply's body is read through: the room both decoders read into,
+    /// and the decompressor itself.
+    buffers: Buffers,
+    /// The reader over the reply's body, wired up when the stream is made. It
+    /// points into `buffers` and into the request, so it is made once those are
+    /// where they will stay.
+    reader: *std.Io.Reader,
 
     /// The bytes of the frame being read, kept between reads so a frame that
     /// spans two of them is not lost.
@@ -402,6 +411,37 @@ pub const Stream = struct {
     /// ran out. Anything after that is not the reply's.
     done: bool = false,
 
+    /// The memory a reply's body is read through: the transfer decoding's buffer,
+    /// the window the decompressor reads through, and the decompressor itself.
+    ///
+    /// All of it is room to read into, so nothing here is initialised until
+    /// something is read. The window is the one part that is allocated, and only
+    /// for a body that arrived compressed.
+    pub const Buffers = struct {
+        /// The buffer the transfer decoding reads through.
+        transfer_buffer: [4096]u8 = undefined,
+        /// The window the decompressor reads through, sized for the encoding it
+        /// decompresses and empty for a body that arrived as it was sent. It is
+        /// this struct's to free, since `http.Decompress` only borrows it.
+        decompress_buffer: []u8,
+        /// The decompressor the reader reads through, once it has been wired up.
+        decompress: std.http.Decompress = undefined,
+
+        /// The room a body that arrived as `content_encoding` is read through.
+        fn init(gpa: std.mem.Allocator, content_encoding: std.http.ContentEncoding) !Buffers {
+            return .{ .decompress_buffer = switch (content_encoding) {
+                .identity => &.{},
+                .zstd => try gpa.alloc(u8, zstd_window_len),
+                .deflate, .gzip => try gpa.alloc(u8, std.compress.flate.max_window_len),
+                .compress => return error.UnsupportedCompressionMethod,
+            } };
+        }
+
+        fn deinit(buffers: *Buffers, gpa: std.mem.Allocator) void {
+            gpa.free(buffers.decompress_buffer);
+        }
+    };
+
     /// Reads until the next piece of the reply, or null when the stream has
     /// ended. The stream ends at its `[DONE]` frame or at the end of the body;
     /// anything left then is a frame cut off mid-way, which is not the reply's.
@@ -416,10 +456,9 @@ pub const Stream = struct {
                 continue;
             }
 
-            const reader = self.bodyReader();
             var buffer: [4096]u8 = undefined;
             var slices = [_][]u8{&buffer};
-            const n = reader.readVec(&slices) catch |err| switch (err) {
+            const n = self.reader.readVec(&slices) catch |err| switch (err) {
                 // The body is over. Every complete frame was taken off the
                 // front of `pending` above, so what is left is a frame cut off
                 // mid-way, which is not the reply's and is dropped.
@@ -451,27 +490,12 @@ pub const Stream = struct {
     /// is discarded, which is what lets the connection be used again.
     pub fn deinit(self: *Stream) void {
         self.request.deinit();
-        self.gpa.free(self.decompress_buffer);
+        self.buffers.deinit(self.gpa);
         self.pending.deinit(self.gpa);
         self.data.deinit(self.gpa);
         self.arena.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
-    }
-
-    /// The reader over the reply's body, made once so the decompressor and the
-    /// buffer it reads through are not moved while they are in use.
-    fn bodyReader(self: *Stream) *std.Io.Reader {
-        if (self.reader) |reader| return reader;
-        self.reader = self.request.reader.bodyReaderDecompressing(
-            &self.transfer_buffer,
-            self.request.response_transfer_encoding,
-            self.request.response_content_length,
-            self.content_encoding,
-            &self.decompress,
-            self.decompress_buffer,
-        );
-        return self.reader.?;
     }
 
     fn consume(self: *Stream, n: usize) void {
