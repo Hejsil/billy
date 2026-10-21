@@ -175,22 +175,15 @@ pub fn display(config: Config, style: Terminal.Style) Terminal.Display {
     };
 }
 
-/// What a run is configured from: the settings that decide what the agent does.
-/// Where its requests go is resolved separately, as `agentEndpoint`, what its
-/// tools run with as `toolSettings`, and how its blocks are shown as `display`.
-pub fn agentConfig(
-    config: Config,
-    environ: *const std.process.Environ.Map,
-    user_instructions_dir: ?std.Io.Dir,
-) agent.Config {
+/// How far a run's agent goes: the turns it gives the model, the share of the
+/// window it fills before the conversation is folded into a summary, and whether
+/// it names the session. Where its requests go is resolved separately, as
+/// `agentEndpoint`, what its tools run with as `toolSettings`, and how its blocks
+/// are shown as `display`.
+pub fn limits(config: Config) agent.Limits {
     const stored = &config.stored;
     return .{
         .max_turns = stored.max_turns,
-        .home = environ.get("HOME"),
-        // The user's own instructions, which live beside the configuration and
-        // join every session's prompt. The caller owns the directory and outlives
-        // every runner built from this.
-        .user_instructions_dir = user_instructions_dir,
         .compact_at = stored.compact_at,
         .title = stored.title,
     };

@@ -217,11 +217,12 @@ pub fn run(billy: *Billy, out: *std.Io.Writer, resume_id: ?[]const u8) !void {
     const display = Endpoints.display(billy.config, Terminal.Style.detect(billy.io, .stdout()));
 
     // What the run is given, resolved once for the whole of it: where its
-    // requests go, what it reads while it runs, what its tools run with, and how
-    // its blocks are shown.
+    // requests go, how far it goes, what its tools run with, how its blocks are
+    // shown, and the home directory and instructions it reads outside the
+    // session.
     const options = agent.Options{
         .endpoint = Endpoints.agentEndpoint(billy.config, endpoint),
-        .config = billy.agentConfig(),
+        .limits = Endpoints.limits(billy.config),
         .tools = Endpoints.toolSettings(
             billy.config,
             try Endpoints.Backends.build(arena, billy.config, &billy.credentials),
@@ -229,6 +230,10 @@ pub fn run(billy: *Billy, out: *std.Io.Writer, resume_id: ?[]const u8) !void {
             display,
         ),
         .display = display,
+        .home = billy.environ.get("HOME"),
+        // The user's own instructions live beside the configuration, and join
+        // every session's prompt. Billy owns the directory and outlives the run.
+        .instructions = billy.dirs.config,
     };
 
     if (resume_id != null) {
@@ -304,18 +309,6 @@ pub fn serve(billy: *Billy, host: []const u8, port: u16) !void {
         .backends = try Endpoints.Backends.build(arena, billy.config, &billy.credentials),
     };
     return server.serve(host, port);
-}
-
-/// The settings a run is built from. Where its requests go is
-/// `Endpoints.agentEndpoint`, what its tools run with is
-/// `Endpoints.toolSettings`, and how its blocks are shown is `Endpoints.display`,
-/// all resolved beside this.
-fn agentConfig(billy: *const Billy) agent.Config {
-    return Endpoints.agentConfig(
-        billy.config,
-        billy.environ,
-        billy.dirs.config,
-    );
 }
 
 test "the listing writes each session's id and title on one line" {

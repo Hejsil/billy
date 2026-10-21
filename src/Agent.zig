@@ -67,15 +67,16 @@ pub const Endpoint = struct {
     reasoning: llm.Reasoning = .provider_default,
 };
 
-/// What a run is given, in one value: where its requests go, the settings the
-/// agent reads while it runs, what its tools run with, how its blocks are shown,
-/// and the mode it starts in. Each part is resolved by the frontend, from the
-/// configuration and the credentials, so the agent is handed the run rather than
+/// What a run is given, in one value: where its requests go, how far the agent
+/// goes on it, what its tools run with, how its blocks are shown, the mode it
+/// starts in, and the home directory and instructions the run reads outside the
+/// session. Each part is resolved by the frontend, from the configuration, the
+/// credentials and the environment, so the agent is handed the run rather than
 /// the file it came from.
 pub const Options = struct {
     /// Where the run's requests are sent, and which provider answers them.
     endpoint: Endpoint,
-    config: Config,
+    limits: Limits,
     tools: Tools.Settings,
     /// How the run's blocks are shown: the formatter scripts and the terminal's
     /// style. A page lays its own blocks out, so it sets this plainly.
@@ -83,20 +84,21 @@ pub const Options = struct {
     /// The mode the run starts in, which is the frontend's choice until the
     /// session's first prompt settles it.
     mode: Mode = .general,
-};
-
-/// What a run is told beyond where it sends its requests: the settings the agent
-/// reads while it runs.
-pub const Config = struct {
-    /// Model turns allowed for one request before the harness gives up on it.
-    max_turns: usize,
     /// Home directory, so the header can shorten a path inside it; null when unset.
-    home: ?[]const u8,
+    home: ?[]const u8 = null,
     /// Directory holding the user's own instructions file, read into every
     /// session's prompt ahead of the project's; null in a test, or when there is
-    /// no such file. Borrowed from the setup, which owns it and outlives the
+    /// no such file. Borrowed from the frontend, which owns it and outlives the
     /// agent, so nothing here closes it.
-    user_instructions_dir: ?std.Io.Dir = null,
+    instructions: ?std.Io.Dir = null,
+};
+
+/// How far the agent goes on a session: how many turns it gives the model before
+/// giving up, how full the window may get before the conversation is folded into
+/// a summary, and whether it asks the model for a name for the session.
+pub const Limits = struct {
+    /// Model turns allowed for one request before the harness gives up on it.
+    max_turns: usize,
     /// How full the context window must be, as a whole percentage, before the
     /// conversation is compacted into a summary. Zero turns compaction off.
     /// Nothing is compacted for a model whose window is unknown, since there is
@@ -422,7 +424,12 @@ pub fn displayPath(out: *std.Io.Writer, cwd: []const u8, home: ?[]const u8) !voi
 /// client is the run's own, so every request shares its connections.
 io: std.Io,
 gpa: std.mem.Allocator,
-config: Config,
+/// How far the agent goes on the session, which is the configuration's say.
+limits: Limits,
+/// Directory holding the user's own instructions file, read into every prompt
+/// ahead of the project's; null when there is no such file. Borrowed from the
+/// frontend, which owns it and outlives the agent.
+instructions: ?std.Io.Dir = null,
 /// What the session may do and what its prompt says, which is the frontend's
 /// choice until the session's first prompt settles it and the session's own
 /// from then on. See `mode.zig`.
@@ -466,7 +473,8 @@ pub fn init(
     return .{
         .io = io,
         .gpa = gpa,
-        .config = options.config,
+        .limits = options.limits,
+        .instructions = options.instructions,
         .mode = options.mode,
         .work_dir = work_dir,
         .tool_set = tool_set,
@@ -513,7 +521,7 @@ pub fn prepare(agent: *Agent, session: *Session, target: ?Target) !void {
             agent.io,
             agent.gpa,
             agent.work_dir,
-            agent.config.user_instructions_dir,
+            agent.instructions,
             agent.mode,
         );
         defer agent.gpa.free(prompt_text);
@@ -667,7 +675,7 @@ pub fn ask(agent: *Agent, emitter: Emitter, session: *Session, text: []const u8)
         return emitter.show(.{ .notice = failureNotice(&notice, err) });
     };
 
-    if (first_turn and agent.config.title) {
+    if (first_turn and agent.limits.title) {
         titleSession(agent, session) catch |err|
             std.log.warn("could not title the session: {s}", .{@errorName(err)});
     }
@@ -685,6 +693,10 @@ fn failureNotice(buffer: []u8, err: anyerror) []const u8 {
         "the request failed — nothing was sent, try again";
 }
 
+/// Runs one session on the terminal, from `options`, until the input ends: each
+/// line is taken as the agent decides what it is, and the blocks of the answer
+/// are shown as they happen. A resumed session is prepared with `target`, which
+/// is where it recorded being sent.
 pub fn run(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -730,7 +742,7 @@ pub fn run(
         try header.writer.print("{f}", .{SessionHeader.of(
             session,
             agent.modelInfo(),
-            agent.config.home,
+            options.home,
         )});
         const line = (try editor.readLine(header.written(), prompt)) orelse break;
         if (line.len == 0) continue;
@@ -937,7 +949,7 @@ fn turn(agent: *Agent, emitter: Emitter, session: *Session) !void {
     var scratch_state = std.heap.ArenaAllocator.init(agent.tool_set.gpa);
     defer scratch_state.deinit();
 
-    var remaining: usize = agent.config.max_turns;
+    var remaining: usize = agent.limits.max_turns;
     // A compaction that failed is not tried again within the same turn, so a
     // provider that will not summarize cannot turn every request of a long turn
     // into a second failed one. The next turn tries afresh.
@@ -982,7 +994,7 @@ fn turn(agent: *Agent, emitter: Emitter, session: *Session) !void {
     const stopped = std.fmt.bufPrint(
         &buffer,
         "stopped after {d} turns without a final answer",
-        .{agent.config.max_turns},
+        .{agent.limits.max_turns},
     ) catch "stopped without a final answer";
     try emitter.show(.{ .notice = stopped });
 }
@@ -1076,7 +1088,7 @@ fn refreshLead(
         agent.io,
         agent.gpa,
         agent.tool_set.dir,
-        agent.config.user_instructions_dir,
+        agent.instructions,
         mode,
     );
     defer agent.gpa.free(prompt_text);
@@ -1165,9 +1177,9 @@ const compact_prompt =
 /// when compaction is off, or when the model's window is unknown and there is
 /// then no threshold to measure a conversation against.
 fn compactThreshold(agent: *const Agent) usize {
-    if (agent.config.compact_at == 0) return 0;
+    if (agent.limits.compact_at == 0) return 0;
     const info = agent.modelInfo() orelse return 0;
-    return info.context_window * agent.config.compact_at / 100;
+    return info.context_window * agent.limits.compact_at / 100;
 }
 
 /// Compacts the conversation into a summary when it has filled the context
@@ -1551,31 +1563,29 @@ fn testAgentIn(
 /// text rather than a terminal's decoration.
 const TestSetup = struct {
     endpoint: Endpoint,
-    config: Config,
+    limits: Limits = .{ .max_turns = 10 },
     tools: Tools.Settings = .{ .bash_timeout_s = 120 },
     /// The mode the run starts in, which is what a frontend passes before the
     /// session's first prompt settles it.
     mode: Mode = .general,
+    home: ?[]const u8 = null,
+    instructions: ?std.Io.Dir = null,
 
     /// A setup for `model`, which is the one thing every test names, since it is
     /// what the session records and the header shows.
     fn init(model: []const u8) TestSetup {
-        return .{
-            .endpoint = .{ .url = "u", .api_key = "k", .model = model },
-            .config = .{
-                .max_turns = 10,
-                .home = null,
-            },
-        };
+        return .{ .endpoint = .{ .url = "u", .api_key = "k", .model = model } };
     }
 
     /// The run a test's agent is built from.
     fn options(setup: TestSetup) Options {
         return .{
             .endpoint = setup.endpoint,
-            .config = setup.config,
+            .limits = setup.limits,
             .tools = setup.tools,
             .mode = setup.mode,
+            .home = setup.home,
+            .instructions = setup.instructions,
         };
     }
 };
@@ -1993,13 +2003,13 @@ test "the compaction threshold is the configured share of the window, or off" {
     try std.testing.expectEqual(800_000, agent.compactThreshold());
 
     // Zero turns it off.
-    agent.config.compact_at = 0;
+    agent.limits.compact_at = 0;
     try std.testing.expectEqual(0, agent.compactThreshold());
 
     // Any share the file names, whether or not it divides the window evenly.
-    agent.config.compact_at = 50;
+    agent.limits.compact_at = 50;
     try std.testing.expectEqual(500_000, agent.compactThreshold());
-    agent.config.compact_at = 33;
+    agent.limits.compact_at = 33;
     try std.testing.expectEqual(330_000, agent.compactThreshold());
 }
 
@@ -2022,7 +2032,7 @@ test "maybeCompact folds the conversation once it has filled the window" {
     try session.append(.{ .role = .assistant, .content = "OLDANSWER" });
 
     var setup = TestSetup.init("deepseek-flash");
-    setup.config.compact_at = 80;
+    setup.limits.compact_at = 80;
     // A conversation that has filled the window past the threshold.
     session.context_tokens = 900_000;
 
@@ -2107,7 +2117,7 @@ test "maybeCompact does nothing below the threshold, off, or with nothing new" {
     try std.testing.expect(!try agent.maybeCompact(emitter, &session));
     // Turned off.
     session.context_tokens = 999_900;
-    agent.config.compact_at = 0;
+    agent.limits.compact_at = 0;
     try std.testing.expect(!try agent.maybeCompact(emitter, &session));
 
     // A model with no known window has no threshold to measure against, which is
@@ -2137,7 +2147,7 @@ test "a compaction asked for now folds the conversation in whatever its size" {
 
     var setup = TestSetup.init("m");
     // Compaction is off, so only a manual one runs.
-    setup.config.compact_at = 0;
+    setup.limits.compact_at = 0;
 
     var mock = try Mock.start("/chat/completions", 1, Mock.completion("the summary"));
     defer mock.deinit();
@@ -2292,7 +2302,7 @@ test "prepare gives a fresh session the user's instructions from the configurati
     defer session.deinit();
 
     var setup = TestSetup.init("m");
-    setup.config.user_instructions_dir = config_dir.dir;
+    setup.instructions = config_dir.dir;
     // `Agent.init` opens the directory it works in, so it has to be one that
     // exists; the session's recorded directory is separate.
     var agent = try testAgent(io, gpa, setup, null);
@@ -2323,7 +2333,7 @@ test "prepare gives a chat session no prompt and only the tools it allows" {
 
     var setup = TestSetup.init("m");
     setup.mode = .chat;
-    setup.config.user_instructions_dir = config_dir.dir;
+    setup.instructions = config_dir.dir;
     var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
 
@@ -2661,7 +2671,7 @@ test "the first turn names the session, and the naming is not part of it" {
     try mock.serve();
 
     var setup = TestSetup.init("m");
-    setup.config.title = true;
+    setup.limits.title = true;
     // The agent builds the model client from the endpoint, so it carries the
     // address of the mock.
     setup.endpoint.url = mock.url;

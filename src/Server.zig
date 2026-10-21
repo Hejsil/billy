@@ -98,10 +98,15 @@ fn options(server: *const Server, mode: Agent.Mode) Agent.Options {
     const display = Endpoints.display(server.config, .plain);
     return .{
         .endpoint = Endpoints.agentEndpoint(server.config, server.endpoint),
-        .config = Endpoints.agentConfig(server.config, server.environ, server.config_dir),
+        .limits = Endpoints.limits(server.config),
         .tools = Endpoints.toolSettings(server.config, server.backends, server.health, display),
         .display = display,
         .mode = mode,
+        .home = server.environ.get("HOME"),
+        // The user's own instructions live beside the configuration, and join
+        // every session's prompt. The server owns the directory and outlives
+        // every turn.
+        .instructions = server.config_dir,
     };
 }
 
