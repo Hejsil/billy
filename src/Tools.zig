@@ -3,7 +3,6 @@
 const std = @import("std");
 const llm = @import("llm.zig");
 const Health = @import("Health.zig");
-const formatting = @import("format.zig");
 const Terminal = @import("Terminal.zig");
 const Session = @import("Session.zig");
 const agent = @import("Agent.zig");
@@ -14,19 +13,6 @@ const Write = @import("Tools/Write.zig");
 pub const web = @import("Tools/web.zig");
 
 const Tools = @This();
-
-/// Laying a bash command out for the display.
-pub const Format = formatting.Format;
-
-/// The formatter scripts a tool's block is laid out with. Null shows the text as
-/// written. Presentation only: what runs, what a session stores and what the
-/// model is sent keep the text they were given.
-pub const Formats = struct {
-    /// How a bash command is laid out before it is shown.
-    bash: Format = null,
-    /// How an edit's diff is laid out before it is shown.
-    edit: Format = null,
-};
 
 /// Longest result handed back to the model, so one command cannot flood the
 /// conversation.
@@ -58,12 +44,8 @@ io: std.Io,
 dir: std.Io.Dir,
 /// For temporary buffers.
 gpa: std.mem.Allocator,
-/// Shared with the transcript, so a replay shows a call the way the run did.
-formats: Formats,
 /// Longest a bash command may run before it is killed, in seconds.
 bash_timeout_s: usize,
-/// Shared with the transcript, so a replay looks like the run.
-style: Terminal.Style,
 /// Null leaves `web_search` out of the tools offered, so the model is never given
 /// one that could not run.
 search: ?web.Search.Config,
@@ -81,9 +63,6 @@ health: ?*Health,
 /// frontend drifts from the other and the agent builds the set from what they
 /// agree on rather than from the configuration file itself.
 pub const Settings = struct {
-    /// How a tool's block is laid out and decorated, shared with the transcript
-    /// so a replay shows a call the way the run did.
-    display: Terminal.Display = .{},
     /// No default: a missing timeout is worth catching at the call site.
     bash_timeout_s: usize,
     /// Null leaves `web_search` out of the tools offered, so the model is never
@@ -115,9 +94,7 @@ pub fn init(options: Options) !Tools {
         .io = options.io,
         .dir = options.dir,
         .gpa = options.gpa,
-        .formats = settings.display.formats,
         .bash_timeout_s = settings.bash_timeout_s,
-        .style = settings.display.style,
         .search = settings.search,
         .fetch = settings.fetch,
         .http = options.http,
@@ -561,13 +538,6 @@ fn allowedSpecs(comptime source: []const Session.Definition, comptime mode: agen
 
 const chat_specs = allowedSpecs(&specs, .chat);
 const chat_specs_with_web = allowedSpecs(&specs_with_web, .chat);
-
-test "exit codes of signals follow the shell convention" {
-    try std.testing.expectEqual(0, formatting.exitCode(.{ .exited = 0 }));
-    try std.testing.expectEqual(1, formatting.exitCode(.{ .exited = 1 }));
-    try std.testing.expectEqual(130, formatting.exitCode(.{ .signal = .INT }));
-    try std.testing.expectEqual(143, formatting.exitCode(.{ .signal = .TERM }));
-}
 
 test "a bash result splits into its status and its streams" {
     // The status is the code and whether it means success, and the two streams

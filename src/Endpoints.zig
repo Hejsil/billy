@@ -1,6 +1,6 @@
 //! What a run is given, resolved from the configuration and the credentials: the
 //! backends its web tools ask, how its agent behaves, what its tools run with,
-//! how its blocks are shown, and the model a header names.
+//! and the model a header names.
 //!
 //! Where a request is actually sent -- the provider and model resolved into a URL
 //! and a key -- is `Endpoint`, which the agent resolves for itself before every
@@ -48,32 +48,10 @@ pub const Backends = struct {
     }
 };
 
-/// How a run's blocks are laid out and decorated: the formatter scripts the
-/// configuration names for a tool's block, and the style of the terminal that
-/// shows them. A reply and a prompt are markdown, laid out by billy's own
-/// renderer.
-///
-/// Only the display changes: the command that runs, the file that is written, the
-/// session and the model keep the text as it was written.
-pub fn display(config: Config, style: Terminal.Style) Terminal.Display {
-    const stored = &config.stored;
-    return .{
-        // A bash command is laid out by its format script, so the user reads the
-        // command the way it runs; an edit is shown as a diff, laid out by its
-        // own script when one is set.
-        .formats = .{
-            .bash = if (stored.tools.bash.format) |script| .{ .script = script } else null,
-            .edit = if (stored.tools.edit.format) |script| .{ .script = script } else null,
-        },
-        .style = style,
-    };
-}
-
 /// How a run's agent behaves: the turns it gives the model, the share of the
 /// window it fills before the conversation is folded into a summary, and whether
 /// it names the session. Where each turn is sent is resolved separately, as
-/// `configuredTarget` and `sessionTarget`, what its tools run with as
-/// `toolSettings`, and how its blocks are shown as `display`.
+/// `sessionTarget`, and what its tools run with as `toolSettings`.
 pub fn behaviour(config: Config) agent.Behaviour {
     const stored = &config.stored;
     return .{
@@ -98,18 +76,9 @@ pub fn sessionModel(config: Config, session: *const Session) Endpoint.Model {
 /// The run adds its own plumbing -- its I/O, the directory it works in, its
 /// allocator and its HTTP client -- when it builds the set, so neither frontend
 /// handles those and neither can offer a tool the others do not.
-pub fn toolSettings(
-    config: Config,
-    backends: Backends,
-    health: ?*Health,
-    shown: Terminal.Display,
-) tools.Settings {
+pub fn toolSettings(config: Config, backends: Backends, health: ?*Health) tools.Settings {
     const stored = &config.stored;
     return .{
-        // A tool's block is laid out and decorated for the display the run's
-        // blocks are shown on, so a call reads the same in the transcript as it
-        // did when it ran.
-        .display = shown,
         .bash_timeout_s = stored.tools.bash.timeout_s,
         // A web tool is offered only when the configuration names a backend for
         // it and its key is set; the tool is left out of the request otherwise.

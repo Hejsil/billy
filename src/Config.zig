@@ -29,7 +29,6 @@ pub const Opened = struct {
 /// Settings for the tools the agent can call, one group per tool.
 pub const Tools = struct {
     bash: Bash = .{},
-    edit: Edit = .{},
     web_search: WebSearch = .{},
     web_fetch: WebFetch = .{},
 };
@@ -79,34 +78,12 @@ pub const WebSearch = struct {
 
 /// Settings for the bash tool.
 pub const Bash = struct {
-    /// A shell script that lays a bash command out for the display: it reads the
-    /// command on standard input and writes the formatted command on standard
-    /// output, such as `shfmt | bat -l bash`. Null shows the command exactly as
-    /// the model wrote it.
-    ///
-    /// Only the display changes; the command that runs, and everything stored
-    /// in the session, keep what the model wrote.
-    format: ?[]const u8 = null,
     /// Longest a command may run before it is killed, in seconds. A command that
     /// outlives this is killed, so a runaway command cannot hang the agent
     /// forever. Zero would kill every command as it starts, which is never what
     /// the file is meant to say, so it is rejected rather than read as "no
     /// limit"; set a large value for a command that legitimately runs long.
     timeout_s: usize = 120,
-};
-
-/// Settings for the edit tool.
-pub const Edit = struct {
-    /// A shell script that lays an edit's diff out for the display: it reads the
-    /// diff on standard input and writes the laid-out diff on standard output,
-    /// such as `delta --paging=never` or `bat -l diff --plain`. The two sides of
-    /// the change are also written to billy's own files, whose paths are passed as
-    /// the script's first two arguments, so a two-file differ can name them, such
-    /// as `difft "$1" "$2"`. Null shows the diff the way billy colours it.
-    ///
-    /// Only the display changes; the file that is written, what a session stores
-    /// and what the model is sent keep the text as it was written.
-    format: ?[]const u8 = null,
 };
 
 /// The configuration file as it is written to and read from disk. The settings
@@ -264,9 +241,9 @@ pub const Providers = struct {
     }
 };
 
-/// Backs every string the configuration holds, which is the format scripts read
-/// out of the file. The configuration owns it, so a caller frees the whole
-/// configuration with `deinit` rather than tracking each string, and every
+/// Backs every string the configuration holds, which is what the settings read
+/// out of the file are kept in. The configuration owns it, so a caller frees the
+/// whole configuration with `deinit` rather than tracking each string, and every
 /// allocation `open` makes goes through it.
 arena: std.heap.ArenaAllocator,
 stored: Stored = .default,
@@ -331,7 +308,7 @@ pub fn save(config: *const Config, io: std.Io, dir: std.Io.Dir) !void {
     try atomic.replace(io);
 }
 
-/// Sets the option named by the dotted `path` -- such as `tools.bash.format` --
+/// Sets the option named by the dotted `path` -- such as `tools.bash.timeout_s` --
 /// to `value`, the text a user typed. The path names a field of the settings
 /// and, dot by dot, the sections it lives in; the value is read as that field's
 /// type, a string kept as it is and `null` clearing an optional setting. Every
@@ -471,17 +448,17 @@ test "open writes the defaults when the file is missing" {
     try std.testing.expectEqual(Stored.default.max_turns, second.config.stored.max_turns);
 }
 
-test "open reads the max_turns and the bash format from the file" {
+test "open reads the max_turns and the bash timeout from the file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     // An unknown field and a missing version must not stop the read.
     var opened = try openFrom(&tmp, "{\"max_turns\":7,\"future\":true," ++
-        "\"tools\":{\"bash\":{\"format\":\"shfmt | bat -l bash\",\"unknown\":1}}}");
+        "\"tools\":{\"bash\":{\"timeout_s\":30,\"unknown\":1}}}");
     defer opened.config.deinit();
     try std.testing.expect(!opened.created);
     try std.testing.expectEqual(7, opened.config.stored.max_turns);
-    try std.testing.expectEqualStrings("shfmt | bat -l bash", opened.config.stored.tools.bash.format.?);
+    try std.testing.expectEqual(30, opened.config.stored.tools.bash.timeout_s);
     // A file without a replay count shows the default number of blocks.
     try std.testing.expectEqual(Stored.default.resume_blocks, opened.config.stored.resume_blocks);
 }
@@ -529,40 +506,21 @@ test "a retired markdown setting in the file is ignored" {
     var opened = try openFrom(&tmp, "{\"markdown\":{\"format\":\"glow -\"},\"max_turns\":7}");
     defer opened.config.deinit();
     try std.testing.expectEqual(7, opened.config.stored.max_turns);
-    try std.testing.expect(opened.config.stored.tools.bash.format == null);
-}
-
-test "open leaves the bash format unset when the file does not set one" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    // A session saved before the setting existed has no tools at all.
-    var older = try openFrom(&tmp, "{\"max_turns\":7}");
-    defer older.config.deinit();
-    try std.testing.expect(older.config.stored.tools.bash.format == null);
-    // The timeout the setting was added with is the default for a file without one.
-    try std.testing.expectEqual(Stored.default.tools.bash.timeout_s, older.config.stored.tools.bash.timeout_s);
-
-    // A format of null is the same as not setting one.
-    var explicit = try openFrom(&tmp, "{\"tools\":{\"bash\":{\"format\":null}}}");
-    defer explicit.config.deinit();
-    try std.testing.expect(explicit.config.stored.tools.bash.format == null);
 }
 
 test "open reads the bash timeout from the file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // The timeout is set alongside the format, and each is read on its own.
-    var opened = try openFrom(&tmp, "{\"tools\":{\"bash\":{\"format\":\"shfmt\",\"timeout_s\":30}}}");
+    // A file written before the setting existed has no tools at all, so the
+    // default timeout stands.
+    var older = try openFrom(&tmp, "{\"max_turns\":7}");
+    defer older.config.deinit();
+    try std.testing.expectEqual(Stored.default.tools.bash.timeout_s, older.config.stored.tools.bash.timeout_s);
+
+    var opened = try openFrom(&tmp, "{\"tools\":{\"bash\":{\"timeout_s\":30}}}");
     defer opened.config.deinit();
     try std.testing.expectEqual(30, opened.config.stored.tools.bash.timeout_s);
-    try std.testing.expectEqualStrings("shfmt", opened.config.stored.tools.bash.format.?);
-
-    // A file without one falls back to the default.
-    var bare = try openFrom(&tmp, "{\"tools\":{\"bash\":{\"format\":\"shfmt\"}}}");
-    defer bare.config.deinit();
-    try std.testing.expectEqual(Stored.default.tools.bash.timeout_s, bare.config.stored.tools.bash.timeout_s);
 }
 
 test "open reads a self-hosted backend's instance from the file" {
@@ -646,11 +604,7 @@ test "the file is indented, so it can be read and edited by hand" {
         \\  "title": true,
         \\  "tools": {
         \\    "bash": {
-        \\      "format": null,
         \\      "timeout_s": 120
-        \\    },
-        \\    "edit": {
-        \\      "format": null
         \\    },
         \\    "web_search": {
         \\      "providers": [],
@@ -786,14 +740,8 @@ test "set names a setting by its dotted path" {
     var config = Config.init(std.testing.allocator);
     defer config.deinit();
 
-    try config.set("tools.bash.format", "shfmt | bat -l bash");
-    try std.testing.expectEqualStrings("shfmt | bat -l bash", config.stored.tools.bash.format.?);
-
     try config.set("tools.bash.timeout_s", "30");
     try std.testing.expectEqual(30, config.stored.tools.bash.timeout_s);
-
-    try config.set("tools.edit.format", "delta --paging=never");
-    try std.testing.expectEqualStrings("delta --paging=never", config.stored.tools.edit.format.?);
 
     try config.set("max_turns", "7");
     try std.testing.expectEqual(7, config.stored.max_turns);
@@ -816,10 +764,6 @@ test "set writes null to clear a setting that has no value" {
     var config = Config.init(std.testing.allocator);
     defer config.deinit();
 
-    try config.set("tools.edit.format", "delta");
-    try config.set("tools.edit.format", "null");
-    try std.testing.expect(config.stored.tools.edit.format == null);
-
     try config.set("tools.web_search.searxng.url", "https://searx.example.org");
     try config.set("tools.web_search.searxng.url", "null");
     try std.testing.expect(config.stored.tools.web_search.searxng.url == null);
@@ -837,7 +781,7 @@ test "set refuses a setting that is unknown, a section, or a bad value" {
     // A section is walked into, not set from one string, and a value has nothing
     // below it.
     try std.testing.expectError(error.NotASection, config.set("tools", "x"));
-    try std.testing.expectError(error.NotASection, config.set("tools.bash.format.x", "y"));
+    try std.testing.expectError(error.NotASection, config.set("tools.bash.timeout_s.x", "y"));
     // Text that is not the kind of value the setting takes.
     try std.testing.expectError(error.InvalidValue, config.set("tools.bash.timeout_s", "soon"));
     // A list setting is edited in the file, not named by a path, so it is not a
@@ -857,7 +801,6 @@ test "a setting set by path is written and read back" {
 
     var config = Config.init(std.testing.allocator);
     defer config.deinit();
-    try config.set("tools.bash.format", "shfmt");
     try config.set("tools.bash.timeout_s", "45");
     try config.set("tools.web_search.searxng.url", "https://searx.example.org");
     try config.save(std.testing.io, tmp.dir);
@@ -865,7 +808,6 @@ test "a setting set by path is written and read back" {
     var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
     defer opened.config.deinit();
 
-    try std.testing.expectEqualStrings("shfmt", opened.config.stored.tools.bash.format.?);
     try std.testing.expectEqual(45, opened.config.stored.tools.bash.timeout_s);
     try std.testing.expectEqualStrings("https://searx.example.org", opened.config.stored.tools.web_search.searxng.url.?);
 }

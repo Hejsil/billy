@@ -7,7 +7,6 @@ pub const diff = @import("diff.zig");
 pub const Dirs = @import("Dirs.zig");
 pub const Endpoint = @import("Endpoint.zig");
 pub const Endpoints = @import("Endpoints.zig");
-pub const format = @import("format.zig");
 pub const Health = @import("Health.zig");
 pub const html = @import("html.zig");
 pub const http = @import("http.zig");

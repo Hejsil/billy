@@ -18,7 +18,7 @@ const login_about =
 const config_about =
     \\Set one setting in the configuration file, named by its dotted path, and
     \\write it back, so a setting can be changed without opening the file by
-    \\hand; for example, `billy config tools.bash.format 'shfmt'`. A string is
+    \\hand; for example, `billy config tools.bash.timeout_s '300'`. A string is
     \\taken as it is, a number from its digits, and `null` clears a setting that
     \\has no value.
 ;
@@ -402,17 +402,17 @@ fn expectHost(expected: []const u8, actual: Options) !void {
 
 test "parseArgs reads the config subcommand on its own" {
     try expectOptions(
-        .{ .command = .{ .config = .{ .path = "tools.bash.format", .value = "shfmt | bat -l bash" } } },
-        try parseArgsSlice(&.{ "config", "tools.bash.format", "shfmt | bat -l bash" }),
+        .{ .command = .{ .config = .{ .path = "tools.bash.timeout_s", .value = "300" } } },
+        try parseArgsSlice(&.{ "config", "tools.bash.timeout_s", "300" }),
     );
     // A value may look like an option or be empty; the path may not.
     try expectOptions(
-        .{ .command = .{ .config = .{ .path = "tools.bash.format", .value = "--nope" } } },
-        try parseArgsSlice(&.{ "config", "tools.bash.format", "--nope" }),
+        .{ .command = .{ .config = .{ .path = "tools.bash.timeout_s", .value = "--nope" } } },
+        try parseArgsSlice(&.{ "config", "tools.bash.timeout_s", "--nope" }),
     );
     try expectOptions(
-        .{ .command = .{ .config = .{ .path = "tools.edit.format", .value = "" } } },
-        try parseArgsSlice(&.{ "config", "tools.edit.format", "" }),
+        .{ .command = .{ .config = .{ .path = "tools.web_search.searxng.url", .value = "" } } },
+        try parseArgsSlice(&.{ "config", "tools.web_search.searxng.url", "" }),
     );
     // The subcommand has its own usage.
     try expectOptions(.{ .command = .{ .config = .{ .help = true } } }, try parseArgsSlice(&.{ "config", "-h" }));

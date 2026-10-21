@@ -101,21 +101,6 @@ fn appendHunk(gpa: std.mem.Allocator, out: *std.ArrayList(Line), kind: Kind, lin
     }
 }
 
-/// The diff as the plain text a formatter reads: every line on its own, opened
-/// with the mark of its kind, as a unified diff opens a line.
-pub fn render(gpa: std.mem.Allocator, diff: []const Line) ![]const u8 {
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    for (diff) |line| {
-        if (line.kind == .elided) {
-            try out.writer.print(" … {d} more lines\n", .{line.hidden});
-        } else {
-            try out.writer.print("{c}{s}\n", .{ line.kind.mark(), line.text });
-        }
-    }
-    return out.toOwnedSlice();
-}
-
 /// Writes the diff the way billy shows it: a removed line red, an added line
 /// green, the context dim, and each line opened with the mark of its kind. The
 /// marks carry the meaning where the colour does not, such as a pipe or a
@@ -216,13 +201,4 @@ test "a large side is counted rather than shown whole" {
     try std.testing.expectEqual(Kind.elided, diff[20].kind);
     try std.testing.expectEqual(@as(usize, 5), diff[20].hidden);
     try std.testing.expectEqual(Kind.added, diff[21].kind);
-}
-
-test "the plain text opens each line with the mark of its kind" {
-    const gpa = std.testing.allocator;
-    const diff = try lines(gpa, "a\nb\nc", "a\nx\nc");
-    defer gpa.free(diff);
-    const text = try render(gpa, diff);
-    defer gpa.free(text);
-    try std.testing.expectEqualStrings(" a\n-b\n+x\n c\n", text);
 }

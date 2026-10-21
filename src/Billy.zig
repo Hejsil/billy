@@ -215,9 +215,9 @@ pub fn run(billy: *Billy, out: *std.Io.Writer, resume_id: ?[]const u8) !void {
     // from the model the session records when it begins.
     _ = try Endpoint.configured(&billy.config, &billy.credentials, arena);
 
-    // The terminal lays its blocks out for the terminal it is on, which the
+    // The terminal decorates its blocks for the terminal it is on, which the
     // escape codes of a pipe or a redirection would only be noise in.
-    const display = Endpoints.display(billy.config, Terminal.Style.detect(billy.io, .stdout()));
+    const style = Terminal.Style.detect(billy.io, .stdout());
 
     // What the run is given, resolved once for the whole of it: what its targets
     // are resolved from, how far it goes, what its tools run with, how its blocks
@@ -231,9 +231,8 @@ pub fn run(billy: *Billy, out: *std.Io.Writer, resume_id: ?[]const u8) !void {
             billy.config,
             try Endpoints.Backends.build(arena, billy.config, &billy.credentials),
             &billy.health,
-            display,
         ),
-        .display = display,
+        .style = style,
         .home = billy.environ.get("HOME"),
         // The user's own instructions live beside the configuration, and join
         // every session's prompt. Billy owns the directory and outlives the run.
@@ -249,7 +248,7 @@ pub fn run(billy: *Billy, out: *std.Io.Writer, resume_id: ?[]const u8) !void {
             billy.gpa,
             out,
             &session,
-            display,
+            style,
             billy.config.stored.resume_blocks,
         );
     }

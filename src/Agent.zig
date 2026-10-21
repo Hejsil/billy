@@ -51,9 +51,9 @@ pub const Options = struct {
     store: *const Credentials,
     behaviour: Behaviour,
     tools: Tools.Settings,
-    /// How the run's blocks are shown: the formatter scripts and the terminal's
-    /// style. A page lays its own blocks out, so it sets this plainly.
-    display: Terminal.Display = .{},
+    /// How the terminal decorates the lines it prints itself. A page lays its own
+    /// blocks out, so it sets this plainly.
+    style: Terminal.Style = .plain,
     /// The mode the run starts in, which is the frontend's choice until the
     /// session's first prompt settles it.
     mode: Mode = .general,
@@ -719,7 +719,7 @@ pub fn run(
 
     // The blocks of the run are shown on the terminal, the way billy has always
     // shown them.
-    var terminal = Terminal{ .out = out, .io = io, .display = options.display, .scratch = gpa };
+    var terminal = Terminal{ .out = out, .io = io, .style = options.style, .scratch = gpa };
     const emitter = terminal.emitter();
 
     // The header is rebuilt for every prompt, so it reflects the context size
@@ -779,13 +779,13 @@ pub fn printTranscript(
     gpa: std.mem.Allocator,
     out: *std.Io.Writer,
     session: *const Session,
-    display: Terminal.Display,
+    style: Terminal.Style,
     blocks: usize,
 ) !void {
     // A replay is what the terminal is shown when a session is picked up again,
     // and it goes through the same emitter a live run does, so a prompt reads
     // the same whether it was just typed or stored.
-    var terminal = Terminal{ .out = out, .io = io, .display = display, .scratch = gpa };
+    var terminal = Terminal{ .out = out, .io = io, .style = style, .scratch = gpa };
     try walk(gpa, session, blocks, terminal.emitter());
     try out.flush();
 }
@@ -1275,9 +1275,9 @@ fn expectTranscript(
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    // No bash format: what these cover is how a message is headed and laid out,
-    // which the tool format does not touch. Zero shows the whole conversation.
-    try printTranscript(io, gpa, &out.writer, &session, .{ .style = style }, 0);
+    // Plain, since what these cover is how a message is headed and laid out
+    // rather than how a terminal decorates it. Zero shows the whole conversation.
+    try printTranscript(io, gpa, &out.writer, &session, style, 0);
     try std.testing.expectEqualStrings(expected, out.written());
 }
 
@@ -1307,7 +1307,7 @@ test "printTranscript shows only the last blocks and counts the rest" {
     // The last two blocks are the second call and the reply, so the trim falls
     // inside the tool-calling message: its first call and everything before it is
     // counted, and only its second call shows.
-    try printTranscript(io, gpa, &out.writer, &session, .{}, 2);
+    try printTranscript(io, gpa, &out.writer, &session, .plain, 2);
     try std.testing.expectEqualStrings(
         "… 2 earlier blocks\n\n" ++
             "▸ read b.zig\n▾ output\ncontents b\n\n" ++
@@ -1318,13 +1318,13 @@ test "printTranscript shows only the last blocks and counts the rest" {
 
     // A count larger than the conversation leaves nothing out, so nothing is
     // counted and the whole session shows.
-    try printTranscript(io, gpa, &out.writer, &session, .{}, 10);
+    try printTranscript(io, gpa, &out.writer, &session, .plain, 10);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "earlier blocks") == null);
     try std.testing.expect(std.mem.startsWith(u8, out.written(), "» prompt\none\n\n"));
     out.clearRetainingCapacity();
 
     // Zero shows the whole session too.
-    try printTranscript(io, gpa, &out.writer, &session, .{}, 0);
+    try printTranscript(io, gpa, &out.writer, &session, .plain, 0);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "earlier blocks") == null);
     try std.testing.expect(std.mem.startsWith(u8, out.written(), "» prompt\none\n\n"));
 }
@@ -1433,7 +1433,7 @@ test "printTranscript shows a compaction as a single line" {
     // The prompt that asked for the compaction and the summary it produced show
     // as one line, headed like every other block, and the rest of the history
     // shows as it always did.
-    try printTranscript(io, gpa, &out.writer, &session, .{}, 0);
+    try printTranscript(io, gpa, &out.writer, &session, .plain, 0);
     try std.testing.expectEqualStrings(
         "» prompt\none\n\n" ++
             "◆ answer\na1\n\n" ++
@@ -1446,7 +1446,7 @@ test "printTranscript shows a compaction as a single line" {
 
     // The pair counts as one block, so a trim that keeps the last three blocks
     // starts at the compaction and counts what came before it.
-    try printTranscript(io, gpa, &out.writer, &session, .{}, 3);
+    try printTranscript(io, gpa, &out.writer, &session, .plain, 3);
     try std.testing.expectEqualStrings(
         "… 2 earlier blocks\n\n" ++
             "⊟ compacted\n\n" ++
@@ -1472,7 +1472,7 @@ test "a compaction is headed by its own mark, and hides what it stands for" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try printTranscript(io, gpa, &out.writer, &session, .{ .style = .ansi }, 0);
+    try printTranscript(io, gpa, &out.writer, &session, .ansi, 0);
 
     // The line carries the compaction mark: the glyph in its colour and the name
     // in bold, the way every other block header is written.
@@ -1637,8 +1637,8 @@ const TestSetup = struct {
 /// A terminal a test can show blocks through and read back from `out`. The
 /// returned value has to outlive the emitter taken from it, since the emitter
 /// borrows it.
-fn testTerminal(out: *std.Io.Writer, display: Terminal.Display) Terminal {
-    return .{ .out = out, .io = std.testing.io, .display = display, .scratch = std.testing.allocator };
+fn testTerminal(out: *std.Io.Writer, style: Terminal.Style) Terminal {
+    return .{ .out = out, .io = std.testing.io, .style = style, .scratch = std.testing.allocator };
 }
 
 /// The id the header tests run under. A real one is a ULID, but the header only
@@ -2110,7 +2110,7 @@ test "maybeCompact folds the conversation once it has filled the window" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var terminal = testTerminal(&out.writer, .{});
+    var terminal = testTerminal(&out.writer, .plain);
     var client = try agent.clientFor(&session);
     try std.testing.expect(try agent.maybeCompact(terminal.emitter(), &session, &client));
 
@@ -2168,7 +2168,7 @@ test "maybeCompact does nothing below the threshold, off, or with nothing new" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var terminal = testTerminal(&out.writer, .{});
+    var terminal = testTerminal(&out.writer, .plain);
     const emitter = terminal.emitter();
     var client = try agent.clientFor(&session);
 
@@ -2226,7 +2226,7 @@ test "a compaction asked for now folds the conversation in whatever its size" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var terminal = testTerminal(&out.writer, .{});
+    var terminal = testTerminal(&out.writer, .plain);
     // Asked for now, so the threshold and the setting are ignored: the
     // conversation is folded whatever size it has grown to.
     var client = try agent.clientFor(&session);
@@ -2281,7 +2281,7 @@ test "maybeCompact does not compact a summary that stands alone" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var terminal = testTerminal(&out.writer, .{});
+    var terminal = testTerminal(&out.writer, .plain);
     var client = try agent.clientFor(&session);
     try std.testing.expect(!try agent.maybeCompact(terminal.emitter(), &session, &client));
 
@@ -2529,7 +2529,7 @@ test "the terminal shows a tool call the way a replay does" {
     // result once it is in, exactly as the turn does it.
     var live: std.Io.Writer.Allocating = .init(gpa);
     defer live.deinit();
-    var terminal = testTerminal(&live.writer, .{});
+    var terminal = testTerminal(&live.writer, .plain);
     const emitter = terminal.emitter();
 
     const parsed = Tools.parse(call_state.allocator(), call);
@@ -2542,7 +2542,7 @@ test "the terminal shows a tool call the way a replay does" {
     // A replay renders the stored call on its own.
     var replayed: std.Io.Writer.Allocating = .init(gpa);
     defer replayed.deinit();
-    try Terminal.tool.describe(io, gpa, parsed, result.written(), .{}, .plain, &replayed.writer);
+    try Terminal.tool.describe(gpa, parsed, result.written(), .plain, &replayed.writer);
 
     // The two paths show the same bytes, which is what keeps a run and a resume
     // of it reading alike. The header before the result is what a slow command
@@ -2751,7 +2751,7 @@ test "the first turn names the session, and the naming is not part of it" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var terminal = testTerminal(&out.writer, .{});
+    var terminal = testTerminal(&out.writer, .plain);
     try agent.ask(terminal.emitter(), &session, "the flaky test keeps failing, please fix it");
 
     try mock.group.await(io);
@@ -2843,7 +2843,7 @@ test "a turn is sent to the model the session records when it begins" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var terminal = testTerminal(&out.writer, .{});
+    var terminal = testTerminal(&out.writer, .plain);
 
     // The session runs on one model, and the turn goes to that model's server.
     try session.setModel("test/deepseek/deepseek-flash");
@@ -2899,7 +2899,7 @@ test "a session is sent where the choice it recorded points, not the configurati
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var terminal = testTerminal(&out.writer, .{});
+    var terminal = testTerminal(&out.writer, .plain);
     try agent.ask(terminal.emitter(), &session, "a question");
 
     try chosen.group.await(io);

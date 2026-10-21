@@ -92,13 +92,12 @@ backends: Endpoints.Backends,
 /// plainly rather than decorated for a terminal. The mode is the one the caller
 /// settled, which a session asked before keeps over it.
 fn options(server: *const Server, mode: Agent.Mode) Agent.Options {
-    const display = Endpoints.display(server.config, .plain);
     return .{
         .config = &server.config,
         .store = &server.store,
         .behaviour = Endpoints.behaviour(server.config),
-        .tools = Endpoints.toolSettings(server.config, server.backends, server.health, display),
-        .display = display,
+        .tools = Endpoints.toolSettings(server.config, server.backends, server.health),
+        .style = .plain,
         .mode = mode,
         .home = server.environ.get("HOME"),
         // The user's own instructions live beside the configuration, and join

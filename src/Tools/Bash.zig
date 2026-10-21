@@ -1,6 +1,5 @@
 const std = @import("std");
 const Tools = @import("../Tools.zig");
-const format = @import("../format.zig");
 
 const Bash = @This();
 
@@ -48,7 +47,7 @@ pub fn run(
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);
 
-    try out.print("exit code: {d}\n", .{format.exitCode(result.term)});
+    try out.print("exit code: {d}\n", .{exitCode(result.term)});
 
     if (result.stdout.len == 0 and result.stderr.len == 0) {
         try out.writeAll("(no output)\n");
@@ -59,4 +58,22 @@ pub fn run(
         if (result.stdout.len > 0) try out.writeAll("\n");
         try out.print("stderr:\n{s}", .{result.stderr});
     }
+}
+
+/// The status a command ended with, the way a shell reports it: the code it
+/// exited with, or 128 plus the number of the signal that ended it.
+pub fn exitCode(term: std.process.Child.Term) u8 {
+    return switch (term) {
+        .exited => |code| code,
+        .signal => |signal| @intCast(128 + @as(u32, @backingInt(signal))),
+        .stopped => 128,
+        .unknown => 255,
+    };
+}
+
+test "exit codes of signals follow the shell convention" {
+    try std.testing.expectEqual(0, exitCode(.{ .exited = 0 }));
+    try std.testing.expectEqual(1, exitCode(.{ .exited = 1 }));
+    try std.testing.expectEqual(130, exitCode(.{ .signal = .INT }));
+    try std.testing.expectEqual(143, exitCode(.{ .signal = .TERM }));
 }

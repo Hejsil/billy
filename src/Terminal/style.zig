@@ -2,8 +2,8 @@
 //! block, the label over a section of one, and the exit status of a command.
 //!
 //! Only those lines are decorated. What a tool returned, what a session stores
-//! and what the model is sent are printed exactly as they are, which is also
-//! what leaves the command of a bash call to the format script that lays it out.
+//! and what the model is sent are printed exactly as they are, and so is the
+//! command of a bash call.
 
 const std = @import("std");
 
@@ -66,8 +66,7 @@ pub const Style = enum {
 
     /// A foreground colour, named by the escape code that selects it. Only the
     /// colours every terminal has are used, so they read as part of the terminal
-    /// rather than as a theme of billy's own competing with the one a format script
-    /// paints the text in.
+    /// rather than as a theme of billy's own.
     pub const Color = enum(u8) {
         red = 31,
         green = 32,
