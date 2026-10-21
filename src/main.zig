@@ -2,6 +2,7 @@ const std = @import("std");
 
 const Billy = @import("billy").Billy;
 const Server = @import("billy").Server;
+const Terminal = @import("billy").Terminal;
 const spaghet = @import("spaghet");
 
 /// What billy is, shown at the top of its own help.
@@ -75,7 +76,7 @@ const serve_options =
 /// none, as `login` and `config` do: a subcommand lists only the subcommands it
 /// has, and a command that has none says nothing of them.
 fn printHelp(
-    out: *std.Io.Writer,
+    out: Terminal.Writer,
     invocation: []const u8,
     description: []const u8,
     commands: ?[]const u8,
@@ -149,7 +150,10 @@ pub fn main(init: std.process.Init) !void {
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const out = &stdout_file_writer.interface;
+    // Everything billy prints goes through one writer, which decorates its blocks
+    // only when it is a terminal it is printing to. A subcommand that prints no
+    // blocks writes the same text either way.
+    const out = Terminal.Writer.detect(&stdout_file_writer);
     defer out.flush() catch {};
 
     const argv = try std.process.Args.toSlice(init.minimal.args, arena);
@@ -179,7 +183,7 @@ pub fn main(init: std.process.Init) !void {
 /// Prints the usage `options` asked for, and says whether it asked for one. A
 /// subcommand's usage is its own, so `billy serve --help` prints that rather
 /// than billy's.
-fn printAskedHelp(options: Options, out: *std.Io.Writer) !bool {
+fn printAskedHelp(options: Options, out: Terminal.Writer) !bool {
     if (options.help) {
         try printHelp(out, "billy [command] [options]", billy_about, billy_commands, run_options);
         return true;
@@ -523,7 +527,7 @@ test "every help message reads the same way" {
 
     for (help_messages) |message| {
         out.clearRetainingCapacity();
-        try printHelp(&out.writer, message.invocation, message.description, message.commands, message.options);
+        try printHelp(.{ .out = &out.writer }, message.invocation, message.description, message.commands, message.options);
         const text = out.written();
 
         // The parts come in one order: how it is invoked, what it is, the

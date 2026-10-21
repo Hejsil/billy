@@ -312,15 +312,15 @@ fn fromJson(comptime T: type, arena: std.mem.Allocator, json: []const u8) !T {
 /// rather than in front of every row of output, which the terminal wraps on its
 /// own and cannot be marked without folding it here.
 const marks = struct {
-    const read = Terminal.Style.Mark{ .glyph = "▸", .hue = .blue };
-    const write = Terminal.Style.Mark{ .glyph = "◂", .hue = .green };
-    const edit = Terminal.Style.Mark{ .glyph = "✎", .hue = .yellow };
-    const bash = Terminal.Style.Mark{ .glyph = "❯", .hue = .cyan };
-    const search = Terminal.Style.Mark{ .glyph = "⌕", .hue = .magenta };
-    const fetch = Terminal.Style.Mark{ .glyph = "⇣", .hue = .magenta };
+    const read = Terminal.Writer.Mark{ .glyph = "▸", .hue = .blue };
+    const write = Terminal.Writer.Mark{ .glyph = "◂", .hue = .green };
+    const edit = Terminal.Writer.Mark{ .glyph = "✎", .hue = .yellow };
+    const bash = Terminal.Writer.Mark{ .glyph = "❯", .hue = .cyan };
+    const search = Terminal.Writer.Mark{ .glyph = "⌕", .hue = .magenta };
+    const fetch = Terminal.Writer.Mark{ .glyph = "⇣", .hue = .magenta };
     /// A call that could not be named: a tool billy does not implement, or
     /// arguments that could not be read.
-    const unknown = Terminal.Style.Mark{ .glyph = "?", .hue = .red };
+    const unknown = Terminal.Writer.Mark{ .glyph = "?", .hue = .red };
 };
 
 /// How a call is headed: the glyph its tool is marked with, the name of the tool
@@ -331,7 +331,7 @@ pub const Heading = struct {
     /// The glyph the tool is marked with.
     glyph: []const u8,
     /// The colour the terminal shows the glyph in. The web has its own.
-    hue: Terminal.Style.Color,
+    hue: Terminal.Writer.Color,
     /// The name of the tool the call names.
     name: []const u8,
     /// What the call acts on, such as a read's path or a search's query, or
@@ -361,7 +361,7 @@ pub const Heading = struct {
 
     /// The heading of a call to the tool `mark` stands for: the mark's glyph, the
     /// tool's name, and what the call acts on.
-    fn marked(mark: Terminal.Style.Mark, name: []const u8, target: []const u8) Heading {
+    fn marked(mark: Terminal.Writer.Mark, name: []const u8, target: []const u8) Heading {
         return .{ .glyph = mark.glyph, .hue = mark.hue, .name = name, .target = target };
     }
 };
@@ -694,7 +694,8 @@ test "a fetch that fails reaches the reader as a failure" {
     // answer the call gave.
     var shown: std.Io.Writer.Allocating = .init(gpa);
     defer shown.deinit();
-    try Terminal.tool.printResult(call, result.written(), .ansi, &shown.writer);
+    const writer: Terminal.Writer = .{ .style = .ansi, .out = &shown.writer };
+    try Terminal.tool.printResult(call, result.written(), writer);
     try std.testing.expect(std.mem.indexOf(u8, shown.written(), "output") != null);
 }
 

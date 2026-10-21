@@ -97,7 +97,6 @@ fn options(server: *const Server, mode: Agent.Mode) Agent.Options {
         .store = &server.store,
         .behaviour = Endpoints.behaviour(server.config),
         .tools = Endpoints.toolSettings(server.config, server.backends, server.health),
-        .style = .plain,
         .mode = mode,
         .home = server.environ.get("HOME"),
         // The user's own instructions live beside the configuration, and join

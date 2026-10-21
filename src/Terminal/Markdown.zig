@@ -16,7 +16,8 @@
 const std = @import("std");
 const md = @import("../md.zig");
 const md4c = @import("../md4c.zig");
-const Style = @import("style.zig").Style;
+const Writer = @import("Writer.zig");
+const Style = Writer.Style;
 const terminal_width = @import("width.zig");
 
 const Markdown = @This();
@@ -34,8 +35,10 @@ const rule: [40]u8 = @splat('-');
 const max_columns = 32;
 
 gpa: std.mem.Allocator,
-out: *std.Io.Writer,
-style: Style,
+/// Where the laid-out text goes, and the style it is decorated in. The renderer
+/// writes its own text through it and lays the codes of a style in between, which
+/// it asks the writer for rather than writing itself.
+writer: Writer,
 /// The first failure, kept here because a callback returns a number, not an
 /// error.
 err: ?anyerror = null,
@@ -98,11 +101,11 @@ const Row = struct {
     cells: std.ArrayList([]u8) = .empty,
 };
 
-/// Writes `text`, read as markdown, as the terminal shows it. `style` decides
-/// whether bold, colour and links are written as escape codes or left out, which
-/// is what makes a pipe to a file read as plain structured text.
-pub fn write(gpa: std.mem.Allocator, text: []const u8, style: Style, out: *std.Io.Writer) !void {
-    var render = Markdown{ .gpa = gpa, .out = out, .style = style };
+/// Writes `text`, read as markdown, as the terminal shows it. The writer's style
+/// decides whether bold, colour and links are written as escape codes or left
+/// out, which is what makes a pipe to a file read as plain structured text.
+pub fn write(gpa: std.mem.Allocator, text: []const u8, writer: Writer) !void {
+    var render = Markdown{ .gpa = gpa, .writer = writer };
     defer render.deinit();
 
     var p = md4c.parser(Markdown);
@@ -122,7 +125,7 @@ fn deinit(self: *Markdown) void {
 /// returning whether the write worked, so a callback can stop the parse.
 fn raw(self: *Markdown, bytes: []const u8) bool {
     if (self.err != null) return false;
-    self.out.writeAll(bytes) catch |err| {
+    self.writer.out.writeAll(bytes) catch |err| {
         self.err = err;
         return false;
     };
@@ -233,7 +236,7 @@ pub fn openBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyop
             if (!self.beginBlock(false)) return false;
             self.quote_depth += 1;
             self.container_depth += 1;
-            if (!self.raw(self.style.on("2"))) return false;
+            if (!self.raw(self.writer.dim())) return false;
         },
         md.c.MD_BLOCK_UL => return self.openList(false, 1),
         md.c.MD_BLOCK_OL => {
@@ -248,12 +251,12 @@ pub fn openBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyop
         md.c.MD_BLOCK_H => {
             if (!self.beginBlock(true)) return false;
             // A heading is its text in bold; the `#` is not shown.
-            if (!self.raw(self.style.on("1"))) return false;
+            if (!self.raw(self.writer.bold())) return false;
         },
         md.c.MD_BLOCK_CODE => {
             if (!self.beginBlock(false)) return false;
             self.in_code = true;
-            if (!self.raw(self.style.on("2"))) return false;
+            if (!self.raw(self.writer.dim())) return false;
         },
         md.c.MD_BLOCK_P => {
             if (!self.beginBlock(false)) return false;
@@ -281,7 +284,7 @@ pub fn closeBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyo
     switch (block_type) {
         md.c.MD_BLOCK_DOC => {},
         md.c.MD_BLOCK_QUOTE => {
-            if (!self.raw(self.style.off())) return false;
+            if (!self.raw(self.writer.reset())) return false;
             self.quote_depth -= 1;
             self.container_depth -= 1;
             self.endBlock();
@@ -298,12 +301,12 @@ pub fn closeBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyo
             self.endBlock();
         },
         md.c.MD_BLOCK_H => {
-            if (!self.raw(self.style.off())) return false;
+            if (!self.raw(self.writer.reset())) return false;
             self.endLine();
             self.endBlock();
         },
         md.c.MD_BLOCK_CODE => {
-            if (!self.raw(self.style.off())) return false;
+            if (!self.raw(self.writer.reset())) return false;
             self.in_code = false;
             self.endLine();
             self.endBlock();
@@ -467,7 +470,7 @@ fn writeCell(self: *Markdown, text: []const u8, width: usize, alignment: md.c.MD
 /// Writes `byte` `count` times.
 fn fill(self: *Markdown, byte: u8, count: usize) bool {
     if (self.err != null) return false;
-    self.out.splatByteAll(byte, count) catch |err| {
+    self.writer.out.splatByteAll(byte, count) catch |err| {
         self.err = err;
         return false;
     };
@@ -519,10 +522,10 @@ pub fn openSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaqu
     // the column widths wrong.
     if (self.table) return true;
     return switch (span_type) {
-        md.c.MD_SPAN_EM => self.raw(self.style.on("3")),
-        md.c.MD_SPAN_STRONG => self.raw(self.style.on("1")),
-        md.c.MD_SPAN_CODE => self.raw(self.style.on("2")),
-        md.c.MD_SPAN_DEL => self.raw(self.style.on("9")),
+        md.c.MD_SPAN_EM => self.raw(self.writer.italic()),
+        md.c.MD_SPAN_STRONG => self.raw(self.writer.bold()),
+        md.c.MD_SPAN_CODE => self.raw(self.writer.dim()),
+        md.c.MD_SPAN_DEL => self.raw(self.writer.strike()),
         md.c.MD_SPAN_A => self.openA(@ptrCast(@alignCast(detail.?))),
         // An image is its alt text, written when the label has been read.
         else => true,
@@ -534,7 +537,7 @@ pub fn closeSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaq
     if (span_type == md.c.MD_SPAN_IMG) return self.closeImg();
     if (self.table) return true;
     return switch (span_type) {
-        md.c.MD_SPAN_EM, md.c.MD_SPAN_STRONG, md.c.MD_SPAN_CODE, md.c.MD_SPAN_DEL => self.raw(self.style.off()),
+        md.c.MD_SPAN_EM, md.c.MD_SPAN_STRONG, md.c.MD_SPAN_CODE, md.c.MD_SPAN_DEL => self.raw(self.writer.reset()),
         md.c.MD_SPAN_A => self.closeA(),
         else => true,
     };
@@ -545,14 +548,14 @@ pub fn closeSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaq
 /// address is written after the text instead (see `closeA`).
 fn openA(self: *Markdown, detail: *const md.c.MD_SPAN_A_DETAIL) bool {
     self.link_url = attribute(detail.href);
-    if (self.style != .ansi) return true;
-    if (!self.raw("\x1b]8;;") or !self.raw(self.link_url) or !self.raw("\x1b\\")) return false;
+    if (self.writer.linkOpen().len == 0) return true;
+    if (!self.raw(self.writer.linkOpen()) or !self.raw(self.link_url) or !self.raw(self.writer.linkClose())) return false;
     return true;
 }
 
 fn closeA(self: *Markdown) bool {
-    if (self.style == .ansi) {
-        if (!self.raw("\x1b]8;;\x1b\\")) return false;
+    if (self.writer.linkOpen().len > 0) {
+        if (!self.raw(self.writer.linkOpen()) or !self.raw(self.writer.linkClose())) return false;
     } else if (self.link_url.len > 0) {
         // With no escape codes the address has to be visible, or the link is
         // lost; it follows the text the way a printed markdown note would.
@@ -576,12 +579,13 @@ fn closeImg(self: *Markdown) bool {
     const label = self.image_label.items;
     const has_label = std.mem.trim(u8, label, " \t\r\n").len > 0;
     const shown: []const u8 = if (has_label) label else self.image_url;
-    const opens = self.style == .ansi and self.image_url.len > 0;
-    if (opens and !self.raw("\x1b]8;;")) return false;
+    const opens = self.writer.linkOpen().len > 0 and self.image_url.len > 0;
+    if (opens and !self.raw(self.writer.linkOpen())) return false;
     if (opens and !self.raw(self.image_url)) return false;
-    if (opens and !self.raw("\x1b\\")) return false;
+    if (opens and !self.raw(self.writer.linkClose())) return false;
     if (!self.put(shown)) return false;
-    if (opens and !self.raw("\x1b]8;;\x1b\\")) return false;
+    if (opens and !self.raw(self.writer.linkOpen())) return false;
+    if (opens and !self.raw(self.writer.linkClose())) return false;
     self.image_label.clearRetainingCapacity();
     self.image_url = "";
     return true;
@@ -645,7 +649,8 @@ fn attribute(value: md.c.MD_ATTRIBUTE) []const u8 {
 fn expectRendered(expected: []const u8, text: []const u8, style: Style) !void {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try write(std.testing.allocator, text, style, &out.writer);
+    const writer: Writer = .{ .style = style, .out = &out.writer };
+    try write(std.testing.allocator, text, writer);
     try std.testing.expectEqualStrings(expected, out.written());
 }
 
@@ -754,7 +759,8 @@ test "a list nested past the indent cap is still shown" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try write(gpa, text.items, .plain, &out.writer);
+    const writer: Writer = .{ .out = &out.writer };
+    try write(gpa, text.items, writer);
 
     // The last line is as far in as the cap lets it go.
     const written = out.written();

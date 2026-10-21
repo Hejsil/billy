@@ -38,11 +38,12 @@ const Command = enum {
 const Target = Endpoint.Target;
 
 /// What a run is given, in one value: what each turn's target is resolved from,
-/// how its agent behaves on it, what its tools run with, how its blocks are
-/// shown, the mode it starts in, and the home directory and instructions the run
-/// reads outside the session. Each part is resolved by the frontend, from the
-/// configuration, the credentials and the environment, so the agent is handed the
-/// run rather than the file it came from.
+/// how its agent behaves on it, what its tools run with, the mode it starts in,
+/// and the home directory and instructions the run reads outside the session.
+/// Each part is resolved by the frontend, from the configuration, the credentials
+/// and the environment, so the agent is handed the run rather than the file it
+/// came from. What a run shows is written through the frontend's writer, which
+/// carries the style, so the run needs nothing here to be shown plainly.
 pub const Options = struct {
     /// The configuration a session's model is resolved with, and the keys stored
     /// for the providers it names. Borrowed from the frontend, which owns both and
@@ -51,9 +52,6 @@ pub const Options = struct {
     store: *const Credentials,
     behaviour: Behaviour,
     tools: Tools.Settings,
-    /// How the terminal decorates the lines it prints itself. A page lays its own
-    /// blocks out, so it sets this plainly.
-    style: Terminal.Style = .plain,
     /// The mode the run starts in, which is the frontend's choice until the
     /// session's first prompt settles it.
     mode: Mode = .general,
@@ -695,7 +693,7 @@ fn failureNotice(buffer: []u8, err: anyerror) []const u8 {
 pub fn run(
     io: std.Io,
     gpa: std.mem.Allocator,
-    out: *std.Io.Writer,
+    writer: Terminal.Writer,
     options: Options,
     session: *Session,
 ) !void {
@@ -714,12 +712,12 @@ pub fn run(
 
     // The editor holds the lines it returns and its history in an arena of its
     // own, over `gpa`, so the run need not keep an allocator for them.
-    var editor = LineEditor.init(io, out, gpa);
+    var editor = LineEditor.init(io, writer.out, gpa);
     defer editor.deinit();
 
     // The blocks of the run are shown on the terminal, the way billy has always
-    // shown them.
-    var terminal = Terminal{ .out = out, .io = io, .style = options.style, .scratch = gpa };
+    // shown them, through the writer the frontend gave the run.
+    var terminal = Terminal{ .writer = writer, .io = io, .scratch = gpa };
     const emitter = terminal.emitter();
 
     // The header is rebuilt for every prompt, so it reflects the context size
@@ -747,7 +745,7 @@ pub fn run(
         // anything else is what is asked.
         const waiting = try agent.take(emitter, session, line);
         if (waiting == .ran) {
-            try out.flush();
+            try writer.flush();
             continue;
         }
         const text = switch (waiting) {
@@ -765,9 +763,9 @@ pub fn run(
         // terminal going away, reaches here.
         agent.ask(emitter, session, text) catch |err|
             std.log.err("could not show the turn: {s}", .{@errorName(err)});
-        try out.flush();
+        try writer.flush();
     }
-    try out.flush();
+    try writer.flush();
 }
 
 /// Replays a stored conversation on the terminal as the blocks it was made of,
@@ -777,17 +775,16 @@ pub fn run(
 pub fn printTranscript(
     io: std.Io,
     gpa: std.mem.Allocator,
-    out: *std.Io.Writer,
+    writer: Terminal.Writer,
     session: *const Session,
-    style: Terminal.Style,
     blocks: usize,
 ) !void {
     // A replay is what the terminal is shown when a session is picked up again,
     // and it goes through the same emitter a live run does, so a prompt reads
     // the same whether it was just typed or stored.
-    var terminal = Terminal{ .out = out, .io = io, .style = style, .scratch = gpa };
+    var terminal = Terminal{ .writer = writer, .io = io, .scratch = gpa };
     try walk(gpa, session, blocks, terminal.emitter());
-    try out.flush();
+    try writer.flush();
 }
 
 /// Shows the blocks of a stored conversation, oldest first, through `emitter`.
@@ -1260,7 +1257,7 @@ fn askWith(agent: *Agent, session: *Session, client: *llm.Client, question: []co
 fn expectTranscript(
     expected: []const u8,
     messages: []const llm.Message,
-    style: Terminal.Style,
+    style: Terminal.Writer.Style,
 ) !void {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
@@ -1277,7 +1274,8 @@ fn expectTranscript(
 
     // Plain, since what these cover is how a message is headed and laid out
     // rather than how a terminal decorates it. Zero shows the whole conversation.
-    try printTranscript(io, gpa, &out.writer, &session, style, 0);
+    const writer: Terminal.Writer = .{ .style = style, .out = &out.writer };
+    try printTranscript(io, gpa, writer, &session, 0);
     try std.testing.expectEqualStrings(expected, out.written());
 }
 
@@ -1303,11 +1301,12 @@ test "printTranscript shows only the last blocks and counts the rest" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
+    const writer: Terminal.Writer = .{ .out = &out.writer };
 
     // The last two blocks are the second call and the reply, so the trim falls
     // inside the tool-calling message: its first call and everything before it is
     // counted, and only its second call shows.
-    try printTranscript(io, gpa, &out.writer, &session, .plain, 2);
+    try printTranscript(io, gpa, writer, &session, 2);
     try std.testing.expectEqualStrings(
         "… 2 earlier blocks\n\n" ++
             "▸ read b.zig\n▾ output\ncontents b\n\n" ++
@@ -1318,13 +1317,13 @@ test "printTranscript shows only the last blocks and counts the rest" {
 
     // A count larger than the conversation leaves nothing out, so nothing is
     // counted and the whole session shows.
-    try printTranscript(io, gpa, &out.writer, &session, .plain, 10);
+    try printTranscript(io, gpa, writer, &session, 10);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "earlier blocks") == null);
     try std.testing.expect(std.mem.startsWith(u8, out.written(), "» prompt\none\n\n"));
     out.clearRetainingCapacity();
 
     // Zero shows the whole session too.
-    try printTranscript(io, gpa, &out.writer, &session, .plain, 0);
+    try printTranscript(io, gpa, writer, &session, 0);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "earlier blocks") == null);
     try std.testing.expect(std.mem.startsWith(u8, out.written(), "» prompt\none\n\n"));
 }
@@ -1429,11 +1428,12 @@ test "printTranscript shows a compaction as a single line" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
+    const writer: Terminal.Writer = .{ .out = &out.writer };
 
     // The prompt that asked for the compaction and the summary it produced show
     // as one line, headed like every other block, and the rest of the history
     // shows as it always did.
-    try printTranscript(io, gpa, &out.writer, &session, .plain, 0);
+    try printTranscript(io, gpa, writer, &session, 0);
     try std.testing.expectEqualStrings(
         "» prompt\none\n\n" ++
             "◆ answer\na1\n\n" ++
@@ -1446,7 +1446,7 @@ test "printTranscript shows a compaction as a single line" {
 
     // The pair counts as one block, so a trim that keeps the last three blocks
     // starts at the compaction and counts what came before it.
-    try printTranscript(io, gpa, &out.writer, &session, .plain, 3);
+    try printTranscript(io, gpa, writer, &session, 3);
     try std.testing.expectEqualStrings(
         "… 2 earlier blocks\n\n" ++
             "⊟ compacted\n\n" ++
@@ -1472,7 +1472,8 @@ test "a compaction is headed by its own mark, and hides what it stands for" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try printTranscript(io, gpa, &out.writer, &session, .ansi, 0);
+    const writer: Terminal.Writer = .{ .style = .ansi, .out = &out.writer };
+    try printTranscript(io, gpa, writer, &session, 0);
 
     // The line carries the compaction mark: the glyph in its colour and the name
     // in bold, the way every other block header is written.
@@ -1637,8 +1638,8 @@ const TestSetup = struct {
 /// A terminal a test can show blocks through and read back from `out`. The
 /// returned value has to outlive the emitter taken from it, since the emitter
 /// borrows it.
-fn testTerminal(out: *std.Io.Writer, style: Terminal.Style) Terminal {
-    return .{ .out = out, .io = std.testing.io, .style = style, .scratch = std.testing.allocator };
+fn testTerminal(writer: Terminal.Writer) Terminal {
+    return .{ .writer = writer, .io = std.testing.io, .scratch = std.testing.allocator };
 }
 
 /// The id the header tests run under. A real one is a ULID, but the header only
@@ -2110,7 +2111,7 @@ test "maybeCompact folds the conversation once it has filled the window" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var terminal = testTerminal(&out.writer, .plain);
+    var terminal = testTerminal(.{ .out = &out.writer });
     var client = try agent.clientFor(&session);
     try std.testing.expect(try agent.maybeCompact(terminal.emitter(), &session, &client));
 
@@ -2168,7 +2169,7 @@ test "maybeCompact does nothing below the threshold, off, or with nothing new" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var terminal = testTerminal(&out.writer, .plain);
+    var terminal = testTerminal(.{ .out = &out.writer });
     const emitter = terminal.emitter();
     var client = try agent.clientFor(&session);
 
@@ -2226,7 +2227,7 @@ test "a compaction asked for now folds the conversation in whatever its size" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var terminal = testTerminal(&out.writer, .plain);
+    var terminal = testTerminal(.{ .out = &out.writer });
     // Asked for now, so the threshold and the setting are ignored: the
     // conversation is folded whatever size it has grown to.
     var client = try agent.clientFor(&session);
@@ -2281,7 +2282,7 @@ test "maybeCompact does not compact a summary that stands alone" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var terminal = testTerminal(&out.writer, .plain);
+    var terminal = testTerminal(.{ .out = &out.writer });
     var client = try agent.clientFor(&session);
     try std.testing.expect(!try agent.maybeCompact(terminal.emitter(), &session, &client));
 
@@ -2529,7 +2530,7 @@ test "the terminal shows a tool call the way a replay does" {
     // result once it is in, exactly as the turn does it.
     var live: std.Io.Writer.Allocating = .init(gpa);
     defer live.deinit();
-    var terminal = testTerminal(&live.writer, .plain);
+    var terminal = testTerminal(.{ .out = &live.writer });
     const emitter = terminal.emitter();
 
     const parsed = Tools.parse(call_state.allocator(), call);
@@ -2542,7 +2543,7 @@ test "the terminal shows a tool call the way a replay does" {
     // A replay renders the stored call on its own.
     var replayed: std.Io.Writer.Allocating = .init(gpa);
     defer replayed.deinit();
-    try Terminal.tool.describe(gpa, parsed, result.written(), .plain, &replayed.writer);
+    try Terminal.tool.describe(gpa, parsed, result.written(), .{ .out = &replayed.writer });
 
     // The two paths show the same bytes, which is what keeps a run and a resume
     // of it reading alike. The header before the result is what a slow command
@@ -2751,7 +2752,7 @@ test "the first turn names the session, and the naming is not part of it" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var terminal = testTerminal(&out.writer, .plain);
+    var terminal = testTerminal(.{ .out = &out.writer });
     try agent.ask(terminal.emitter(), &session, "the flaky test keeps failing, please fix it");
 
     try mock.group.await(io);
@@ -2843,7 +2844,7 @@ test "a turn is sent to the model the session records when it begins" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var terminal = testTerminal(&out.writer, .plain);
+    var terminal = testTerminal(.{ .out = &out.writer });
 
     // The session runs on one model, and the turn goes to that model's server.
     try session.setModel("test/deepseek/deepseek-flash");
@@ -2899,7 +2900,7 @@ test "a session is sent where the choice it recorded points, not the configurati
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var terminal = testTerminal(&out.writer, .plain);
+    var terminal = testTerminal(.{ .out = &out.writer });
     try agent.ask(terminal.emitter(), &session, "a question");
 
     try chosen.group.await(io);

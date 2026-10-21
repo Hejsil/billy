@@ -49,7 +49,7 @@ cwd: []const u8,
 ///
 /// `out` is for the note that the configuration file was created, which is the
 /// one thing here the user is told about.
-pub fn open(init: std.process.Init, out: *std.Io.Writer) !Billy {
+pub fn open(init: std.process.Init, out: Terminal.Writer) !Billy {
     const io = init.io;
     const arena = init.arena.allocator();
     const environ = init.environ_map;
@@ -100,13 +100,13 @@ pub fn deinit(billy: *Billy) void {
 /// The providers the configuration defines are the names a key can be stored for
 /// beside the services billy ships; one it names nothing of is one no request
 /// will ever ask for, so such a key is refused rather than stored.
-pub fn login(billy: *Billy, out: *std.Io.Writer, service: ?[]const u8) !void {
+pub fn login(billy: *Billy, out: Terminal.Writer, service: ?[]const u8) !void {
     var provider_names: std.ArrayList([]const u8) = .empty;
     for (billy.config.stored.providers.entries) |entry| {
         try provider_names.append(billy.arena, entry.name);
     }
 
-    const name = service orelse return billy.credentials.list(out, provider_names.items);
+    const name = service orelse return billy.credentials.list(out.out, provider_names.items);
     if (!Credentials.acceptable(name, provider_names.items)) {
         std.log.err(
             "'{s}' is neither a service billy knows nor a provider the configuration names;" ++
@@ -143,10 +143,10 @@ pub fn login(billy: *Billy, out: *std.Io.Writer, service: ?[]const u8) !void {
 /// what lets a key be piped in.
 ///
 /// Returns null at end of input, before anything was typed.
-fn readSecret(billy: *Billy, out: *std.Io.Writer, prompt: []const u8) !?[]const u8 {
+fn readSecret(billy: *Billy, out: Terminal.Writer, prompt: []const u8) !?[]const u8 {
     // The same reader the run prompts with, in its secret mode, so a key and a
     // prompt are read the one way.
-    var editor = LineEditor.init(billy.io, out, billy.arena);
+    var editor = LineEditor.init(billy.io, out.out, billy.arena);
     defer editor.deinit();
 
     const line = (try editor.readSecret(prompt)) orelse return null;
@@ -157,7 +157,7 @@ fn readSecret(billy: *Billy, out: *std.Io.Writer, prompt: []const u8) !?[]const 
 
 /// Sets the configuration setting `path` to `value` and writes the file back, so
 /// a setting can be changed without opening it by hand.
-pub fn configSet(billy: *Billy, out: *std.Io.Writer, path: []const u8, value: []const u8) !void {
+pub fn configSet(billy: *Billy, out: Terminal.Writer, path: []const u8, value: []const u8) !void {
     Config.set(&billy.config, path, value) catch |err| switch (err) {
         error.UnknownOption => {
             std.log.err("'{s}' is not a configuration setting", .{path});
@@ -181,7 +181,7 @@ pub fn configSet(billy: *Billy, out: *std.Io.Writer, path: []const u8, value: []
 }
 
 /// Runs one session in the terminal, resuming `resume_id` or starting a new one.
-pub fn run(billy: *Billy, out: *std.Io.Writer, resume_id: ?[]const u8) !void {
+pub fn run(billy: *Billy, out: Terminal.Writer, resume_id: ?[]const u8) !void {
     // A resumed session keeps the directory it was saved with, so a session
     // continues where it was started rather than wherever it is picked up.
     var session = Session.open(
@@ -215,10 +215,6 @@ pub fn run(billy: *Billy, out: *std.Io.Writer, resume_id: ?[]const u8) !void {
     // from the model the session records when it begins.
     _ = try Endpoint.configured(&billy.config, &billy.credentials, arena);
 
-    // The terminal decorates its blocks for the terminal it is on, which the
-    // escape codes of a pipe or a redirection would only be noise in.
-    const style = Terminal.Style.detect(billy.io, .stdout());
-
     // What the run is given, resolved once for the whole of it: what its targets
     // are resolved from, how far it goes, what its tools run with, how its blocks
     // are shown, and the home directory and instructions it reads outside the
@@ -232,7 +228,6 @@ pub fn run(billy: *Billy, out: *std.Io.Writer, resume_id: ?[]const u8) !void {
             try Endpoints.Backends.build(arena, billy.config, &billy.credentials),
             &billy.health,
         ),
-        .style = style,
         .home = billy.environ.get("HOME"),
         // The user's own instructions live beside the configuration, and join
         // every session's prompt. Billy owns the directory and outlives the run.
@@ -248,7 +243,6 @@ pub fn run(billy: *Billy, out: *std.Io.Writer, resume_id: ?[]const u8) !void {
             billy.gpa,
             out,
             &session,
-            style,
             billy.config.stored.resume_blocks,
         );
     }
@@ -261,7 +255,7 @@ pub fn run(billy: *Billy, out: *std.Io.Writer, resume_id: ?[]const u8) !void {
 /// A session that has not been named -- one that has not been asked anything
 /// yet, and one saved before titles were kept -- is listed by its id alone,
 /// rather than as an id with a space after it that a shell would split off.
-pub fn listSessions(billy: *Billy, out: *std.Io.Writer) !void {
+pub fn listSessions(billy: *Billy, out: Terminal.Writer) !void {
     const listed = Session.list(billy.io, billy.dirs.sessions, billy.gpa) catch |err| {
         std.log.err("cannot list the sessions: {s}", .{@errorName(err)});
         return err;
@@ -278,7 +272,7 @@ pub fn listSessions(billy: *Billy, out: *std.Io.Writer) !void {
 }
 
 /// Writes `listed` as the listing reads: each session's id, then its title.
-fn printSessions(out: *std.Io.Writer, listed: []const Session.Named) !void {
+fn printSessions(out: Terminal.Writer, listed: []const Session.Named) !void {
     for (listed) |named| {
         const space = if (named.title.len != 0) " " else "";
         try out.print("{s}{s}{s}\n", .{ named.id, space, named.title });
@@ -320,7 +314,7 @@ test "the listing writes each session's id and title on one line" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    try printSessions(&out.writer, &.{
+    try printSessions(.{ .out = &out.writer }, &.{
         .{ .id = "01M3AAAAAAAAAAAAAAAAAAAAAA", .title = "Fix the flaky test" },
         .{ .id = "01M3BBBBBBBBBBBBBBBBBBBBBB", .title = "Two words" },
         // A session with no title is written as its id alone, leaving no space

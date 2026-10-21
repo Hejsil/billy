@@ -105,26 +105,22 @@ fn appendHunk(gpa: std.mem.Allocator, out: *std.ArrayList(Line), kind: Kind, lin
 /// green, the context dim, and each line opened with the mark of its kind. The
 /// marks carry the meaning where the colour does not, such as a pipe or a
 /// colour-blind terminal.
-pub fn print(diff: []const Line, style: Terminal.Style, out: *std.Io.Writer) !void {
+pub fn print(diff: []const Line, writer: Terminal.Writer) !void {
     for (diff) |line| {
         switch (line.kind) {
-            .context => {
-                try style.dim(" ", out);
-                try style.dim(line.text, out);
-            },
-            .removed => try markedLine(line.kind, line.text, .red, style, out),
-            .added => try markedLine(line.kind, line.text, .green, style, out),
-            .elided => try out.print("{s} … {d} more lines{s}", .{ style.on("2"), line.hidden, style.off() }),
+            .context => try writer.print("{s} {s}{s}", .{ writer.dim(), line.text, writer.reset() }),
+            .removed => try markedLine(line.kind, line.text, .red, writer),
+            .added => try markedLine(line.kind, line.text, .green, writer),
+            .elided => try writer.print("{s} … {d} more lines{s}", .{ writer.dim(), line.hidden, writer.reset() }),
         }
-        try out.writeAll("\n");
+        try writer.write("\n");
     }
 }
 
 /// Writes one line as its mark and its text in `hue`, so a removed line reads
 /// `-what it was` and an added line `+what it is`.
-fn markedLine(kind: Kind, text: []const u8, hue: Terminal.Style.Color, style: Terminal.Style, out: *std.Io.Writer) !void {
-    try style.color(hue, &.{kind.mark()}, out);
-    try style.color(hue, text, out);
+fn markedLine(kind: Kind, text: []const u8, hue: Terminal.Writer.Color, writer: Terminal.Writer) !void {
+    try writer.print("{s}{c}{s}{s}", .{ writer.color(hue), kind.mark(), text, writer.reset() });
 }
 
 /// The lines of `text`, without a trailing empty line for a terminating newline:

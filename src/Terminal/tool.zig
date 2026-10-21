@@ -6,7 +6,7 @@ const std = @import("std");
 const Tools = @import("../Tools.zig");
 const llm = @import("../llm.zig");
 const diffing = @import("../diff.zig");
-const Style = @import("style.zig").Style;
+const Writer = @import("Writer.zig");
 
 const max_block_lines = 5;
 
@@ -14,34 +14,28 @@ const max_block_lines = 5;
 /// what it acts on, then its output. The transcript reuses it so a replay matches
 /// the run. `scratch` is the caller's, for what the block builds, such as an
 /// edit's diff.
-pub fn describe(
-    scratch: std.mem.Allocator,
-    call: Tools.Call,
-    result: []const u8,
-    style: Style,
-    out: *std.Io.Writer,
-) !void {
-    try printHead(scratch, call, style, out);
-    try printResult(call, result, style, out);
-    try out.writeAll("\n");
+pub fn describe(scratch: std.mem.Allocator, call: Tools.Call, result: []const u8, writer: Writer) !void {
+    try printHead(scratch, call, writer);
+    try printResult(call, result, writer);
+    try writer.write("\n");
 }
 
 /// Prints the header block of a call: which tool it is and what it acts on. An
 /// edit is shown as the diff of the strings it works on, a bash call as the
 /// command it runs, and a search as the query it ran.
-pub fn printHead(scratch: std.mem.Allocator, call: Tools.Call, style: Style, out: *std.Io.Writer) !void {
+pub fn printHead(scratch: std.mem.Allocator, call: Tools.Call, writer: Writer) !void {
     const head = Tools.Heading.of(call);
-    const mark = Style.Mark{ .glyph = head.glyph, .hue = head.hue };
-    try mark.header(head.name, head.target, style, out);
+    const mark = Writer.Mark{ .glyph = head.glyph, .hue = head.hue };
+    try mark.header(head.name, head.target, writer);
     // What a call shows under its header: the change it means to make, or the
     // command it runs. Every other call is its header alone.
     switch (call) {
-        .edit => |args| try printDiff(scratch, args.old_string, args.new_string, style, out),
+        .edit => |args| try printDiff(scratch, args.old_string, args.new_string, writer),
         .bash => |args| {
             // The command is shown as the model wrote it, with only the newline
             // that ends it dropped, so the block ends where the command does.
-            try out.writeAll(std.mem.trimEnd(u8, args.command, "\n"));
-            try out.writeAll("\n");
+            try writer.write(std.mem.trimEnd(u8, args.command, "\n"));
+            try writer.write("\n");
         },
         else => {},
     }
@@ -51,13 +45,13 @@ pub fn printHead(scratch: std.mem.Allocator, call: Tools.Call, style: Style, out
 /// and what replaces it. The diff is built from the call, so it shows the model's
 /// intent and a replay recomputes the same one. An edit that changes nothing
 /// shows no diff at all.
-fn printDiff(scratch: std.mem.Allocator, old: []const u8, new: []const u8, style: Style, out: *std.Io.Writer) !void {
+fn printDiff(scratch: std.mem.Allocator, old: []const u8, new: []const u8, writer: Writer) !void {
     const diff = try diffing.lines(scratch, old, new);
     defer scratch.free(diff);
     if (diff.len == 0) return;
 
-    try printLabel("diff", style, out);
-    try diffing.print(diff, style, out);
+    try printLabel("diff", writer);
+    try diffing.print(diff, writer);
 }
 
 /// The mark in front of the labels that break a block into sections, such as
@@ -71,21 +65,21 @@ const label_mark = "▾";
 const Ink = union(enum) {
     plain,
     dim,
-    hue: Style.Color,
+    hue: Writer.Color,
 };
 
 /// Prints a label such as `▾ stdout` in bold, so it reads as the heading of the
 /// lines under it rather than as the first of them.
-fn printLabel(name: []const u8, style: Style, out: *std.Io.Writer) !void {
-    try out.print("{s}{s} {s}{s}\n", .{ style.on("1"), label_mark, name, style.off() });
+fn printLabel(name: []const u8, writer: Writer) !void {
+    try writer.print("{s}{s} {s}{s}\n", .{ writer.bold(), label_mark, name, writer.reset() });
 }
 
 /// Prints `text` in the way `ink` asks for.
-fn printInk(text: []const u8, ink: Ink, style: Style, out: *std.Io.Writer) !void {
+fn printInk(text: []const u8, ink: Ink, writer: Writer) !void {
     switch (ink) {
-        .plain => try out.writeAll(text),
-        .dim => try style.dim(text, out),
-        .hue => |hue| try style.color(hue, text, out),
+        .plain => try writer.write(text),
+        .dim => try writer.print("{s}{s}{s}", .{ writer.dim(), text, writer.reset() }),
+        .hue => |hue| try writer.print("{s}{s}{s}", .{ writer.color(hue), text, writer.reset() }),
     }
 }
 
@@ -93,28 +87,28 @@ fn printInk(text: []const u8, ink: Ink, style: Style, out: *std.Io.Writer) !void
 /// it put in the file; an edit shows nothing, since its result would only repeat
 /// the change shown above it. Anything that failed shows why instead, whatever
 /// it was asked to do.
-pub fn printResult(call: Tools.Call, result: []const u8, style: Style, out: *std.Io.Writer) !void {
+pub fn printResult(call: Tools.Call, result: []const u8, writer: Writer) !void {
     // A call that failed reports why, whatever it was asked to do. The whole
     // result is billy's own message, so it is shown the way billy shows a
     // failure.
     if (std.mem.startsWith(u8, result, "error: ")) {
-        try printLabel("output", style, out);
-        return printTruncated(result, .{ .hue = .red }, style, out);
+        try printLabel("output", writer);
+        return printTruncated(result, .{ .hue = .red }, writer);
     }
     switch (call) {
         // A write succeeds by putting the content in the file, so that content
         // is what it produced. It is on the call rather than in the result, so a
         // replayed session shows it without it having to be stored twice.
         .write => |args| {
-            try printLabel("output", style, out);
-            return printTruncated(args.content, .dim, style, out);
+            try printLabel("output", writer);
+            return printTruncated(args.content, .dim, writer);
         },
         // An edit's result would only repeat the diff shown above it.
         .edit => {},
-        .bash => return printBash(result, style, out),
+        .bash => return printBash(result, writer),
         else => {
-            try printLabel("output", style, out);
-            return printTruncated(result, .dim, style, out);
+            try printLabel("output", writer);
+            return printTruncated(result, .dim, writer);
         },
     }
 }
@@ -126,22 +120,22 @@ pub fn printResult(call: Tools.Call, result: []const u8, style: Style, out: *std
 ///
 /// The status and the split are read back from the result, which is what billy
 /// stored and handed the model, so a replayed session shows the same block.
-fn printBash(result: []const u8, style: Style, out: *std.Io.Writer) !void {
+fn printBash(result: []const u8, writer: Writer) !void {
     const parts = Tools.bashOutput(result) orelse {
         // A result that is not one billy wrote is shown as it is, so a session
         // saved before the status was written still shows everything.
-        try printLabel("output", style, out);
-        return printTruncated(result, .dim, style, out);
+        try printLabel("output", writer);
+        return printTruncated(result, .dim, writer);
     };
-    try printExit(parts.exit, style, out);
+    try printExit(parts.exit, writer);
     const streams = [_]struct { name: []const u8, text: []const u8 }{
         .{ .name = "stdout", .text = parts.stdout },
         .{ .name = "stderr", .text = parts.stderr },
     };
     for (streams) |stream| {
         if (stream.text.len == 0) continue;
-        try printLabel(stream.name, style, out);
-        try printTruncated(stream.text, .dim, style, out);
+        try printLabel(stream.name, writer);
+        try printTruncated(stream.text, .dim, writer);
     }
 }
 
@@ -149,19 +143,19 @@ fn printBash(result: []const u8, style: Style, out: *std.Io.Writer) !void {
 /// in green when the command succeeded, `✗ exit 1` and the rest in red when it
 /// did not. The stored line reads `exit code: N` for the model; only the line
 /// the user sees is marked and shortened.
-fn printExit(exit: Tools.Exit, style: Style, out: *std.Io.Writer) !void {
+fn printExit(exit: Tools.Exit, writer: Writer) !void {
     const mark = if (exit.ok) Tools.exit_marks.ok else Tools.exit_marks.failed;
     var buffer: [64]u8 = undefined;
     const line = std.fmt.bufPrint(&buffer, "{s} exit {s}", .{ mark, exit.code }) catch exit.code;
-    try style.boldColor(if (exit.ok) .green else .red, line, out);
-    try out.writeAll("\n");
+    const hue: Writer.Color = if (exit.ok) .green else .red;
+    try writer.print("{s}{s}{s}\n", .{ writer.boldColor(hue), line, writer.reset() });
 }
 
 /// Prints `text`, keeping at most `max_block_lines` lines. When it had more, a
 /// count of the rest is printed in place of them, so the block stays short
 /// without hiding that there was more. Every line is printed in `ink`, which is
 /// dim for a tool's output and a colour for billy's own message.
-fn printTruncated(text: []const u8, ink: Ink, style: Style, out: *std.Io.Writer) !void {
+fn printTruncated(text: []const u8, ink: Ink, writer: Writer) !void {
     const body = std.mem.trimEnd(u8, text, "\n");
     if (body.len == 0) return;
 
@@ -171,12 +165,12 @@ fn printTruncated(text: []const u8, ink: Ink, style: Style, out: *std.Io.Writer)
     while (lines.next()) |line| {
         total += 1;
         if (shown == max_block_lines) continue;
-        try printInk(line, ink, style, out);
-        try out.writeAll("\n");
+        try printInk(line, ink, writer);
+        try writer.write("\n");
         shown += 1;
     }
     if (total > shown) {
-        try out.print("{s}… {d} more lines{s}\n", .{ style.on("2"), total - shown, style.off() });
+        try writer.print("{s}… {d} more lines{s}\n", .{ writer.dim(), total - shown, writer.reset() });
     }
 }
 
@@ -375,7 +369,8 @@ test "a bash block shows only the streams the command filled" {
         );
         // `run` writes the result but shows nothing, so what a call and its
         // result look like is rendered here the way the terminal renders it.
-        try describe(gpa, parsed, result.written(), .plain, &log.writer);
+        const shown: Writer = .{ .out = &log.writer };
+        try describe(gpa, parsed, result.written(), shown);
         try std.testing.expectEqualStrings(case.expected, log.written());
     }
 }
@@ -397,7 +392,8 @@ test "a bash result with no status line is shown as it is" {
 
     // A session saved before the status was written into the result has none,
     // so nothing is claimed about the call and the whole result is shown.
-    try describe(gpa, Tools.parse(arena, call), "built\nnothing to do", .plain, &out.writer);
+    const shown: Writer = .{ .out = &out.writer };
+    try describe(gpa, Tools.parse(arena, call), "built\nnothing to do", shown);
     try std.testing.expectEqualStrings(
         "❯ bash\nmake\n▾ output\nbuilt\nnothing to do\n\n",
         out.written(),
@@ -416,12 +412,13 @@ test "what a call failed with is shown red, and what it left out is dimmed" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
+    const writer: Writer = .{ .style = .ansi, .out = &out.writer };
 
     // A failure is billy's own message, so the whole result is shown as one.
     try describe(gpa, Tools.parse(arena, .{ .id = "1", .function = .{
         .name = "read",
         .arguments = "{\"path\":\"a.zig\"}",
-    } }), "error: cannot read a.zig: FileNotFound", .ansi, &out.writer);
+    } }), "error: cannot read a.zig: FileNotFound", writer);
     try std.testing.expectEqualStrings(
         "\x1b[34m▸\x1b[0m \x1b[1mread\x1b[0m \x1b[2ma.zig\x1b[0m\n\x1b[1m▾ output\x1b[0m\n" ++
             "\x1b[31merror: cannot read a.zig: FileNotFound\x1b[0m\n\n",
@@ -430,12 +427,12 @@ test "what a call failed with is shown red, and what it left out is dimmed" {
     out.clearRetainingCapacity();
 
     // The count of the lines left out is structure too, so it is dimmed.
+    const ansi: Writer = .{ .style = .ansi, .out = &out.writer };
     try describe(
         arena_state.allocator(),
         .{ .read = .{ .path = "a.zig" } },
         "1\n2\n3\n4\n5\n6\n7\n",
-        .ansi,
-        &out.writer,
+        ansi,
     );
     try std.testing.expectEqualStrings(
         "\x1b[34m▸\x1b[0m \x1b[1mread\x1b[0m \x1b[2ma.zig\x1b[0m\n\x1b[1m▾ output\x1b[0m\n" ++
@@ -455,12 +452,12 @@ test "describe keeps a block short and says how much it left out" {
     defer out.deinit();
 
     // Exactly the limit: nothing is left out.
+    const plain: Writer = .{ .out = &out.writer };
     try describe(
         arena_state.allocator(),
         .{ .read = .{ .path = "a.zig" } },
         "1\n2\n3\n4\n5",
-        .plain,
-        &out.writer,
+        plain,
     );
     try std.testing.expectEqualStrings(
         "▸ read a.zig\n▾ output\n1\n2\n3\n4\n5\n\n",
@@ -474,8 +471,7 @@ test "describe keeps a block short and says how much it left out" {
         arena_state.allocator(),
         .{ .read = .{ .path = "a.zig" } },
         "1\n2\n3\n4\n5\n6\n7\n",
-        .plain,
-        &out.writer,
+        plain,
     );
     try std.testing.expectEqualStrings(
         "▸ read a.zig\n▾ output\n1\n2\n3\n4\n5\n… 2 more lines\n\n",
@@ -484,7 +480,7 @@ test "describe keeps a block short and says how much it left out" {
     out.clearRetainingCapacity();
 
     // An empty result leaves the header with nothing under it.
-    try describe(arena_state.allocator(), .{ .read = .{ .path = "a.zig" } }, "", .plain, &out.writer);
+    try describe(arena_state.allocator(), .{ .read = .{ .path = "a.zig" } }, "", plain);
     try std.testing.expectEqualStrings("▸ read a.zig\n▾ output\n\n", out.written());
     out.clearRetainingCapacity();
 
@@ -498,8 +494,7 @@ test "describe keeps a block short and says how much it left out" {
             .new_string = "b",
         } },
         "replaced 1 occurrence(s) in a.zig",
-        .plain,
-        &out.writer,
+        plain,
     );
     try std.testing.expectEqualStrings(
         "✎ edit a.zig\n▾ diff\n-1\n-2\n-3\n-4\n-5\n-6\n+b\n\n",
@@ -535,7 +530,8 @@ test "run logs exactly what describe prints" {
     defer result.deinit();
     const parsed = try Tools.runCall(arena, &tool_set, call, &result.writer);
 
-    try describe(gpa, parsed, result.written(), .plain, &log.writer);
+    const shown: Writer = .{ .out = &log.writer };
+    try describe(gpa, parsed, result.written(), shown);
     try std.testing.expectEqualStrings(
         "❯ bash\ntrue\n✓ exit 0\n\n",
         log.written(),
@@ -549,7 +545,7 @@ fn expectDescribe(
     name: []const u8,
     arguments: []const u8,
     result: []const u8,
-    style: Style,
+    style: Writer.Style,
 ) !void {
     const gpa = std.testing.allocator;
 
@@ -558,16 +554,17 @@ fn expectDescribe(
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
+    const writer: Writer = .{ .style = style, .out = &out.writer };
     try describe(arena_state.allocator(), Tools.parse(arena_state.allocator(), .{ .id = "1", .function = .{
         .name = name,
         .arguments = arguments,
-    } }), result, style, &out.writer);
+    } }), result, writer);
     try std.testing.expectEqualStrings(expected, out.written());
 }
 
 /// Writes the header of a call named `name` with `arguments`, and checks it
 /// against `expected`. A header alone, without a result under it.
-fn expectHead(expected: []const u8, name: []const u8, arguments: []const u8, style: Style) !void {
+fn expectHead(expected: []const u8, name: []const u8, arguments: []const u8, style: Writer.Style) !void {
     const gpa = std.testing.allocator;
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -575,9 +572,10 @@ fn expectHead(expected: []const u8, name: []const u8, arguments: []const u8, sty
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
+    const writer: Writer = .{ .style = style, .out = &out.writer };
     try printHead(arena_state.allocator(), Tools.parse(arena_state.allocator(), .{ .id = "1", .function = .{
         .name = name,
         .arguments = arguments,
-    } }), style, &out.writer);
+    } }), writer);
     try std.testing.expectEqualStrings(expected, out.written());
 }
