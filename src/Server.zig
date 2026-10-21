@@ -22,7 +22,6 @@ const Credentials = @import("Credentials.zig");
 const Endpoints = @import("Endpoints.zig");
 const Health = @import("Health.zig");
 const html = @import("html.zig");
-const models = @import("models.zig");
 const Session = @import("Session.zig");
 
 const Server = @This();
@@ -910,13 +909,14 @@ fn serveTurn(
 
 /// Writes the header line the page shows above `session`'s conversation.
 fn writeHeader(server: *const Server, session: *const Session, out: *std.Io.Writer) !void {
+    const shown = Endpoints.sessionModel(server.config, session);
     try html.header(.{
         .id = session.id(),
-        .model = server.endpoint.model,
+        .model = shown.id,
         .cwd = session.cwd(),
         .home = server.environ.get("HOME"),
         .context_tokens = session.context_tokens,
-        .model_info = models.lookup(server.endpoint.provider, server.endpoint.model),
+        .model_info = shown.info,
     }, out);
 }
 

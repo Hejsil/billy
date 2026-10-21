@@ -79,7 +79,7 @@ pub fn open(arena: std.mem.Allocator, config: Config, store: *const Credentials)
         // so one is enough; a base that already carries it would double it, and
         // none of them do.
         .url = try completionsUrl(arena, base_url),
-        .model = modelOf(choice.text),
+        .model = choice.model(),
         .provider = models.Provider.fromName(name),
     };
 }
@@ -120,7 +120,7 @@ fn targetFor(
     // session passes is a slice of its own string pool, and a pointer into that
     // pool survives no write to it, so the next intern would leave the target
     // naming freed bytes. The URL is allocated here for the same reason.
-    const model = try arena.dupe(u8, modelOf(choice));
+    const model = try arena.dupe(u8, (models.Choice{ .text = choice }).model());
     return .{
         .url = try completionsUrl(arena, base_url),
         .api_key = store.get(name) orelse return missingKey(name),
@@ -191,6 +191,30 @@ pub fn limits(config: Config) agent.Limits {
     };
 }
 
+/// One model as a header shows it: the id a request names, and what is known
+/// about its window.
+pub const Model = struct {
+    /// The model id, which is the half of a choice after the provider.
+    id: []const u8,
+    /// What is known about it: its window, for the gauge. Null for a model billy
+    /// has no numbers for.
+    info: ?models.Metadata,
+};
+
+/// The model a session is sent to, as the header above its conversation shows
+/// it: the choice it recorded, or the configured one for a session that recorded
+/// none. A session keeps the choice it was started with, so the header names
+/// where it goes rather than where billy is pointed, and both frontends read it
+/// here so a page and a terminal agree.
+pub fn sessionModel(config: Config, session: *const Session) Model {
+    const choice = models.Choice{ .text = session.modelChoice(config.stored.model) };
+    const id = choice.model();
+    return .{
+        .id = id,
+        .info = models.lookup(models.Provider.fromName(choice.provider()), id),
+    };
+}
+
 /// How a run's tools are built: how their blocks are laid out, the limits they
 /// run under, and the backends its web tools ask.
 ///
@@ -250,15 +274,6 @@ fn resolveBaseUrl(providers: Config.Providers, choice: []const u8) error{Unknown
         std.log.err("'{s}' names no provider the configuration defines", .{choice});
         return error.UnknownProvider;
     };
-}
-
-/// The model id to send, from the choice a run was given. A choice with a
-/// provider in front of it carries its own model; one without is a bare model
-/// id, which is what a run against a proxy names and which is sent as it is.
-fn modelOf(choice: []const u8) []const u8 {
-    const chosen = models.Choice{ .text = choice };
-    if (chosen.provider().len > 0) return chosen.model();
-    return choice;
 }
 
 /// Reports that no key is stored for the provider a request is sent to, naming
@@ -470,19 +485,37 @@ test "a fetch backend is asked for its key, and raw for none" {
     try std.testing.expect((try fetchConfig(arena, &store, none, &failed)) == null);
 }
 
-test "the model id is the half after the provider, and a bare one is itself" {
-    // A configured choice carries its provider in the string, so the id sent is
-    // the half after the slash.
-    try std.testing.expectEqualStrings("deepseek-flash", modelOf("deepseek/deepseek-flash"));
-    try std.testing.expectEqualStrings("glm-5.3-flash", modelOf("opencode_go/glm-5.3-flash"));
-    try std.testing.expectEqualStrings("kimi-k2.7-code", modelOf("opencode_go/kimi-k2.7-code"));
-    // A model id with a slash of its own keeps the rest of it.
-    try std.testing.expectEqualStrings("model/variant", modelOf("vendor/model/variant"));
+test "a header names the model the session goes to, not the one billy is pointed at" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    // An override with no provider in front of it is a bare model id, which is
-    // what a run against a proxy or a local server names.
-    try std.testing.expectEqualStrings("m", modelOf("m"));
-    try std.testing.expectEqualStrings("qwen3-coder:30b", modelOf("qwen3-coder:30b"));
+    // The configuration points at DeepSeek; the session recorded a model of
+    // another provider, which is where it is sent.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = Config.file_name,
+        .data = "{\"model\":\"deepseek/deepseek-flash\"}",
+    });
+    var opened = try Config.open(std.testing.io, tmp.dir, gpa);
+    defer opened.config.deinit();
+
+    var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    try session.setModel("opencode_go/kimi-k2.7-code");
+
+    // The id is the half of its own choice, and the window the one of that model.
+    const recorded = sessionModel(opened.config, &session);
+    try std.testing.expectEqualStrings("kimi-k2.7-code", recorded.id);
+    try std.testing.expectEqual(@as(usize, 262_144), recorded.info.?.context_window);
+    try std.testing.expectEqual(models.Provider.opencode_go, recorded.info.?.provider);
+
+    // A session that recorded none is sent where the configuration points, so
+    // that is what its header names.
+    var older = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    defer older.deinit();
+    const configured = sessionModel(opened.config, &older);
+    try std.testing.expectEqualStrings("deepseek-flash", configured.id);
+    try std.testing.expectEqual(@as(usize, 1_000_000), configured.info.?.context_window);
 }
 
 test "a target names bytes of its own, not a slice of the session's pool" {

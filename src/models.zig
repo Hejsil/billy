@@ -206,6 +206,26 @@ fn metadataOf(provider: Provider, entry: Entry) Metadata {
     };
 }
 
+test "a choice names its provider before the slash and its model after it" {
+    const flash = Choice{ .text = "deepseek/deepseek-flash" };
+    try std.testing.expectEqualStrings("deepseek", flash.provider());
+    try std.testing.expectEqualStrings("deepseek-flash", flash.model());
+    try std.testing.expect(flash.isComplete());
+
+    // Only the first slash is the split, so a model id with one of its own keeps
+    // the rest of it.
+    const variant = Choice{ .text = "vendor/model/variant" };
+    try std.testing.expectEqualStrings("vendor", variant.provider());
+    try std.testing.expectEqualStrings("model/variant", variant.model());
+
+    // A bare model id names no provider, so it is sent as it is: it is what a run
+    // against a proxy or a local server names, and it is not a complete choice.
+    const bare = Choice{ .text = "qwen3-coder:30b" };
+    try std.testing.expectEqualStrings("", bare.provider());
+    try std.testing.expectEqualStrings("qwen3-coder:30b", bare.model());
+    try std.testing.expect(!bare.isComplete());
+}
+
 test "hostOf strips the scheme, port and path" {
     try std.testing.expectEqualStrings("api.deepseek.com", hostOf("https://api.deepseek.com/chat/completions").?);
     try std.testing.expectEqualStrings("api.deepseek.com", hostOf("https://api.deepseek.com").?);

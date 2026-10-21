@@ -336,13 +336,14 @@ pub const SessionHeader = struct {
 
     /// The header for `session`: what it holds -- its mode, id, model, directory
     /// and size -- with the window `model_info` reports and the `home` a path is
-    /// shortened against, which the session keeps neither of. The model is the
-    /// choice it was made with, or empty for a session that recorded none.
+    /// shortened against, which the session keeps neither of. The model is the id
+    /// half of the choice it was made with, which is what the request names, or
+    /// empty for a session that recorded none; a page shows the same id.
     pub fn of(session: *const Session, model_info: ?models.Metadata, home: ?[]const u8) SessionHeader {
         return .{
             .mode = session.mode,
             .id = session.id(),
-            .model = session.model() orelse "",
+            .model = (models.Choice{ .text = session.model() orelse "" }).model(),
             .cwd = session.cwd(),
             .home = home,
             .context_tokens = session.context_tokens,
@@ -1704,11 +1705,12 @@ test "a header is built from a session" {
 
     // The mode, the id, the model and the directory all come from the session; only
     // the window it is measured against is passed in, since that is the model
-    // table's and not the session's.
+    // table's and not the session's. The model is the id half of the choice the
+    // session recorded, which is what a request names and what a page shows.
     var expected: std.Io.Writer.Allocating = .init(gpa);
     defer expected.deinit();
     try expected.writer.print(
-        "billy · chat · {s} · deepseek/deepseek-flash · /work · 100/128k (<1%)",
+        "billy · chat · {s} · deepseek-flash · /work · 100/128k (<1%)",
         .{session.id()},
     );
     try std.testing.expectEqualStrings(expected.written(), out.written());
