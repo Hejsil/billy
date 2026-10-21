@@ -1502,7 +1502,8 @@ test "a whole conversation is rendered, a tool call and a compaction included" {
 pub const Header = struct {
     /// The session being shown.
     id: []const u8,
-    /// The model the session runs.
+    /// The provider and model the session runs, as `<provider>/<model>`, the
+    /// same choice the terminal header shows.
     model: []const u8,
     /// The directory the session works in, shortened to `~` when it is inside
     /// `home`.
@@ -1555,7 +1556,7 @@ test "the header carries the model, the directory and the gauge" {
 
     try header(.{
         .id = "01HF7YAT000000000000000000",
-        .model = "deepseek-flash",
+        .model = "deepseek/deepseek-flash",
         .cwd = "/home/user/repo/billy",
         .home = "/home/user",
         .context_tokens = 16_000,
@@ -1570,7 +1571,7 @@ test "the header carries the model, the directory and the gauge" {
         "<div class=\"header\">" ++
             "<span class=\"id\">01HF7YAT000000000000000000</span>" ++
             "<span class=\"sep\">·</span>" ++
-            "<span class=\"model\">deepseek-flash</span>" ++
+            "<span class=\"model\">deepseek/deepseek-flash</span>" ++
             "<span class=\"sep\">·</span><span class=\"cwd\">~/repo/billy</span>" ++
             "<span class=\"sep\">·</span><span class=\"gauge\">16k/128k (12%)</span>" ++
             "</div>\n",

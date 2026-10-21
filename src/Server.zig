@@ -912,7 +912,7 @@ fn writeHeader(server: *const Server, session: *const Session, out: *std.Io.Writ
     const shown = Endpoints.sessionModel(server.config, session);
     try html.header(.{
         .id = session.id(),
-        .model = shown.id,
+        .model = shown.choice,
         .cwd = session.cwd(),
         .home = server.environ.get("HOME"),
         .context_tokens = session.context_tokens,
@@ -1249,6 +1249,9 @@ test "one session is opened as the page the frontend reads" {
     try std.testing.expectEqualStrings("HTTP/1.1 200 OK", opened.statusLine());
     // The three things the page reads: the header, the blocks, and the mode.
     try std.testing.expect(opened.contains("\"header\":"));
+    // The header names the model the session is sent to, provider and all, which
+    // is the same choice the terminal header shows.
+    try std.testing.expect(opened.contains("deepseek/deepseek-flash"));
     try std.testing.expect(opened.contains("\"blocks\":"));
     try std.testing.expect(opened.contains("\"mode\":"));
     // The conversation is in the blocks, as the page shows it.

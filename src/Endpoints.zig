@@ -191,11 +191,12 @@ pub fn behaviour(config: Config) agent.Behaviour {
     };
 }
 
-/// One model as a header shows it: the id a request names, and what is known
-/// about its window.
+/// One model as a header shows it: the provider and model a request names, and
+/// what is known about its window.
 pub const Model = struct {
-    /// The model id, which is the half of a choice after the provider.
-    id: []const u8,
+    /// The provider and model, as `<provider>/<model>`, which is the whole choice
+    /// a session records and what both headers show.
+    choice: []const u8,
     /// What is known about it: its window, for the gauge. Null for a model billy
     /// has no numbers for.
     info: ?models.Metadata,
@@ -207,11 +208,11 @@ pub const Model = struct {
 /// where it goes rather than where billy is pointed, and both frontends read it
 /// here so a page and a terminal agree.
 pub fn sessionModel(config: Config, session: *const Session) Model {
-    const choice = models.Choice{ .text = session.modelChoice(config.stored.model) };
-    const id = choice.model();
+    const choice = session.modelChoice(config.stored.model);
+    const halves = models.Choice{ .text = choice };
     return .{
-        .id = id,
-        .info = models.lookup(models.Provider.fromName(choice.provider()), id),
+        .choice = choice,
+        .info = models.lookup(models.Provider.fromName(halves.provider()), halves.model()),
     };
 }
 
@@ -503,9 +504,10 @@ test "a header names the model the session goes to, not the one billy is pointed
     defer session.deinit();
     try session.setModel("opencode_go/kimi-k2.7-code");
 
-    // The id is the half of its own choice, and the window the one of that model.
+    // The choice is the session's own, provider and all, and the window is that
+    // model's.
     const recorded = sessionModel(opened.config, &session);
-    try std.testing.expectEqualStrings("kimi-k2.7-code", recorded.id);
+    try std.testing.expectEqualStrings("opencode_go/kimi-k2.7-code", recorded.choice);
     try std.testing.expectEqual(@as(usize, 262_144), recorded.info.?.context_window);
     try std.testing.expectEqual(models.Provider.opencode_go, recorded.info.?.provider);
 
@@ -514,7 +516,7 @@ test "a header names the model the session goes to, not the one billy is pointed
     var older = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer older.deinit();
     const configured = sessionModel(opened.config, &older);
-    try std.testing.expectEqualStrings("deepseek-flash", configured.id);
+    try std.testing.expectEqualStrings("deepseek/deepseek-flash", configured.choice);
     try std.testing.expectEqual(@as(usize, 1_000_000), configured.info.?.context_window);
 }
 
