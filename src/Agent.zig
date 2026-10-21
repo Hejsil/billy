@@ -1,8 +1,10 @@
 //! The agent loop: read a request from the user, ask the model, run the tools
 //! it asks for, and repeat until it answers with text.
 const std = @import("std");
+const Config = @import("Config.zig");
+const Credentials = @import("Credentials.zig");
+const Endpoint = @import("Endpoint.zig");
 const llm = @import("llm.zig");
-const models = @import("models.zig");
 const Tools = @import("Tools.zig");
 const Mock = @import("Mock.zig");
 const LineEditor = @import("LineEditor.zig");
@@ -30,67 +32,23 @@ const Command = enum {
     }
 };
 
-/// Where a run's requests are sent, and how they are asked: everything a request
-/// needs of the provider and model, which the conversation does not carry.
-///
-/// One is resolved from the configured choice when a run starts, and another from
-/// the session's own model before every turn, so a session changed to another
-/// model is sent there -- and asked the way that provider takes -- from the next
-/// turn on.
-///
-/// It lives here rather than beside the module that resolves it, because that
-/// module imports this one; the two are kept apart by naming only what a request
-/// needs, which both can.
-pub const Target = struct {
-    /// Full URL of the chat completions endpoint under `base_url`.
-    url: []const u8,
-    api_key: []const u8,
-    /// The model id to send, which is the half of the choice after the provider.
-    model: []const u8,
-    /// The provider the endpoint belongs to, or null for one billy does not
-    /// know, such as a proxy. It is what the model's window is looked up by.
-    provider: ?models.Provider,
-    /// What the request asks of the model's thinking, settled against the
-    /// provider's own rules: only a provider that takes the fields is asked for
-    /// them, since one that does not may refuse a request carrying them.
-    reasoning: llm.Reasoning = .provider_default,
-};
+/// Where a request is sent, and how it is asked. Resolved from the session's own
+/// model just before each turn, so a session moved to another model is sent
+/// there, and asked that provider's way, from the next turn on.
+const Target = Endpoint.Target;
 
-/// Where a session's requests are sent, resolved from the model the session
-/// records now.
-///
-/// The agent asks before every turn, so a session whose model is changed is sent
-/// to its new provider from the next turn on. The frontend answers, because it is
-/// what holds the configuration and the credentials a target is resolved from;
-/// the agent knows only the session, and keeps where it points from turn to turn.
-pub const Resolver = struct {
-    context: *const anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        /// Where `session` is sent, with the strings the target names allocated
-        /// from `gpa`, which the caller owns and frees. It is asked before every
-        /// turn, so it must answer for the model the session records then; a
-        /// session that records none is given the configured choice to keep.
-        target: *const fn (context: *const anyopaque, gpa: std.mem.Allocator, session: *Session) anyerror!Target,
-    };
-
-    /// Where `session` is sent now.
-    pub fn target(resolver: Resolver, gpa: std.mem.Allocator, session: *Session) !Target {
-        return resolver.vtable.target(resolver.context, gpa, session);
-    }
-};
-
-/// What a run is given, in one value: where its requests go, how its agent
-/// behaves on it, what its tools run with, how its blocks are shown, the mode it
-/// starts in, and the home directory and instructions the run reads outside the
-/// session. Each part is resolved by the frontend, from the configuration, the
-/// credentials and the environment, so the agent is handed the run rather than
-/// the file it came from.
+/// What a run is given, in one value: what each turn's target is resolved from,
+/// how its agent behaves on it, what its tools run with, how its blocks are
+/// shown, the mode it starts in, and the home directory and instructions the run
+/// reads outside the session. Each part is resolved by the frontend, from the
+/// configuration, the credentials and the environment, so the agent is handed the
+/// run rather than the file it came from.
 pub const Options = struct {
-    /// Where the run starts pointed, resolved from the configured choice. A turn
-    /// goes there until `resolveTarget` finds where the session's own model lives.
-    target: Target,
+    /// The configuration a session's model is resolved with, and the keys stored
+    /// for the providers it names. Borrowed from the frontend, which owns both and
+    /// outlives the run: resolving a target needs nothing else.
+    config: *const Config,
+    store: *const Credentials,
     behaviour: Behaviour,
     tools: Tools.Settings,
     /// How the run's blocks are shown: the formatter scripts and the terminal's
@@ -106,10 +64,6 @@ pub const Options = struct {
     /// no such file. Borrowed from the frontend, which owns it and outlives the
     /// agent, so nothing here closes it.
     instructions: ?std.Io.Dir = null,
-    /// Where the session's own model is resolved into the endpoint it is sent to,
-    /// asked before every turn. Null keeps the run pointed at `endpoint`, which is
-    /// what a test that names no configuration wants.
-    resolver: ?Resolver = null,
 };
 
 /// How the agent behaves on a session: how many turns it gives the model before
@@ -360,20 +314,18 @@ pub const SessionHeader = struct {
     /// which has no gauge.
     context_window: ?usize = null,
 
-    /// The header for `session`: what it holds -- its mode, id, model, directory
-    /// and size -- with the window `model_info` reports and the `home` a path is
-    /// shortened against, which the session keeps neither of. The model is the
-    /// choice it was made with, as `<provider>/<model>`, or empty for a session
-    /// that recorded none; a page shows the same choice.
-    pub fn of(session: *const Session, model_info: ?models.Metadata, home: ?[]const u8) SessionHeader {
+    /// The header for `session`: what it holds -- its mode, id, directory and
+    /// size -- with the model it goes to and the window of that model, and the
+    /// `home` a path is shortened against, which the session keeps none of.
+    pub fn of(session: *const Session, model: Endpoint.Model, home: ?[]const u8) SessionHeader {
         return .{
             .mode = session.mode,
             .id = session.id(),
-            .model = session.model() orelse "",
+            .model = model.choice,
             .cwd = session.cwd(),
             .home = home,
             .context_tokens = session.context_tokens,
-            .context_window = if (model_info) |info| info.context_window else null,
+            .context_window = if (model.info) |info| info.context_window else null,
         };
     }
 
@@ -448,12 +400,15 @@ io: std.Io,
 gpa: std.mem.Allocator,
 /// How the agent behaves on the session, which is the configuration's say.
 behaviour: Behaviour,
-/// Where the current turn is sent, asked of the frontend before each turn so a
-/// session whose model changes is sent elsewhere from then on. Null keeps the
-/// client pointed at the endpoint the run was given.
-resolver: ?Resolver = null,
-/// Owns what the resolved target names -- the URL and model id of the endpoint
-/// the current turn is sent to -- and is emptied at the start of each turn.
+/// What a turn's target is resolved from: the providers the configuration names
+/// and the keys stored for them. Borrowed, and read before every turn.
+config: *const Config,
+store: *const Credentials,
+/// The HTTP client every request of the run is sent over, borrowed from the
+/// frontend that owns it, so connections and certificates are shared.
+http: *std.http.Client,
+/// Owns what the target of the current turn names -- the URL and model id of the
+/// endpoint it is sent to -- and is emptied when the next turn is resolved.
 target_state: std.heap.ArenaAllocator,
 /// Directory holding the user's own instructions file, read into every prompt
 /// ahead of the project's; null when there is no such file. Borrowed from the
@@ -463,19 +418,11 @@ instructions: ?std.Io.Dir = null,
 /// choice until the session's first prompt settles it and the session's own
 /// from then on. See `mode.zig`.
 mode: Mode = .general,
-/// The provider the session is sent to, or null for one billy does not know,
-/// such as a proxy. The model's window is looked up from it rather than kept
-/// beside it, since a copy would be a second thing to keep in step with the
-/// model id the client sends.
-provider: ?models.Provider = null,
 /// The directory the session works in. For a resumed session it is the one the
 /// session was started in.
 work_dir: std.Io.Dir,
 /// The tools, working in `work_dir`.
 tool_set: Tools,
-/// The model client: where the conversation is sent, and the key and model id
-/// it is sent with.
-client: llm.Client,
 
 /// Opens a session for asking things from `options`, working in `cwd` and
 /// sharing `http_client`.
@@ -504,22 +451,14 @@ pub fn init(
         .io = io,
         .gpa = gpa,
         .behaviour = options.behaviour,
-        .resolver = options.resolver,
+        .config = options.config,
+        .store = options.store,
+        .http = http_client,
         .target_state = std.heap.ArenaAllocator.init(gpa),
         .instructions = options.instructions,
         .mode = options.mode,
         .work_dir = work_dir,
         .tool_set = tool_set,
-        .client = .{
-            .gpa = gpa,
-            .io = io,
-            .api_key = options.target.api_key,
-            .url = options.target.url,
-            .model = options.target.model,
-            .http = http_client,
-            .reasoning = options.target.reasoning,
-        },
-        .provider = options.target.provider,
     };
 }
 
@@ -556,41 +495,43 @@ pub fn prepare(agent: *Agent, session: *Session) !void {
     try session.ensureTools(agent.tool_set.definitions(agent.mode));
 }
 
-/// Points the client at where `session` is sent now, which is resolved from the
-/// model it records at this moment.
+/// Where `session` is sent right now, resolved from the model it records at this
+/// moment: a turn is sent to the provider that model names, so a session moved to
+/// another model is sent there from the next turn on, with nothing else told.
 ///
-/// A turn calls it before it begins -- the terminal loop before the header above
-/// a prompt, `ask` before the prompt is added -- so a session whose model was
-/// changed is sent to its new provider from the next turn on, with no other
-/// telling. What the target names is owned by the agent and replaced by the next
-/// call, so a request made with it must be sent before then. A run with no
-/// resolver keeps the endpoint it was given, which is what a test wants.
-pub fn resolveTarget(agent: *Agent, session: *Session) !void {
-    const resolver = agent.resolver orelse return;
+/// A session that recorded no model yet is given the configured choice, and keeps
+/// it: where it was being sent anyway is where it goes from here on.
+///
+/// What the target names is owned by the agent and replaced when the next turn is
+/// resolved, so it must be used, and no more than one turn at a time may hold on
+/// to one.
+fn targetFor(agent: *Agent, session: *Session) !Target {
     _ = agent.target_state.reset(.retain_capacity);
-    agent.useTarget(try resolver.target(agent.target_state.allocator(), session));
+    const choice = session.modelChoice(agent.config.stored.model);
+    if (session.model() == null) try session.setModel(choice);
+    return Endpoint.targetFor(agent.config, agent.store, agent.target_state.allocator(), choice);
 }
 
-/// Points the client at the target, and records which provider answers it.
-fn useTarget(agent: *Agent, resolved: Target) void {
-    agent.client.url = resolved.url;
-    agent.client.api_key = resolved.api_key;
-    // The client's model is the id the header shows, so it is the resolved one
-    // rather than the configured choice: a session sent to its own provider
-    // would otherwise be headed with a model it is not asking.
-    agent.client.model = resolved.model;
-    // The thinking fields are the provider's own, so what is asked of them
-    // follows the provider a turn is sent to, not the one the run started on.
-    agent.client.reasoning = resolved.reasoning;
-    agent.provider = resolved.provider;
+/// The client one turn is sent with, built from where the session's model points
+/// now. A client is made per turn rather than kept, so that a model changed
+/// between turns is picked up by the next one without anything being updated.
+fn clientFor(agent: *Agent, session: *Session) !llm.Client {
+    const target = try agent.targetFor(session);
+    return .{
+        .gpa = agent.gpa,
+        .io = agent.io,
+        .api_key = target.api_key,
+        .url = target.url,
+        .model = target.model,
+        .http = agent.http,
+        .reasoning = target.reasoning,
+    };
 }
 
-/// What is known about the model the run is sent to: its window, for the header's
-/// gauge and the compaction threshold. Looked up from the provider and the model
-/// id the client sends, which are the run's own state, rather than kept as a copy
-/// that would have to be updated with them.
-fn modelInfo(agent: *const Agent) ?models.Metadata {
-    return models.lookup(agent.provider, agent.client.model);
+/// The model `session` goes to, as a header shows it: the choice it recorded, or
+/// the configured one for a session that recorded none.
+fn sessionModel(agent: *const Agent, session: *const Session) Endpoint.Model {
+    return Endpoint.modelOf(session.modelChoice(agent.config.stored.model));
 }
 
 /// What asking `agent` to start a session with a first prompt came to.
@@ -618,11 +559,16 @@ pub const Waiting = union(enum) {
 /// model, which is left to `ask`. A frontend need know nothing more of a line:
 /// commands, the first-prompt rules and compaction are all handled here.
 pub fn take(agent: *Agent, emitter: Emitter, session: *Session, line: []const u8) !Waiting {
+    // Compaction is a request of its own, made before the prompt is added, so the
+    // client for the model the session records now is made before the line is
+    // looked at.
+    var client = try agent.clientFor(session);
+
     // A command is run rather than asked.
     if (Command.of(line)) |cmd| {
         switch (cmd) {
             .compact => {
-                if (agent.compact(emitter, session, .now) != .done)
+                if (agent.compact(emitter, session, &client, .now) != .done)
                     try emitter.show(.{ .notice = "nothing to compact" });
             },
         }
@@ -631,7 +577,7 @@ pub fn take(agent: *Agent, emitter: Emitter, session: *Session, line: []const u8
 
     // Before the prompt is added, so the prompt is not folded into the summary
     // it triggers.
-    _ = agent.compact(emitter, session, .when_needed);
+    _ = agent.compact(emitter, session, &client, .when_needed);
 
     const started = try agent.start(session, line);
     return switch (started) {
@@ -664,10 +610,16 @@ const Compaction = enum { done, nothing, failed };
 /// `.when_needed` waits for the context to pass the threshold, so a long session
 /// goes on rather than failing on an overlong request; `.now` is for `/compact`. A
 /// failure is logged and the request goes out with the conversation as it is.
-fn compact(agent: *Agent, emitter: Emitter, session: *Session, when: enum { when_needed, now }) Compaction {
+fn compact(
+    agent: *Agent,
+    emitter: Emitter,
+    session: *Session,
+    client: *llm.Client,
+    when: enum { when_needed, now },
+) Compaction {
     const compacted = (switch (when) {
-        .when_needed => agent.maybeCompact(emitter, session),
-        .now => agent.fold(emitter, session),
+        .when_needed => agent.maybeCompact(emitter, session, client),
+        .now => agent.fold(emitter, session, client),
     }) catch |err| {
         std.log.warn("compaction failed: {s}", .{@errorName(err)});
         return .failed;
@@ -698,10 +650,10 @@ fn refresh(agent: *Agent, session: *Session) void {
 /// on from. Only a failure of the emitter itself, which is the frontend going
 /// away, is passed on to the caller.
 pub fn ask(agent: *Agent, emitter: Emitter, session: *Session, text: []const u8) !void {
-    // The turn is sent where the session's model points now, settled before the
-    // prompt is appended so the model it is sent to is recorded with the message
-    // that was sent with it.
-    try agent.resolveTarget(session);
+    // The client this turn is sent with is made here, from the model the session
+    // records now, so the model it goes to is recorded before the prompt is
+    // appended: the message and the provider it went to are written together.
+    var client = try agent.clientFor(session);
 
     // The system prompt is kept apart from the conversation, so the first turn is
     // the session's first message.
@@ -715,14 +667,14 @@ pub fn ask(agent: *Agent, emitter: Emitter, session: *Session, text: []const u8)
     // is visible in the conversation rather than only in a log. The turn is
     // given up rather than retried: what went wrong is the provider's or the
     // network's, and asking again is the user's decision.
-    turn(agent, emitter, session) catch |err| {
+    turn(agent, emitter, session, &client) catch |err| {
         std.log.err("a request failed: {s}", .{@errorName(err)});
         var notice: [256]u8 = undefined;
         return emitter.show(.{ .notice = failureNotice(&notice, err) });
     };
 
     if (first_turn and agent.behaviour.title) {
-        titleSession(agent, session) catch |err|
+        titleSession(agent, session, &client) catch |err|
             std.log.warn("could not title the session: {s}", .{@errorName(err)});
     }
 }
@@ -741,8 +693,8 @@ fn failureNotice(buffer: []u8, err: anyerror) []const u8 {
 
 /// Runs one session on the terminal, from `options`, until the input ends: each
 /// line is taken as the agent decides what it is, and the blocks of the answer
-/// are shown as they happen. Each turn is sent where the session's model points,
-/// which is resolved again every time round.
+/// are shown as they happen. Each turn is sent where the session's model points
+/// when it begins, which is resolved again for every one of them.
 pub fn run(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -779,19 +731,16 @@ pub fn run(
     var header: std.Io.Writer.Allocating = .init(gpa);
     defer header.deinit();
     while (true) {
-        // Where this turn is sent is settled before anything is shown, so the
-        // header gauges the model the session is headed with now -- which is a
-        // different one if a command changed it since the last turn -- and every
-        // block of the turn below goes there.
-        try agent.resolveTarget(session);
         header.clearRetainingCapacity();
         // The header is built each pass, so it shows the session as it stands: the
         // mode the first prompt may have set, the model it recorded, and the
         // directory, which is read from the session since its pool has grown with
-        // the turn and moved every string taken from it before.
+        // the turn and moved every string taken from it before. The gauge is the
+        // window of the model the session goes to now, so a model changed since
+        // the last turn reads right at once.
         try header.writer.print("{f}", .{SessionHeader.of(
             session,
-            agent.modelInfo(),
+            agent.sessionModel(session),
             options.home,
         )});
         const line = (try editor.readLine(header.written(), prompt)) orelse break;
@@ -992,7 +941,7 @@ fn showDeltaText(emitter: Emitter, delta: llm.Delta) !void {
 
 /// Runs the model until it replies with text instead of tool calls, showing what
 /// happens as blocks as it goes.
-fn turn(agent: *Agent, emitter: Emitter, session: *Session) !void {
+fn turn(agent: *Agent, emitter: Emitter, session: *Session, client: *llm.Client) !void {
     // Holds the parsed call of each tool call the model asks for, which is read
     // until that call has been run and shown. Reset per call, so a turn that
     // makes many calls holds only the one it is on.
@@ -1006,14 +955,14 @@ fn turn(agent: *Agent, emitter: Emitter, session: *Session) !void {
     var compact_failed = false;
     while (remaining > 0) : (remaining -= 1) {
         // A failure to compact is not the turn's, and is not retried within it.
-        if (!compact_failed) compact_failed = agent.compact(emitter, session, .when_needed) == .failed;
+        if (!compact_failed) compact_failed = agent.compact(emitter, session, client, .when_needed) == .failed;
 
         // The stream hands the reply over a delta at a time. It is added up here,
         // because the session keeps the whole message, and each delta is shown as
         // it arrives so a frontend that streams can show the answer while it is
         // written. Nothing of the conversation or the reply is copied on the way
         // to the wire: the request is written out of the session's pool.
-        var stream = try agent.client.complete(
+        var stream = try client.complete(
             agent.gpa,
             session.id(),
             session.conversation(&.{}),
@@ -1168,8 +1117,8 @@ const title_prompt =
 /// request shares the conversation's cache. A model that answers with nothing
 /// usable leaves the session as it is, so the title it already has (the one
 /// derived from the first prompt) stands.
-fn titleSession(agent: *Agent, session: *Session) !void {
-    const raw = try agent.askWith(session, title_prompt) orelse return;
+fn titleSession(agent: *Agent, session: *Session, client: *llm.Client) !void {
+    const raw = try agent.askWith(session, client, title_prompt) orelse return;
     defer agent.gpa.free(raw);
     const title = try cleanTitle(agent.gpa, raw) orelse return;
     defer agent.gpa.free(title);
@@ -1226,9 +1175,11 @@ const compact_prompt =
 /// The number of tokens the conversation may reach before it is compacted. Zero
 /// when compaction is off, or when the model's window is unknown and there is
 /// then no threshold to measure a conversation against.
-fn compactThreshold(agent: *const Agent) usize {
+fn compactThreshold(agent: *const Agent, session: *const Session) usize {
     if (agent.behaviour.compact_at == 0) return 0;
-    const info = agent.modelInfo() orelse return 0;
+    // The window is the one of the model the session goes to now, which is what
+    // the next request will be measured against.
+    const info = agent.sessionModel(session).info orelse return 0;
     return info.context_window * agent.behaviour.compact_at / 100;
 }
 
@@ -1239,14 +1190,14 @@ fn compactThreshold(agent: *const Agent) usize {
 /// This is the automatic compaction, which waits for the threshold; a caller
 /// that wants the conversation folded now, whatever it has grown to, asks for
 /// `compact` instead.
-fn maybeCompact(agent: *Agent, emitter: Emitter, session: *Session) !bool {
+fn maybeCompact(agent: *Agent, emitter: Emitter, session: *Session, client: *llm.Client) !bool {
     // Nothing is compacted for a model whose window is unknown, since there is
     // then no threshold to measure the conversation against; and a conversation
     // that has not reached it is left alone for the next request to fold, if it
     // ever does.
-    const threshold = agent.compactThreshold();
+    const threshold = agent.compactThreshold(session);
     if (threshold == 0 or session.context_tokens < threshold) return false;
-    return agent.fold(emitter, session);
+    return agent.fold(emitter, session, client);
 }
 
 /// Compacts the conversation into a summary now, whatever it has grown to, and
@@ -1260,14 +1211,14 @@ fn maybeCompact(agent: *Agent, emitter: Emitter, session: *Session) !bool {
 /// which is what would have happened without compaction at all. The caller
 /// refreshes the session's prompt and tools when it did compact, which is why
 /// the answer is reported rather than swallowed.
-fn fold(agent: *Agent, emitter: Emitter, session: *Session) !bool {
+fn fold(agent: *Agent, emitter: Emitter, session: *Session, client: *llm.Client) !bool {
     // Nothing has been added since the last compaction, so there is nothing new
     // to fold in: compacting again would only summarize the summary, and would
     // do so on every request.
     const sent_from = session.sentFrom();
     if (session.messages.items.len - sent_from <= 1) return false;
 
-    const summary = try agent.askWith(session, compact_prompt) orelse return false;
+    const summary = try agent.askWith(session, client, compact_prompt) orelse return false;
     defer agent.gpa.free(summary);
 
     // The conversation a request now carries is the summary and little else, so
@@ -1287,9 +1238,9 @@ fn fold(agent: *Agent, emitter: Emitter, session: *Session) !bool {
 /// reply, owned by the caller, or null when it has no text. The context gauge is
 /// not moved, since the conversation it was sent is not what the next request
 /// carries.
-fn askWith(agent: *Agent, session: *Session, question: []const u8) !?[]u8 {
+fn askWith(agent: *Agent, session: *Session, client: *llm.Client, question: []const u8) !?[]u8 {
     const extra = [_]llm.Message{.{ .role = .user, .content = question }};
-    var stream = try agent.client.complete(
+    var stream = try client.complete(
         agent.gpa,
         session.id(),
         session.conversation(&extra),
@@ -1600,19 +1551,25 @@ fn testAgentIn(
     return Agent.init(io, gpa, setup.options(), work_dir, http_client orelse &unused);
 }
 
-/// What a test builds an agent from: where its requests would be sent, the
-/// settings it runs with, the settings its tools run with, and the mode the
-/// frontend would have chosen.
+/// What a test builds an agent from: the configuration and the keys a turn's
+/// target is resolved from, and the settings the run reads.
 ///
-/// The URL is one nothing listens on until a test points it at a mock, so a
-/// request made where a test expected none fails it rather than passing. Neither
-/// the endpoint nor the settings say anything about the model, so the header is
-/// just the model and the directory; a test that needs a gauge names a model
-/// billy knows. No home directory either, which only the header used and now
-/// takes as a value of its own. Blocks are shown plainly, since a test reads the
-/// text rather than a terminal's decoration.
+/// The configuration names two providers, `test` and `other`, and stores a key for
+/// each. Both sit at a closed port until a test points one at the server it is
+/// listening on, so a request that went somewhere a test did not mean it to fails
+/// rather than passing. The configured model is `test/<model>`, which is where a
+/// session that recorded none is sent.
+///
+/// The configuration and the keys live in the arena, so a copy of this value still
+/// points at them: the run borrows them and outlives the value it was built from.
 const TestSetup = struct {
-    target: Target,
+    arena: std.heap.ArenaAllocator,
+    config: *Config,
+    store: *Credentials,
+    /// The provider entries the configuration names, which a test points at its
+    /// servers.
+    entries: []Config.Providers.Entry,
+    /// How the agent behaves, which a test sets only what it is about.
     behaviour: Behaviour = .{ .max_turns = 10 },
     tools: Tools.Settings = .{ .bash_timeout_s = 120 },
     /// The mode the run starts in, which is what a frontend passes before the
@@ -1620,54 +1577,64 @@ const TestSetup = struct {
     mode: Mode = .general,
     home: ?[]const u8 = null,
     instructions: ?std.Io.Dir = null,
-    resolver: ?Resolver = null,
 
-    /// A setup for `model`, which is the one thing every test names, since it is
-    /// what the session records and the header shows.
-    fn init(model: []const u8) TestSetup {
-        return .{ .target = .{ .url = "u", .api_key = "k", .model = model, .provider = null } };
+    /// A setup whose configured model is `test/<model>`, which is the one thing
+    /// every test names, since it is what the session records and the header
+    /// shows. A test that needs a gauge names a model billy knows.
+    fn init(gpa: std.mem.Allocator, model: []const u8) !TestSetup {
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const store = try arena.create(Credentials);
+        store.* = .{};
+        try store.put(arena, "test", "k");
+        try store.put(arena, "other", "k");
+
+        const config = try arena.create(Config);
+        config.* = Config.init(gpa);
+        errdefer config.deinit();
+        config.stored.model = try std.fmt.allocPrint(arena, "test/{s}", .{model});
+        // A closed port, so a request that went somewhere a test did not mean it
+        // to fails rather than waiting for an answer that never comes.
+        const entries = try arena.dupe(Config.Providers.Entry, &.{
+            .{ .name = "test", .base_url = "http://127.0.0.1:1" },
+            .{ .name = "other", .base_url = "http://127.0.0.1:1" },
+        });
+        config.stored.providers = .{ .entries = entries };
+
+        return .{
+            .arena = arena_state,
+            .config = config,
+            .store = store,
+            .entries = entries,
+        };
+    }
+
+    fn deinit(setup: *TestSetup) void {
+        setup.config.deinit();
+        setup.arena.deinit();
+    }
+
+    /// Points the provider `name` at `url`, which a test does once the server it
+    /// listens on is up.
+    fn pointAt(setup: *TestSetup, name: []const u8, url: []const u8) void {
+        for (setup.entries) |*entry| {
+            if (std.mem.eql(u8, entry.name, name)) entry.base_url = url;
+        }
     }
 
     /// The run a test's agent is built from.
     fn options(setup: TestSetup) Options {
         return .{
-            .target = setup.target,
+            .config = setup.config,
+            .store = setup.store,
             .behaviour = setup.behaviour,
             .tools = setup.tools,
             .mode = setup.mode,
             .home = setup.home,
             .instructions = setup.instructions,
-            .resolver = setup.resolver,
         };
-    }
-};
-
-/// A resolver for a test: the server a session is sent to follows the model it
-/// records, from a table the test fills in. A frontend's resolver does the same
-/// from the configuration and the credentials, which an agent is never given.
-const TestResolver = struct {
-    /// One entry per model the test knows: the whole choice, and the URL of the
-    /// server that answers it.
-    entries: []const struct { choice: []const u8, url: []const u8 },
-
-    fn target(context: *const anyopaque, gpa: std.mem.Allocator, session: *Session) anyerror!Target {
-        _ = gpa;
-        const self: *const TestResolver = @ptrCast(@alignCast(context));
-        const choice = models.Choice{ .text = session.model() orelse "" };
-        for (self.entries) |entry| {
-            if (!std.mem.eql(u8, entry.choice, choice.text)) continue;
-            return .{
-                .url = entry.url,
-                .api_key = "k",
-                .model = choice.model(),
-                .provider = models.Provider.fromName(choice.provider()),
-            };
-        }
-        return error.UnknownProvider;
-    }
-
-    fn of(self: *const TestResolver) Resolver {
-        return .{ .context = self, .vtable = &.{ .target = target } };
     }
 };
 
@@ -1784,8 +1751,11 @@ test "a header is built from a session" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    const info: models.Metadata = .{ .provider = .deepseek, .context_window = 128_000 };
-    try out.writer.print("{f}", .{SessionHeader.of(&session, info, null)});
+    const model: Endpoint.Model = .{
+        .choice = "deepseek/deepseek-flash",
+        .info = .{ .provider = .deepseek, .context_window = 128_000 },
+    };
+    try out.writer.print("{f}", .{SessionHeader.of(&session, model, null)});
 
     // The mode, the id, the model and the directory all come from the session; only
     // the window it is measured against is passed in, since that is the model
@@ -2070,29 +2040,39 @@ test "the compaction threshold is the configured share of the window, or off" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+
     // A model without a known window has nothing to measure a conversation
     // against, so there is no threshold even with compaction on.
-    var unknown = try testAgent(io, gpa, TestSetup.init("m"), null);
+    var unknown_setup = try TestSetup.init(gpa, "m");
+    defer unknown_setup.deinit();
+    var unknown = try testAgent(io, gpa, unknown_setup, null);
     defer unknown.deinit();
-    try std.testing.expectEqual(0, unknown.compactThreshold());
+    try session.setModel("test/m");
+    try std.testing.expectEqual(0, unknown.compactThreshold(&session));
 
-    // A model billy knows is measured against the window of the provider it is
-    // sent to.
-    var agent = try testAgent(io, gpa, TestSetup.init("deepseek-flash"), null);
+    // A model billy knows is measured against the window it is sent with.
+    var setup = try TestSetup.init(gpa, "deepseek-flash");
+    defer setup.deinit();
+    var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
+    try session.setModel("test/deepseek-flash");
 
     // The default is a share of the window, not the whole of it.
-    try std.testing.expectEqual(800_000, agent.compactThreshold());
+    try std.testing.expectEqual(800_000, agent.compactThreshold(&session));
 
     // Zero turns it off.
     agent.behaviour.compact_at = 0;
-    try std.testing.expectEqual(0, agent.compactThreshold());
+    try std.testing.expectEqual(0, agent.compactThreshold(&session));
 
     // Any share the file names, whether or not it divides the window evenly.
     agent.behaviour.compact_at = 50;
-    try std.testing.expectEqual(500_000, agent.compactThreshold());
+    try std.testing.expectEqual(500_000, agent.compactThreshold(&session));
     agent.behaviour.compact_at = 33;
-    try std.testing.expectEqual(330_000, agent.compactThreshold());
+    try std.testing.expectEqual(330_000, agent.compactThreshold(&session));
 }
 
 test "maybeCompact folds the conversation once it has filled the window" {
@@ -2113,7 +2093,8 @@ test "maybeCompact folds the conversation once it has filled the window" {
     try session.append(.{ .role = .tool, .tool_call_id = "call_x", .content = "OLDTOOLOUTPUT" });
     try session.append(.{ .role = .assistant, .content = "OLDANSWER" });
 
-    var setup = TestSetup.init("deepseek-flash");
+    var setup = try TestSetup.init(gpa, "deepseek-flash");
+    defer setup.deinit();
     setup.behaviour.compact_at = 80;
     // A conversation that has filled the window past the threshold.
     session.context_tokens = 900_000;
@@ -2126,8 +2107,7 @@ test "maybeCompact folds the conversation once it has filled the window" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    setup.target.url = mock.url;
-    setup.target.api_key = "k";
+    setup.pointAt("test", mock.url);
 
     var agent = try testAgent(io, gpa, setup, &http_client);
     defer agent.deinit();
@@ -2135,7 +2115,8 @@ test "maybeCompact folds the conversation once it has filled the window" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var terminal = testTerminal(&out.writer, .{});
-    try std.testing.expect(try agent.maybeCompact(terminal.emitter(), &session));
+    var client = try agent.clientFor(&session);
+    try std.testing.expect(try agent.maybeCompact(terminal.emitter(), &session, &client));
 
     try mock.group.await(io);
     if (mock.err) |err| return err;
@@ -2180,11 +2161,11 @@ test "maybeCompact does nothing below the threshold, off, or with nothing new" {
     try session.setSystemPrompt("s");
     try session.append(.{ .role = .user, .content = "hello" });
 
-    var setup = TestSetup.init("deepseek-flash");
+    var setup = try TestSetup.init(gpa, "deepseek-flash");
+    defer setup.deinit();
 
     // Nothing is listening on this address, so a request made where the function
     // should have returned first would fail the test rather than pass it.
-    setup.target.url = "http://127.0.0.1:1/chat/completions";
 
     var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
@@ -2193,21 +2174,25 @@ test "maybeCompact does nothing below the threshold, off, or with nothing new" {
     defer out.deinit();
     var terminal = testTerminal(&out.writer, .{});
     const emitter = terminal.emitter();
+    var client = try agent.clientFor(&session);
 
     // Below the threshold.
     session.context_tokens = 100;
-    try std.testing.expect(!try agent.maybeCompact(emitter, &session));
+    try std.testing.expect(!try agent.maybeCompact(emitter, &session, &client));
     // Turned off.
     session.context_tokens = 999_900;
     agent.behaviour.compact_at = 0;
-    try std.testing.expect(!try agent.maybeCompact(emitter, &session));
+    try std.testing.expect(!try agent.maybeCompact(emitter, &session, &client));
 
     // A model with no known window has no threshold to measure against, which is
     // a run of its own: the window follows the model it is sent to.
-    var unknown = try testAgent(io, gpa, TestSetup.init("m"), null);
+    var unknown_setup = try TestSetup.init(gpa, "m");
+    defer unknown_setup.deinit();
+    var unknown = try testAgent(io, gpa, unknown_setup, null);
     defer unknown.deinit();
     session.context_tokens = 999_900;
-    try std.testing.expect(!try unknown.maybeCompact(emitter, &session));
+    var unknown_client = try unknown.clientFor(&session);
+    try std.testing.expect(!try unknown.maybeCompact(emitter, &session, &unknown_client));
 
     // Nothing was added, and nothing was printed.
     try std.testing.expectEqual(1, session.messages.items.len);
@@ -2227,7 +2212,8 @@ test "a compaction asked for now folds the conversation in whatever its size" {
     try session.append(.{ .role = .user, .content = "hello" });
     try session.append(.{ .role = .assistant, .content = "hi" });
 
-    var setup = TestSetup.init("m");
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
     // Compaction is off, so only a manual one runs.
     setup.behaviour.compact_at = 0;
 
@@ -2237,8 +2223,7 @@ test "a compaction asked for now folds the conversation in whatever its size" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    setup.target.url = mock.url;
-    setup.target.api_key = "k";
+    setup.pointAt("test", mock.url);
 
     var agent = try testAgent(io, gpa, setup, &http_client);
     defer agent.deinit();
@@ -2248,7 +2233,8 @@ test "a compaction asked for now folds the conversation in whatever its size" {
     var terminal = testTerminal(&out.writer, .{});
     // Asked for now, so the threshold and the setting are ignored: the
     // conversation is folded whatever size it has grown to.
-    try std.testing.expect(try agent.fold(terminal.emitter(), &session));
+    var client = try agent.clientFor(&session);
+    try std.testing.expect(try agent.fold(terminal.emitter(), &session, &client));
     try mock.group.await(io);
     if (mock.err) |err| return err;
 
@@ -2259,7 +2245,7 @@ test "a compaction asked for now folds the conversation in whatever its size" {
     // Asking again does nothing: the summary is the last message, so there is
     // nothing new to fold in, and a request would only re-summarize it.
     out.clearRetainingCapacity();
-    try std.testing.expect(!try agent.fold(terminal.emitter(), &session));
+    try std.testing.expect(!try agent.fold(terminal.emitter(), &session, &client));
     try std.testing.expectEqualStrings("", out.written());
 }
 
@@ -2286,21 +2272,22 @@ test "maybeCompact does not compact a summary that stands alone" {
     try session.setSystemPrompt("s");
     try session.appendCompaction("p", "a summary");
 
-    var setup = TestSetup.init("deepseek-flash");
+    var setup = try TestSetup.init(gpa, "deepseek-flash");
+    defer setup.deinit();
 
     // Over the threshold, but the last message is the summary itself, so there is
     // nothing new to fold in and a request would only re-summarize it.
     session.context_tokens = 900_000;
     // Nothing is listening there, so a request made where this should have
     // returned first would fail the test.
-    setup.target.url = "http://127.0.0.1:1/chat/completions";
     var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var terminal = testTerminal(&out.writer, .{});
-    try std.testing.expect(!try agent.maybeCompact(terminal.emitter(), &session));
+    var client = try agent.clientFor(&session);
+    try std.testing.expect(!try agent.maybeCompact(terminal.emitter(), &session, &client));
 
     try std.testing.expectEqual(2, session.messages.items.len);
     try std.testing.expectEqualStrings("", out.written());
@@ -2341,7 +2328,9 @@ test "refreshLead replaces the prompt, the project instructions and the tools" {
     // them. No client is given, since this reads no model.
     const work_dir = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(work_dir);
-    var agent = try testAgentIn(io, gpa, TestSetup.init("m"), work_dir, null);
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
+    var agent = try testAgentIn(io, gpa, setup, work_dir, null);
     defer agent.deinit();
 
     try refreshLead(&agent, .general, &new_tools, &session);
@@ -2383,7 +2372,8 @@ test "prepare gives a fresh session the user's instructions from the configurati
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
 
-    var setup = TestSetup.init("m");
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
     setup.instructions = config_dir.dir;
     // `Agent.init` opens the directory it works in, so it has to be one that
     // exists; the session's recorded directory is separate.
@@ -2413,7 +2403,8 @@ test "prepare gives a chat session no prompt and only the tools it allows" {
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
 
-    var setup = TestSetup.init("m");
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
     setup.mode = .chat;
     setup.instructions = config_dir.dir;
     var agent = try testAgent(io, gpa, setup, null);
@@ -2444,7 +2435,9 @@ test "a first prompt names the mode and says what to ask" {
     // asked as it was typed.
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
-    var agent = try testAgent(io, gpa, TestSetup.init("m"), null);
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
+    var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
 
     const plain = try agent.start(&session, "do the thing");
@@ -2472,7 +2465,9 @@ test "a first prompt that names only a mode asks nothing" {
 
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
-    var agent = try testAgent(io, gpa, TestSetup.init("m"), null);
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
+    var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
 
     // `/chat` on its own opens that mode: the session is set up and ready, and
@@ -2493,7 +2488,9 @@ test "a prompt after the first leaves the session as it was set up" {
 
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
-    var agent = try testAgent(io, gpa, TestSetup.init("m"), null);
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
+    var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
 
     _ = try agent.start(&session, "the first thing");
@@ -2676,14 +2673,15 @@ test "a turn shows the tool it runs and then the answer" {
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    var setup = TestSetup.init("m");
-    setup.target.url = mock.url;
-    setup.target.api_key = "k";
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
+    setup.pointAt("test", mock.url);
     var agent = try testAgent(io, gpa, setup, &http_client);
     defer agent.deinit();
 
     var recorder = Recorder{ .gpa = arena_state.allocator() };
-    try turn(&agent, recorder.emitter(), &session);
+    var client = try agent.clientFor(&session);
+    try turn(&agent, recorder.emitter(), &session, &client);
 
     try mock.group.await(io);
     if (mock.err) |err| return err;
@@ -2752,11 +2750,11 @@ test "the first turn names the session, and the naming is not part of it" {
     defer mock.deinit();
     try mock.serve();
 
-    var setup = TestSetup.init("m");
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
     setup.behaviour.title = true;
-    // The agent builds the model client from the endpoint, so it carries the
-    // address of the mock.
-    setup.target.url = mock.url;
+    // The session is sent where its model's provider points, which is the mock.
+    setup.pointAt("test", mock.url);
     // `Agent.init` opens the directory it works in, so it has to be one that
     // exists; the session's recorded directory is separate and stays "/work".
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
@@ -2837,14 +2835,14 @@ test "a turn is sent to the model the session records when it begins" {
     defer opencode.deinit();
     try opencode.serve();
 
-    var resolver = TestResolver{ .entries = &.{
-        .{ .choice = "deepseek/deepseek-flash", .url = deepseek.url },
-        .{ .choice = "opencode_go/kimi-k2.7-code", .url = opencode.url },
-    } };
-    var setup = TestSetup.init("m");
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
     // Naming the session is a request of its own, which is not what this is about.
     setup.behaviour.title = false;
-    setup.resolver = resolver.of();
+    // Each provider of the configuration is pointed at a server of its own, so a
+    // turn sent to the wrong one fails the test rather than passing.
+    setup.pointAt("test", deepseek.url);
+    setup.pointAt("other", opencode.url);
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
@@ -2861,12 +2859,12 @@ test "a turn is sent to the model the session records when it begins" {
     var terminal = testTerminal(&out.writer, .{});
 
     // The session runs on one model, and the turn goes to that model's server.
-    try session.setModel("deepseek/deepseek-flash");
+    try session.setModel("test/deepseek/deepseek-flash");
     try agent.ask(terminal.emitter(), &session, "the first question");
 
     // The model is changed to one of another provider between turns, and the
     // next turn goes there, with nothing else told to the agent.
-    try session.setModel("opencode_go/kimi-k2.7-code");
+    try session.setModel("other/kimi-k2.7-code");
     try agent.ask(terminal.emitter(), &session, "the second question");
 
     try deepseek.group.await(io);
@@ -2893,14 +2891,14 @@ test "a session is sent where the choice it recorded points, not the configurati
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    // The resolver a frontend would give the run: where a model lives, which the
-    // session's own record chooses between.
-    var resolver = TestResolver{ .entries = &.{
-        .{ .choice = "opencode_go/kimi-k2.7-code", .url = chosen.url },
-    } };
-    var setup = TestSetup.init("m");
-    setup.target.url = "http://127.0.0.1:1/chat/completions";
-    setup.resolver = resolver.of();
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
+    // Only the provider the session records is pointed at a server; the one the
+    // configuration names is left at a closed port, so a turn that went there
+    // would fail rather than answer. Naming the session is a request of its own,
+    // which is not what this is about.
+    setup.behaviour.title = false;
+    setup.pointAt("other", chosen.url);
     var agent = try testAgent(io, gpa, setup, &http_client);
     defer agent.deinit();
 
@@ -2909,31 +2907,18 @@ test "a session is sent where the choice it recorded points, not the configurati
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
 
-    // The session records a model of its own, and the resolver answers with where
-    // that model lives.
-    try session.setModel("opencode_go/kimi-k2.7-code");
-    try agent.resolveTarget(&session);
+    // The session records a model of another provider, and the turn goes there.
+    try session.setModel("other/kimi-k2.7-code");
 
-    // The client was pointed at the endpoint the session named rather than the
-    // configured one, the model id it was given is sent, and the header reads
-    // the window of that model.
-    try std.testing.expectEqualStrings(chosen.url, agent.client.url);
-    try std.testing.expect(!std.mem.eql(u8, setup.target.url, agent.client.url));
-    try std.testing.expectEqualStrings("kimi-k2.7-code", agent.client.model);
-    // The window is the one of the model the session named rather than of the
-    // configured one, which billy knows nothing of.
-    try std.testing.expectEqual(@as(usize, 262_144), agent.modelInfo().?.context_window);
-    try std.testing.expectEqual(models.Provider.opencode_go, agent.modelInfo().?.provider);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var terminal = testTerminal(&out.writer, .{});
+    try agent.ask(terminal.emitter(), &session, "a question");
 
-    // And the request goes there rather than to the configured endpoint, which
-    // nothing is listening on.
-    var stream = try agent.client.complete(gpa, "01SESSION", session.conversation(&.{}), session.toolSet());
-    defer stream.deinit();
-    var reply: llm.Reply = .{ .gpa = gpa };
-    defer reply.deinit();
-    try reply.collect(stream);
     try chosen.group.await(io);
     if (chosen.err) |err| return err;
     try std.testing.expectEqual(@as(usize, 1), chosen.served);
-    try std.testing.expectEqualStrings("chosen", reply.content.items);
+    // The model it was sent is the one the session recorded, not the configured
+    // one, which names a model of the provider nothing is listening on.
+    try std.testing.expect(std.mem.indexOf(u8, chosen.bodies.items[0], "\"model\":\"kimi-k2.7-code\"") != null);
 }

@@ -84,10 +84,8 @@ health: *Health,
 /// directory shown in the header, and what the model is told about itself.
 cwd: []const u8,
 environ: *const std.process.Environ.Map,
-/// Where the configuration sends its requests, and the backends its web tools
-/// ask, resolved before anything was served so a key that is missing is
-/// reported then rather than on the first thing asked.
-endpoint: Endpoints.Endpoint,
+/// The backends its web tools ask, resolved before anything was served so a key
+/// that is missing is reported then rather than on the first thing asked.
 backends: Endpoints.Backends,
 
 /// What a turn is given, resolved the same way a terminal run's is and laid out
@@ -96,28 +94,18 @@ backends: Endpoints.Backends,
 fn options(server: *const Server, mode: Agent.Mode) Agent.Options {
     const display = Endpoints.display(server.config, .plain);
     return .{
-        .target = Endpoints.configuredTarget(server.config, server.endpoint),
+        .config = &server.config,
+        .store = &server.store,
         .behaviour = Endpoints.behaviour(server.config),
         .tools = Endpoints.toolSettings(server.config, server.backends, server.health, display),
         .display = display,
         .mode = mode,
-        // Where each turn is sent, resolved from the model the session records
-        // when the turn begins: a session changed to another model is sent to its
-        // new provider from the next turn on.
-        .resolver = .{ .context = server, .vtable = &.{ .target = resolveTarget } },
         .home = server.environ.get("HOME"),
         // The user's own instructions live beside the configuration, and join
         // every session's prompt. The server owns the directory and outlives
         // every turn.
         .instructions = server.config_dir,
     };
-}
-
-/// Where a session's requests go, for a turn to ask before it begins: the
-/// endpoint its recorded model names, with the key stored for that provider.
-fn resolveTarget(context: *const anyopaque, gpa: std.mem.Allocator, session: *Session) anyerror!Agent.Target {
-    const server: *const Server = @ptrCast(@alignCast(context));
-    return Endpoints.sessionTarget(server.config, &server.store, gpa, session);
 }
 
 /// Serves the frontend on the address `host` at `port`, until the process is
@@ -839,11 +827,6 @@ fn serveTurn(
     const gpa = r.server.gpa;
     var agent = try Agent.init(r.server.io, gpa, run_options, session.cwd(), http_client);
     defer agent.deinit();
-    // Where the turn is sent is resolved from the session's own model before
-    // anything else, so a compaction this prompt triggers is measured against the
-    // window of the model it is going to. It is sent where its own recorded
-    // provider lives, which may not be where the server is configured.
-    try agent.resolveTarget(session);
     // The session is prepared from the mode the caller settled, which is the
     // session's own once it has been asked something.
     try agent.prepare(session);
@@ -1073,13 +1056,6 @@ const TestServer = struct {
                 .health = health,
                 .cwd = ".",
                 .environ = environ,
-                .endpoint = .{
-                    .base_url = "https://api.deepseek.com",
-                    .url = "https://api.deepseek.com/chat/completions",
-                    .api_key = "k",
-                    .model = "m",
-                    .provider = .deepseek,
-                },
                 .backends = .{ .search = null, .fetch = null },
             },
         };

@@ -1,40 +1,24 @@
-//! The endpoints billy talks to: the model endpoint its requests are sent to,
-//! which follows from the provider and model the configuration names, and the
-//! backends its web tools ask.
+//! What a run is given, resolved from the configuration and the credentials: the
+//! backends its web tools ask, how its agent behaves, what its tools run with,
+//! how its blocks are shown, and the model a header names.
 //!
-//! What a run is otherwise given, beyond its conversation, is resolved here too,
-//! since it follows from the same two things: the settings the agent reads while
-//! it runs, what its tools run with, and how its blocks are shown.
+//! Where a request is actually sent -- the provider and model resolved into a URL
+//! and a key -- is `Endpoint`, which the agent resolves for itself before every
+//! turn. What is here is the rest of what a frontend hands a run before it starts.
 //!
-//! All of it is built from the configuration and the credentials, both of which
-//! are read in once and passed in. Nothing is held here, so a caller that has
-//! those two can build any of it where it is needed, and a session can be sent
-//! somewhere other than where the configuration points.
+//! Nothing is held here: every function takes the two it needs and returns a
+//! value, so either frontend can build any of it where it is needed.
 
 const std = @import("std");
 const agent = @import("Agent.zig");
 const Config = @import("Config.zig");
 const Credentials = @import("Credentials.zig");
+const Endpoint = @import("Endpoint.zig");
 const Health = @import("Health.zig");
-const llm = @import("llm.zig");
 const models = @import("models.zig");
 const Session = @import("Session.zig");
 const Terminal = @import("Terminal.zig");
 const tools = @import("Tools.zig");
-
-/// The model endpoint requests are sent to: where it is, what it is asked with,
-/// and which model it is asked for.
-pub const Endpoint = struct {
-    base_url: []const u8,
-    /// The full URL of the completions endpoint, built from `base_url`.
-    url: []const u8,
-    api_key: []const u8,
-    model: []const u8,
-    /// The provider the endpoint belongs to, or null for one billy does not
-    /// know, such as a proxy. It is what the model's window is looked up by, and
-    /// what decides whether the provider's own thinking fields are sent.
-    provider: ?models.Provider,
-};
 
 /// The backends billy's web tools ask, in the order they are tried. A tool whose
 /// backend is null is left out of the ones the model is offered.
@@ -63,93 +47,6 @@ pub const Backends = struct {
         return .{ .search = search_config, .fetch = fetch_config };
     }
 };
-
-/// Where the configuration sends its requests: the provider and model it names,
-/// resolved to an endpoint and the key stored for it.
-pub fn open(arena: std.mem.Allocator, config: Config, store: *const Credentials) !Endpoint {
-    const choice = config.stored.choice();
-    const name = providerName(choice.text);
-    const base_url = try resolveBaseUrl(config.stored.providers, choice.text);
-    const api_key = store.get(name) orelse return missingKey(name);
-
-    return .{
-        .base_url = base_url,
-        .api_key = api_key,
-        // Every provider billy knows takes the completions path under its base,
-        // so one is enough; a base that already carries it would double it, and
-        // none of them do.
-        .url = try completionsUrl(arena, base_url),
-        .model = choice.model(),
-        .provider = models.Provider.fromName(name),
-    };
-}
-
-/// Where `session` is sent, recording the configured choice on a session that
-/// has none.
-///
-/// A session keeps the choice it began with rather than following the
-/// configuration, because a conversation belongs to the model that produced it.
-/// One that recorded none was being sent wherever billy was pointed, so it takes
-/// the configured choice and keeps it from here on.
-pub fn sessionTarget(
-    config: Config,
-    store: *const Credentials,
-    arena: std.mem.Allocator,
-    session: *Session,
-) !agent.Target {
-    const choice = config.stored.model;
-    if (session.model() == null) try session.setModel(choice);
-    return targetFor(config, store, arena, session.modelChoice(choice));
-}
-
-/// Where `choice` is sent, which is the four things a request needs that follow
-/// from it rather than from the configured endpoint.
-fn targetFor(
-    config: Config,
-    store: *const Credentials,
-    arena: std.mem.Allocator,
-    choice: []const u8,
-) !agent.Target {
-    const name = providerName(choice);
-    // A session's own provider decides where it goes, resolved through the same
-    // table the configured one was: a provider the configuration defines, or one
-    // of billy's the file did not override.
-    const base_url = try resolveBaseUrl(config.stored.providers, choice);
-
-    // The model is copied out rather than sliced from `choice`: the choice a
-    // session passes is a slice of its own string pool, and a pointer into that
-    // pool survives no write to it, so the next intern would leave the target
-    // naming freed bytes. The URL is allocated here for the same reason.
-    const model = try arena.dupe(u8, (models.Choice{ .text = choice }).model());
-    return .{
-        .url = try completionsUrl(arena, base_url),
-        .api_key = store.get(name) orelse return missingKey(name),
-        .model = model,
-        // Which provider answers, which is what the agent looks the model's
-        // window up by. Null for a proxy, which leaves the model to be found
-        // among the providers billy ships.
-        .provider = models.Provider.fromName(name),
-        // What the request asks of the thinking follows the provider it is sent
-        // to: a session moved to another provider is asked the way that one takes.
-        .reasoning = reasoningFor(config, models.Provider.fromName(name)),
-    };
-}
-
-/// Where a run starts pointed, as the agent takes it: the endpoint the
-/// configuration resolved to, and which provider answers it, asked for the
-/// model's thinking as the configuration says and that provider allows.
-pub fn configuredTarget(config: Config, endpoint: Endpoint) agent.Target {
-    return .{
-        .url = endpoint.url,
-        .api_key = endpoint.api_key,
-        .model = endpoint.model,
-        // Which provider answers, so the window the header gauges against is the
-        // one of the model actually being sent. A provider billy does not know
-        // leaves the model to be found among the ones it ships.
-        .provider = endpoint.provider,
-        .reasoning = reasoningFor(config, endpoint.provider),
-    };
-}
 
 /// How a run's blocks are laid out and decorated: the formatter scripts the
 /// configuration names for a tool's block, and the style of the terminal that
@@ -186,29 +83,13 @@ pub fn behaviour(config: Config) agent.Behaviour {
     };
 }
 
-/// One model as a header shows it: the provider and model a request names, and
-/// what is known about its window.
-pub const Model = struct {
-    /// The provider and model, as `<provider>/<model>`, which is the whole choice
-    /// a session records and what both headers show.
-    choice: []const u8,
-    /// What is known about it: its window, for the gauge. Null for a model billy
-    /// has no numbers for.
-    info: ?models.Metadata,
-};
-
 /// The model a session is sent to, as the header above its conversation shows
 /// it: the choice it recorded, or the configured one for a session that recorded
 /// none. A session keeps the choice it was started with, so the header names
-/// where it goes rather than where billy is pointed, and both frontends read it
-/// here so a page and a terminal agree.
-pub fn sessionModel(config: Config, session: *const Session) Model {
-    const choice = session.modelChoice(config.stored.model);
-    const halves = models.Choice{ .text = choice };
-    return .{
-        .choice = choice,
-        .info = models.lookup(models.Provider.fromName(halves.provider()), halves.model()),
-    };
+/// where it goes rather than where billy is pointed. The terminal's header is
+/// built from the same `Endpoint.modelOf`, so a page and a terminal agree.
+pub fn sessionModel(config: Config, session: *const Session) Endpoint.Model {
+    return Endpoint.modelOf(session.modelChoice(config.stored.model));
 }
 
 /// How a run's tools are built: how their blocks are laid out, the limits they
@@ -238,68 +119,6 @@ pub fn toolSettings(
         .fetch = backends.fetch,
         .health = health,
     };
-}
-
-/// The full URL of the completions endpoint under `base_url`.
-fn completionsUrl(arena: std.mem.Allocator, base_url: []const u8) ![]u8 {
-    return std.fmt.allocPrint(arena, "{s}/chat/completions", .{
-        std.mem.trimEnd(u8, base_url, "/"),
-    });
-}
-
-/// The provider half of a choice: `deepseek` from `deepseek/deepseek-flash`.
-fn providerName(choice: []const u8) []const u8 {
-    return (models.Choice{ .text = choice }).provider();
-}
-
-/// Where the choice is sent: the base URL the configuration gives the provider,
-/// which may be one of its own or one of billy's the file overrides. Null when
-/// the configuration names neither, which the caller reports.
-fn baseUrlOf(providers: Config.Providers, choice: []const u8) ?[]const u8 {
-    const name = providerName(choice);
-    if (providers.get(name)) |base_url| return base_url;
-    const provider = models.Provider.fromName(name) orelse return null;
-    return models.Provider.baseUrl(provider);
-}
-
-/// The base URL a request is sent to, reporting a provider the configuration
-/// does not name before failing: the name came from a file the user wrote, so
-/// they are the one who can add it.
-fn resolveBaseUrl(providers: Config.Providers, choice: []const u8) error{UnknownProvider}![]const u8 {
-    return baseUrlOf(providers, choice) orelse {
-        std.log.err("'{s}' names no provider the configuration defines", .{choice});
-        return error.UnknownProvider;
-    };
-}
-
-/// Reports that no key is stored for the provider a request is sent to, naming
-/// the login that stores one. Fails the request rather than sending it without a
-/// key, which the provider would only refuse with less to go on.
-fn missingKey(name: []const u8) error{MissingApiKey} {
-    std.log.err("no key stored for '{s}'; run `billy login {s}` to store one", .{ name, name });
-    return error.MissingApiKey;
-}
-
-/// What a request sent to `provider` asks of the model's thinking: the
-/// configuration's say, for a provider that takes the fields. One that does not
-/// is left on whatever it does by itself, since a request carrying fields an
-/// endpoint does not expect may be refused.
-fn reasoningFor(config: Config, provider: ?models.Provider) llm.Reasoning {
-    const known = provider orelse return .provider_default;
-    if (!known.takesThinking()) return .provider_default;
-    return reasoningOf(config.stored.reasoning);
-}
-
-/// What the configuration's `reasoning` asks of the model's thinking: `off` for
-/// none, `default` to leave it to the model's provider, and any other name as an
-/// effort level of the provider's own. A level billy does not know is passed on
-/// rather than refused, since the levels are the provider's to name, and one
-/// that is not a level at all comes back as the provider's own refusal rather
-/// than as a wait that was never set.
-fn reasoningOf(setting: []const u8) llm.Reasoning {
-    if (std.mem.eql(u8, setting, "off")) return .off;
-    if (std.mem.eql(u8, setting, "default")) return .provider_default;
-    return .{ .effort = setting };
 }
 
 /// The web search settings for a configuration that names a backend, or null
@@ -491,39 +310,6 @@ test "a fetch backend is asked for its key, and raw for none" {
     try std.testing.expect((try fetchConfig(arena, &store, none, &failed)) == null);
 }
 
-test "a session moved to a provider that takes no thinking fields is asked for none" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    // The configuration asks for a high effort, which only a provider that takes
-    // the thinking fields can be asked for.
-    var config = Config.init(gpa);
-    defer config.deinit();
-    config.stored.reasoning = "high";
-    var store: Credentials = .{};
-    try store.put(arena, "deepseek", "k");
-    try store.put(arena, "opencode_go", "k");
-
-    var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
-    defer session.deinit();
-
-    // Sent to a provider that takes them, the effort the file names is asked for.
-    try session.setModel("deepseek/deepseek-flash");
-    const taking = try sessionTarget(config, &store, arena, &session);
-    try std.testing.expectEqualStrings("high", taking.reasoning.effort);
-
-    // Moved to one that does not, the next turn asks nothing of them: what is
-    // asked follows the provider the turn is sent to, not the one it started on.
-    try session.setModel("opencode_go/kimi-k2.7-code");
-    const plain = try sessionTarget(config, &store, arena, &session);
-    try std.testing.expectEqual(llm.Reasoning.provider_default, plain.reasoning);
-}
-
 test "a header names the model the session goes to, not the one billy is pointed at" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -581,10 +367,11 @@ test "a target names bytes of its own, not a slice of the session's pool" {
     var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
 
-    const target = try sessionTarget(opened.config, &store, arena, &session);
-    // A session that recorded none is given the configured choice, so every turn
-    // after this one is sent there.
-    try std.testing.expectEqualStrings("opencode_go/glm-5.3-flash", session.modelChoice(""));
+    // The choice a session that recorded none is given is the configured one, so
+    // that is what it is sent to.
+    const choice = session.modelChoice(opened.config.stored.model);
+    try std.testing.expectEqualStrings("opencode_go/glm-5.3-flash", choice);
+    const target = try Endpoint.targetFor(&opened.config, &store, arena, choice);
     // The model the session recorded is interned in its string pool, and a
     // pointer into that pool survives no write to it. Writing more strings, as
     // a turn does when it stores a message, must not leave the target naming
@@ -598,121 +385,4 @@ test "a target names bytes of its own, not a slice of the session's pool" {
     }
     try std.testing.expectEqualStrings("glm-5.3-flash", target.model);
     try std.testing.expectEqualStrings("https://opencode.ai/zen/go/v1/chat/completions", target.url);
-}
-
-test "the endpoint comes from the provider the choice names" {
-    const none: Config.Providers = .{};
-
-    // A provider billy ships decides its own endpoint, so a configured
-    // `opencode_go/glm-5.3-flash` reaches Go with no URL written anywhere.
-    try std.testing.expectEqualStrings(
-        "https://api.deepseek.com",
-        baseUrlOf(none, "deepseek/deepseek-flash").?,
-    );
-    try std.testing.expectEqualStrings(
-        "https://opencode.ai/zen/go/v1",
-        baseUrlOf(none, "opencode_go/glm-5.3-flash").?,
-    );
-
-    // One the configuration defines does the same, which is how a proxy, a
-    // server of the user's own, or a stand-in a test points a run at is reached.
-    const defined: Config.Providers = .{ .entries = &.{
-        .{ .name = "mock", .base_url = "http://127.0.0.1:8901/v1" },
-    } };
-    try std.testing.expectEqualStrings("http://127.0.0.1:8901/v1", baseUrlOf(defined, "mock/m").?);
-
-    // A name the configuration gives to one of billy's own overrides what billy
-    // would have used, so a proxy in front of a known provider is reachable.
-    const overriding: Config.Providers = .{ .entries = &.{
-        .{ .name = "deepseek", .base_url = "http://127.0.0.1:9/v1" },
-    } };
-    try std.testing.expectEqualStrings(
-        "http://127.0.0.1:9/v1",
-        baseUrlOf(overriding, "deepseek/deepseek-flash").?,
-    );
-}
-
-test "a provider the configuration does not name is refused, not defaulted" {
-    const none: Config.Providers = .{};
-    // A typo would otherwise send the conversation to whichever endpoint billy
-    // fell back on, which is worse than failing: the request would go somewhere
-    // the user did not name.
-    try std.testing.expect(baseUrlOf(none, "who-knows/m") == null);
-    try std.testing.expect(baseUrlOf(none, "m") == null);
-    try std.testing.expect(baseUrlOf(none, "/m") == null);
-
-    // Once the configuration defines the name, the same choice resolves, which
-    // is what makes a proxy or a server of the user's own reachable.
-    const defined: Config.Providers = .{ .entries = &.{
-        .{ .name = "who-knows", .base_url = "http://127.0.0.1:8901/v1" },
-    } };
-    try std.testing.expectEqualStrings("http://127.0.0.1:8901/v1", baseUrlOf(defined, "who-knows/m").?);
-}
-
-test "the completions path is appended once, whatever the base carries" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    try std.testing.expectEqualStrings(
-        "https://api.deepseek.com/chat/completions",
-        try completionsUrl(arena, "https://api.deepseek.com"),
-    );
-    // A base written with a trailing slash does not double it.
-    try std.testing.expectEqualStrings(
-        "https://api.deepseek.com/chat/completions",
-        try completionsUrl(arena, "https://api.deepseek.com/"),
-    );
-    try std.testing.expectEqualStrings(
-        "http://127.0.0.1:8901/v1/chat/completions",
-        try completionsUrl(arena, "http://127.0.0.1:8901/v1"),
-    );
-}
-
-test "the reasoning setting names what billy asks of the model's thinking" {
-    // The two names billy knows, and any other name as an effort level of the
-    // provider's own, which is passed on rather than refused.
-    try std.testing.expectEqual(llm.Reasoning.off, reasoningOf("off"));
-    try std.testing.expectEqual(llm.Reasoning.provider_default, reasoningOf("default"));
-    try std.testing.expectEqualStrings("high", reasoningOf("high").effort);
-    try std.testing.expectEqualStrings("low", reasoningOf("low").effort);
-}
-
-test "a run's target carries its address and provider, and only the thinking it takes" {
-    const gpa = std.testing.allocator;
-    var config = Config.init(gpa);
-    defer config.deinit();
-    config.stored.reasoning = "high";
-
-    const endpoint: Endpoint = .{
-        .base_url = "https://api.deepseek.com",
-        .url = "https://api.deepseek.com/chat/completions",
-        .api_key = "k",
-        .model = "deepseek-flash",
-        .provider = .deepseek,
-    };
-
-    // Where the request goes, and which provider answers it, are taken as they
-    // were resolved; a provider that takes the thinking fields is asked for what
-    // the configuration says.
-    const asked = configuredTarget(config, endpoint);
-    try std.testing.expectEqualStrings(endpoint.url, asked.url);
-    try std.testing.expectEqualStrings("k", asked.api_key);
-    try std.testing.expectEqualStrings("deepseek-flash", asked.model);
-    try std.testing.expectEqual(models.Provider.deepseek, asked.provider.?);
-    try std.testing.expectEqualStrings("high", asked.reasoning.effort);
-
-    // A provider that does not take them is left on whatever it does by itself:
-    // a request carrying fields an endpoint does not expect may be refused.
-    var untaken = endpoint;
-    untaken.provider = .opencode_go;
-    try std.testing.expectEqual(llm.Reasoning.provider_default, configuredTarget(config, untaken).reasoning);
-
-    // An endpoint billy knows no provider of keeps that unknown, so the agent
-    // finds the model it names among the ones billy ships.
-    var unknown = endpoint;
-    unknown.provider = null;
-    const unattributed = configuredTarget(config, unknown);
-    try std.testing.expectEqual(llm.Reasoning.provider_default, unattributed.reasoning);
-    try std.testing.expect(unattributed.provider == null);
 }

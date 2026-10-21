@@ -11,6 +11,7 @@ const agent = @import("Agent.zig");
 const Config = @import("Config.zig");
 const Credentials = @import("Credentials.zig");
 const Dirs = @import("Dirs.zig");
+const Endpoint = @import("Endpoint.zig");
 const Endpoints = @import("Endpoints.zig");
 const Health = @import("Health.zig");
 const Session = @import("Session.zig");
@@ -202,27 +203,29 @@ pub fn run(billy: *Billy, out: *std.Io.Writer, resume_id: ?[]const u8) !void {
     };
     defer session.deinit();
 
-    // What the run is built from lives for as long as it does: the endpoint and
-    // the backends are all that a request needs of the configuration, and nothing
-    // outside the run holds them. Each turn's own target is resolved by the agent,
-    // from the model the session records when that turn begins.
+    // What the run is built from lives for as long as it does: the web backends
+    // are all that a request needs beyond the configuration and the credentials,
+    // which the run borrows and resolves each turn's provider from itself.
     var run_state = std.heap.ArenaAllocator.init(billy.gpa);
     defer run_state.deinit();
     const arena = run_state.allocator();
 
-    // Where the configuration sends its requests. Each turn is resolved from the
-    // session's own model instead, which the run asks for by `resolveTarget`.
-    const endpoint = try Endpoints.open(arena, billy.config, &billy.credentials);
+    // The configured choice is resolved once here only to report a provider or a
+    // key that is missing before the run starts: each turn resolves its own target
+    // from the model the session records when it begins.
+    _ = try Endpoint.configured(&billy.config, &billy.credentials, arena);
+
     // The terminal lays its blocks out for the terminal it is on, which the
     // escape codes of a pipe or a redirection would only be noise in.
     const display = Endpoints.display(billy.config, Terminal.Style.detect(billy.io, .stdout()));
 
-    // What the run is given, resolved once for the whole of it: where its
-    // requests go, how far it goes, what its tools run with, how its blocks are
-    // shown, and the home directory and instructions it reads outside the
+    // What the run is given, resolved once for the whole of it: what its targets
+    // are resolved from, how far it goes, what its tools run with, how its blocks
+    // are shown, and the home directory and instructions it reads outside the
     // session.
     const options = agent.Options{
-        .target = Endpoints.configuredTarget(billy.config, endpoint),
+        .config = &billy.config,
+        .store = &billy.credentials,
         .behaviour = Endpoints.behaviour(billy.config),
         .tools = Endpoints.toolSettings(
             billy.config,
@@ -235,10 +238,6 @@ pub fn run(billy: *Billy, out: *std.Io.Writer, resume_id: ?[]const u8) !void {
         // The user's own instructions live beside the configuration, and join
         // every session's prompt. Billy owns the directory and outlives the run.
         .instructions = billy.dirs.config,
-        // Where each turn is sent, resolved from the model the session records
-        // when the turn begins: a session changed to another model is sent to its
-        // new provider from the next turn on.
-        .resolver = .{ .context = billy, .vtable = &.{ .target = resolveTarget } },
     };
 
     if (resume_id != null) {
@@ -255,13 +254,6 @@ pub fn run(billy: *Billy, out: *std.Io.Writer, resume_id: ?[]const u8) !void {
         );
     }
     try agent.run(billy.io, billy.gpa, out, options, &session);
-}
-
-/// Where a session's requests go, for the run to ask before every turn: the
-/// endpoint its recorded model names, with the key stored for that provider.
-fn resolveTarget(context: *const anyopaque, gpa: std.mem.Allocator, session: *Session) anyerror!agent.Target {
-    const billy: *const Billy = @ptrCast(@alignCast(context));
-    return Endpoints.sessionTarget(billy.config, &billy.credentials, gpa, session);
 }
 
 /// Lists the sessions billy has kept, the one written to most recently first,
@@ -297,14 +289,17 @@ fn printSessions(out: *std.Io.Writer, listed: []const Session.Named) !void {
 /// Runs billy as a server with a web frontend, on `host` at `port`, until the
 /// process is stopped.
 pub fn serve(billy: *Billy, host: []const u8, port: u16) !void {
-    // The endpoint and the backends are resolved before anything is served,
-    // since a server that cannot send a request has nothing to do: a key that is
-    // missing is reported here rather than on the first thing asked of it.
+    // What a request is sent to, and the backends it asks, are resolved before
+    // anything is served, since a server that cannot send a request has nothing
+    // to do: a key that is missing is reported here rather than on the first thing
+    // asked of it.
     var server_state = std.heap.ArenaAllocator.init(billy.gpa);
     defer server_state.deinit();
     const arena = server_state.allocator();
 
-    const endpoint = try Endpoints.open(arena, billy.config, &billy.credentials);
+    // The configured choice is resolved once here only to report a provider or a
+    // key that is missing: each turn resolves its own target when it begins.
+    _ = try Endpoint.configured(&billy.config, &billy.credentials, arena);
 
     const server = Server{
         .io = billy.io,
@@ -316,7 +311,6 @@ pub fn serve(billy: *Billy, host: []const u8, port: u16) !void {
         .health = &billy.health,
         .cwd = billy.cwd,
         .environ = billy.environ,
-        .endpoint = endpoint,
         .backends = try Endpoints.Backends.build(arena, billy.config, &billy.credentials),
     };
     return server.serve(host, port);
