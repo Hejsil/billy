@@ -62,8 +62,8 @@ pub const Endpoint = struct {
     reasoning: llm.Reasoning = .provider_default,
 };
 
-/// What a run is given, in one value: where its requests go, how far the agent
-/// goes on it, what its tools run with, how its blocks are shown, the mode it
+/// What a run is given, in one value: where its requests go, how its agent
+/// behaves on it, what its tools run with, how its blocks are shown, the mode it
 /// starts in, and the home directory and instructions the run reads outside the
 /// session. Each part is resolved by the frontend, from the configuration, the
 /// credentials and the environment, so the agent is handed the run rather than
@@ -71,7 +71,7 @@ pub const Endpoint = struct {
 pub const Options = struct {
     /// Where the run's requests are sent, and which provider answers them.
     endpoint: Endpoint,
-    limits: Limits,
+    behaviour: Behaviour,
     tools: Tools.Settings,
     /// How the run's blocks are shown: the formatter scripts and the terminal's
     /// style. A page lays its own blocks out, so it sets this plainly.
@@ -88,10 +88,10 @@ pub const Options = struct {
     instructions: ?std.Io.Dir = null,
 };
 
-/// How far the agent goes on a session: how many turns it gives the model before
+/// How the agent behaves on a session: how many turns it gives the model before
 /// giving up, how full the window may get before the conversation is folded into
 /// a summary, and whether it asks the model for a name for the session.
-pub const Limits = struct {
+pub const Behaviour = struct {
     /// Model turns allowed for one request before the harness gives up on it.
     max_turns: usize,
     /// How full the context window must be, as a whole percentage, before the
@@ -420,8 +420,8 @@ pub fn displayPath(out: *std.Io.Writer, cwd: []const u8, home: ?[]const u8) !voi
 /// client is the run's own, so every request shares its connections.
 io: std.Io,
 gpa: std.mem.Allocator,
-/// How far the agent goes on the session, which is the configuration's say.
-limits: Limits,
+/// How the agent behaves on the session, which is the configuration's say.
+behaviour: Behaviour,
 /// Directory holding the user's own instructions file, read into every prompt
 /// ahead of the project's; null when there is no such file. Borrowed from the
 /// frontend, which owns it and outlives the agent.
@@ -470,7 +470,7 @@ pub fn init(
     return .{
         .io = io,
         .gpa = gpa,
-        .limits = options.limits,
+        .behaviour = options.behaviour,
         .instructions = options.instructions,
         .mode = options.mode,
         .work_dir = work_dir,
@@ -672,7 +672,7 @@ pub fn ask(agent: *Agent, emitter: Emitter, session: *Session, text: []const u8)
         return emitter.show(.{ .notice = failureNotice(&notice, err) });
     };
 
-    if (first_turn and agent.limits.title) {
+    if (first_turn and agent.behaviour.title) {
         titleSession(agent, session) catch |err|
             std.log.warn("could not title the session: {s}", .{@errorName(err)});
     }
@@ -946,7 +946,7 @@ fn turn(agent: *Agent, emitter: Emitter, session: *Session) !void {
     var scratch_state = std.heap.ArenaAllocator.init(agent.tool_set.gpa);
     defer scratch_state.deinit();
 
-    var remaining: usize = agent.limits.max_turns;
+    var remaining: usize = agent.behaviour.max_turns;
     // A compaction that failed is not tried again within the same turn, so a
     // provider that will not summarize cannot turn every request of a long turn
     // into a second failed one. The next turn tries afresh.
@@ -991,7 +991,7 @@ fn turn(agent: *Agent, emitter: Emitter, session: *Session) !void {
     const stopped = std.fmt.bufPrint(
         &buffer,
         "stopped after {d} turns without a final answer",
-        .{agent.limits.max_turns},
+        .{agent.behaviour.max_turns},
     ) catch "stopped without a final answer";
     try emitter.show(.{ .notice = stopped });
 }
@@ -1174,9 +1174,9 @@ const compact_prompt =
 /// when compaction is off, or when the model's window is unknown and there is
 /// then no threshold to measure a conversation against.
 fn compactThreshold(agent: *const Agent) usize {
-    if (agent.limits.compact_at == 0) return 0;
+    if (agent.behaviour.compact_at == 0) return 0;
     const info = agent.modelInfo() orelse return 0;
-    return info.context_window * agent.limits.compact_at / 100;
+    return info.context_window * agent.behaviour.compact_at / 100;
 }
 
 /// Compacts the conversation into a summary when it has filled the context
@@ -1560,7 +1560,7 @@ fn testAgentIn(
 /// text rather than a terminal's decoration.
 const TestSetup = struct {
     target: Target,
-    limits: Limits = .{ .max_turns = 10 },
+    behaviour: Behaviour = .{ .max_turns = 10 },
     tools: Tools.Settings = .{ .bash_timeout_s = 120 },
     /// The mode the run starts in, which is what a frontend passes before the
     /// session's first prompt settles it.
@@ -1578,7 +1578,7 @@ const TestSetup = struct {
     fn options(setup: TestSetup) Options {
         return .{
             .endpoint = .{ .target = setup.target },
-            .limits = setup.limits,
+            .behaviour = setup.behaviour,
             .tools = setup.tools,
             .mode = setup.mode,
             .home = setup.home,
@@ -2001,13 +2001,13 @@ test "the compaction threshold is the configured share of the window, or off" {
     try std.testing.expectEqual(800_000, agent.compactThreshold());
 
     // Zero turns it off.
-    agent.limits.compact_at = 0;
+    agent.behaviour.compact_at = 0;
     try std.testing.expectEqual(0, agent.compactThreshold());
 
     // Any share the file names, whether or not it divides the window evenly.
-    agent.limits.compact_at = 50;
+    agent.behaviour.compact_at = 50;
     try std.testing.expectEqual(500_000, agent.compactThreshold());
-    agent.limits.compact_at = 33;
+    agent.behaviour.compact_at = 33;
     try std.testing.expectEqual(330_000, agent.compactThreshold());
 }
 
@@ -2030,7 +2030,7 @@ test "maybeCompact folds the conversation once it has filled the window" {
     try session.append(.{ .role = .assistant, .content = "OLDANSWER" });
 
     var setup = TestSetup.init("deepseek-flash");
-    setup.limits.compact_at = 80;
+    setup.behaviour.compact_at = 80;
     // A conversation that has filled the window past the threshold.
     session.context_tokens = 900_000;
 
@@ -2115,7 +2115,7 @@ test "maybeCompact does nothing below the threshold, off, or with nothing new" {
     try std.testing.expect(!try agent.maybeCompact(emitter, &session));
     // Turned off.
     session.context_tokens = 999_900;
-    agent.limits.compact_at = 0;
+    agent.behaviour.compact_at = 0;
     try std.testing.expect(!try agent.maybeCompact(emitter, &session));
 
     // A model with no known window has no threshold to measure against, which is
@@ -2145,7 +2145,7 @@ test "a compaction asked for now folds the conversation in whatever its size" {
 
     var setup = TestSetup.init("m");
     // Compaction is off, so only a manual one runs.
-    setup.limits.compact_at = 0;
+    setup.behaviour.compact_at = 0;
 
     var mock = try Mock.start("/chat/completions", 1, Mock.completion("the summary"));
     defer mock.deinit();
@@ -2669,7 +2669,7 @@ test "the first turn names the session, and the naming is not part of it" {
     try mock.serve();
 
     var setup = TestSetup.init("m");
-    setup.limits.title = true;
+    setup.behaviour.title = true;
     // The agent builds the model client from the endpoint, so it carries the
     // address of the mock.
     setup.target.url = mock.url;

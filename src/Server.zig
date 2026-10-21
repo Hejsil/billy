@@ -97,7 +97,7 @@ fn options(server: *const Server, mode: Agent.Mode) Agent.Options {
     const display = Endpoints.display(server.config, .plain);
     return .{
         .endpoint = Endpoints.agentEndpoint(server.config, server.endpoint),
-        .limits = Endpoints.limits(server.config),
+        .behaviour = Endpoints.behaviour(server.config),
         .tools = Endpoints.toolSettings(server.config, server.backends, server.health, display),
         .display = display,
         .mode = mode,

@@ -222,7 +222,7 @@ pub fn run(billy: *Billy, out: *std.Io.Writer, resume_id: ?[]const u8) !void {
     // session.
     const options = agent.Options{
         .endpoint = Endpoints.agentEndpoint(billy.config, endpoint),
-        .limits = Endpoints.limits(billy.config),
+        .behaviour = Endpoints.behaviour(billy.config),
         .tools = Endpoints.toolSettings(
             billy.config,
             try Endpoints.Backends.build(arena, billy.config, &billy.credentials),

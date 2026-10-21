@@ -177,12 +177,12 @@ pub fn display(config: Config, style: Terminal.Style) Terminal.Display {
     };
 }
 
-/// How far a run's agent goes: the turns it gives the model, the share of the
+/// How a run's agent behaves: the turns it gives the model, the share of the
 /// window it fills before the conversation is folded into a summary, and whether
 /// it names the session. Where its requests go is resolved separately, as
 /// `agentEndpoint`, what its tools run with as `toolSettings`, and how its blocks
 /// are shown as `display`.
-pub fn limits(config: Config) agent.Limits {
+pub fn behaviour(config: Config) agent.Behaviour {
     const stored = &config.stored;
     return .{
         .max_turns = stored.max_turns,
