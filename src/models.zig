@@ -28,21 +28,6 @@ pub const Provider = enum {
         return std.meta.stringToEnum(Provider, text);
     }
 
-    /// Whether the provider takes the thinking fields billy sends for a
-    /// reasoning setting: the `thinking` toggle and `reasoning_effort`.
-    ///
-    /// These are one provider's own fields rather than part of the
-    /// OpenAI-compatible request, so an endpoint that does not know them refuses
-    /// the whole request. Sending them because the provider is merely *known*
-    /// would do that, which is what an endpoint serving several upstreams --
-    /// OpenCode Go among them -- answers with `unknown field "thinking"`.
-    pub fn takesThinking(provider: Provider) bool {
-        return switch (provider) {
-            .deepseek => true,
-            .opencode_go => false,
-        };
-    }
-
     /// Where the provider's API lives, as the base URL its completions path is
     /// appended to.
     pub fn baseUrl(provider: Provider) []const u8 {

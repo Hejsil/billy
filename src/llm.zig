@@ -33,11 +33,6 @@ pub const Message = struct {
     content: ?[]const u8 = null,
     tool_calls: ?[]const ToolCall = null,
     tool_call_id: ?[]const u8 = null,
-    /// What a reasoning model thought before it answered, which the API reports
-    /// beside `content`. A provider that wants it back on the next request is
-    /// sent it from here; a provider that does not, or does not have one, is
-    /// sent nothing, since the field is written only when it is set.
-    reasoning_content: ?[]const u8 = null,
 };
 
 pub const ToolCall = struct {
@@ -67,8 +62,6 @@ pub const Usage = struct {
 pub const Delta = struct {
     /// More of the reply's text.
     content: ?[]const u8 = null,
-    /// More of what the model thought before it answered.
-    reasoning: ?[]const u8 = null,
     /// Pieces of the tool calls the reply asks for. The first piece of a call
     /// carries its id and name, and the arguments follow a fragment at a time.
     tool_calls: []const ToolCallDelta = &.{},
@@ -83,21 +76,6 @@ pub const ToolCallDelta = struct {
     name: ?[]const u8 = null,
     arguments: ?[]const u8 = null,
 };
-
-/// What a request asks of a provider's thinking, for a model that has it.
-/// Thinking is a provider's own default and most providers have none, so a
-/// provider nothing is asked of is left to do whatever it does.
-pub const Reasoning = union(enum) {
-    /// Say nothing, which leaves the model on its provider's own default.
-    provider_default,
-    /// Ask for no thinking.
-    off,
-    /// Ask for a level of thinking, by the name the provider gives it.
-    effort: []const u8,
-};
-
-/// The thinking toggle, in the shape the API takes it: `{"type": "..."}`.
-pub const Thinking = struct { type: []const u8 };
 
 /// `stream_options`: what a streamed reply should carry beside the deltas. The
 /// usage count is only sent when it is asked for, and without it the context
@@ -122,21 +100,6 @@ fn Request(comptime Messages: type, comptime Tools: type) type {
         /// Ask for a usage count in the stream, which a provider sends only when
         /// asked for.
         stream_options: StreamOptions = .{},
-        /// The thinking toggle. Null sends none, which is what leaves the model
-        /// on its own default.
-        thinking: ?Thinking = null,
-        /// How hard the model should think, by the provider's own name for the
-        /// level. Null sends none.
-        reasoning_effort: ?[]const u8 = null,
-
-        /// The two thinking controls `reasoning` asks for.
-        fn controls(reasoning: Reasoning) struct { thinking: ?Thinking, reasoning_effort: ?[]const u8 } {
-            return switch (reasoning) {
-                .provider_default => .{ .thinking = null, .reasoning_effort = null },
-                .off => .{ .thinking = .{ .type = "disabled" }, .reasoning_effort = null },
-                .effort => |level| .{ .thinking = null, .reasoning_effort = level },
-            };
-        }
     };
 }
 
@@ -159,8 +122,6 @@ pub const Client = struct {
     /// request, chat and search alike, shares its connections and its scanned
     /// certificates. The run owns it and outlives this.
     http: *std.http.Client,
-    /// What the request asks of the model's thinking.
-    reasoning: Reasoning = .provider_default,
 
     /// Sends the conversation and returns the reply as it streams in. The caller
     /// keeps calling `Stream.next` until it returns null, adding the deltas up
@@ -194,13 +155,10 @@ pub const Client = struct {
         defer client.gpa.free(authorization);
 
         const Request_ = Request(@TypeOf(messages), @TypeOf(tools));
-        const controls = Request_.controls(client.reasoning);
         const request: Request_ = .{
             .model = client.model,
             .messages = messages,
             .tools = tools,
-            .thinking = controls.thinking,
-            .reasoning_effort = controls.reasoning_effort,
         };
 
         var attempt: usize = 0;
@@ -576,12 +534,8 @@ pub const Stream = struct {
                 .arguments = fragment.function.arguments,
             };
         }
-        const delta: Delta = .{
-            .content = piece.content,
-            .reasoning = piece.reasoning_content,
-            .tool_calls = calls,
-        };
-        if (delta.content == null and delta.reasoning == null and delta.tool_calls.len == 0) return null;
+        const delta: Delta = .{ .content = piece.content, .tool_calls = calls };
+        if (delta.content == null and delta.tool_calls.len == 0) return null;
         return delta;
     }
 };
@@ -591,9 +545,8 @@ pub const Stream = struct {
 /// `deinit`.
 pub const Reply = struct {
     gpa: std.mem.Allocator,
-    /// The answer, the model's thinking, and one set of pieces per tool call.
+    /// The answer, and one set of pieces per tool call.
     content: std.ArrayList(u8) = .empty,
-    reasoning: std.ArrayList(u8) = .empty,
     calls: std.ArrayList(Call) = .empty,
     tool_calls: std.ArrayList(ToolCall) = .empty,
 
@@ -611,7 +564,6 @@ pub const Reply = struct {
 
     pub fn deinit(self: *Reply) void {
         self.content.deinit(self.gpa);
-        self.reasoning.deinit(self.gpa);
         for (self.calls.items) |*call| call.deinit(self.gpa);
         self.calls.deinit(self.gpa);
         self.tool_calls.deinit(self.gpa);
@@ -625,7 +577,6 @@ pub const Reply = struct {
     /// Adds one delta of a streamed reply.
     pub fn add(self: *Reply, delta: Delta) !void {
         if (delta.content) |text| try self.content.appendSlice(self.gpa, text);
-        if (delta.reasoning) |text| try self.reasoning.appendSlice(self.gpa, text);
         for (delta.tool_calls) |fragment| try self.addCall(fragment);
     }
 
@@ -650,7 +601,6 @@ pub const Reply = struct {
         return .{
             .role = .assistant,
             .content = if (self.content.items.len > 0) self.content.items else null,
-            .reasoning_content = if (self.reasoning.items.len > 0) self.reasoning.items else null,
             .tool_calls = if (self.tool_calls.items.len > 0) self.tool_calls.items else null,
         };
     }
@@ -673,7 +623,6 @@ const Chunk = struct {
     const Choice = struct { delta: Piece = .{} };
     const Piece = struct {
         content: ?[]const u8 = null,
-        reasoning_content: ?[]const u8 = null,
         tool_calls: []const Call = &.{},
     };
     /// A piece of a tool call, in the shape the API nests it.
@@ -743,35 +692,6 @@ fn writeBody(writer: *std.Io.Writer, request: anytype) !void {
 /// Stands for the tools of a request that has none. The request is generic over
 /// the tools, so a test that sends none still names a type for them.
 const NoTools = struct {};
-
-test "what a request asks of the model's thinking, by setting" {
-    const gpa = std.testing.allocator;
-    const messages = [_]Message{.{ .role = .user, .content = "hi" }};
-
-    // The three shapes, and the field each puts on the wire: none at all for the
-    // model's own default, the toggle for no thinking, and the level for an
-    // effort the provider named. Never two of them, which would ask twice.
-    const cases = [_]struct { reasoning: Reasoning, has: []const u8, has_not: []const u8 }{
-        .{ .reasoning = .provider_default, .has = "", .has_not = "thinking" },
-        .{ .reasoning = .off, .has = "\"thinking\":{\"type\":\"disabled\"}", .has_not = "reasoning_effort" },
-        .{ .reasoning = .{ .effort = "high" }, .has = "\"reasoning_effort\":\"high\"", .has_not = "thinking" },
-    };
-    for (cases) |case| {
-        const Request_ = Request(@TypeOf(&messages), []const NoTools);
-        const controls = Request_.controls(case.reasoning);
-        const request: Request_ = .{
-            .model = "m",
-            .messages = &messages,
-            .tools = &.{},
-            .thinking = controls.thinking,
-            .reasoning_effort = controls.reasoning_effort,
-        };
-        const body = try std.json.Stringify.valueAlloc(gpa, request, .{ .emit_null_optional_fields = false });
-        defer gpa.free(body);
-        if (case.has.len > 0) try std.testing.expect(std.mem.indexOf(u8, body, case.has) != null);
-        try std.testing.expect(std.mem.indexOf(u8, body, case.has_not) == null);
-    }
-}
 
 test "a request counts out to exactly the body it writes" {
     const gpa = std.testing.allocator;
@@ -917,7 +837,6 @@ test "a streamed reply is read a delta at a time" {
         "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n" ++
             "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n" ++
             "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n" ++
-            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"a thought\"}}]}\n\n" ++
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n" ++
             "data: [DONE]\n\n",
@@ -947,7 +866,6 @@ test "a streamed reply is read a delta at a time" {
 
     // The caller adds the deltas up into the reply it keeps.
     try std.testing.expectEqualStrings("hello", collected.content.items);
-    try std.testing.expectEqualStrings("a thought", collected.reasoning.items);
     try std.testing.expectEqual(0, collected.calls.items.len);
     try std.testing.expectEqual(5, stream.usage().total_tokens);
 }

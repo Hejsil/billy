@@ -1,7 +1,6 @@
-//! Where a request is sent, and how it is asked: the provider and model a choice
-//! names, resolved into the URL of its completions endpoint, the key stored for
-//! it, what is known about its window, and what that provider takes of the
-//! model's thinking.
+//! Where a request is sent: the provider and model a choice names, resolved into
+//! the URL of its completions endpoint, the key stored for it, and what is known
+//! about its window.
 //!
 //! Everything here follows from the configuration and the credentials alone, so
 //! the agent can resolve a target itself, from the two it is given, at the moment
@@ -13,7 +12,6 @@
 const std = @import("std");
 const Config = @import("Config.zig");
 const Credentials = @import("Credentials.zig");
-const llm = @import("llm.zig");
 const models = @import("models.zig");
 
 /// Where a request is sent, and how it is asked: everything a request needs of
@@ -27,10 +25,6 @@ pub const Target = struct {
     /// The provider the endpoint belongs to, or null for one billy does not
     /// know, such as a proxy. It is what the model's window is looked up by.
     provider: ?models.Provider,
-    /// What the request asks of the model's thinking, settled against the
-    /// provider's own rules: only a provider that takes the fields is asked for
-    /// them, since one that does not may refuse a request carrying them.
-    reasoning: llm.Reasoning = .provider_default,
 };
 
 /// Where the configuration points: the target of the choice the file names.
@@ -70,9 +64,6 @@ pub fn targetFor(
         // by. Null for a proxy, which leaves the model to be found among the
         // providers billy ships.
         .provider = provider,
-        // What the request asks of the thinking follows the provider it is sent
-        // to: a session moved to another provider is asked the way that one takes.
-        .reasoning = reasoningFor(config, provider),
     };
 }
 
@@ -132,57 +123,29 @@ fn missingKey(name: []const u8) error{MissingApiKey} {
     return error.MissingApiKey;
 }
 
-/// What a request sent to `provider` asks of the model's thinking: the
-/// configuration's say, for a provider that takes the fields. One that does not
-/// is left on whatever it does by itself, since a request carrying fields an
-/// endpoint does not expect may be refused.
-fn reasoningFor(config: *const Config, provider: ?models.Provider) llm.Reasoning {
-    const known = provider orelse return .provider_default;
-    if (!known.takesThinking()) return .provider_default;
-    return reasoningOf(config.stored.reasoning);
-}
-
-/// What the configuration's `reasoning` asks of the model's thinking: `off` for
-/// none, `default` to leave it to the model's provider, and any other name as an
-/// effort level of the provider's own. A level billy does not know is passed on
-/// rather than refused, since the levels are the provider's to name, and one
-/// that is not a level at all comes back as the provider's own refusal rather
-/// than as a wait that was never set.
-fn reasoningOf(setting: []const u8) llm.Reasoning {
-    if (std.mem.eql(u8, setting, "off")) return .off;
-    if (std.mem.eql(u8, setting, "default")) return .provider_default;
-    return .{ .effort = setting };
-}
-
-test "a target names its provider's address and only the thinking it takes" {
+test "a target carries the address, the key and the model of the choice it names" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // The configuration asks for a high effort, which only a provider that takes
-    // the thinking fields can be asked for.
     var config = Config.init(gpa);
     defer config.deinit();
-    config.stored.reasoning = "high";
     var store: Credentials = .{};
     try store.put(arena, "deepseek", "k");
     try store.put(arena, "opencode_go", "k");
 
-    // Sent to a provider that takes them, the effort the file names is asked for.
-    const taking = try targetFor(&config, &store, arena, "deepseek/deepseek-flash");
-    try std.testing.expectEqualStrings("https://api.deepseek.com/chat/completions", taking.url);
-    try std.testing.expectEqualStrings("k", taking.api_key);
-    try std.testing.expectEqualStrings("deepseek-flash", taking.model);
-    try std.testing.expectEqual(models.Provider.deepseek, taking.provider.?);
-    try std.testing.expectEqualStrings("high", taking.reasoning.effort);
+    const flash = try targetFor(&config, &store, arena, "deepseek/deepseek-flash");
+    try std.testing.expectEqualStrings("https://api.deepseek.com/chat/completions", flash.url);
+    try std.testing.expectEqualStrings("k", flash.api_key);
+    try std.testing.expectEqualStrings("deepseek-flash", flash.model);
+    try std.testing.expectEqual(@as(?models.Provider, .deepseek), flash.provider);
 
-    // Sent to one that does not, the request asks nothing of them: what is asked
-    // follows the provider the request goes to, not the one it started on.
-    const plain = try targetFor(&config, &store, arena, "opencode_go/kimi-k2.7-code");
-    try std.testing.expectEqualStrings("https://opencode.ai/zen/go/v1/chat/completions", plain.url);
-    try std.testing.expectEqual(@as(?models.Provider, .opencode_go), plain.provider);
-    try std.testing.expectEqual(llm.Reasoning.provider_default, plain.reasoning);
+    // Another provider is another address, and the key stored for that one.
+    const kimi = try targetFor(&config, &store, arena, "opencode_go/kimi-k2.7-code");
+    try std.testing.expectEqualStrings("https://opencode.ai/zen/go/v1/chat/completions", kimi.url);
+    try std.testing.expectEqualStrings("kimi-k2.7-code", kimi.model);
+    try std.testing.expectEqual(@as(?models.Provider, .opencode_go), kimi.provider);
 }
 
 test "a target is resolved through a provider the configuration defines itself" {
@@ -206,7 +169,6 @@ test "a target is resolved through a provider the configuration defines itself" 
     try std.testing.expectEqualStrings("qwen3-coder:30b", target.model);
     // A provider billy knows nothing of is left to be found by its model's name.
     try std.testing.expect(target.provider == null);
-    try std.testing.expectEqual(llm.Reasoning.provider_default, target.reasoning);
 }
 
 test "a model as a header shows it carries the choice and the window of its model" {
@@ -292,15 +254,6 @@ test "the completions path is appended once, whatever the base carries" {
         "http://127.0.0.1:8901/v1/chat/completions",
         try completionsUrl(arena, "http://127.0.0.1:8901/v1"),
     );
-}
-
-test "the reasoning setting names what billy asks of the model's thinking" {
-    // The two names billy knows, and any other name as an effort level of the
-    // provider's own, which is passed on rather than refused.
-    try std.testing.expectEqual(llm.Reasoning.off, reasoningOf("off"));
-    try std.testing.expectEqual(llm.Reasoning.provider_default, reasoningOf("default"));
-    try std.testing.expectEqualStrings("high", reasoningOf("high").effort);
-    try std.testing.expectEqualStrings("low", reasoningOf("low").effort);
 }
 
 test "the configured choice is the target the configuration points at" {

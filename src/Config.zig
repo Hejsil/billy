@@ -146,15 +146,6 @@ const Stored = struct {
     /// first turn, so the web frontend can list it by name. Off asks for none,
     /// and a session is then listed by its id.
     title: bool = true,
-    /// What billy asks of the model's thinking: `off` asks for none, which is
-    /// the default because a model that can already do the work pays for
-    /// thinking it did not need; `default` asks for nothing at all, leaving the
-    /// model on whatever its provider does by itself; and any other name is an
-    /// effort level of the provider's own, such as `low` or `high`.
-    ///
-    /// Only the provider billy knows the model of is asked, since an endpoint
-    /// that does not know these fields may refuse the request.
-    reasoning: []const u8 = "off",
     tools: Tools = .{},
 
     const default = Stored{};
@@ -167,9 +158,6 @@ const Stored = struct {
         if (stored.version > Stored.default.version) return error.UnsupportedConfigVersion;
         if (stored.max_turns == 0) return error.InvalidConfig;
         if (stored.tools.bash.timeout_s == 0) return error.InvalidConfig;
-        // An empty name is neither of the two billy knows nor an effort level,
-        // and would be sent to the provider as one.
-        if (stored.reasoning.len == 0) return error.InvalidConfig;
         try stored.validateProviders();
         try stored.validateModel();
     }
@@ -656,7 +644,6 @@ test "the file is indented, so it can be read and edited by hand" {
         \\  "web_blocks": 200,
         \\  "compact_at": 80,
         \\  "title": true,
-        \\  "reasoning": "off",
         \\  "tools": {
         \\    "bash": {
         \\      "format": null,

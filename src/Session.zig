@@ -175,9 +175,6 @@ pub const Message = struct {
     role: llm.Role,
     content: StringIndex = .none,
     tool_call_id: StringIndex = .none,
-    /// What the model thought before this message, for a provider that reports
-    /// it and wants it sent back. `.none` for a model that reports none.
-    reasoning: StringIndex = .none,
     tool_calls: ToolCallIndex = .empty,
 
     /// The message as the API client takes it, with every string resolved out of
@@ -195,7 +192,6 @@ pub const Message = struct {
             .role = message.role,
             .content = session.pool.get(message.content),
             .tool_call_id = session.pool.get(message.tool_call_id),
-            .reasoning_content = session.pool.get(message.reasoning),
             .tool_calls = calls,
         };
     }
@@ -420,14 +416,6 @@ fn writeMessage(session: *const Session, json: anytype, message: Message) !void 
         try json.write(tool_call_id);
     }
 
-    // Sent back so a provider that concatenates its own reasoning into the
-    // context on the next request has it to send. Written last, after every
-    // other field, so a message that carries none is byte for byte the message
-    // it was before this field existed and a cached prefix still matches.
-    if (session.pool.get(message.reasoning)) |reasoning| {
-        try json.objectField("reasoning_content");
-        try json.write(reasoning);
-    }
     try json.endObject();
 }
 
@@ -610,7 +598,6 @@ fn appendMessage(session: *Session, message: llm.Message) !void {
         .role = message.role,
         .content = try session.pool.intern(session.gpa, message.content),
         .tool_call_id = try session.pool.intern(session.gpa, message.tool_call_id),
-        .reasoning = try session.pool.intern(session.gpa, message.reasoning_content),
         .tool_calls = interned_tool_calls,
     });
 }

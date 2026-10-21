@@ -135,12 +135,10 @@ pub const Block = union(enum) {
 /// A fragment of an answer as the model writes it, on its way to the `answer`
 /// block that carries the whole of it. A frontend that streams shows the
 /// fragments as they arrive; one that shows a reply whole ignores them and shows
-/// the block. At least one field is set.
+/// the block.
 pub const Delta = struct {
     /// More of the reply's text.
     content: ?[]const u8 = null,
-    /// More of what the model thought before it answered.
-    reasoning: ?[]const u8 = null,
 };
 
 /// Where a run's blocks go. The run says what happened and the emitter decides
@@ -524,7 +522,6 @@ fn clientFor(agent: *Agent, session: *Session) !llm.Client {
         .url = target.url,
         .model = target.model,
         .http = agent.http,
-        .reasoning = target.reasoning,
     };
 }
 
@@ -936,7 +933,6 @@ fn blocksIn(session: *const Session, messages: []const Session.Message, index: u
 /// shown: a call is shown whole when it has been parsed, just before it runs.
 fn showDeltaText(emitter: Emitter, delta: llm.Delta) !void {
     if (delta.content) |text| try emitter.showDelta(.{ .content = text });
-    if (delta.reasoning) |text| try emitter.showDelta(.{ .reasoning = text });
 }
 
 /// Runs the model until it replies with text instead of tool calls, showing what
@@ -2579,7 +2575,7 @@ const Recorder = struct {
         elided: usize,
     };
 
-    const Fragment = struct { reasoning: bool, text: []const u8 };
+    const Fragment = struct { text: []const u8 };
 
     fn emitter(self: *Recorder) Emitter {
         return .{ .context = self, .vtable = &.{ .block = show, .delta = showDelta } };
@@ -2608,11 +2604,6 @@ const Recorder = struct {
     fn showDelta(context: *anyopaque, delta: Delta) anyerror!void {
         const self = selfOf(context);
         if (delta.content) |text| try self.deltas.append(self.gpa, .{
-            .reasoning = false,
-            .text = try self.keeper(text),
-        });
-        if (delta.reasoning) |text| try self.deltas.append(self.gpa, .{
-            .reasoning = true,
             .text = try self.keeper(text),
         });
     }
@@ -2648,8 +2639,7 @@ test "a turn shows the tool it runs and then the answer" {
         fn answer(_: usize, body: []const u8) Mock.Answer {
             if (std.mem.indexOf(u8, body, "\"tool\"") != null) {
                 return .{
-                    .body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n" ++
-                        "data: {\"choices\":[{\"delta\":{\"content\":\"all \"}}]}\n\n" ++
+                    .body = "data: {\"choices\":[{\"delta\":{\"content\":\"all \"}}]}\n\n" ++
                         "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n" ++
                         "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":2,\"total_tokens\":22}}\n\n" ++
                         "data: [DONE]\n\n",
@@ -2697,12 +2687,9 @@ test "a turn shows the tool it runs and then the answer" {
 
     // The answer reached the frontend while it was still being written, as the
     // pieces the model sent, before the block that carries the whole of it.
-    try std.testing.expectEqual(3, recorder.deltas.items.len);
-    try std.testing.expect(recorder.deltas.items[0].reasoning);
-    try std.testing.expectEqualStrings("thinking", recorder.deltas.items[0].text);
-    try std.testing.expect(!recorder.deltas.items[1].reasoning);
-    try std.testing.expectEqualStrings("all ", recorder.deltas.items[1].text);
-    try std.testing.expectEqualStrings("done", recorder.deltas.items[2].text);
+    try std.testing.expectEqual(2, recorder.deltas.items.len);
+    try std.testing.expectEqualStrings("all ", recorder.deltas.items[0].text);
+    try std.testing.expectEqualStrings("done", recorder.deltas.items[1].text);
 
     // What was shown is what the session kept, so a resume replays the turn.
     try std.testing.expectEqualStrings(
