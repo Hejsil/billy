@@ -934,6 +934,11 @@ fn showDeltaText(emitter: Emitter, delta: llm.Delta) !void {
 
 /// Runs the model until it replies with text instead of tool calls, showing what
 /// happens as blocks as it goes.
+///
+/// A reply that carries neither text nor a call says nothing, and a conversation
+/// holding one is refused whole by a provider that checks its history, which
+/// costs the session every turn after it. Such a reply is not kept: the turn is
+/// asked again, and that costs it one of its turns.
 fn turn(agent: *Agent, emitter: Emitter, session: *Session, client: *llm.Client) !void {
     // Holds the parsed call of each tool call the model asks for, which is read
     // until that call has been run and shown. Reset per call, so a turn that
@@ -970,13 +975,21 @@ fn turn(agent: *Agent, emitter: Emitter, session: *Session, client: *llm.Client)
             try showDeltaText(emitter, delta);
         }
 
+        const message = try reply.message();
+        const calls = message.tool_calls orelse &.{};
+
+        // A model that thought and then stopped sends a reply with neither text
+        // nor a call. It says nothing, so nothing of it is kept, and it is asked
+        // again: a conversation holding such a message is refused whole by a
+        // provider that checks its history. Asking again asks the same question,
+        // since an empty reply leaves the conversation as it was.
+        if (calls.len == 0 and message.content == null) continue;
+
         // Recorded before the message is appended, so the save inside `append`
         // stores the size along with it.
         session.recordUsage(stream.usage());
-        const message = try reply.message();
         try session.append(message);
 
-        const calls = message.tool_calls orelse &.{};
         // No calls means the model answered, which ends the turn.
         if (calls.len == 0) return emitter.show(.{ .answer = message.content orelse "" });
 
@@ -2701,6 +2714,81 @@ test "a turn shows the tool it runs and then the answer" {
         "all done",
         session.contentOf(session.messages.items[session.messages.items.len - 1]).?,
     );
+}
+
+test "a reply with nothing is not kept, and the turn is asked again" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    try session.setSystemPrompt("be terse");
+    try session.append(.{ .role = .user, .content = "first" });
+
+    // A model that thinks and then stops sends a choice with neither text nor a
+    // call. The first request is answered with one, the second with the answer
+    // the model should have given.
+    const answering = struct {
+        fn answer(number: usize, _: []const u8) Mock.Answer {
+            if (number == 1) {
+                return .{
+                    .body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking it over\"}}]}\n\n" ++
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+                        "data: [DONE]\n\n",
+                    .content_type = "text/event-stream",
+                };
+            }
+            return .{
+                .body = "data: {\"choices\":[{\"delta\":{\"content\":\"all done\"}}]," ++
+                    "\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":1,\"total_tokens\":13}}\n\n" ++
+                    "data: [DONE]\n\n",
+                .content_type = "text/event-stream",
+            };
+        }
+    }.answer;
+    var mock = try Mock.start("/chat/completions", 2, answering);
+    defer mock.deinit();
+    try mock.serve();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
+    setup.pointAt("test", mock.url);
+    var agent = try testAgent(io, gpa, setup, &http_client);
+    defer agent.deinit();
+
+    var recorder = Recorder{ .gpa = arena_state.allocator() };
+    var client = try agent.clientFor(&session);
+    try turn(&agent, recorder.emitter(), &session, &client);
+
+    try mock.group.await(io);
+    if (mock.err) |err| return err;
+
+    // The answer is what the turn ends with, and the empty reply is not shown:
+    // it carried no text, so asking again repeats nothing on screen.
+    try std.testing.expectEqual(1, recorder.seen.items.len);
+    try std.testing.expectEqualStrings("all done", recorder.seen.items[0].answer);
+    try std.testing.expectEqual(@as(usize, 1), recorder.deltas.items.len);
+
+    // The second request is the first one again, byte for byte: the empty reply
+    // was not put into the conversation, so asking again asks the same question.
+    try std.testing.expectEqualStrings(mock.bodies.items[0], mock.bodies.items[1]);
+    try std.testing.expect(std.mem.indexOf(u8, mock.bodies.items[1], "\"assistant\"") == null);
+
+    // The session holds the prompt and the answer, with no empty message between
+    // them, so every request after this one carries a conversation a provider
+    // takes.
+    try std.testing.expectEqual(@as(usize, 2), session.messages.items.len);
+    try std.testing.expectEqualStrings("assistant", session.roleOf(session.messages.items[1]));
+    try std.testing.expectEqualStrings("all done", session.contentOf(session.messages.items[1]).?);
 }
 
 test "the first turn names the session, and the naming is not part of it" {
