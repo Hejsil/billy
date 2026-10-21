@@ -636,8 +636,7 @@ pub fn setMode(session: *Session, mode: agent.Mode) void {
 ///
 /// Where a session goes is resolved from this before every turn, so setting it is
 /// what moves a session to another provider: the next turn is sent there, and
-/// every turn after it, until it is changed again. Where it came from is recorded
-/// with the session, since a conversation belongs to the model that produced it.
+/// every turn after it, until it is changed again.
 pub fn setModel(session: *Session, choice: []const u8) !void {
     session.interned.model = try session.pool.intern(session.gpa, choice);
 }

@@ -30,9 +30,13 @@ const Command = enum {
     }
 };
 
-/// Where a choice of provider and model is sent: what a request needs from it
-/// that the configuration's own endpoint cannot supply, since a session may name
-/// a provider other than the configured one.
+/// Where a run's requests are sent, and how they are asked: everything a request
+/// needs of the provider and model, which the conversation does not carry.
+///
+/// One is resolved from the configured choice when a run starts, and another from
+/// the session's own model before every turn, so a session changed to another
+/// model is sent there -- and asked the way that provider takes -- from the next
+/// turn on.
 ///
 /// It lives here rather than beside the module that resolves it, because that
 /// module imports this one; the two are kept apart by naming only what a request
@@ -46,6 +50,10 @@ pub const Target = struct {
     /// The provider the endpoint belongs to, or null for one billy does not
     /// know, such as a proxy. It is what the model's window is looked up by.
     provider: ?models.Provider,
+    /// What the request asks of the model's thinking, settled against the
+    /// provider's own rules: only a provider that takes the fields is asked for
+    /// them, since one that does not may refuse a request carrying them.
+    reasoning: llm.Reasoning = .provider_default,
 };
 
 /// Where a session's requests are sent, resolved from the model the session
@@ -73,20 +81,6 @@ pub const Resolver = struct {
     }
 };
 
-/// Where a run's requests are sent: the destination the configuration resolves
-/// to, and what the request asks of the model's thinking.
-///
-/// A run starts pointed here, and is re-pointed before every turn at the
-/// destination the session's own model names, through a `Target`: the same
-/// destination without the thinking rule, which the configuration settled when
-/// the run started.
-pub const Endpoint = struct {
-    target: Target,
-    /// What the request asks of the model's thinking, from the configuration and
-    /// settled against the provider's own rules before the run starts.
-    reasoning: llm.Reasoning = .provider_default,
-};
-
 /// What a run is given, in one value: where its requests go, how its agent
 /// behaves on it, what its tools run with, how its blocks are shown, the mode it
 /// starts in, and the home directory and instructions the run reads outside the
@@ -94,10 +88,9 @@ pub const Endpoint = struct {
 /// credentials and the environment, so the agent is handed the run rather than
 /// the file it came from.
 pub const Options = struct {
-    /// Where the run starts pointed: the endpoint the configuration resolves to,
-    /// which is where a turn goes until `resolveTarget` finds where the session's
-    /// own model lives.
-    endpoint: Endpoint,
+    /// Where the run starts pointed, resolved from the configured choice. A turn
+    /// goes there until `resolveTarget` finds where the session's own model lives.
+    target: Target,
     behaviour: Behaviour,
     tools: Tools.Settings,
     /// How the run's blocks are shown: the formatter scripts and the terminal's
@@ -520,13 +513,13 @@ pub fn init(
         .client = .{
             .gpa = gpa,
             .io = io,
-            .api_key = options.endpoint.target.api_key,
-            .url = options.endpoint.target.url,
-            .model = options.endpoint.target.model,
+            .api_key = options.target.api_key,
+            .url = options.target.url,
+            .model = options.target.model,
             .http = http_client,
-            .reasoning = options.endpoint.reasoning,
+            .reasoning = options.target.reasoning,
         },
-        .provider = options.endpoint.target.provider,
+        .provider = options.target.provider,
     };
 }
 
@@ -586,6 +579,9 @@ fn useTarget(agent: *Agent, resolved: Target) void {
     // rather than the configured choice: a session sent to its own provider
     // would otherwise be headed with a model it is not asking.
     agent.client.model = resolved.model;
+    // The thinking fields are the provider's own, so what is asked of them
+    // follows the provider a turn is sent to, not the one the run started on.
+    agent.client.reasoning = resolved.reasoning;
     agent.provider = resolved.provider;
 }
 
@@ -1635,7 +1631,7 @@ const TestSetup = struct {
     /// The run a test's agent is built from.
     fn options(setup: TestSetup) Options {
         return .{
-            .endpoint = .{ .target = setup.target },
+            .target = setup.target,
             .behaviour = setup.behaviour,
             .tools = setup.tools,
             .mode = setup.mode,

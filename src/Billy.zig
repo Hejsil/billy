@@ -222,7 +222,7 @@ pub fn run(billy: *Billy, out: *std.Io.Writer, resume_id: ?[]const u8) !void {
     // shown, and the home directory and instructions it reads outside the
     // session.
     const options = agent.Options{
-        .endpoint = Endpoints.agentEndpoint(billy.config, endpoint),
+        .target = Endpoints.configuredTarget(billy.config, endpoint),
         .behaviour = Endpoints.behaviour(billy.config),
         .tools = Endpoints.toolSettings(
             billy.config,

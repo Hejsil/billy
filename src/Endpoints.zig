@@ -129,30 +129,25 @@ fn targetFor(
         // window up by. Null for a proxy, which leaves the model to be found
         // among the providers billy ships.
         .provider = models.Provider.fromName(name),
+        // What the request asks of the thinking follows the provider it is sent
+        // to: a session moved to another provider is asked the way that one takes.
+        .reasoning = reasoningFor(config, models.Provider.fromName(name)),
     };
 }
 
-/// Where a run's requests are sent, as the agent takes it: the endpoint the
+/// Where a run starts pointed, as the agent takes it: the endpoint the
 /// configuration resolved to, and which provider answers it, asked for the
 /// model's thinking as the configuration says and that provider allows.
-pub fn agentEndpoint(config: Config, endpoint: Endpoint) agent.Endpoint {
+pub fn configuredTarget(config: Config, endpoint: Endpoint) agent.Target {
     return .{
-        .target = .{
-            .url = endpoint.url,
-            .api_key = endpoint.api_key,
-            .model = endpoint.model,
-            // Which provider answers, so the window the header gauges against is
-            // the one of the model actually being sent. A provider billy does not
-            // know leaves the model to be found among the ones it ships.
-            .provider = endpoint.provider,
-        },
-        // The thinking fields are one provider's own, so they are sent only to a
-        // provider that takes them: a model whose provider billy does not know,
-        // or one whose endpoint does not accept them, is left alone.
-        .reasoning = if (endpoint.provider) |provider|
-            if (provider.takesThinking()) reasoningOf(config.stored.reasoning) else .provider_default
-        else
-            .provider_default,
+        .url = endpoint.url,
+        .api_key = endpoint.api_key,
+        .model = endpoint.model,
+        // Which provider answers, so the window the header gauges against is the
+        // one of the model actually being sent. A provider billy does not know
+        // leaves the model to be found among the ones it ships.
+        .provider = endpoint.provider,
+        .reasoning = reasoningFor(config, endpoint.provider),
     };
 }
 
@@ -179,9 +174,9 @@ pub fn display(config: Config, style: Terminal.Style) Terminal.Display {
 
 /// How a run's agent behaves: the turns it gives the model, the share of the
 /// window it fills before the conversation is folded into a summary, and whether
-/// it names the session. Where its requests go is resolved separately, as
-/// `agentEndpoint`, what its tools run with as `toolSettings`, and how its blocks
-/// are shown as `display`.
+/// it names the session. Where each turn is sent is resolved separately, as
+/// `configuredTarget` and `sessionTarget`, what its tools run with as
+/// `toolSettings`, and how its blocks are shown as `display`.
 pub fn behaviour(config: Config) agent.Behaviour {
     const stored = &config.stored;
     return .{
@@ -283,6 +278,16 @@ fn resolveBaseUrl(providers: Config.Providers, choice: []const u8) error{Unknown
 fn missingKey(name: []const u8) error{MissingApiKey} {
     std.log.err("no key stored for '{s}'; run `billy login {s}` to store one", .{ name, name });
     return error.MissingApiKey;
+}
+
+/// What a request sent to `provider` asks of the model's thinking: the
+/// configuration's say, for a provider that takes the fields. One that does not
+/// is left on whatever it does by itself, since a request carrying fields an
+/// endpoint does not expect may be refused.
+fn reasoningFor(config: Config, provider: ?models.Provider) llm.Reasoning {
+    const known = provider orelse return .provider_default;
+    if (!known.takesThinking()) return .provider_default;
+    return reasoningOf(config.stored.reasoning);
 }
 
 /// What the configuration's `reasoning` asks of the model's thinking: `off` for
@@ -486,6 +491,39 @@ test "a fetch backend is asked for its key, and raw for none" {
     try std.testing.expect((try fetchConfig(arena, &store, none, &failed)) == null);
 }
 
+test "a session moved to a provider that takes no thinking fields is asked for none" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The configuration asks for a high effort, which only a provider that takes
+    // the thinking fields can be asked for.
+    var config = Config.init(gpa);
+    defer config.deinit();
+    config.stored.reasoning = "high";
+    var store: Credentials = .{};
+    try store.put(arena, "deepseek", "k");
+    try store.put(arena, "opencode_go", "k");
+
+    var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+
+    // Sent to a provider that takes them, the effort the file names is asked for.
+    try session.setModel("deepseek/deepseek-flash");
+    const taking = try sessionTarget(config, &store, arena, &session);
+    try std.testing.expectEqualStrings("high", taking.reasoning.effort);
+
+    // Moved to one that does not, the next turn asks nothing of them: what is
+    // asked follows the provider the turn is sent to, not the one it started on.
+    try session.setModel("opencode_go/kimi-k2.7-code");
+    const plain = try sessionTarget(config, &store, arena, &session);
+    try std.testing.expectEqual(llm.Reasoning.provider_default, plain.reasoning);
+}
+
 test "a header names the model the session goes to, not the one billy is pointed at" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -640,7 +678,7 @@ test "the reasoning setting names what billy asks of the model's thinking" {
     try std.testing.expectEqualStrings("low", reasoningOf("low").effort);
 }
 
-test "a run's endpoint carries the address and the provider, and only the thinking it takes" {
+test "a run's target carries its address and provider, and only the thinking it takes" {
     const gpa = std.testing.allocator;
     var config = Config.init(gpa);
     defer config.deinit();
@@ -657,24 +695,24 @@ test "a run's endpoint carries the address and the provider, and only the thinki
     // Where the request goes, and which provider answers it, are taken as they
     // were resolved; a provider that takes the thinking fields is asked for what
     // the configuration says.
-    const asked = agentEndpoint(config, endpoint);
-    try std.testing.expectEqualStrings(endpoint.url, asked.target.url);
-    try std.testing.expectEqualStrings("k", asked.target.api_key);
-    try std.testing.expectEqualStrings("deepseek-flash", asked.target.model);
-    try std.testing.expectEqual(models.Provider.deepseek, asked.target.provider.?);
+    const asked = configuredTarget(config, endpoint);
+    try std.testing.expectEqualStrings(endpoint.url, asked.url);
+    try std.testing.expectEqualStrings("k", asked.api_key);
+    try std.testing.expectEqualStrings("deepseek-flash", asked.model);
+    try std.testing.expectEqual(models.Provider.deepseek, asked.provider.?);
     try std.testing.expectEqualStrings("high", asked.reasoning.effort);
 
     // A provider that does not take them is left on whatever it does by itself:
     // a request carrying fields an endpoint does not expect may be refused.
     var untaken = endpoint;
     untaken.provider = .opencode_go;
-    try std.testing.expectEqual(llm.Reasoning.provider_default, agentEndpoint(config, untaken).reasoning);
+    try std.testing.expectEqual(llm.Reasoning.provider_default, configuredTarget(config, untaken).reasoning);
 
     // An endpoint billy knows no provider of keeps that unknown, so the agent
     // finds the model it names among the ones billy ships.
     var unknown = endpoint;
     unknown.provider = null;
-    const unattributed = agentEndpoint(config, unknown);
+    const unattributed = configuredTarget(config, unknown);
     try std.testing.expectEqual(llm.Reasoning.provider_default, unattributed.reasoning);
-    try std.testing.expect(unattributed.target.provider == null);
+    try std.testing.expect(unattributed.provider == null);
 }
