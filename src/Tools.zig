@@ -76,19 +76,16 @@ http: *std.http.Client,
 health: ?*Health,
 
 /// What a tool set runs with, beyond the plumbing of the run it belongs to: the
-/// limits it runs under, how its blocks are laid out, and the backends it asks.
-/// A frontend resolves these from the configuration and the credentials, so
-/// neither frontend drifts from the other and the agent builds the set from what
-/// they agree on rather than from the configuration file itself.
+/// limits it runs under, how its blocks are shown, and the backends it asks. A
+/// frontend resolves these from the configuration and the credentials, so neither
+/// frontend drifts from the other and the agent builds the set from what they
+/// agree on rather than from the configuration file itself.
 pub const Settings = struct {
-    /// How a tool's block is laid out before it is shown, shared with the
-    /// transcript so a replay shows a call the way the run did.
-    formats: Formats = .{},
+    /// How a tool's block is laid out and decorated, shared with the transcript
+    /// so a replay shows a call the way the run did.
+    display: Terminal.Display = .{},
     /// No default: a missing timeout is worth catching at the call site.
     bash_timeout_s: usize,
-    /// How billy decorates the lines it prints itself, shared with the transcript
-    /// so a replay looks like the run.
-    style: Terminal.Style = .plain,
     /// Null leaves `web_search` out of the tools offered, so the model is never
     /// given one that could not run.
     search: ?web.Search.Config = null,
@@ -118,9 +115,9 @@ pub fn init(options: Options) !Tools {
         .io = options.io,
         .dir = options.dir,
         .gpa = options.gpa,
-        .formats = settings.formats,
+        .formats = settings.display.formats,
         .bash_timeout_s = settings.bash_timeout_s,
-        .style = settings.style,
+        .style = settings.display.style,
         .search = settings.search,
         .fetch = settings.fetch,
         .http = options.http,

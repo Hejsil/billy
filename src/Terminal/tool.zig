@@ -640,7 +640,7 @@ test "the format changes what is shown and nothing else" {
         .dir = std.Io.Dir.cwd(),
         .gpa = gpa,
         .http = &http_client,
-        .settings = .{ .formats = .{ .bash = format }, .bash_timeout_s = 120 },
+        .settings = .{ .display = .{ .formats = .{ .bash = format } }, .bash_timeout_s = 120 },
     });
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",

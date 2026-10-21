@@ -229,10 +229,10 @@ pub fn toolSettings(
 ) tools.Settings {
     const stored = &config.stored;
     return .{
-        // A tool's block is laid out for the display the run's blocks are shown
-        // on, so a call reads the same in the transcript as it did when it ran.
-        .formats = shown.formats,
-        .style = shown.style,
+        // A tool's block is laid out and decorated for the display the run's
+        // blocks are shown on, so a call reads the same in the transcript as it
+        // did when it ran.
+        .display = shown,
         .bash_timeout_s = stored.tools.bash.timeout_s,
         // A web tool is offered only when the configuration names a backend for
         // it and its key is set; the tool is left out of the request otherwise.
