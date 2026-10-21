@@ -137,13 +137,15 @@ fn targetFor(
 /// model's thinking as the configuration says and that provider allows.
 pub fn agentEndpoint(config: Config, endpoint: Endpoint) agent.Endpoint {
     return .{
-        .url = endpoint.url,
-        .api_key = endpoint.api_key,
-        .model = endpoint.model,
-        // Which provider answers, so the window the header gauges against is the
-        // one of the model actually being sent. A provider billy does not know
-        // leaves the model to be found among the ones it ships.
-        .provider = endpoint.provider,
+        .target = .{
+            .url = endpoint.url,
+            .api_key = endpoint.api_key,
+            .model = endpoint.model,
+            // Which provider answers, so the window the header gauges against is
+            // the one of the model actually being sent. A provider billy does not
+            // know leaves the model to be found among the ones it ships.
+            .provider = endpoint.provider,
+        },
         // The thinking fields are one provider's own, so they are sent only to a
         // provider that takes them: a model whose provider billy does not know,
         // or one whose endpoint does not accept them, is left alone.
@@ -618,10 +620,10 @@ test "a run's endpoint carries the address and the provider, and only the thinki
     // were resolved; a provider that takes the thinking fields is asked for what
     // the configuration says.
     const asked = agentEndpoint(config, endpoint);
-    try std.testing.expectEqualStrings(endpoint.url, asked.url);
-    try std.testing.expectEqualStrings("k", asked.api_key);
-    try std.testing.expectEqualStrings("deepseek-flash", asked.model);
-    try std.testing.expectEqual(models.Provider.deepseek, asked.provider.?);
+    try std.testing.expectEqualStrings(endpoint.url, asked.target.url);
+    try std.testing.expectEqualStrings("k", asked.target.api_key);
+    try std.testing.expectEqualStrings("deepseek-flash", asked.target.model);
+    try std.testing.expectEqual(models.Provider.deepseek, asked.target.provider.?);
     try std.testing.expectEqualStrings("high", asked.reasoning.effort);
 
     // A provider that does not take them is left on whatever it does by itself:
@@ -636,5 +638,5 @@ test "a run's endpoint carries the address and the provider, and only the thinki
     unknown.provider = null;
     const unattributed = agentEndpoint(config, unknown);
     try std.testing.expectEqual(llm.Reasoning.provider_default, unattributed.reasoning);
-    try std.testing.expect(unattributed.provider == null);
+    try std.testing.expect(unattributed.target.provider == null);
 }

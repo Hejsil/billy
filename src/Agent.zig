@@ -48,20 +48,15 @@ pub const Target = struct {
     provider: ?models.Provider,
 };
 
-/// Where a run's requests are sent: the endpoint the configuration resolves to,
-/// with what a request needs to be sent at all.
+/// Where a run's requests are sent: the destination the configuration resolves
+/// to, and what the request asks of the model's thinking.
 ///
 /// A run starts pointed here. A session that recorded a provider of its own is
-/// re-pointed at it instead, through a `Target`, which is the same destination
-/// without the thinking rule the configuration settled.
+/// re-pointed at it instead, through a `Target`, which is that destination
+/// without the thinking rule the configuration settled: that rule is the run's,
+/// settled once when it started.
 pub const Endpoint = struct {
-    /// Full URL of the chat completions endpoint.
-    url: []const u8,
-    api_key: []const u8,
-    model: []const u8,
-    /// The provider the endpoint belongs to, or null for one billy does not
-    /// know, such as a proxy. It is what the model's window is looked up by.
-    provider: ?models.Provider = null,
+    target: Target,
     /// What the request asks of the model's thinking, from the configuration and
     /// settled against the provider's own rules before the run starts.
     reasoning: llm.Reasoning = .provider_default,
@@ -444,7 +439,8 @@ provider: ?models.Provider = null,
 work_dir: std.Io.Dir,
 /// The tools, working in `work_dir`.
 tool_set: Tools,
-/// The model client, sending the conversation to `endpoint.url`.
+/// The model client: where the conversation is sent, and the key and model id
+/// it is sent with.
 client: llm.Client,
 
 /// Opens a session for asking things from `options`, working in `cwd` and
@@ -481,13 +477,13 @@ pub fn init(
         .client = .{
             .gpa = gpa,
             .io = io,
-            .api_key = options.endpoint.api_key,
-            .url = options.endpoint.url,
-            .model = options.endpoint.model,
+            .api_key = options.endpoint.target.api_key,
+            .url = options.endpoint.target.url,
+            .model = options.endpoint.target.model,
             .http = http_client,
             .reasoning = options.endpoint.reasoning,
         },
-        .provider = options.endpoint.provider,
+        .provider = options.endpoint.target.provider,
     };
 }
 
@@ -1562,7 +1558,7 @@ fn testAgentIn(
 /// takes as a value of its own. Blocks are shown plainly, since a test reads the
 /// text rather than a terminal's decoration.
 const TestSetup = struct {
-    endpoint: Endpoint,
+    target: Target,
     limits: Limits = .{ .max_turns = 10 },
     tools: Tools.Settings = .{ .bash_timeout_s = 120 },
     /// The mode the run starts in, which is what a frontend passes before the
@@ -1574,13 +1570,13 @@ const TestSetup = struct {
     /// A setup for `model`, which is the one thing every test names, since it is
     /// what the session records and the header shows.
     fn init(model: []const u8) TestSetup {
-        return .{ .endpoint = .{ .url = "u", .api_key = "k", .model = model } };
+        return .{ .target = .{ .url = "u", .api_key = "k", .model = model, .provider = null } };
     }
 
     /// The run a test's agent is built from.
     fn options(setup: TestSetup) Options {
         return .{
-            .endpoint = setup.endpoint,
+            .endpoint = .{ .target = setup.target },
             .limits = setup.limits,
             .tools = setup.tools,
             .mode = setup.mode,
@@ -2044,8 +2040,8 @@ test "maybeCompact folds the conversation once it has filled the window" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    setup.endpoint.url = mock.url;
-    setup.endpoint.api_key = "k";
+    setup.target.url = mock.url;
+    setup.target.api_key = "k";
 
     var agent = try testAgent(io, gpa, setup, &http_client);
     defer agent.deinit();
@@ -2102,7 +2098,7 @@ test "maybeCompact does nothing below the threshold, off, or with nothing new" {
 
     // Nothing is listening on this address, so a request made where the function
     // should have returned first would fail the test rather than pass it.
-    setup.endpoint.url = "http://127.0.0.1:1/chat/completions";
+    setup.target.url = "http://127.0.0.1:1/chat/completions";
 
     var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
@@ -2155,8 +2151,8 @@ test "a compaction asked for now folds the conversation in whatever its size" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    setup.endpoint.url = mock.url;
-    setup.endpoint.api_key = "k";
+    setup.target.url = mock.url;
+    setup.target.api_key = "k";
 
     var agent = try testAgent(io, gpa, setup, &http_client);
     defer agent.deinit();
@@ -2211,7 +2207,7 @@ test "maybeCompact does not compact a summary that stands alone" {
     session.context_tokens = 900_000;
     // Nothing is listening there, so a request made where this should have
     // returned first would fail the test.
-    setup.endpoint.url = "http://127.0.0.1:1/chat/completions";
+    setup.target.url = "http://127.0.0.1:1/chat/completions";
     var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
 
@@ -2595,8 +2591,8 @@ test "a turn shows the tool it runs and then the answer" {
     defer http_client.deinit();
 
     var setup = TestSetup.init("m");
-    setup.endpoint.url = mock.url;
-    setup.endpoint.api_key = "k";
+    setup.target.url = mock.url;
+    setup.target.api_key = "k";
     var agent = try testAgent(io, gpa, setup, &http_client);
     defer agent.deinit();
 
@@ -2674,7 +2670,7 @@ test "the first turn names the session, and the naming is not part of it" {
     setup.limits.title = true;
     // The agent builds the model client from the endpoint, so it carries the
     // address of the mock.
-    setup.endpoint.url = mock.url;
+    setup.target.url = mock.url;
     // `Agent.init` opens the directory it works in, so it has to be one that
     // exists; the session's recorded directory is separate and stays "/work".
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
@@ -2756,7 +2752,7 @@ test "a session is sent where the choice it recorded points, not the configurati
     defer http_client.deinit();
 
     var setup = TestSetup.init("m");
-    setup.endpoint.url = "http://127.0.0.1:1/chat/completions";
+    setup.target.url = "http://127.0.0.1:1/chat/completions";
     var agent = try testAgent(io, gpa, setup, &http_client);
     defer agent.deinit();
 
@@ -2781,7 +2777,7 @@ test "a session is sent where the choice it recorded points, not the configurati
     // configured one, the model id it was given is sent, and the header reads
     // the window of that model.
     try std.testing.expectEqualStrings(chosen.url, agent.client.url);
-    try std.testing.expect(!std.mem.eql(u8, setup.endpoint.url, agent.client.url));
+    try std.testing.expect(!std.mem.eql(u8, setup.target.url, agent.client.url));
     try std.testing.expectEqualStrings("kimi-k2.7-code", agent.client.model);
     // The window is the one of the model the session named rather than of the
     // configured one, which billy knows nothing of.
