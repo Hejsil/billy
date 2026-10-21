@@ -3,6 +3,7 @@
 //! their format scripts.
 const std = @import("std");
 const agent = @import("Agent.zig");
+const Tools = @import("Tools.zig");
 
 pub const tool = @import("Terminal/tool.zig");
 
@@ -11,9 +12,25 @@ pub const Markdown = @import("Terminal/Markdown.zig");
 
 const Terminal = @This();
 
+/// How billy lays out and decorates what it shows: the formatter scripts for a
+/// tool's block and the terminal style. They travel together through the
+/// printing, so they are gathered here rather than passed apart as a run of
+/// arguments that had grown hard to read.
+///
+/// The layout is presentation only: the command that runs, what a session stores
+/// and what the model is sent keep the text as it was written.
+pub const Display = struct {
+    /// How a tool's block is laid out before it is shown: a bash command and an
+    /// edit's diff. Null shows each as it was written.
+    formats: Tools.Formats = .{},
+    /// How billy decorates the lines it prints itself, such as a block header.
+    /// Plain everywhere the terminal does not take escape codes.
+    style: Style = .plain,
+};
+
 out: *std.Io.Writer,
 io: std.Io,
-display: agent.Display,
+display: Display,
 /// For what showing a block builds, such as an edit's diff. Each block frees
 /// what it takes, so nothing is kept between them.
 scratch: std.mem.Allocator,
@@ -71,7 +88,7 @@ fn selfOf(context: *anyopaque) *Terminal {
 /// `markdown` when one is set, and the blank line after it. A live prompt and a
 /// replayed one are both printed by this, so the two read the same. The `> ` the
 /// line is typed behind is not part of the prompt and is not printed.
-fn printPrompt(gpa: std.mem.Allocator, out: *std.Io.Writer, text: []const u8, display: agent.Display) !void {
+fn printPrompt(gpa: std.mem.Allocator, out: *std.Io.Writer, text: []const u8, display: Display) !void {
     try marks.prompt.header("prompt", "", display.style, out);
     try Markdown.write(gpa, text, display.style, out);
     try out.writeAll("\n\n");
@@ -80,7 +97,7 @@ fn printPrompt(gpa: std.mem.Allocator, out: *std.Io.Writer, text: []const u8, di
 /// Prints a reply under its own header, laid out as markdown, and the blank
 /// line that ends the block. Only the display changes; the session and the model
 /// keep the text itself.
-fn printAnswer(gpa: std.mem.Allocator, out: *std.Io.Writer, content: ?[]const u8, display: agent.Display) !void {
+fn printAnswer(gpa: std.mem.Allocator, out: *std.Io.Writer, content: ?[]const u8, display: Display) !void {
     try marks.answer.header("answer", "", display.style, out);
     const text = content orelse "";
     if (text.len == 0) {

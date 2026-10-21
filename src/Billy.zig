@@ -214,16 +214,22 @@ pub fn run(billy: *Billy, out: *std.Io.Writer, resume_id: ?[]const u8) !void {
     const endpoint = try Endpoints.open(arena, billy.config, &billy.credentials);
     // The terminal lays its blocks out for the terminal it is on, which the
     // escape codes of a pipe or a redirection would only be noise in.
-    const style = Terminal.Style.detect(billy.io, .stdout());
-    const config = billy.agentConfig(style);
+    const display = Endpoints.display(billy.config, Terminal.Style.detect(billy.io, .stdout()));
 
-    // The tools the model is offered, resolved once for the whole run.
-    const tools = Endpoints.toolSettings(
-        billy.config,
-        try Endpoints.Backends.build(arena, billy.config, &billy.credentials),
-        &billy.health,
-        style,
-    );
+    // What the run is given, resolved once for the whole of it: where its
+    // requests go, what it reads while it runs, what its tools run with, and how
+    // its blocks are shown.
+    const options = agent.Options{
+        .endpoint = Endpoints.agentEndpoint(billy.config, endpoint),
+        .config = billy.agentConfig(),
+        .tools = Endpoints.toolSettings(
+            billy.config,
+            try Endpoints.Backends.build(arena, billy.config, &billy.credentials),
+            &billy.health,
+            display,
+        ),
+        .display = display,
+    };
 
     if (resume_id != null) {
         // Replay the conversation as a transcript, so the context does not
@@ -234,21 +240,12 @@ pub fn run(billy: *Billy, out: *std.Io.Writer, resume_id: ?[]const u8) !void {
             billy.gpa,
             out,
             &session,
-            config.display,
+            display,
             billy.config.stored.resume_blocks,
         );
     }
     const target = try Endpoints.sessionTarget(billy.config, &billy.credentials, arena, &session);
-    try agent.run(
-        billy.io,
-        billy.gpa,
-        out,
-        Endpoints.agentEndpoint(billy.config, endpoint),
-        config,
-        tools,
-        &session,
-        target,
-    );
+    try agent.run(billy.io, billy.gpa, out, options, &session, target);
 }
 
 /// Lists the sessions billy has kept, the one written to most recently first,
@@ -310,13 +307,13 @@ pub fn serve(billy: *Billy, host: []const u8, port: u16) !void {
 }
 
 /// The settings a run is built from. Where its requests go is
-/// `Endpoints.agentEndpoint` and what its tools run with is
-/// `Endpoints.toolSettings`, both resolved beside this.
-fn agentConfig(billy: *const Billy, style: Terminal.Style) agent.Config {
+/// `Endpoints.agentEndpoint`, what its tools run with is
+/// `Endpoints.toolSettings`, and how its blocks are shown is `Endpoints.display`,
+/// all resolved beside this.
+fn agentConfig(billy: *const Billy) agent.Config {
     return Endpoints.agentConfig(
         billy.config,
         billy.environ,
-        style,
         billy.dirs.config,
     );
 }

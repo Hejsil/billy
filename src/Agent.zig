@@ -67,8 +67,26 @@ pub const Endpoint = struct {
     reasoning: llm.Reasoning = .provider_default,
 };
 
+/// What a run is given, in one value: where its requests go, the settings the
+/// agent reads while it runs, what its tools run with, how its blocks are shown,
+/// and the mode it starts in. Each part is resolved by the frontend, from the
+/// configuration and the credentials, so the agent is handed the run rather than
+/// the file it came from.
+pub const Options = struct {
+    /// Where the run's requests are sent, and which provider answers them.
+    endpoint: Endpoint,
+    config: Config,
+    tools: Tools.Settings,
+    /// How the run's blocks are shown: the formatter scripts and the terminal's
+    /// style. A page lays its own blocks out, so it sets this plainly.
+    display: Terminal.Display = .{},
+    /// The mode the run starts in, which is the frontend's choice until the
+    /// session's first prompt settles it.
+    mode: Mode = .general,
+};
+
 /// What a run is told beyond where it sends its requests: the settings the agent
-/// reads while it runs, and what it builds its tools and its blocks from.
+/// reads while it runs.
 pub const Config = struct {
     /// Model turns allowed for one request before the harness gives up on it.
     max_turns: usize,
@@ -88,24 +106,6 @@ pub const Config = struct {
     /// Whether the model is asked for a short title for a session, after its
     /// first turn, so a frontend can list it by name. Mirrors the configuration.
     title: bool = true,
-    /// How what billy shows is laid out and decorated, from the configuration.
-    display: Display = .{},
-};
-
-/// How billy lays out and decorates what it shows: the formatter scripts for a
-/// tool's block and the terminal style. They travel together through the
-/// printing, so they are gathered here rather than passed apart as a run of
-/// arguments that had grown hard to read.
-///
-/// The layout is presentation only: the command that runs, what a session stores
-/// and what the model is sent keep the text as it was written.
-pub const Display = struct {
-    /// How a tool's block is laid out before it is shown: a bash command and an
-    /// edit's diff. Null shows each as it was written.
-    formats: Tools.Formats = .{},
-    /// How billy decorates the lines it prints itself, such as a block header.
-    /// Plain everywhere the terminal does not take escape codes.
-    style: Terminal.Style = .plain,
 };
 
 /// One unit of what a run shows: the pieces a conversation is made of, in the
@@ -440,15 +440,12 @@ tool_set: Tools,
 /// The model client, sending the conversation to `endpoint.url`.
 client: llm.Client,
 
-/// Opens a session for asking things, working in `cwd`, sending its requests to
-/// `endpoint`, offering the tools `tool_settings` build, and sharing
-/// `http_client`.
+/// Opens a session for asking things from `options`, working in `cwd` and
+/// sharing `http_client`.
 pub fn init(
     io: std.Io,
     gpa: std.mem.Allocator,
-    endpoint: Endpoint,
-    config: Config,
-    tool_settings: Tools.Settings,
+    options: Options,
     cwd: []const u8,
     http_client: *std.http.Client,
 ) !Agent {
@@ -463,25 +460,26 @@ pub fn init(
         .dir = work_dir,
         .gpa = gpa,
         .http = http_client,
-        .settings = tool_settings,
+        .settings = options.tools,
     });
 
     return .{
         .io = io,
         .gpa = gpa,
-        .config = config,
+        .config = options.config,
+        .mode = options.mode,
         .work_dir = work_dir,
         .tool_set = tool_set,
         .client = .{
             .gpa = gpa,
             .io = io,
-            .api_key = endpoint.api_key,
-            .url = endpoint.url,
-            .model = endpoint.model,
+            .api_key = options.endpoint.api_key,
+            .url = options.endpoint.url,
+            .model = options.endpoint.model,
             .http = http_client,
-            .reasoning = endpoint.reasoning,
+            .reasoning = options.endpoint.reasoning,
         },
-        .provider = endpoint.provider,
+        .provider = options.endpoint.provider,
     };
 }
 
@@ -691,9 +689,7 @@ pub fn run(
     io: std.Io,
     gpa: std.mem.Allocator,
     out: *std.Io.Writer,
-    endpoint: Endpoint,
-    config: Config,
-    tool_settings: Tools.Settings,
+    options: Options,
     session: *Session,
     target: ?Target,
 ) !void {
@@ -703,7 +699,7 @@ pub fn run(
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    var agent = try Agent.init(io, gpa, endpoint, config, tool_settings, session.cwd(), &http_client);
+    var agent = try Agent.init(io, gpa, options, session.cwd(), &http_client);
     defer agent.deinit();
     // A resumed session keeps the prompt and tools it was saved with, so it is
     // prepared here; a new one gets them from its first prompt, through `start`.
@@ -717,7 +713,7 @@ pub fn run(
 
     // The blocks of the run are shown on the terminal, the way billy has always
     // shown them.
-    var terminal = Terminal{ .out = out, .io = io, .display = config.display, .scratch = gpa };
+    var terminal = Terminal{ .out = out, .io = io, .display = options.display, .scratch = gpa };
     const emitter = terminal.emitter();
 
     // The header is rebuilt for every prompt, so it reflects the context size
@@ -775,7 +771,7 @@ pub fn printTranscript(
     gpa: std.mem.Allocator,
     out: *std.Io.Writer,
     session: *const Session,
-    display: Display,
+    display: Terminal.Display,
     blocks: usize,
 ) !void {
     // A replay is what the terminal is shown when a session is picked up again,
@@ -1539,18 +1535,7 @@ fn testAgentIn(
     // A test that only drives the loop is given a client it never reads, which is
     // left undefined rather than built: nothing touches it unless a tool does.
     var unused: std.http.Client = undefined;
-    var agent = try Agent.init(
-        io,
-        gpa,
-        setup.endpoint,
-        setup.config,
-        setup.tools,
-        work_dir,
-        http_client orelse &unused,
-    );
-    // The mode a frontend would have chosen, which `init` leaves at its default.
-    agent.mode = setup.mode;
-    return agent;
+    return Agent.init(io, gpa, setup.options(), work_dir, http_client orelse &unused);
 }
 
 /// What a test builds an agent from: where its requests would be sent, the
@@ -1562,7 +1547,8 @@ fn testAgentIn(
 /// the endpoint nor the settings say anything about the model, so the header is
 /// just the model and the directory; a test that needs a gauge names a model
 /// billy knows. No home directory either, which only the header used and now
-/// takes as a value of its own.
+/// takes as a value of its own. Blocks are shown plainly, since a test reads the
+/// text rather than a terminal's decoration.
 const TestSetup = struct {
     endpoint: Endpoint,
     config: Config,
@@ -1582,12 +1568,22 @@ const TestSetup = struct {
             },
         };
     }
+
+    /// The run a test's agent is built from.
+    fn options(setup: TestSetup) Options {
+        return .{
+            .endpoint = setup.endpoint,
+            .config = setup.config,
+            .tools = setup.tools,
+            .mode = setup.mode,
+        };
+    }
 };
 
 /// A terminal a test can show blocks through and read back from `out`. The
 /// returned value has to outlive the emitter taken from it, since the emitter
 /// borrows it.
-fn testTerminal(out: *std.Io.Writer, display: Display) Terminal {
+fn testTerminal(out: *std.Io.Writer, display: Terminal.Display) Terminal {
     return .{ .out = out, .io = std.testing.io, .display = display, .scratch = std.testing.allocator };
 }
 

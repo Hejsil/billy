@@ -91,15 +91,18 @@ environ: *const std.process.Environ.Map,
 endpoint: Endpoints.Endpoint,
 backends: Endpoints.Backends,
 
-/// The settings a turn is built from: the same as a terminal run's, laid out
-/// plainly rather than decorated for a terminal.
-fn agentConfig(server: *const Server) Agent.Config {
-    return Endpoints.agentConfig(
-        server.config,
-        server.environ,
-        .plain,
-        server.config_dir,
-    );
+/// What a turn is given, resolved the same way a terminal run's is and laid out
+/// plainly rather than decorated for a terminal. The mode is the one the caller
+/// settled, which a session asked before keeps over it.
+fn options(server: *const Server, mode: Agent.Mode) Agent.Options {
+    const display = Endpoints.display(server.config, .plain);
+    return .{
+        .endpoint = Endpoints.agentEndpoint(server.config, server.endpoint),
+        .config = Endpoints.agentConfig(server.config, server.environ, server.config_dir),
+        .tools = Endpoints.toolSettings(server.config, server.backends, server.health, display),
+        .display = display,
+        .mode = mode,
+    };
 }
 
 /// Serves the frontend on the address `host` at `port`, until the process is
@@ -775,7 +778,7 @@ fn createSession(r: *Request, registry: *Registry, http_client: *std.http.Client
     if (choice.text.len == 0)
         return r.reply(.text, "the prompt is empty\n", .bad_request);
 
-    try serveTurn(r, http_client, &session, r.server.agentConfig(), choice.mode, choice.text, true);
+    try serveTurn(r, http_client, &session, r.server.options(choice.mode), choice.text, true);
 }
 
 /// `POST /api/sessions/{id}/message`: asks the session `text`, answering with the
@@ -798,7 +801,7 @@ fn askSession(r: *Request, registry: *Registry, http_client: *std.http.Client, i
     var session = (try r.openSession(id)) orelse return;
     defer session.deinit();
 
-    try serveTurn(r, http_client, &session, r.server.agentConfig(), session.mode, parsed.value.text, false);
+    try serveTurn(r, http_client, &session, r.server.options(session.mode), parsed.value.text, false);
 }
 
 /// Answers one prompt as the run happens: the run's blocks as the events of a
@@ -814,25 +817,13 @@ fn serveTurn(
     r: *Request,
     http_client: *std.http.Client,
     session: *Session,
-    config: Agent.Config,
-    mode: Agent.Mode,
+    run_options: Agent.Options,
     text: []const u8,
     announce: bool,
 ) !void {
     const gpa = r.server.gpa;
-    var agent = try Agent.init(
-        r.server.io,
-        gpa,
-        Endpoints.agentEndpoint(r.server.config, r.server.endpoint),
-        config,
-        Endpoints.toolSettings(r.server.config, r.server.backends, r.server.health, .plain),
-        session.cwd(),
-        http_client,
-    );
+    var agent = try Agent.init(r.server.io, gpa, run_options, session.cwd(), http_client);
     defer agent.deinit();
-    // The mode the caller settled, which the run starts in. A session asked
-    // before keeps its own, which `prepare` reads back out of it.
-    agent.mode = mode;
     // Where the session is sent is resolved into a buffer of its own, freed
     // when the turn is over: it is built per turn, and holding it in the
     // server's own allocator would grow with every request the page makes.

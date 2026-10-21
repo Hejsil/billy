@@ -2,6 +2,10 @@
 //! which follows from the provider and model the configuration names, and the
 //! backends its web tools ask.
 //!
+//! What a run is otherwise given, beyond its conversation, is resolved here too,
+//! since it follows from the same two things: the settings the agent reads while
+//! it runs, what its tools run with, and how its blocks are shown.
+//!
 //! All of it is built from the configuration and the credentials, both of which
 //! are read in once and passed in. Nothing is held here, so a caller that has
 //! those two can build any of it where it is needed, and a session can be sent
@@ -150,13 +154,33 @@ pub fn agentEndpoint(config: Config, endpoint: Endpoint) agent.Endpoint {
     };
 }
 
+/// How a run's blocks are laid out and decorated: the formatter scripts the
+/// configuration names for a tool's block, and the style of the terminal that
+/// shows them. A reply and a prompt are markdown, laid out by billy's own
+/// renderer.
+///
+/// Only the display changes: the command that runs, the file that is written, the
+/// session and the model keep the text as it was written.
+pub fn display(config: Config, style: Terminal.Style) Terminal.Display {
+    const stored = &config.stored;
+    return .{
+        // A bash command is laid out by its format script, so the user reads the
+        // command the way it runs; an edit is shown as a diff, laid out by its
+        // own script when one is set.
+        .formats = .{
+            .bash = if (stored.tools.bash.format) |script| .{ .script = script } else null,
+            .edit = if (stored.tools.edit.format) |script| .{ .script = script } else null,
+        },
+        .style = style,
+    };
+}
+
 /// What a run is configured from: the settings that decide what the agent does.
-/// Where its requests go is resolved separately, as `agentEndpoint`, and what its
-/// tools run with as `toolSettings`.
+/// Where its requests go is resolved separately, as `agentEndpoint`, what its
+/// tools run with as `toolSettings`, and how its blocks are shown as `display`.
 pub fn agentConfig(
     config: Config,
     environ: *const std.process.Environ.Map,
-    style: Terminal.Style,
     user_instructions_dir: ?std.Io.Dir,
 ) agent.Config {
     const stored = &config.stored;
@@ -169,18 +193,6 @@ pub fn agentConfig(
         .user_instructions_dir = user_instructions_dir,
         .compact_at = stored.compact_at,
         .title = stored.title,
-        // How what billy shows is laid out and decorated. A reply and a prompt
-        // are markdown, laid out by billy's own renderer, and the blocks are
-        // decorated for `style`. Only the display changes: the command that runs,
-        // the file that is written, the session and the model keep the text as it
-        // was written.
-        .display = .{
-            .formats = .{
-                .bash = if (stored.tools.bash.format) |script| .{ .script = script } else null,
-                .edit = if (stored.tools.edit.format) |script| .{ .script = script } else null,
-            },
-            .style = style,
-        },
     };
 }
 
@@ -194,19 +206,15 @@ pub fn toolSettings(
     config: Config,
     backends: Backends,
     health: ?*Health,
-    style: Terminal.Style,
+    shown: Terminal.Display,
 ) tools.Settings {
     const stored = &config.stored;
     return .{
-        // A bash command is laid out by its format script, so the user reads the
-        // command the way it runs; an edit is shown as a diff, laid out by its
-        // own script when one is set.
-        .formats = .{
-            .bash = if (stored.tools.bash.format) |script| .{ .script = script } else null,
-            .edit = if (stored.tools.edit.format) |script| .{ .script = script } else null,
-        },
+        // A tool's block is laid out for the display the run's blocks are shown
+        // on, so a call reads the same in the transcript as it did when it ran.
+        .formats = shown.formats,
+        .style = shown.style,
         .bash_timeout_s = stored.tools.bash.timeout_s,
-        .style = style,
         // A web tool is offered only when the configuration names a backend for
         // it and its key is set; the tool is left out of the request otherwise.
         // The waits travel with the run, so a backend that just failed is
