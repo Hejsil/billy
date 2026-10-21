@@ -48,13 +48,38 @@ pub const Target = struct {
     provider: ?models.Provider,
 };
 
+/// Where a session's requests are sent, resolved from the model the session
+/// records now.
+///
+/// The agent asks before every turn, so a session whose model is changed is sent
+/// to its new provider from the next turn on. The frontend answers, because it is
+/// what holds the configuration and the credentials a target is resolved from;
+/// the agent knows only the session, and keeps where it points from turn to turn.
+pub const Resolver = struct {
+    context: *const anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Where `session` is sent, with the strings the target names allocated
+        /// from `gpa`, which the caller owns and frees. It is asked before every
+        /// turn, so it must answer for the model the session records then; a
+        /// session that records none is given the configured choice to keep.
+        target: *const fn (context: *const anyopaque, gpa: std.mem.Allocator, session: *Session) anyerror!Target,
+    };
+
+    /// Where `session` is sent now.
+    pub fn target(resolver: Resolver, gpa: std.mem.Allocator, session: *Session) !Target {
+        return resolver.vtable.target(resolver.context, gpa, session);
+    }
+};
+
 /// Where a run's requests are sent: the destination the configuration resolves
 /// to, and what the request asks of the model's thinking.
 ///
-/// A run starts pointed here. A session that recorded a provider of its own is
-/// re-pointed at it instead, through a `Target`, which is that destination
-/// without the thinking rule the configuration settled: that rule is the run's,
-/// settled once when it started.
+/// A run starts pointed here, and is re-pointed before every turn at the
+/// destination the session's own model names, through a `Target`: the same
+/// destination without the thinking rule, which the configuration settled when
+/// the run started.
 pub const Endpoint = struct {
     target: Target,
     /// What the request asks of the model's thinking, from the configuration and
@@ -69,7 +94,9 @@ pub const Endpoint = struct {
 /// credentials and the environment, so the agent is handed the run rather than
 /// the file it came from.
 pub const Options = struct {
-    /// Where the run's requests are sent, and which provider answers them.
+    /// Where the run starts pointed: the endpoint the configuration resolves to,
+    /// which is where a turn goes until `resolveTarget` finds where the session's
+    /// own model lives.
     endpoint: Endpoint,
     behaviour: Behaviour,
     tools: Tools.Settings,
@@ -86,6 +113,10 @@ pub const Options = struct {
     /// no such file. Borrowed from the frontend, which owns it and outlives the
     /// agent, so nothing here closes it.
     instructions: ?std.Io.Dir = null,
+    /// Where the session's own model is resolved into the endpoint it is sent to,
+    /// asked before every turn. Null keeps the run pointed at `endpoint`, which is
+    /// what a test that names no configuration wants.
+    resolver: ?Resolver = null,
 };
 
 /// How the agent behaves on a session: how many turns it gives the model before
@@ -424,6 +455,13 @@ io: std.Io,
 gpa: std.mem.Allocator,
 /// How the agent behaves on the session, which is the configuration's say.
 behaviour: Behaviour,
+/// Where the current turn is sent, asked of the frontend before each turn so a
+/// session whose model changes is sent elsewhere from then on. Null keeps the
+/// client pointed at the endpoint the run was given.
+resolver: ?Resolver = null,
+/// Owns what the resolved target names -- the URL and model id of the endpoint
+/// the current turn is sent to -- and is emptied at the start of each turn.
+target_state: std.heap.ArenaAllocator,
 /// Directory holding the user's own instructions file, read into every prompt
 /// ahead of the project's; null when there is no such file. Borrowed from the
 /// frontend, which owns it and outlives the agent.
@@ -473,6 +511,8 @@ pub fn init(
         .io = io,
         .gpa = gpa,
         .behaviour = options.behaviour,
+        .resolver = options.resolver,
+        .target_state = std.heap.ArenaAllocator.init(gpa),
         .instructions = options.instructions,
         .mode = options.mode,
         .work_dir = work_dir,
@@ -491,6 +531,7 @@ pub fn init(
 }
 
 pub fn deinit(agent: *Agent) void {
+    agent.target_state.deinit();
     agent.work_dir.close(agent.io);
 }
 
@@ -500,15 +541,7 @@ pub fn deinit(agent: *Agent) void {
 /// matches the earlier run byte for byte and hits the prompt cache. The user's
 /// instructions come from the configuration directory and the project's from the
 /// session's directory.
-pub fn prepare(agent: *Agent, session: *Session, target: ?Target) !void {
-    // Where the session is sent follows the choice it recorded, not the
-    // configuration, so a session resumed against a provider other than the
-    // configured one still reaches its own. A session that recorded none takes
-    // the configured choice, which is where it was being sent anyway, and is
-    // saved with it from here on. The caller resolves the target, since it owns
-    // the credentials a provider's key is read from.
-    if (target) |resolved| agent.useTarget(resolved);
-
+pub fn prepare(agent: *Agent, session: *Session) !void {
     // A session with a conversation keeps the mode and prompt it was saved with;
     // a new one takes the mode the frontend chose. Either way the agent's mode
     // ends up the session's own.
@@ -530,9 +563,22 @@ pub fn prepare(agent: *Agent, session: *Session, target: ?Target) !void {
     try session.ensureTools(agent.tool_set.definitions(agent.mode));
 }
 
-/// Points the client at where the session is sent.
+/// Points the client at where `session` is sent now, which is resolved from the
+/// model it records at this moment.
 ///
-/// The resolved URL is owned by whoever resolved it, which outlives the session.
+/// A turn calls it before it begins -- the terminal loop before the header above
+/// a prompt, `ask` before the prompt is added -- so a session whose model was
+/// changed is sent to its new provider from the next turn on, with no other
+/// telling. What the target names is owned by the agent and replaced by the next
+/// call, so a request made with it must be sent before then. A run with no
+/// resolver keeps the endpoint it was given, which is what a test wants.
+pub fn resolveTarget(agent: *Agent, session: *Session) !void {
+    const resolver = agent.resolver orelse return;
+    _ = agent.target_state.reset(.retain_capacity);
+    agent.useTarget(try resolver.target(agent.target_state.allocator(), session));
+}
+
+/// Points the client at the target, and records which provider answers it.
 fn useTarget(agent: *Agent, resolved: Target) void {
     agent.client.url = resolved.url;
     agent.client.api_key = resolved.api_key;
@@ -610,7 +656,7 @@ pub fn start(agent: *Agent, session: *Session, text: []const u8) !Started {
 
     const choice = Mode.start(text, agent.mode);
     agent.mode = choice.mode;
-    try agent.prepare(session, null);
+    try agent.prepare(session);
     if (choice.text.len == 0) return .mode_only;
     return .{ .prompt = choice.text };
 }
@@ -656,6 +702,11 @@ fn refresh(agent: *Agent, session: *Session) void {
 /// on from. Only a failure of the emitter itself, which is the frontend going
 /// away, is passed on to the caller.
 pub fn ask(agent: *Agent, emitter: Emitter, session: *Session, text: []const u8) !void {
+    // The turn is sent where the session's model points now, settled before the
+    // prompt is appended so the model it is sent to is recorded with the message
+    // that was sent with it.
+    try agent.resolveTarget(session);
+
     // The system prompt is kept apart from the conversation, so the first turn is
     // the session's first message.
     const first_turn = session.messages.items.len == 0;
@@ -694,15 +745,14 @@ fn failureNotice(buffer: []u8, err: anyerror) []const u8 {
 
 /// Runs one session on the terminal, from `options`, until the input ends: each
 /// line is taken as the agent decides what it is, and the blocks of the answer
-/// are shown as they happen. A resumed session is prepared with `target`, which
-/// is where it recorded being sent.
+/// are shown as they happen. Each turn is sent where the session's model points,
+/// which is resolved again every time round.
 pub fn run(
     io: std.Io,
     gpa: std.mem.Allocator,
     out: *std.Io.Writer,
     options: Options,
     session: *Session,
-    target: ?Target,
 ) !void {
     // One HTTP client for the run, shared by the model requests and the search
     // backend, so both reuse its connections and share the certificates it scans
@@ -715,7 +765,7 @@ pub fn run(
     // A resumed session keeps the prompt and tools it was saved with, so it is
     // prepared here; a new one gets them from its first prompt, through `start`.
     const resumed = session.messages.items.len > 0;
-    if (resumed) try agent.prepare(session, target);
+    if (resumed) try agent.prepare(session);
 
     // The editor holds the lines it returns and its history in an arena of its
     // own, over `gpa`, so the run need not keep an allocator for them.
@@ -733,6 +783,11 @@ pub fn run(
     var header: std.Io.Writer.Allocating = .init(gpa);
     defer header.deinit();
     while (true) {
+        // Where this turn is sent is settled before anything is shown, so the
+        // header gauges the model the session is headed with now -- which is a
+        // different one if a command changed it since the last turn -- and every
+        // block of the turn below goes there.
+        try agent.resolveTarget(session);
         header.clearRetainingCapacity();
         // The header is built each pass, so it shows the session as it stands: the
         // mode the first prompt may have set, the model it recorded, and the
@@ -1569,6 +1624,7 @@ const TestSetup = struct {
     mode: Mode = .general,
     home: ?[]const u8 = null,
     instructions: ?std.Io.Dir = null,
+    resolver: ?Resolver = null,
 
     /// A setup for `model`, which is the one thing every test names, since it is
     /// what the session records and the header shows.
@@ -1585,7 +1641,37 @@ const TestSetup = struct {
             .mode = setup.mode,
             .home = setup.home,
             .instructions = setup.instructions,
+            .resolver = setup.resolver,
         };
+    }
+};
+
+/// A resolver for a test: the server a session is sent to follows the model it
+/// records, from a table the test fills in. A frontend's resolver does the same
+/// from the configuration and the credentials, which an agent is never given.
+const TestResolver = struct {
+    /// One entry per model the test knows: the whole choice, and the URL of the
+    /// server that answers it.
+    entries: []const struct { choice: []const u8, url: []const u8 },
+
+    fn target(context: *const anyopaque, gpa: std.mem.Allocator, session: *Session) anyerror!Target {
+        _ = gpa;
+        const self: *const TestResolver = @ptrCast(@alignCast(context));
+        const choice = models.Choice{ .text = session.model() orelse "" };
+        for (self.entries) |entry| {
+            if (!std.mem.eql(u8, entry.choice, choice.text)) continue;
+            return .{
+                .url = entry.url,
+                .api_key = "k",
+                .model = choice.model(),
+                .provider = models.Provider.fromName(choice.provider()),
+            };
+        }
+        return error.UnknownProvider;
+    }
+
+    fn of(self: *const TestResolver) Resolver {
+        return .{ .context = self, .vtable = &.{ .target = target } };
     }
 };
 
@@ -2308,7 +2394,7 @@ test "prepare gives a fresh session the user's instructions from the configurati
     var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
 
-    try agent.prepare(&session, null);
+    try agent.prepare(&session);
 
     // The prompt the session runs with carries the user's instructions, so the
     // configuration directory is read for every session and not only a project.
@@ -2337,7 +2423,7 @@ test "prepare gives a chat session no prompt and only the tools it allows" {
     var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
 
-    try agent.prepare(&session, null);
+    try agent.prepare(&session);
 
     // The mode is recorded, no system prompt is set at all (a chat request is the
     // conversation alone, so the instructions never reach it), and the tools
@@ -2742,6 +2828,62 @@ fn expectCleanTitle(gpa: std.mem.Allocator, expected: []const u8, raw: []const u
     try std.testing.expectEqualStrings(expected, title);
 }
 
+test "a turn is sent to the model the session records when it begins" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // One server per model, each answering once: a turn sent to the wrong one
+    // fails the test rather than passing.
+    var deepseek = try Mock.start("/chat/completions", 1, Mock.completion("from the deepseek model"));
+    defer deepseek.deinit();
+    try deepseek.serve();
+    var opencode = try Mock.start("/chat/completions", 1, Mock.completion("from the opencode model"));
+    defer opencode.deinit();
+    try opencode.serve();
+
+    var resolver = TestResolver{ .entries = &.{
+        .{ .choice = "deepseek/deepseek-flash", .url = deepseek.url },
+        .{ .choice = "opencode_go/kimi-k2.7-code", .url = opencode.url },
+    } };
+    var setup = TestSetup.init("m");
+    // Naming the session is a request of its own, which is not what this is about.
+    setup.behaviour.title = false;
+    setup.resolver = resolver.of();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+    var agent = try testAgent(io, gpa, setup, &http_client);
+    defer agent.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var terminal = testTerminal(&out.writer, .{});
+
+    // The session runs on one model, and the turn goes to that model's server.
+    try session.setModel("deepseek/deepseek-flash");
+    try agent.ask(terminal.emitter(), &session, "the first question");
+
+    // The model is changed to one of another provider between turns, and the
+    // next turn goes there, with nothing else told to the agent.
+    try session.setModel("opencode_go/kimi-k2.7-code");
+    try agent.ask(terminal.emitter(), &session, "the second question");
+
+    try deepseek.group.await(io);
+    if (deepseek.err) |err| return err;
+    try opencode.group.await(io);
+    if (opencode.err) |err| return err;
+
+    // Each server answered exactly the turn meant for it: the change was picked
+    // up at the turn after it was made.
+    try std.testing.expectEqual(@as(usize, 1), deepseek.served);
+    try std.testing.expectEqual(@as(usize, 1), opencode.served);
+}
+
 test "a session is sent where the choice it recorded points, not the configuration" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -2755,8 +2897,14 @@ test "a session is sent where the choice it recorded points, not the configurati
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
+    // The resolver a frontend would give the run: where a model lives, which the
+    // session's own record chooses between.
+    var resolver = TestResolver{ .entries = &.{
+        .{ .choice = "opencode_go/kimi-k2.7-code", .url = chosen.url },
+    } };
     var setup = TestSetup.init("m");
     setup.target.url = "http://127.0.0.1:1/chat/completions";
+    setup.resolver = resolver.of();
     var agent = try testAgent(io, gpa, setup, &http_client);
     defer agent.deinit();
 
@@ -2765,17 +2913,10 @@ test "a session is sent where the choice it recorded points, not the configurati
     var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
 
-    // The target the frontend resolves from the session's own choice: the
-    // endpoint it names, the key for it, and the model id with the provider
-    // stripped off.
-    try agent.prepare(&session, .{
-        .url = chosen.url,
-        .api_key = "k",
-        .model = "kimi-k2.7-code",
-        // The provider that answers it, which is what the window the header
-        // gauges against is looked up by.
-        .provider = .opencode_go,
-    });
+    // The session records a model of its own, and the resolver answers with where
+    // that model lives.
+    try session.setModel("opencode_go/kimi-k2.7-code");
+    try agent.resolveTarget(&session);
 
     // The client was pointed at the endpoint the session named rather than the
     // configured one, the model id it was given is sent, and the header reads
@@ -2799,33 +2940,4 @@ test "a session is sent where the choice it recorded points, not the configurati
     if (chosen.err) |err| return err;
     try std.testing.expectEqual(@as(usize, 1), chosen.served);
     try std.testing.expectEqualStrings("chosen", reply.content.items);
-}
-
-test "a session with no recorded model takes the choice it is prepared with" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
-    var agent = try testAgent(io, gpa, TestSetup.init("m"), &http_client);
-    defer agent.deinit();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
-    defer session.deinit();
-    // What an older session file reads back as.
-    try std.testing.expect(session.model() == null);
-
-    try agent.prepare(&session, .{
-        .url = "https://api.deepseek.com/chat/completions",
-        .api_key = "k",
-        .model = "deepseek-flash",
-        .provider = .deepseek,
-    });
-
-    // The session was sent to the configured model, which is recorded by the
-    // caller that resolved it, so a later run keeps it.
-    try std.testing.expectEqualStrings("deepseek-flash", agent.client.model);
 }

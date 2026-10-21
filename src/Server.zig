@@ -101,12 +101,23 @@ fn options(server: *const Server, mode: Agent.Mode) Agent.Options {
         .tools = Endpoints.toolSettings(server.config, server.backends, server.health, display),
         .display = display,
         .mode = mode,
+        // Where each turn is sent, resolved from the model the session records
+        // when the turn begins: a session changed to another model is sent to its
+        // new provider from the next turn on.
+        .resolver = .{ .context = server, .vtable = &.{ .target = resolveTarget } },
         .home = server.environ.get("HOME"),
         // The user's own instructions live beside the configuration, and join
         // every session's prompt. The server owns the directory and outlives
         // every turn.
         .instructions = server.config_dir,
     };
+}
+
+/// Where a session's requests go, for a turn to ask before it begins: the
+/// endpoint its recorded model names, with the key stored for that provider.
+fn resolveTarget(context: *const anyopaque, gpa: std.mem.Allocator, session: *Session) anyerror!Agent.Target {
+    const server: *const Server = @ptrCast(@alignCast(context));
+    return Endpoints.sessionTarget(server.config, &server.store, gpa, session);
 }
 
 /// Serves the frontend on the address `host` at `port`, until the process is
@@ -828,20 +839,14 @@ fn serveTurn(
     const gpa = r.server.gpa;
     var agent = try Agent.init(r.server.io, gpa, run_options, session.cwd(), http_client);
     defer agent.deinit();
-    // Where the session is sent is resolved into a buffer of its own, freed
-    // when the turn is over: it is built per turn, and holding it in the
-    // server's own allocator would grow with every request the page makes.
-    var target_state = std.heap.ArenaAllocator.init(gpa);
-    defer target_state.deinit();
+    // Where the turn is sent is resolved from the session's own model before
+    // anything else, so a compaction this prompt triggers is measured against the
+    // window of the model it is going to. It is sent where its own recorded
+    // provider lives, which may not be where the server is configured.
+    try agent.resolveTarget(session);
     // The session is prepared from the mode the caller settled, which is the
-    // session's own once it has been asked something. It is sent where its own
-    // recorded provider lives, which may not be where the server is configured.
-    try agent.prepare(session, try Endpoints.sessionTarget(
-        r.server.config,
-        &r.server.store,
-        target_state.allocator(),
-        session,
-    ));
+    // session's own once it has been asked something.
+    try agent.prepare(session);
 
     // The head of the reply goes out before the run starts, so the page can read
     // the stream while the model is working. From here on a failure is part of

@@ -202,15 +202,16 @@ pub fn run(billy: *Billy, out: *std.Io.Writer, resume_id: ?[]const u8) !void {
     };
     defer session.deinit();
 
-    // What the run is built from lives for as long as it does: the endpoint, the
-    // backends and the target are all that a request needs, and nothing outside
-    // the run holds them.
+    // What the run is built from lives for as long as it does: the endpoint and
+    // the backends are all that a request needs of the configuration, and nothing
+    // outside the run holds them. Each turn's own target is resolved by the agent,
+    // from the model the session records when that turn begins.
     var run_state = std.heap.ArenaAllocator.init(billy.gpa);
     defer run_state.deinit();
     const arena = run_state.allocator();
 
-    // Where the configuration sends its requests. A session that recorded a
-    // provider of its own is sent there instead, which is `target` below.
+    // Where the configuration sends its requests. Each turn is resolved from the
+    // session's own model instead, which the run asks for by `resolveTarget`.
     const endpoint = try Endpoints.open(arena, billy.config, &billy.credentials);
     // The terminal lays its blocks out for the terminal it is on, which the
     // escape codes of a pipe or a redirection would only be noise in.
@@ -234,6 +235,10 @@ pub fn run(billy: *Billy, out: *std.Io.Writer, resume_id: ?[]const u8) !void {
         // The user's own instructions live beside the configuration, and join
         // every session's prompt. Billy owns the directory and outlives the run.
         .instructions = billy.dirs.config,
+        // Where each turn is sent, resolved from the model the session records
+        // when the turn begins: a session changed to another model is sent to its
+        // new provider from the next turn on.
+        .resolver = .{ .context = billy, .vtable = &.{ .target = resolveTarget } },
     };
 
     if (resume_id != null) {
@@ -249,8 +254,14 @@ pub fn run(billy: *Billy, out: *std.Io.Writer, resume_id: ?[]const u8) !void {
             billy.config.stored.resume_blocks,
         );
     }
-    const target = try Endpoints.sessionTarget(billy.config, &billy.credentials, arena, &session);
-    try agent.run(billy.io, billy.gpa, out, options, &session, target);
+    try agent.run(billy.io, billy.gpa, out, options, &session);
+}
+
+/// Where a session's requests go, for the run to ask before every turn: the
+/// endpoint its recorded model names, with the key stored for that provider.
+fn resolveTarget(context: *const anyopaque, gpa: std.mem.Allocator, session: *Session) anyerror!agent.Target {
+    const billy: *const Billy = @ptrCast(@alignCast(context));
+    return Endpoints.sessionTarget(billy.config, &billy.credentials, gpa, session);
 }
 
 /// Lists the sessions billy has kept, the one written to most recently first,

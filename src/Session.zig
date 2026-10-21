@@ -632,16 +632,18 @@ pub fn setMode(session: *Session, mode: agent.Mode) void {
     session.mode = mode;
 }
 
-/// Records the provider and model the session is sent to. Set once, when the
-/// session starts, and kept for every run after it; a session that already has
-/// one is left alone, since the conversation belongs to the model that produced
-/// it.
+/// Records the provider and model the session is sent to.
+///
+/// Where a session goes is resolved from this before every turn, so setting it is
+/// what moves a session to another provider: the next turn is sent there, and
+/// every turn after it, until it is changed again. Where it came from is recorded
+/// with the session, since a conversation belongs to the model that produced it.
 pub fn setModel(session: *Session, choice: []const u8) !void {
     session.interned.model = try session.pool.intern(session.gpa, choice);
 }
 
-/// The provider and model the session was started on, or null for one saved
-/// before either was recorded.
+/// The provider and model the session is sent to, or null for one saved before
+/// either was recorded.
 pub fn model(session: *const Session) ?[]const u8 {
     return session.pool.get(session.interned.model);
 }

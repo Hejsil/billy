@@ -544,6 +544,9 @@ test "a target names bytes of its own, not a slice of the session's pool" {
     defer session.deinit();
 
     const target = try sessionTarget(opened.config, &store, arena, &session);
+    // A session that recorded none is given the configured choice, so every turn
+    // after this one is sent there.
+    try std.testing.expectEqualStrings("opencode_go/glm-5.3-flash", session.modelChoice(""));
     // The model the session recorded is interned in its string pool, and a
     // pointer into that pool survives no write to it. Writing more strings, as
     // a turn does when it stores a message, must not leave the target naming
