@@ -158,7 +158,7 @@ fn readSecret(billy: *Billy, out: Terminal.Writer, prompt: []const u8) !?[]const
 /// Sets the configuration setting `path` to `value` and writes the file back, so
 /// a setting can be changed without opening it by hand.
 pub fn configSet(billy: *Billy, out: Terminal.Writer, path: []const u8, value: []const u8) !void {
-    Config.set(&billy.config, path, value) catch |err| switch (err) {
+    billy.config.set(path, value) catch |err| switch (err) {
         error.UnknownOption => {
             std.log.err("'{s}' is not a configuration setting", .{path});
             return err;
