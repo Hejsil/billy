@@ -95,7 +95,7 @@ fn options(server: *const Server, mode: Agent.Mode) Agent.Options {
     return .{
         .config = &server.config,
         .store = &server.store,
-        .behaviour = Endpoints.behaviour(server.config),
+        .behaviour = Agent.Behaviour.fromConfig(server.config),
         .tools = Endpoints.toolSettings(server.config, server.backends, server.health),
         .mode = mode,
         .home = server.environ.get("HOME"),

@@ -222,7 +222,7 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resume_id: ?[]const u8) !void {
     const options = Agent.Options{
         .config = &billy.config,
         .store = &billy.credentials,
-        .behaviour = Endpoints.behaviour(billy.config),
+        .behaviour = Agent.Behaviour.fromConfig(billy.config),
         .tools = Endpoints.toolSettings(
             billy.config,
             try Endpoints.Backends.build(arena, billy.config, &billy.credentials),

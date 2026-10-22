@@ -79,6 +79,19 @@ pub const Behaviour = struct {
     /// Whether the model is asked for a short title for a session, after its
     /// first turn, so a frontend can list it by name. Mirrors the configuration.
     title: bool = true,
+
+    /// How a run's agent behaves: the turns it gives the model, the share of the
+    /// window it fills before the conversation is folded into a summary, and whether
+    /// it names the session. Where each turn is sent is resolved separately, as
+    /// `sessionTarget`, and what its tools run with as `toolSettings`.
+    pub fn fromConfig(config: Config) Behaviour {
+        const stored = &config.stored;
+        return .{
+            .max_turns = stored.max_turns,
+            .compact_at = stored.compact_at,
+            .title = stored.title,
+        };
+    }
 };
 
 /// One unit of what a run shows: the pieces a conversation is made of, in the
