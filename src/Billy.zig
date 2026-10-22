@@ -7,7 +7,7 @@
 //! to send a request, is handed the one thing it needs rather than this.
 
 const std = @import("std");
-const agent = @import("Agent.zig");
+const Agent = @import("Agent.zig");
 const Config = @import("Config.zig");
 const Credentials = @import("Credentials.zig");
 const Dirs = @import("Dirs.zig");
@@ -219,7 +219,7 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resume_id: ?[]const u8) !void {
     // are resolved from, how far it goes, what its tools run with, how its blocks
     // are shown, and the home directory and instructions it reads outside the
     // session.
-    const options = agent.Options{
+    const options = Agent.Options{
         .config = &billy.config,
         .store = &billy.credentials,
         .behaviour = Endpoints.behaviour(billy.config),
@@ -238,7 +238,7 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resume_id: ?[]const u8) !void {
         // Replay the conversation as a transcript, so the context does not
         // have to be remembered from the previous run. Only the last few blocks
         // are shown, so resuming a long one is quick.
-        try agent.printTranscript(
+        try Agent.printTranscript(
             billy.io,
             billy.gpa,
             out,
@@ -246,7 +246,7 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resume_id: ?[]const u8) !void {
             billy.config.stored.resume_blocks,
         );
     }
-    try agent.run(billy.io, billy.gpa, out, options, &session);
+    try Agent.run(billy.io, billy.gpa, out, options, &session);
 }
 
 /// Lists the sessions billy has kept, the one written to most recently first,
