@@ -149,7 +149,8 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    var stdout_file_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+
     // Everything billy prints goes through one writer, which decorates its blocks
     // only when it is a terminal it is printing to. A subcommand that prints no
     // blocks writes the same text either way.
