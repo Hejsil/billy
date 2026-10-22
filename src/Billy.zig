@@ -210,11 +210,6 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resume_id: ?[]const u8) !void {
     defer run_state.deinit();
     const arena = run_state.allocator();
 
-    // The configured choice is resolved once here only to report a provider or a
-    // key that is missing before the run starts: each turn resolves its own target
-    // from the model the session records when it begins.
-    _ = try Endpoint.configured(&billy.config, &billy.credentials, arena);
-
     // What the run is given, resolved once for the whole of it: what its targets
     // are resolved from, how far it goes, what its tools run with, how its blocks
     // are shown, and the home directory and instructions it reads outside the
