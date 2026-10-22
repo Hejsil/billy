@@ -395,8 +395,14 @@ pub const Stream = struct {
     reader: *std.Io.Reader,
 
     /// The bytes of the frame being read, kept between reads so a frame that
-    /// spans two of them is not lost.
+    /// spans two of them is not lost. It is also the room the body is read into:
+    /// `next` hands its buffer to the writer it reads through, so the list is
+    /// empty while a read is under way.
     pending: std.ArrayList(u8) = .empty,
+    /// Where the next frame starts in `pending`. A frame is moved past by
+    /// moving this index, and its bytes stay where they arrived, so the buffer
+    /// holds the whole of the body as it streams in.
+    parsed: usize = 0,
     /// The `data:` lines of the frame being read, joined with newlines.
     data: std.ArrayList(u8) = .empty,
     /// The parsed chunk a delta points into, reset before the next one is read.
@@ -447,34 +453,28 @@ pub const Stream = struct {
     /// A provider that sent no choices at all is reported as `error.NoChoices`
     /// rather than as an empty reply.
     pub fn next(self: *Stream) !?Delta {
+        var writer = std.Io.Writer.Allocating.fromArrayList(self.gpa, &self.pending);
+        defer self.pending = writer.toArrayList();
+
         while (!self.done) {
-            if (frameEnd(self.pending.items)) |end| {
-                const delta = try self.parseFrame(self.pending.items[0..end.body]);
-                self.consume(end.consumed);
+            const unparsed = writer.written()[self.parsed..];
+            if (frameEnd(unparsed)) |end| {
+                const delta = try self.parseFrame(unparsed[0..end.body]);
+                self.parsed += end.consumed;
                 if (delta) |d| return d;
                 continue;
             }
 
-            var buffer: [4096]u8 = undefined;
-            var slices = [_][]u8{&buffer};
-            const n = self.reader.readVec(&slices) catch |err| switch (err) {
-                // The body is over. Every complete frame was taken off the
-                // front of `pending` above, so what is left is a frame cut off
-                // mid-way, which is not the reply's and is dropped.
+            _ = self.reader.stream(&writer.writer, .unlimited) catch |err| switch (err) {
                 error.EndOfStream => {
                     self.done = true;
                     continue;
                 },
                 else => return err,
             };
-            // A read may hand over no bytes without the stream being over: a
-            // reader is allowed to put them in its own buffer and return zero,
-            // and the next read hands them on. Reading reaches the end only as
-            // `error.EndOfStream`, so zero is waited past rather than taken for
-            // the end, which would cut the reply off where it stood.
-            if (n > 0) try self.pending.appendSlice(self.gpa, buffer[0..n]);
         }
-        if (!self.saw_choice) return error.NoChoices;
+        if (!self.saw_choice)
+            return error.NoChoices;
         return null;
     }
 
@@ -488,19 +488,13 @@ pub const Stream = struct {
     /// Stops reading and frees the stream. A body that was not read to the end
     /// is discarded, which is what lets the connection be used again.
     pub fn deinit(self: *Stream) void {
-        self.request.deinit();
-        self.buffers.deinit(self.gpa);
-        self.pending.deinit(self.gpa);
-        self.data.deinit(self.gpa);
-        self.arena.deinit();
         const gpa = self.gpa;
+        self.request.deinit();
+        self.buffers.deinit(gpa);
+        self.pending.deinit(gpa);
+        self.data.deinit(gpa);
+        self.arena.deinit();
         gpa.destroy(self);
-    }
-
-    fn consume(self: *Stream, n: usize) void {
-        const rest = self.pending.items[n..];
-        std.mem.copyForwards(u8, self.pending.items[0..rest.len], rest);
-        self.pending.items.len = rest.len;
     }
 
     /// Reads one frame into a delta. Only its `data:` lines carry the JSON; the
@@ -561,7 +555,8 @@ pub const Stream = struct {
             .reasoning = piece.reasoning_content,
             .tool_calls = calls,
         };
-        if (delta.content == null and delta.reasoning == null and delta.tool_calls.len == 0) return null;
+        if (delta.content == null and delta.reasoning == null and delta.tool_calls.len == 0)
+            return null;
         return delta;
     }
 };
@@ -906,6 +901,128 @@ test "a streamed reply is read a delta at a time" {
     try std.testing.expectEqualStrings("hello", message.content.?);
     try std.testing.expectEqual(0, collected.calls.items.len);
     try std.testing.expectEqual(5, stream.usage().total_tokens);
+}
+
+test "a streamed reply that arrived compressed is read" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const events =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n" ++
+        "data: [DONE]\n\n";
+
+    // A provider may compress the events, and a compressed body is read through
+    // a decoder that keeps what it has decoded in a buffer of its own. That
+    // buffer is only handed over by a read through the reader, so a stream read
+    // any other way would lose the whole body.
+    var compressed: std.Io.Writer.Allocating = try .initCapacity(gpa, 4096);
+    defer compressed.deinit();
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var compressor = try std.compress.flate.Compress.init(
+        &compressed.writer,
+        &window,
+        .gzip,
+        .default,
+    );
+    try compressor.writer.writeAll(events);
+    try compressor.finish();
+
+    const gzipped = struct {
+        var body: []const u8 = &.{};
+        fn answer(_: usize, _: []const u8) Mock.Answer {
+            return .{
+                .body = body,
+                .content_type = "text/event-stream",
+                .content_encoding = "gzip",
+            };
+        }
+    };
+    gzipped.body = compressed.written();
+
+    const messages = [_]Message{.{ .role = .user, .content = "hi" }};
+    var mock = try Mock.start("/chat/completions", 1, gzipped.answer);
+    defer mock.deinit();
+    try mock.serve();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+    var client: Client = .{
+        .gpa = gpa,
+        .io = io,
+        .api_key = "k",
+        .url = mock.url,
+        .model = "m",
+        .http = &http_client,
+    };
+
+    var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
+    defer stream.deinit();
+    var collected: Reply = .{ .gpa = gpa };
+    defer collected.deinit();
+    try collected.collect(stream);
+
+    try mock.group.await(io);
+    if (mock.err) |err| return err;
+
+    try std.testing.expectEqualStrings("hello", collected.content.items);
+}
+
+test "a frame that arrives in pieces is joined" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // A body arrives in whatever pieces the network hands over, and this one is
+    // larger than any buffer it passes through, so the frame carrying it is cut
+    // in two by the reads that bring it. The rest of a frame is found where the
+    // frame before it ended, not at the front of what was last read.
+    const long = try gpa.alloc(u8, 30_000);
+    defer gpa.free(long);
+    @memset(long, 'x');
+    const reply = try std.fmt.allocPrint(
+        gpa,
+        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{s}\"}}}}]}}\n\n" ++
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"the end\"}}}}]}}\n\n" ++
+            "data: [DONE]\n\n",
+        .{long},
+    );
+    defer gpa.free(reply);
+
+    const streamed = struct {
+        var body: []const u8 = &.{};
+        fn answer(_: usize, _: []const u8) Mock.Answer {
+            return .{ .body = body, .content_type = "text/event-stream" };
+        }
+    };
+    streamed.body = reply;
+
+    const messages = [_]Message{.{ .role = .user, .content = "hi" }};
+    var mock = try Mock.start("/chat/completions", 1, streamed.answer);
+    defer mock.deinit();
+    try mock.serve();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+    var client: Client = .{
+        .gpa = gpa,
+        .io = io,
+        .api_key = "k",
+        .url = mock.url,
+        .model = "m",
+        .http = &http_client,
+    };
+
+    var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
+    defer stream.deinit();
+    var collected: Reply = .{ .gpa = gpa };
+    defer collected.deinit();
+    try collected.collect(stream);
+
+    try mock.group.await(io);
+    if (mock.err) |err| return err;
+
+    try std.testing.expectEqualStrings(long, collected.content.items[0..long.len]);
+    try std.testing.expectEqualStrings("the end", collected.content.items[long.len..]);
 }
 
 test "a frame ends at the blank line that follows it" {

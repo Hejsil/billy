@@ -51,6 +51,9 @@ pub const Answer = struct {
     keep_alive: bool = false,
     /// The `Content-Type` to send the body with, or none.
     content_type: ?[]const u8 = null,
+    /// The `Content-Encoding` the body is sent as, or none for a body that is
+    /// sent as it is.
+    content_encoding: ?[]const u8 = null,
 };
 
 /// Starts a mock listening on a free port, at `path` -- `/chat/completions` for
@@ -162,16 +165,20 @@ fn serveConnection(mock: *Mock, io: std.Io, stream: std.Io.net.Stream) !void {
 
         const answer = mock.answer(mock.served + 1, body);
         mock.served += 1;
-        var content_type: [1]std.http.Header = undefined;
-        var extra_headers: []const std.http.Header = &.{};
+        var extra: [2]std.http.Header = undefined;
+        var extra_count: usize = 0;
         if (answer.content_type) |value| {
-            content_type[0] = .{ .name = "content-type", .value = value };
-            extra_headers = &content_type;
+            extra[extra_count] = .{ .name = "content-type", .value = value };
+            extra_count += 1;
+        }
+        if (answer.content_encoding) |value| {
+            extra[extra_count] = .{ .name = "content-encoding", .value = value };
+            extra_count += 1;
         }
         try request.respond(answer.body, .{
             .status = answer.status,
             .keep_alive = answer.keep_alive,
-            .extra_headers = extra_headers,
+            .extra_headers = extra[0..extra_count],
         });
         if (!answer.keep_alive) return;
     }
