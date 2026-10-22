@@ -403,15 +403,12 @@ pub const Stream = struct {
     /// moving this index, and its bytes stay where they arrived, so the buffer
     /// holds the whole of the body as it streams in.
     parsed: usize = 0,
-    /// The `data:` lines of the frame being read, joined with newlines.
+    /// The `data:` lines of the frame being read, one after another.
     data: std.ArrayList(u8) = .empty,
     /// The parsed chunk a delta points into, reset before the next one is read.
     arena: std.heap.ArenaAllocator,
     /// The token counts the provider sent, which `usage` reads.
     token_usage: Usage = .{},
-    /// Whether any chunk carried a choice, so a stream that carried none can be
-    /// told from a reply that is simply empty.
-    saw_choice: bool = false,
     /// Whether the stream has ended: its `[DONE]` frame was read, or the body
     /// ran out. Anything after that is not the reply's.
     done: bool = false,
@@ -450,8 +447,9 @@ pub const Stream = struct {
     /// Reads until the next piece of the reply, or null when the stream has
     /// ended. The stream ends at its `[DONE]` frame or at the end of the body;
     /// anything left then is a frame cut off mid-way, which is not the reply's.
-    /// A provider that sent no choices at all is reported as `error.NoChoices`
-    /// rather than as an empty reply.
+    /// A provider that sent no choices at all streams nothing, which is an
+    /// empty reply rather than an error: what that means is the caller's to
+    /// say.
     pub fn next(self: *Stream) !?Delta {
         var writer = std.Io.Writer.Allocating.fromArrayList(self.gpa, &self.pending);
         defer self.pending = writer.toArrayList();
@@ -473,8 +471,6 @@ pub const Stream = struct {
                 else => return err,
             };
         }
-        if (!self.saw_choice)
-            return error.NoChoices;
         return null;
     }
 
@@ -499,16 +495,15 @@ pub const Stream = struct {
 
     /// Reads one frame into a delta. Only its `data:` lines carry the JSON; the
     /// other fields, such as `event:` or a comment, are ones billy has no use
-    /// for. A payload that runs over more than one line is joined back with
-    /// newlines.
+    /// for. A payload that runs over more than one line is put back together,
+    /// its lines one after another: JSON counts the newline between them as
+    /// whitespace, so it is not put back.
     fn parseFrame(self: *Stream, bytes: []const u8) !?Delta {
         self.data.clearRetainingCapacity();
         var lines = std.mem.splitScalar(u8, bytes, '\n');
         while (lines.next()) |line| {
             const field = std.mem.trimEnd(u8, line, "\r");
             const data = std.mem.cutPrefix(u8, field, "data:") orelse continue;
-
-            if (self.data.items.len > 0) try self.data.append(self.gpa, '\n');
             try self.data.appendSlice(self.gpa, std.mem.trim(u8, data, " \t"));
         }
 
@@ -541,7 +536,6 @@ pub const Stream = struct {
         if (chunk.usage) |counts| self.token_usage = counts;
         // The request asks for one choice, so only the first is read.
         if (chunk.choices.len == 0) return null;
-        self.saw_choice = true;
 
         const piece = chunk.choices[0].delta;
         const calls = try arena.alloc(ToolCallDelta, piece.tool_calls.len);
@@ -1200,13 +1194,13 @@ test "a reply that is not a stream is reported, not read as a plain reply" {
     if (mock.err) |err| return err;
 }
 
-test "a stream that carries no choices is reported" {
+test "a stream that carries no choices is an empty reply" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    // An empty stream is not an empty reply: the provider said nothing at all,
-    // which the caller is told rather than being handed a message with nothing
-    // in it.
+    // A provider that says nothing at all streams no choices, which reads as an
+    // empty reply: the caller decides what a reply with nothing in it means,
+    // rather than being handed an error for it here.
     var mock = try Mock.start("/chat/completions", 1, Mock.eventStream("data: [DONE]\n\n"));
     defer mock.deinit();
     try mock.serve();
@@ -1217,10 +1211,16 @@ test "a stream that carries no choices is reported" {
     const messages = [_]Message{.{ .role = .user, .content = "hi" }};
     var stream = try client.complete(gpa, "01SESSION", &messages, @as([]const NoTools, &.{}));
     defer stream.deinit();
-    try std.testing.expectError(error.NoChoices, stream.next());
+    var reply: Reply = .{ .gpa = gpa };
+    defer reply.deinit();
+    try reply.collect(stream);
 
     try mock.group.await(io);
     if (mock.err) |err| return err;
+
+    try std.testing.expectEqualStrings("", reply.content.items);
+    try std.testing.expectEqualStrings("", reply.reasoning.items);
+    try std.testing.expectEqual(0, reply.calls.items.len);
 }
 
 test "a tool call streamed in pieces is put back together" {
