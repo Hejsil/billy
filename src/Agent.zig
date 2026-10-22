@@ -939,8 +939,10 @@ fn blocksIn(session: *const Session, messages: []const Session.Message, index: u
     return if (calls == 0) 1 else calls;
 }
 
-/// Shows the text of a streamed delta to the frontend. Tool call pieces are not
-/// shown: a call is shown whole when it has been parsed, just before it runs.
+/// Shows the text of a streamed delta to the frontend. The model's thinking is
+/// not shown: it is the provider's, and is carried back to it rather than to
+/// the screen. Tool call pieces are not shown either: a call is shown whole
+/// when it has been parsed, just before it runs.
 fn showDeltaText(emitter: Emitter, delta: llm.Delta) !void {
     if (delta.content) |text| try emitter.showDelta(.{ .content = text });
 }
@@ -2674,7 +2676,8 @@ test "a turn shows the tool it runs and then the answer" {
                 };
             }
             return .{
-                .body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\"," ++
+                .body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"I should run the command.\"}}]}\n\n" ++
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\"," ++
                     "\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":" ++
                     "\"{\\\"command\\\":\\\"echo hi\\\"}\"}}]}}]," ++
                     "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}\n\n" ++
@@ -2703,6 +2706,16 @@ test "a turn shows the tool it runs and then the answer" {
     try mock.group.await(io);
     if (mock.err) |err| return err;
 
+    // The thinking the model sent with its call goes back to the provider on the
+    // next request, with the assistant message it belongs to. A provider in
+    // thinking mode refuses the conversation without it.
+    try std.testing.expectEqual(@as(usize, 2), mock.bodies.items.len);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        mock.bodies.items[1],
+        "\"reasoning_content\":\"I should run the command.\"",
+    ) != null);
+
     // The call is shown as it begins, so its header could go up while it ran,
     // and again with the result it produced. The answer follows.
     try std.testing.expectEqual(3, recorder.seen.items.len);
@@ -2713,7 +2726,9 @@ test "a turn shows the tool it runs and then the answer" {
     try std.testing.expectEqualStrings("all done", recorder.seen.items[2].answer);
 
     // The answer reached the frontend while it was still being written, as the
-    // pieces the model sent, before the block that carries the whole of it.
+    // pieces the model sent, before the block that carries the whole of it. The
+    // thinking that came with them was not among them: it is the provider's,
+    // and goes back to it rather than to the screen.
     try std.testing.expectEqual(2, recorder.deltas.items.len);
     try std.testing.expectEqualStrings("all ", recorder.deltas.items[0].text);
     try std.testing.expectEqualStrings("done", recorder.deltas.items[1].text);

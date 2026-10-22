@@ -175,6 +175,7 @@ pub const Message = struct {
     role: llm.Role,
     content: StringIndex = .none,
     tool_call_id: StringIndex = .none,
+    reasoning: StringIndex = .none,
     tool_calls: ToolCallIndex = .empty,
 
     /// The message as the API client takes it, with every string resolved out of
@@ -192,6 +193,7 @@ pub const Message = struct {
             .role = message.role,
             .content = session.pool.get(message.content),
             .tool_call_id = session.pool.get(message.tool_call_id),
+            .reasoning_content = session.pool.get(message.reasoning),
             .tool_calls = calls,
         };
     }
@@ -416,6 +418,11 @@ fn writeMessage(session: *const Session, json: anytype, message: Message) !void 
         try json.write(tool_call_id);
     }
 
+    if (session.pool.get(message.reasoning)) |reasoning| {
+        try json.objectField("reasoning_content");
+        try json.write(reasoning);
+    }
+
     try json.endObject();
 }
 
@@ -598,6 +605,7 @@ fn appendMessage(session: *Session, message: llm.Message) !void {
         .role = message.role,
         .content = try session.pool.intern(session.gpa, message.content),
         .tool_call_id = try session.pool.intern(session.gpa, message.tool_call_id),
+        .reasoning = try session.pool.intern(session.gpa, message.reasoning_content),
         .tool_calls = interned_tool_calls,
     });
 }
@@ -1194,14 +1202,15 @@ fn reopenTestSession(tmp: *std.testing.TmpDir, session_id: []const u8) !Session 
 }
 
 /// Checks two conversations hold the same messages, field for field: the role,
-/// the content, the call a result answers, and every tool call. The text is
-/// compared by content, since two sessions number their strings differently; a
-/// role is the enum itself, so it is compared as one.
+/// the content, the model's thinking, the call a result answers, and every tool
+/// call. The text is compared by content, since two sessions number their
+/// strings differently; a role is the enum itself, so it is compared as one.
 fn expectConvo(expected: []const llm.Message, actual: []const llm.Message) !void {
     try std.testing.expectEqual(expected.len, actual.len);
     for (expected, actual) |want, got| {
         try std.testing.expectEqual(want.role, got.role);
         try std.testing.expectEqualStrings(want.content orelse "", got.content orelse "");
+        try std.testing.expectEqualStrings(want.reasoning_content orelse "", got.reasoning_content orelse "");
         try std.testing.expectEqualStrings(want.tool_call_id orelse "", got.tool_call_id orelse "");
 
         const want_calls = want.tool_calls orelse &.{};
@@ -1667,15 +1676,18 @@ test "setCheckedId rejects names that could escape the session directory" {
 }
 
 test "a session survives a save and resume" {
-    // A message of every shape: a prompt, an assistant message that asks for a
-    // tool, and the result that answers it.
+    // A message of every shape: a prompt, an assistant message that thinks and
+    // asks for a tool, the result that answers it, and the answer that ends the
+    // turn. The thinking has to come back with the message, since a provider in
+    // thinking mode asks for it on every request that carries tools.
     try expectResume(&.{
         .{ .role = .user, .content = "hello" },
-        .{ .role = .assistant, .tool_calls = &.{.{
+        .{ .role = .assistant, .reasoning_content = "I should read the file.", .tool_calls = &.{.{
             .id = "call_1",
             .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" },
         }} },
         .{ .role = .tool, .tool_call_id = "call_1", .content = "1\tconst x = 1;\n" },
+        .{ .role = .assistant, .content = "it is one line", .reasoning_content = "The file is short." },
     });
 }
 
@@ -1807,21 +1819,27 @@ test "a conversation writes the messages a request would have carried" {
     var session = try newTestSession(&tmp);
     defer session.deinit();
 
-    // A message of every shape: an optional left out, one filled in, and a call
-    // alongside the result that answers it. The system prompt is its own field,
+    // A message of every shape: an optional left out, one filled in, a call
+    // alongside the result that answers it, and the thinking that has to go
+    // back with the assistant message. The system prompt is its own field,
     // which the request opens with.
     try session.setSystemPrompt("be terse");
     try session.append(.{ .role = .user, .content = "hello" });
-    try session.append(.{ .role = .assistant, .tool_calls = &.{.{
-        .id = "call_1",
-        .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" },
-    }} });
+    try session.append(.{
+        .role = .assistant,
+        .reasoning_content = "Reading the file.",
+        .tool_calls = &.{.{
+            .id = "call_1",
+            .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" },
+        }},
+    });
     try session.append(.{ .role = .tool, .tool_call_id = "call_1", .content = "1\tconst x = 1;\n" });
 
     const expected = "[{\"role\":\"system\",\"content\":\"be terse\"}," ++
         "{\"role\":\"user\",\"content\":\"hello\"}," ++
         "{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\"," ++
-        "\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.zig\\\"}\"}}]}," ++
+        "\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.zig\\\"}\"}}]," ++
+        "\"reasoning_content\":\"Reading the file.\"}," ++
         "{\"role\":\"tool\",\"content\":\"1\\tconst x = 1;\\n\",\"tool_call_id\":\"call_1\"}]";
     try expectRequestJson(&session, &.{}, expected);
 

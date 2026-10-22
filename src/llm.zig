@@ -33,6 +33,7 @@ pub const Message = struct {
     content: ?[]const u8 = null,
     tool_calls: ?[]const ToolCall = null,
     tool_call_id: ?[]const u8 = null,
+    reasoning_content: ?[]const u8 = null,
 };
 
 pub const ToolCall = struct {
@@ -60,10 +61,8 @@ pub const Usage = struct {
 /// it is only valid until the next `next` call; a caller that keeps one copies
 /// it.
 pub const Delta = struct {
-    /// More of the reply's text.
     content: ?[]const u8 = null,
-    /// Pieces of the tool calls the reply asks for. The first piece of a call
-    /// carries its id and name, and the arguments follow a fragment at a time.
+    reasoning: ?[]const u8 = null,
     tool_calls: []const ToolCallDelta = &.{},
 };
 
@@ -557,8 +556,12 @@ pub const Stream = struct {
                 .arguments = fragment.function.arguments,
             };
         }
-        const delta: Delta = .{ .content = piece.content, .tool_calls = calls };
-        if (delta.content == null and delta.tool_calls.len == 0) return null;
+        const delta: Delta = .{
+            .content = piece.content,
+            .reasoning = piece.reasoning_content,
+            .tool_calls = calls,
+        };
+        if (delta.content == null and delta.reasoning == null and delta.tool_calls.len == 0) return null;
         return delta;
     }
 };
@@ -568,8 +571,9 @@ pub const Stream = struct {
 /// `deinit`.
 pub const Reply = struct {
     gpa: std.mem.Allocator,
-    /// The answer, and one set of pieces per tool call.
+    /// The answer, the model's thinking, and one set of pieces per tool call.
     content: std.ArrayList(u8) = .empty,
+    reasoning: std.ArrayList(u8) = .empty,
     calls: std.ArrayList(Call) = .empty,
     tool_calls: std.ArrayList(ToolCall) = .empty,
 
@@ -587,6 +591,7 @@ pub const Reply = struct {
 
     pub fn deinit(self: *Reply) void {
         self.content.deinit(self.gpa);
+        self.reasoning.deinit(self.gpa);
         for (self.calls.items) |*call| call.deinit(self.gpa);
         self.calls.deinit(self.gpa);
         self.tool_calls.deinit(self.gpa);
@@ -600,6 +605,7 @@ pub const Reply = struct {
     /// Adds one delta of a streamed reply.
     pub fn add(self: *Reply, delta: Delta) !void {
         if (delta.content) |text| try self.content.appendSlice(self.gpa, text);
+        if (delta.reasoning) |text| try self.reasoning.appendSlice(self.gpa, text);
         for (delta.tool_calls) |fragment| try self.addCall(fragment);
     }
 
@@ -625,6 +631,7 @@ pub const Reply = struct {
             .role = .assistant,
             .content = if (self.content.items.len > 0) self.content.items else null,
             .tool_calls = if (self.tool_calls.items.len > 0) self.tool_calls.items else null,
+            .reasoning_content = if (self.reasoning.items.len > 0) self.reasoning.items else null,
         };
     }
 };
@@ -646,6 +653,7 @@ const Chunk = struct {
     const Choice = struct { delta: Piece = .{} };
     const Piece = struct {
         content: ?[]const u8 = null,
+        reasoning_content: ?[]const u8 = null,
         tool_calls: []const Call = &.{},
     };
     /// A piece of a tool call, in the shape the API nests it.
@@ -860,6 +868,7 @@ test "a streamed reply is read a delta at a time" {
         "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n" ++
             "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n" ++
             "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n" ++
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"a thought\"}}]}\n\n" ++
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n" ++
             "data: [DONE]\n\n",
@@ -887,8 +896,14 @@ test "a streamed reply is read a delta at a time" {
     try mock.group.await(io);
     if (mock.err) |err| return err;
 
-    // The caller adds the deltas up into the reply it keeps.
+    // The caller adds the deltas up into the reply it keeps. The model's
+    // thinking arrives beside the answer and is kept apart from it, so the
+    // message can carry both back to a provider that asks for them.
     try std.testing.expectEqualStrings("hello", collected.content.items);
+    try std.testing.expectEqualStrings("a thought", collected.reasoning.items);
+    const message = try collected.message();
+    try std.testing.expectEqualStrings("a thought", message.reasoning_content.?);
+    try std.testing.expectEqualStrings("hello", message.content.?);
     try std.testing.expectEqual(0, collected.calls.items.len);
     try std.testing.expectEqual(5, stream.usage().total_tokens);
 }
