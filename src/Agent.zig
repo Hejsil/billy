@@ -947,13 +947,24 @@ fn showDeltaText(emitter: Emitter, delta: llm.Delta) !void {
     if (delta.content) |text| try emitter.showDelta(.{ .content = text });
 }
 
+/// How many replies that say nothing a turn takes before it gives up on the
+/// model, counted by decrementing for each one, so this is the length of the run
+/// that ends the turn.
+///
+/// Asking again is worth it for a model that thought and then stopped, whose
+/// silence is the reply's own. It is not worth it for a provider that answers
+/// with nothing at all: the next ask gets the same nothing, and the turn would
+/// spend every one of its turns on it, showing the user nothing the whole way.
+const max_retries: usize = 3;
+
 /// Runs the model until it replies with text instead of tool calls, showing what
 /// happens as blocks as it goes.
 ///
 /// A reply that carries neither text nor a call says nothing, and a conversation
 /// holding one is refused whole by a provider that checks its history, which
 /// costs the session every turn after it. Such a reply is not kept: the turn is
-/// asked again, and that costs it one of its turns.
+/// asked again, and that costs it one of its turns. A reply that says something
+/// is the turn getting somewhere, so the run of silence starts over from there.
 fn turn(agent: *Agent, emitter: Emitter, session: *Session, client: *llm.Client) !void {
     // Holds the parsed call of each tool call the model asks for, which is read
     // until that call has been run and shown. Reset per call, so a turn that
@@ -962,11 +973,16 @@ fn turn(agent: *Agent, emitter: Emitter, session: *Session, client: *llm.Client)
     defer scratch_state.deinit();
 
     var remaining: usize = agent.behaviour.max_turns;
+    // The second bound on the loop: how many replies in a row may say nothing
+    // before the turn stops asking. A retry spends a turn whether or not it is
+    // worth taking, so this is what keeps a provider that is not answering from
+    // spending all of them.
+    var retries: usize = max_retries;
     // A compaction that failed is not tried again within the same turn, so a
     // provider that will not summarize cannot turn every request of a long turn
     // into a second failed one. The next turn tries afresh.
     var compact_failed = false;
-    while (remaining > 0) : (remaining -= 1) {
+    while (remaining > 0 and retries > 0) : (remaining -= 1) {
         // A failure to compact is not the turn's, and is not retried within it.
         if (!compact_failed) compact_failed = agent.compact(emitter, session, client, .when_needed) == .failed;
 
@@ -998,7 +1014,15 @@ fn turn(agent: *Agent, emitter: Emitter, session: *Session, client: *llm.Client)
         // again: a conversation holding such a message is refused whole by a
         // provider that checks its history. Asking again asks the same question,
         // since an empty reply leaves the conversation as it was.
-        if (calls.len == 0 and message.content == null) continue;
+        if (calls.len == 0 and message.content == null) {
+            retries -= 1;
+            continue;
+        }
+
+        // This reply said something, so the silence before it is behind the turn
+        // rather than in front of it: the next one may be asked again as often
+        // as the first was.
+        retries = max_retries;
 
         // Recorded before the message is appended, so the save inside `append`
         // stores the size along with it.
@@ -1011,6 +1035,18 @@ fn turn(agent: *Agent, emitter: Emitter, session: *Session, client: *llm.Client)
         try runCalls(&agent.tool_set, emitter, &scratch_state, session, agent.mode, calls);
     }
     var buffer: [96]u8 = undefined;
+    // Which bound stopped the loop says what went wrong. Out of retries means
+    // the model was asked and said nothing, over and over, which is not the same
+    // as a model that used every turn it had; the last thing it did was say
+    // nothing, so it is why the turn ended.
+    if (retries == 0) {
+        const silent = std.fmt.bufPrint(
+            &buffer,
+            "stopped after {d} replies in a row that said nothing",
+            .{max_retries},
+        ) catch "stopped with nothing to show";
+        return emitter.show(.{ .notice = silent });
+    }
     const stopped = std.fmt.bufPrint(
         &buffer,
         "stopped after {d} turns without a final answer",
@@ -2817,6 +2853,212 @@ test "a reply with nothing is not kept, and the turn is asked again" {
     try std.testing.expectEqual(@as(usize, 2), session.messages.items.len);
     try std.testing.expectEqualStrings("assistant", session.roleOf(session.messages.items[1]));
     try std.testing.expectEqualStrings("all done", session.contentOf(session.messages.items[1]).?);
+}
+
+test "a provider that keeps saying nothing ends the turn" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    try session.setSystemPrompt("be terse");
+    try session.append(.{ .role = .user, .content = "first" });
+
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
+
+    // Every reply says nothing, which is a provider that is not answering rather
+    // than a model that thought and stopped: the next ask gets the same nothing.
+    // Asking again is bounded, so the turn is given up on instead of spending
+    // every one of its turns on it with nothing on screen to show for it.
+    //
+    // The mock answers as many requests as the turn has turns, so that a turn
+    // that lost its bound makes all of them and ends in a notice the test can
+    // read, rather than waiting for a reply that is not coming.
+    var mock = try Mock.start("/chat/completions", setup.behaviour.max_turns, Mock.eventStream(
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking it over\"}}]}\n\n" ++
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+            "data: [DONE]\n\n",
+    ));
+    defer mock.deinit();
+    try mock.serve();
+    setup.pointAt("test", mock.url);
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    var agent = try testAgent(io, gpa, setup, &http_client);
+    defer agent.deinit();
+
+    var recorder = Recorder{ .gpa = arena_state.allocator() };
+    var client = try agent.clientFor(&session);
+    try turn(&agent, recorder.emitter(), &session, &client);
+
+    // Stopped rather than waited on, since a turn that stops asking leaves the
+    // mock waiting for the requests it was started for.
+    try mock.stop();
+
+    // What the turn ends with is a notice saying the model kept saying nothing,
+    // which is not the notice a turn that ran out of turns shows: the model was
+    // asked and did not answer, rather than getting as far as it was allowed.
+    // Nothing was shown while the requests were made, since an empty reply has
+    // nothing to show.
+    try std.testing.expectEqual(1, recorder.seen.items.len);
+    try std.testing.expect(recorder.seen.items[0] == .notice);
+    var expected: [96]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        try std.fmt.bufPrint(&expected, "stopped after {d} replies in a row that said nothing", .{max_retries}),
+        recorder.seen.items[0].notice,
+    );
+
+    // The conversation is left as it was -- the prompt and no empty message
+    // after it -- and every ask was the same one, made as many times as the turn
+    // allows and no more.
+    try std.testing.expectEqual(@as(usize, 1), session.messages.items.len);
+    try std.testing.expectEqual(@as(usize, max_retries), mock.bodies.items.len);
+    for (mock.bodies.items[1..]) |body| try std.testing.expectEqualStrings(mock.bodies.items[0], body);
+}
+
+test "a reply that says something starts the run of silence over" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    try session.setSystemPrompt("be terse");
+    try session.append(.{ .role = .user, .content = "first" });
+
+    // Silence, then a call, then silence again, then the answer: more replies
+    // that say nothing than the turn may take in a row, and a call in the middle
+    // of them. A turn that counted the silences across the whole of itself would
+    // give up before the answer; what sees it through is that the call said
+    // something, which is the turn getting somewhere.
+    const answering = struct {
+        fn answer(number: usize, _: []const u8) Mock.Answer {
+            if (number == 2) {
+                return .{
+                    .body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\"," ++
+                        "\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":" ++
+                        "\"{\\\"command\\\":\\\"echo hi\\\"}\"}}]}}]}\n\n" ++
+                        "data: [DONE]\n\n",
+                    .content_type = "text/event-stream",
+                };
+            }
+            if (number == 5) {
+                return .{
+                    .body = "data: {\"choices\":[{\"delta\":{\"content\":\"all done\"}}]}\n\n" ++
+                        "data: [DONE]\n\n",
+                    .content_type = "text/event-stream",
+                };
+            }
+            return .{
+                .body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking it over\"}}]}\n\n" ++
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+                    "data: [DONE]\n\n",
+                .content_type = "text/event-stream",
+            };
+        }
+    }.answer;
+    var mock = try Mock.start("/chat/completions", 5, answering);
+    defer mock.deinit();
+    try mock.serve();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
+    setup.pointAt("test", mock.url);
+    var agent = try testAgent(io, gpa, setup, &http_client);
+    defer agent.deinit();
+
+    var recorder = Recorder{ .gpa = arena_state.allocator() };
+    var client = try agent.clientFor(&session);
+    try turn(&agent, recorder.emitter(), &session, &client);
+
+    // Stopped rather than waited on: the mock is answering the request that
+    // carries the answer, and a turn that stopped before reaching it would leave
+    // the mock waiting for one that is not coming.
+    try mock.stop();
+
+    // The answer is reached, and the replies that said nothing left nothing on
+    // screen on the way: the call is shown as it runs, with its result, and then
+    // the answer.
+    try std.testing.expectEqual(3, recorder.seen.items.len);
+    try std.testing.expectEqualStrings("bash", recorder.seen.items[0].tool_begin);
+    try std.testing.expect(recorder.seen.items[2] == .answer);
+    try std.testing.expectEqualStrings("all done", recorder.seen.items[2].answer);
+    try std.testing.expectEqual(@as(usize, 5), mock.bodies.items.len);
+}
+
+test "a turn that runs out of turns says so" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    try session.setSystemPrompt("be terse");
+    try session.append(.{ .role = .user, .content = "first" });
+
+    // A model that keeps calling a tool never reaches an answer, so the turn is
+    // the turn limit's to end. That is reported differently from a model that
+    // said nothing, since the run got somewhere every time it was asked.
+    var mock = try Mock.start("/chat/completions", 2, Mock.eventStream(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\"," ++
+            "\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":" ++
+            "\"{\\\"command\\\":\\\"echo hi\\\"}\"}}]}}]}\n\n" ++
+            "data: [DONE]\n\n",
+    ));
+    defer mock.deinit();
+    try mock.serve();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
+    setup.pointAt("test", mock.url);
+    var agent = try testAgent(io, gpa, setup, &http_client);
+    defer agent.deinit();
+    agent.behaviour.max_turns = 2;
+
+    var recorder = Recorder{ .gpa = arena_state.allocator() };
+    var client = try agent.clientFor(&session);
+    try turn(&agent, recorder.emitter(), &session, &client);
+
+    // Stopped rather than waited on, since a turn that ended before using both
+    // of its turns would leave the mock waiting for a request that is not coming.
+    try mock.stop();
+
+    // Both calls ran, and what ends the turn is the notice that it ran out of
+    // turns rather than the one about said-nothing replies.
+    try std.testing.expectEqual(@as(usize, 2), mock.bodies.items.len);
+    try std.testing.expectEqual(5, recorder.seen.items.len);
+    try std.testing.expectEqualStrings("bash", recorder.seen.items[0].tool_begin);
+    try std.testing.expectEqualStrings("bash", recorder.seen.items[2].tool_begin);
+    try std.testing.expect(recorder.seen.items[4] == .notice);
+    try std.testing.expectEqualStrings(
+        "stopped after 2 turns without a final answer",
+        recorder.seen.items[4].notice,
+    );
 }
 
 test "the first turn names the session, and the naming is not part of it" {

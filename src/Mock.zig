@@ -117,6 +117,23 @@ pub fn serve(mock: *Mock) !void {
     try mock.group.concurrent(std.testing.io, Mock.serveInGroup, .{mock});
 }
 
+/// Stops the mock wherever it is and returns the first failure it ran into,
+/// ignoring the cancelation that stopping it is.
+///
+/// A test about how many requests a run makes cannot wait on a mock that was
+/// started for more of them than that: `group.await` would wait for a request
+/// that is never coming, which hangs the test instead of failing it. Cancelling
+/// finishes the task where it waits, so what it did can be read afterwards.
+pub fn stop(mock: *Mock) !void {
+    mock.group.cancel(std.testing.io);
+    const err = mock.err orelse return;
+    mock.err = null;
+    // The task was still waiting for a request when it was stopped, which is the
+    // whole reason to stop it rather than wait.
+    if (err == error.Canceled) return;
+    return err;
+}
+
 fn serveInGroup(mock: *Mock) std.Io.Cancelable!void {
     mock.run() catch |err| {
         mock.err = err;
