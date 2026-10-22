@@ -527,7 +527,7 @@ pub const Stream = struct {
             // reply's own memory is not something to skip over.
             error.OutOfMemory => return error.OutOfMemory,
             else => {
-                std.log.warn("a streamed delta could not be read: {s}", .{@errorName(err)});
+                std.log.warn("a streamed delta could not be read: {s}: {s}", .{ @errorName(err), self.data.items });
                 return null;
             },
         };
