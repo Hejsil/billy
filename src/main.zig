@@ -211,13 +211,6 @@ fn printAskedHelp(options: Options, out: Terminal.Writer) !bool {
     return false;
 }
 
-/// Reads a key for a service, or lists the services, so a run need not have the
-/// key exported.
-///
-/// The configuration is read for the names of the providers it defines, which
-/// are the only names beside billy's own that a key can be stored for. Nothing
-/// else of it is used.
-/// Runs one session in the terminal, resuming `resume_id` or starting a new one.
 const ParseError = error{InvalidArgument};
 
 /// Parses `slice`, which is the arguments of one command line with the program
