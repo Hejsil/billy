@@ -506,12 +506,15 @@ pub const Stream = struct {
         var lines = std.mem.splitScalar(u8, bytes, '\n');
         while (lines.next()) |line| {
             const field = std.mem.trimEnd(u8, line, "\r");
-            if (field.len == 0 or field[0] == ':') continue;
-            if (!std.mem.startsWith(u8, field, "data:")) continue;
+            const data = std.mem.cutPrefix(u8, field, "data:") orelse continue;
+
             if (self.data.items.len > 0) try self.data.append(self.gpa, '\n');
-            try self.data.appendSlice(self.gpa, std.mem.trim(u8, field["data:".len..], " \t"));
+            try self.data.appendSlice(self.gpa, std.mem.trim(u8, data, " \t"));
         }
-        if (self.data.items.len == 0) return null;
+
+        if (self.data.items.len == 0)
+            return null;
+
         if (std.mem.eql(u8, self.data.items, "[DONE]")) {
             self.done = true;
             return null;
