@@ -1030,6 +1030,96 @@ test "a frame that arrives in pieces is joined" {
     try std.testing.expectEqualStrings("the end", collected.content.items[long.len..]);
 }
 
+test "a payload that runs over more than one data line is joined" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // OpenAI sends a chunk's JSON on one line, but that is its serializer's
+    // doing and not something a client may lean on: the format is a stream of
+    // events, an event's payload is every one of its `data:` lines, and a
+    // provider built on a generic emitter that splits on newlines -- one that
+    // pretty-prints its JSON, say -- sends the object over several of them. What
+    // this holds to is that every line is taken, which is the part a rewrite can
+    // lose. Whether the newline is put back between them cannot be seen from the
+    // chunk that comes out: JSON counts it as whitespace, so a payload that
+    // parses parses with or without it.
+    const messages = [_]Message{.{ .role = .user, .content = "hi" }};
+    var mock = try Mock.start("/chat/completions", 1, Mock.eventStream(
+        "data: {\n" ++
+            "data:   \"choices\": [\n" ++
+            "data:     {\"delta\": {\"content\": \"hel\"}}\n" ++
+            "data:   ]\n" ++
+            "data: }\n\n" ++
+            // The frame after a joined one starts where the last one ended.
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n" ++
+            "data: [DONE]\n\n",
+    ));
+    defer mock.deinit();
+    try mock.serve();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+    var client = clientAgainst(gpa, io, &http_client, mock.url, 1);
+
+    var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
+    defer stream.deinit();
+
+    // One frame is one delta, however many lines its payload took, so the test
+    // adds the deltas up itself rather than letting `Reply` hide the count.
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var deltas: usize = 0;
+    while (try stream.next()) |delta| {
+        deltas += 1;
+        if (delta.content) |piece| try content.appendSlice(gpa, piece);
+    }
+
+    try mock.group.await(io);
+    if (mock.err) |err| return err;
+
+    try std.testing.expectEqual(2, deltas);
+    try std.testing.expectEqualStrings("hello", content.items);
+}
+
+test "the fields beside data carry nothing billy reads" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // A frame may carry an event name and an id, which billy has no use for,
+    // and a server may send a comment as a keepalive, which is a frame that is
+    // only a comment. None of them is the reply, and none of them ends it.
+    const messages = [_]Message{.{ .role = .user, .content = "hi" }};
+    var mock = try Mock.start("/chat/completions", 1, Mock.eventStream(
+        ": keepalive\n\n" ++
+            "event: message\n" ++
+            "id: 1\n" ++
+            "retry: 5000\n" ++
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" ++
+            "event: ping\n\n" ++
+            ": keepalive\n\n" ++
+            "data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\n" ++
+            "data: [DONE]\n\n",
+    ));
+    defer mock.deinit();
+    try mock.serve();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+    var client = clientAgainst(gpa, io, &http_client, mock.url, 1);
+
+    var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
+    defer stream.deinit();
+    var collected: Reply = .{ .gpa = gpa };
+    defer collected.deinit();
+    try collected.collect(stream);
+
+    try mock.group.await(io);
+    if (mock.err) |err| return err;
+
+    // The keepalives are not deltas, so they leave no trace in the reply.
+    try std.testing.expectEqualStrings("hi there", collected.content.items);
+}
+
 test "a frame ends at the blank line that follows it" {
     // A body arrives in whatever pieces the network hands over, so a frame is
     // only complete once its blank line is in. The line ending may be CRLF.
@@ -1042,6 +1132,42 @@ test "a frame ends at the blank line that follows it" {
     try std.testing.expectEqual(11, crlf.consumed);
 
     try std.testing.expect(frameEnd("data: 1\ndata: 2") == null);
+}
+
+test "a stream whose lines end with CRLF is read" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // A provider is free to end its lines the way HTTP allows. What this holds
+    // to is that a frame that ends this way is found at all, which is what makes
+    // the stream read rather than run to its end unparsed; the carriage return
+    // taken off the field is one JSON would have read as whitespace anyway. The
+    // payload below runs over two lines, so both trims are on the way.
+    const messages = [_]Message{.{ .role = .user, .content = "hi" }};
+    var mock = try Mock.start("/chat/completions", 1, Mock.eventStream(
+        "event: message\r\n" ++
+            "data: {\r\n" ++
+            "data:   \"choices\": [{\"delta\": {\"content\": \"hi\"}}]\r\n" ++
+            "data: }\r\n\r\n" ++
+            "data: [DONE]\r\n\r\n",
+    ));
+    defer mock.deinit();
+    try mock.serve();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+    var client = clientAgainst(gpa, io, &http_client, mock.url, 1);
+
+    var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
+    defer stream.deinit();
+    var collected: Reply = .{ .gpa = gpa };
+    defer collected.deinit();
+    try collected.collect(stream);
+
+    try mock.group.await(io);
+    if (mock.err) |err| return err;
+
+    try std.testing.expectEqualStrings("hi", collected.content.items);
 }
 
 test "a reply that is not a stream is reported, not read as a plain reply" {
