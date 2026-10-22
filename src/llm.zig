@@ -672,11 +672,16 @@ const Chunk = struct {
 const FrameEnd = struct { body: usize, consumed: usize };
 
 fn frameEnd(bytes: []const u8) ?FrameEnd {
-    const lf = std.mem.indexOf(u8, bytes, "\n\n") orelse std.math.maxInt(usize);
-    const crlf = std.mem.indexOf(u8, bytes, "\r\n\r\n") orelse std.math.maxInt(usize);
-    if (lf == std.math.maxInt(usize) and crlf == std.math.maxInt(usize)) return null;
-    if (lf < crlf) return .{ .body = lf, .consumed = lf + 2 };
-    return .{ .body = crlf, .consumed = crlf + 4 };
+    var pos: usize = 0;
+    while (std.mem.indexOfAnyPos(u8, bytes, pos, "\n\r")) |next| {
+        pos = next + 1;
+        if (std.mem.startsWith(u8, bytes[next..], "\n\n"))
+            return .{ .body = next, .consumed = next + 2 };
+        if (std.mem.startsWith(u8, bytes[next..], "\r\n\r\n"))
+            return .{ .body = next, .consumed = next + 4 };
+    }
+
+    return null;
 }
 
 /// Whether a status says to try the request again: a rate limit, or a server
