@@ -123,9 +123,10 @@ pub const Client = struct {
     http: *std.http.Client,
 
     /// Sends the conversation and returns the reply as it streams in. The caller
-    /// keeps calling `Stream.next` until it returns null, adding the deltas up
-    /// into the message it keeps; `Stream.usage` has the token counts once the
-    /// stream has ended.
+    /// keeps calling `Stream.next` until it returns null, showing each delta as
+    /// it arrives; `Stream.message` is the reply those deltas add up to, and
+    /// `Stream.usage` its token counts, the two of them read once the stream has
+    /// ended.
     ///
     /// Every provider billy talks to streams, so a success that is not a stream
     /// is reported as an error rather than read as a plain reply.
@@ -376,8 +377,9 @@ fn isEventStream(content_type: ?[]const u8) bool {
 const zstd_window_len = std.compress.zstd.default_window_len + std.compress.zstd.block_size_max;
 
 /// A reply as it streams in. The caller keeps calling `next` until it returns
-/// null, adding each delta up into the message it keeps; `usage` has the token
-/// counts once the stream has ended.
+/// null, showing each delta as it arrives; the deltas are added up as they are
+/// read, so `message` has the message they spell out once the stream has
+/// ended, and `usage` the token counts.
 ///
 /// The strings a delta holds point into the stream, so a delta is only valid
 /// until the next call. A caller that keeps one copies it.
@@ -409,9 +411,30 @@ pub const Stream = struct {
     arena: std.heap.ArenaAllocator,
     /// The token counts the provider sent, which `usage` reads.
     token_usage: Usage = .{},
+    /// The answer, the model's thinking, and one set of pieces per tool call,
+    /// added up from every delta as it is read, which `message` spells out.
+    content: std.ArrayList(u8) = .empty,
+    reasoning: std.ArrayList(u8) = .empty,
+    calls: std.ArrayList(Call) = .empty,
+    /// The calls `message` hands back, which point into `calls`.
+    tool_calls: std.ArrayList(ToolCall) = .empty,
     /// Whether the stream has ended: its `[DONE]` frame was read, or the body
     /// ran out. Anything after that is not the reply's.
     done: bool = false,
+
+    /// The pieces of one tool call, which arrive a fragment at a time and make
+    /// the `ToolCall` `message` hands back.
+    const Call = struct {
+        id: std.ArrayList(u8) = .empty,
+        name: std.ArrayList(u8) = .empty,
+        arguments: std.ArrayList(u8) = .empty,
+
+        fn deinit(call: *Call, gpa: std.mem.Allocator) void {
+            call.id.deinit(gpa);
+            call.name.deinit(gpa);
+            call.arguments.deinit(gpa);
+        }
+    };
 
     /// The memory a reply's body is read through: the transfer decoding's buffer,
     /// the window the decompressor reads through, and the decompressor itself.
@@ -445,11 +468,11 @@ pub const Stream = struct {
     };
 
     /// Reads until the next piece of the reply, or null when the stream has
-    /// ended. The stream ends at its `[DONE]` frame or at the end of the body;
-    /// anything left then is a frame cut off mid-way, which is not the reply's.
-    /// A provider that sent no choices at all streams nothing, which is an
-    /// empty reply rather than an error: what that means is the caller's to
-    /// say.
+    /// ended, adding the piece to the message as it is read. The stream ends at
+    /// its `[DONE]` frame or at the end of the body; anything left then is a
+    /// frame cut off mid-way, which is not the reply's. A provider that sent no
+    /// choices at all streams nothing, which is an empty reply rather than an
+    /// error: what that means is the caller's to say.
     pub fn next(self: *Stream) !?Delta {
         var writer = std.Io.Writer.Allocating.fromArrayList(self.gpa, &self.pending);
         defer self.pending = writer.toArrayList();
@@ -459,7 +482,10 @@ pub const Stream = struct {
             if (frameEnd(unparsed)) |end| {
                 const delta = try self.parseFrame(unparsed[0..end.body]);
                 self.parsed += end.consumed;
-                if (delta) |d| return d;
+                if (delta) |d| {
+                    try self.add(d);
+                    return d;
+                }
                 continue;
             }
 
@@ -481,6 +507,25 @@ pub const Stream = struct {
         return self.token_usage;
     }
 
+    /// The message the deltas added up to, its strings pointing into the
+    /// stream. Read once the stream has ended: a reply that has not finished
+    /// arriving is not all there.
+    pub fn message(self: *Stream) !Message {
+        std.debug.assert(self.done);
+        self.tool_calls.clearRetainingCapacity();
+        for (self.calls.items) |call|
+            try self.tool_calls.append(self.gpa, .{
+                .id = call.id.items,
+                .function = .{ .name = call.name.items, .arguments = call.arguments.items },
+            });
+        return .{
+            .role = .assistant,
+            .content = if (self.content.items.len > 0) self.content.items else null,
+            .tool_calls = if (self.tool_calls.items.len > 0) self.tool_calls.items else null,
+            .reasoning_content = if (self.reasoning.items.len > 0) self.reasoning.items else null,
+        };
+    }
+
     /// Stops reading and frees the stream. A body that was not read to the end
     /// is discarded, which is what lets the connection be used again.
     pub fn deinit(self: *Stream) void {
@@ -490,7 +535,30 @@ pub const Stream = struct {
         self.pending.deinit(gpa);
         self.data.deinit(gpa);
         self.arena.deinit();
+        self.content.deinit(gpa);
+        self.reasoning.deinit(gpa);
+        for (self.calls.items) |*call| call.deinit(gpa);
+        self.calls.deinit(gpa);
+        self.tool_calls.deinit(gpa);
         gpa.destroy(self);
+    }
+
+    /// Adds one delta to the message, copying the strings it points into the
+    /// stream, since the stream's own copy is what outlives it.
+    fn add(self: *Stream, delta: Delta) !void {
+        if (delta.content) |text| try self.content.appendSlice(self.gpa, text);
+        if (delta.reasoning) |text| try self.reasoning.appendSlice(self.gpa, text);
+        for (delta.tool_calls) |fragment| try self.addCall(fragment);
+    }
+
+    /// Adds a piece of a tool call to the call its `index` names, making that
+    /// call on the first piece.
+    fn addCall(self: *Stream, fragment: ToolCallDelta) !void {
+        while (self.calls.items.len <= fragment.index) try self.calls.append(self.gpa, .{});
+        const call = &self.calls.items[fragment.index];
+        if (fragment.id) |id| try set(&call.id, self.gpa, id);
+        if (fragment.name) |name| try set(&call.name, self.gpa, name);
+        if (fragment.arguments) |arguments| try call.arguments.appendSlice(self.gpa, arguments);
     }
 
     /// Reads one frame into a delta. Only its `data:` lines carry the JSON; the
@@ -555,76 +623,6 @@ pub const Stream = struct {
         if (delta.content == null and delta.reasoning == null and delta.tool_calls.len == 0)
             return null;
         return delta;
-    }
-};
-
-/// Adds the deltas of a streamed reply up into the message they spell out. The
-/// message points into this, so it outlives the message's use and is freed with
-/// `deinit`.
-pub const Reply = struct {
-    gpa: std.mem.Allocator,
-    /// The answer, the model's thinking, and one set of pieces per tool call.
-    content: std.ArrayList(u8) = .empty,
-    reasoning: std.ArrayList(u8) = .empty,
-    calls: std.ArrayList(Call) = .empty,
-    tool_calls: std.ArrayList(ToolCall) = .empty,
-
-    const Call = struct {
-        id: std.ArrayList(u8) = .empty,
-        name: std.ArrayList(u8) = .empty,
-        arguments: std.ArrayList(u8) = .empty,
-
-        fn deinit(call: *Call, gpa: std.mem.Allocator) void {
-            call.id.deinit(gpa);
-            call.name.deinit(gpa);
-            call.arguments.deinit(gpa);
-        }
-    };
-
-    pub fn deinit(self: *Reply) void {
-        self.content.deinit(self.gpa);
-        self.reasoning.deinit(self.gpa);
-        for (self.calls.items) |*call| call.deinit(self.gpa);
-        self.calls.deinit(self.gpa);
-        self.tool_calls.deinit(self.gpa);
-    }
-
-    /// Reads `stream` to its end, adding every delta to the reply.
-    pub fn collect(self: *Reply, stream: *Stream) !void {
-        while (try stream.next()) |delta| try self.add(delta);
-    }
-
-    /// Adds one delta of a streamed reply.
-    pub fn add(self: *Reply, delta: Delta) !void {
-        if (delta.content) |text| try self.content.appendSlice(self.gpa, text);
-        if (delta.reasoning) |text| try self.reasoning.appendSlice(self.gpa, text);
-        for (delta.tool_calls) |fragment| try self.addCall(fragment);
-    }
-
-    /// Adds a piece of a tool call to the call its `index` names, making that call
-    /// on the first piece.
-    fn addCall(self: *Reply, fragment: ToolCallDelta) !void {
-        while (self.calls.items.len <= fragment.index) try self.calls.append(self.gpa, .{});
-        const call = &self.calls.items[fragment.index];
-        if (fragment.id) |id| try set(&call.id, self.gpa, id);
-        if (fragment.name) |name| try set(&call.name, self.gpa, name);
-        if (fragment.arguments) |arguments| try call.arguments.appendSlice(self.gpa, arguments);
-    }
-
-    /// The message the reply adds up to, its strings pointing into this.
-    pub fn message(self: *Reply) !Message {
-        self.tool_calls.clearRetainingCapacity();
-        for (self.calls.items) |call|
-            try self.tool_calls.append(self.gpa, .{
-                .id = call.id.items,
-                .function = .{ .name = call.name.items, .arguments = call.arguments.items },
-            });
-        return .{
-            .role = .assistant,
-            .content = if (self.content.items.len > 0) self.content.items else null,
-            .tool_calls = if (self.tool_calls.items.len > 0) self.tool_calls.items else null,
-            .reasoning_content = if (self.reasoning.items.len > 0) self.reasoning.items else null,
-        };
     }
 };
 
@@ -801,9 +799,7 @@ test "a request reaches the wire with the body the head promised" {
 
     var stream = try client.complete(gpa, "01SESSION", &messages, @as([]const NoTools, &.{}));
     defer stream.deinit();
-    var collected: Reply = .{ .gpa = gpa };
-    defer collected.deinit();
-    try collected.collect(stream);
+    while (try stream.next()) |_| {}
 
     try mock.await();
 
@@ -811,7 +807,7 @@ test "a request reaches the wire with the body the head promised" {
     // the body the counter measured, not something assembled separately.
     try std.testing.expectEqual(@as(u64, expected.len), mock.content_length.?);
     try std.testing.expectEqualStrings(expected, mock.bodies.items[0]);
-    try std.testing.expectEqualStrings("hi there", collected.content.items);
+    try std.testing.expectEqualStrings("hi there", (try stream.message()).content.?);
     try std.testing.expectEqual(9, stream.usage().total_tokens);
 }
 
@@ -884,21 +880,22 @@ test "a streamed reply is read a delta at a time" {
 
     var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
     defer stream.deinit();
-    var collected: Reply = .{ .gpa = gpa };
-    defer collected.deinit();
-    try collected.collect(stream);
+    // The frames that carry nothing but a finish reason or a usage count are
+    // not deltas, so the reply arrives in the three pieces that say something.
+    var deltas: usize = 0;
+    while (try stream.next()) |_| deltas += 1;
 
     try mock.await();
 
-    // The caller adds the deltas up into the reply it keeps. The model's
-    // thinking arrives beside the answer and is kept apart from it, so the
-    // message can carry both back to a provider that asks for them.
-    try std.testing.expectEqualStrings("hello", collected.content.items);
-    try std.testing.expectEqualStrings("a thought", collected.reasoning.items);
-    const message = try collected.message();
-    try std.testing.expectEqualStrings("a thought", message.reasoning_content.?);
+    try std.testing.expectEqual(3, deltas);
+
+    // The stream adds the deltas up as it reads them. The model's thinking
+    // arrives beside the answer and is kept apart from it, so the message can
+    // carry both back to a provider that asks for them.
+    const message = try stream.message();
     try std.testing.expectEqualStrings("hello", message.content.?);
-    try std.testing.expectEqual(0, collected.calls.items.len);
+    try std.testing.expectEqualStrings("a thought", message.reasoning_content.?);
+    try std.testing.expect(message.tool_calls == null);
     try std.testing.expectEqual(5, stream.usage().total_tokens);
 }
 
@@ -957,13 +954,11 @@ test "a streamed reply that arrived compressed is read" {
 
     var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
     defer stream.deinit();
-    var collected: Reply = .{ .gpa = gpa };
-    defer collected.deinit();
-    try collected.collect(stream);
+    while (try stream.next()) |_| {}
 
     try mock.await();
 
-    try std.testing.expectEqualStrings("hello", collected.content.items);
+    try std.testing.expectEqualStrings("hello", (try stream.message()).content.?);
 }
 
 test "a frame that arrives in pieces is joined" {
@@ -1012,14 +1007,13 @@ test "a frame that arrives in pieces is joined" {
 
     var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
     defer stream.deinit();
-    var collected: Reply = .{ .gpa = gpa };
-    defer collected.deinit();
-    try collected.collect(stream);
+    while (try stream.next()) |_| {}
 
     try mock.await();
 
-    try std.testing.expectEqualStrings(long, collected.content.items[0..long.len]);
-    try std.testing.expectEqualStrings("the end", collected.content.items[long.len..]);
+    const content = (try stream.message()).content.?;
+    try std.testing.expectEqualStrings(long, content[0..long.len]);
+    try std.testing.expectEqualStrings("the end", content[long.len..]);
 }
 
 test "a payload that runs over more than one data line is joined" {
@@ -1057,19 +1051,15 @@ test "a payload that runs over more than one data line is joined" {
     defer stream.deinit();
 
     // One frame is one delta, however many lines its payload took, so the test
-    // adds the deltas up itself rather than letting `Reply` hide the count.
-    var content: std.ArrayList(u8) = .empty;
-    defer content.deinit(gpa);
+    // counts the deltas it is handed rather than reading the message, which
+    // adds them up.
     var deltas: usize = 0;
-    while (try stream.next()) |delta| {
-        deltas += 1;
-        if (delta.content) |piece| try content.appendSlice(gpa, piece);
-    }
+    while (try stream.next()) |_| deltas += 1;
 
     try mock.await();
 
     try std.testing.expectEqual(2, deltas);
-    try std.testing.expectEqualStrings("hello", content.items);
+    try std.testing.expectEqualStrings("hello", (try stream.message()).content.?);
 }
 
 test "the fields beside data carry nothing billy reads" {
@@ -1100,14 +1090,12 @@ test "the fields beside data carry nothing billy reads" {
 
     var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
     defer stream.deinit();
-    var collected: Reply = .{ .gpa = gpa };
-    defer collected.deinit();
-    try collected.collect(stream);
+    while (try stream.next()) |_| {}
 
     try mock.await();
 
     // The keepalives are not deltas, so they leave no trace in the reply.
-    try std.testing.expectEqualStrings("hi there", collected.content.items);
+    try std.testing.expectEqualStrings("hi there", (try stream.message()).content.?);
 }
 
 test "a frame ends at the blank line that follows it" {
@@ -1150,13 +1138,11 @@ test "a stream whose lines end with CRLF is read" {
 
     var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
     defer stream.deinit();
-    var collected: Reply = .{ .gpa = gpa };
-    defer collected.deinit();
-    try collected.collect(stream);
+    while (try stream.next()) |_| {}
 
     try mock.await();
 
-    try std.testing.expectEqualStrings("hi", collected.content.items);
+    try std.testing.expectEqualStrings("hi", (try stream.message()).content.?);
 }
 
 test "a reply that is not a stream is reported, not read as a plain reply" {
@@ -1202,15 +1188,16 @@ test "a stream that carries no choices is an empty reply" {
     const messages = [_]Message{.{ .role = .user, .content = "hi" }};
     var stream = try client.complete(gpa, "01SESSION", &messages, @as([]const NoTools, &.{}));
     defer stream.deinit();
-    var reply: Reply = .{ .gpa = gpa };
-    defer reply.deinit();
-    try reply.collect(stream);
+    while (try stream.next()) |_| {}
 
     try mock.await();
 
-    try std.testing.expectEqualStrings("", reply.content.items);
-    try std.testing.expectEqualStrings("", reply.reasoning.items);
-    try std.testing.expectEqual(0, reply.calls.items.len);
+    // Nothing was said, so the message has nothing in it: no text, no thinking
+    // and no call, which is what an empty reply is.
+    const message = try stream.message();
+    try std.testing.expect(message.content == null);
+    try std.testing.expect(message.reasoning_content == null);
+    try std.testing.expect(message.tool_calls == null);
 }
 
 test "a tool call streamed in pieces is put back together" {
@@ -1243,19 +1230,17 @@ test "a tool call streamed in pieces is put back together" {
 
     var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
     defer stream.deinit();
-    var collected: Reply = .{ .gpa = gpa };
-    defer collected.deinit();
-    try collected.collect(stream);
+    while (try stream.next()) |_| {}
 
     try mock.await();
 
     // The id and name arrive once and the arguments a fragment at a time; the
-    // caller puts them back into the one call the model meant.
-    const calls = collected.calls.items;
+    // stream puts them back into the one call the model meant.
+    const calls = (try stream.message()).tool_calls.?;
     try std.testing.expectEqual(1, calls.len);
-    try std.testing.expectEqualStrings("call_1", calls[0].id.items);
-    try std.testing.expectEqualStrings("bash", calls[0].name.items);
-    try std.testing.expectEqualStrings("{\"command\":\"echo hi\"}", calls[0].arguments.items);
+    try std.testing.expectEqualStrings("call_1", calls[0].id);
+    try std.testing.expectEqualStrings("bash", calls[0].function.name);
+    try std.testing.expectEqualStrings("{\"command\":\"echo hi\"}", calls[0].function.arguments);
 }
 
 test "a body only counts as a stream when its content type says so" {
@@ -1385,14 +1370,12 @@ test "a request that is rate limited is tried again and succeeds" {
 
     var stream = try client.complete(gpa, "01SESSION", &messages, @as([]const NoTools, &.{}));
     defer stream.deinit();
-    var collected: Reply = .{ .gpa = gpa };
-    defer collected.deinit();
-    try collected.collect(stream);
+    while (try stream.next()) |_| {}
 
     try mock.await();
 
     try std.testing.expectEqual(@as(usize, 3), mock.served);
-    try std.testing.expectEqualStrings("made it", collected.content.items);
+    try std.testing.expectEqualStrings("made it", (try stream.message()).content.?);
     try std.testing.expectEqual(4, stream.usage().total_tokens);
 }
 
@@ -1457,10 +1440,8 @@ test "the HTTP client is kept, so requests reuse one connection" {
     for (0..2) |_| {
         var stream = try client.complete(gpa, "01SESSION", &messages, @as([]const NoTools, &.{}));
         defer stream.deinit();
-        var collected: Reply = .{ .gpa = gpa };
-        defer collected.deinit();
-        try collected.collect(stream);
-        try std.testing.expectEqualStrings("hi", collected.content.items);
+        while (try stream.next()) |_| {}
+        try std.testing.expectEqualStrings("hi", (try stream.message()).content.?);
     }
 
     try mock.await();

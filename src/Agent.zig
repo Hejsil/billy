@@ -986,11 +986,11 @@ fn turn(agent: *Agent, emitter: Emitter, session: *Session, client: *llm.Client)
         // A failure to compact is not the turn's, and is not retried within it.
         if (!compact_failed) compact_failed = agent.compact(emitter, session, client, .when_needed) == .failed;
 
-        // The stream hands the reply over a delta at a time. It is added up here,
-        // because the session keeps the whole message, and each delta is shown as
-        // it arrives so a frontend that streams can show the answer while it is
-        // written. Nothing of the conversation or the reply is copied on the way
-        // to the wire: the request is written out of the session's pool.
+        // The stream hands the reply over a delta at a time, adding it up as it
+        // goes, and each delta is shown as it arrives so a frontend that streams
+        // can show the answer while it is written. Nothing of the conversation
+        // or the reply is copied on the way to the wire: the request is written
+        // out of the session's pool.
         var stream = try client.complete(
             agent.gpa,
             session.id(),
@@ -999,14 +999,9 @@ fn turn(agent: *Agent, emitter: Emitter, session: *Session, client: *llm.Client)
         );
         defer stream.deinit();
 
-        var reply: llm.Reply = .{ .gpa = agent.gpa };
-        defer reply.deinit();
-        while (try stream.next()) |delta| {
-            try reply.add(delta);
-            try showDeltaText(emitter, delta);
-        }
+        while (try stream.next()) |delta| try showDeltaText(emitter, delta);
 
-        const message = try reply.message();
+        const message = try stream.message();
         const calls = message.tool_calls orelse &.{};
 
         // A model that thought and then stopped sends a reply with neither text
@@ -1305,12 +1300,8 @@ fn askWith(agent: *Agent, session: *Session, client: *llm.Client, question: []co
     );
     defer stream.deinit();
 
-    var reply: llm.Reply = .{ .gpa = agent.gpa };
-    defer reply.deinit();
-    try reply.collect(stream);
-
-    const content = reply.content.items;
-    if (content.len == 0) return null;
+    while (try stream.next()) |_| {}
+    const content = (try stream.message()).content orelse return null;
     return try agent.gpa.dupe(u8, content);
 }
 
