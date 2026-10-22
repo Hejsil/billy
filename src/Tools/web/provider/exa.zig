@@ -125,8 +125,7 @@ test "an exa search posts the query and reads the results back" {
 
     const value = try search(gpa, &http_client, "secret", mock.url, "zig lang", 3);
     defer gpa.free(value.text);
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     // The query, the count and the capped text went out as Exa's body (its field
     // names are camelCase), the key as `x-api-key`, and the reply became the
@@ -157,8 +156,7 @@ test "an exa contents call posts the url and reads its text back" {
 
     const value = try fetch(gpa, &http_client, "secret", mock.url, "https://ziglang.org");
     defer gpa.free(value.text);
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     try std.testing.expectEqualStrings("{\"urls\":[\"https://ziglang.org\"]}", mock.bodies.items[0]);
     try std.testing.expectEqualStrings("secret", mock.header("x-api-key").?);
@@ -183,6 +181,5 @@ test "an exa url it read no text for is not a failure of the backend" {
         error.UrlUnreadable,
         fetch(gpa, &http_client, "secret", mock.url, "https://nope.invalid"),
     );
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 }

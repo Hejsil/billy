@@ -149,8 +149,7 @@ test "a JSON reply is parsed, and one of another shape is a bad reply" {
     try good.serve();
     const answer = try requestJson(Shape, gpa, &http_client, .GET, good.url, null, &.{}, "search");
     defer answer.parsed.deinit();
-    try good.group.await(io);
-    if (good.err) |err| return err;
+    try good.await();
     try std.testing.expectEqual(7, answer.parsed.value.a);
 
     var bad = try Mock.start("/x", 1, Mock.fixed("not json"));
@@ -160,6 +159,5 @@ test "a JSON reply is parsed, and one of another shape is a bad reply" {
         error.BadReply,
         requestJson(Shape, gpa, &http_client, .GET, bad.url, null, &.{}, "search"),
     );
-    try bad.group.await(io);
-    if (bad.err) |err| return err;
+    try bad.await();
 }

@@ -117,12 +117,20 @@ pub fn serve(mock: *Mock) !void {
     try mock.group.concurrent(std.testing.io, Mock.serveInGroup, .{mock});
 }
 
+/// Waits for the mock to answer every request it was started for, and returns
+/// the first failure it ran into, which is what a test does once the run it is
+/// about is over.
+pub fn await(mock: *Mock) !void {
+    try mock.group.await(std.testing.io);
+    if (mock.err) |err| return err;
+}
+
 /// Stops the mock wherever it is and returns the first failure it ran into,
 /// ignoring the cancelation that stopping it is.
 ///
 /// A test about how many requests a run makes cannot wait on a mock that was
-/// started for more of them than that: `group.await` would wait for a request
-/// that is never coming, which hangs the test instead of failing it. Cancelling
+/// started for more of them than that: `await` would wait for a request that
+/// is never coming, which hangs the test instead of failing it. Cancelling
 /// finishes the task where it waits, so what it did can be read afterwards.
 pub fn stop(mock: *Mock) !void {
     mock.group.cancel(std.testing.io);

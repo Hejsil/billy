@@ -167,8 +167,7 @@ test "the backends are tried in order until one answers" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     try run(.{ .query = "zig lang" }, gpa, &http_client, config, null, &out.writer);
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     // Both were tried: the first failed and the second answered.
     try std.testing.expectEqual(@as(usize, 2), mock.served);
@@ -201,8 +200,7 @@ test "a search fails only when every backend has failed" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     try run(.{ .query = "zig lang" }, gpa, &http_client, config, null, &out.writer);
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     try std.testing.expectEqual(@as(usize, 2), mock.served);
     try std.testing.expectEqualStrings("error: search failed: RequestFailed", out.written());
@@ -255,8 +253,7 @@ test "a backend that failed is set aside, so the next search skips it" {
     // Brave answering, not Tavily being asked again.
     out.clearRetainingCapacity();
     try run(.{ .query = "zig lang" }, gpa, &http_client, config, &health, &out.writer);
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     try std.testing.expectEqual(@as(usize, 3), mock.served);
     try std.testing.expectEqualStrings("", mock.bodies.items[2]);
@@ -281,8 +278,7 @@ test "brave is asked for no more results than billy allows any backend" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     try run(.{ .query = "zig" }, gpa, &http_client, config, null, &out.writer);
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     try std.testing.expectEqualStrings("/search?q=zig&count=20", mock.targets.items[0]);
 }
@@ -312,8 +308,7 @@ test "searxng results are capped at the most billy allows any backend" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     try run(.{ .query = "zig" }, gpa, &http_client, config, null, &out.writer);
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     try std.testing.expectEqual(@as(usize, 20), std.mem.count(u8, out.written(), "   u\n"));
 }

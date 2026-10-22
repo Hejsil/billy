@@ -65,8 +65,7 @@ test "a searxng search sends the query to the instance, and caps the results" {
     // first of the two results is rendered.
     const value = try search(gpa, &http_client, mock.url, "zig lang", 1);
     defer gpa.free(value.text);
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     // The query is a GET with no key: SearXNG is the user's own instance.
     try std.testing.expectEqualStrings("", mock.bodies.items[0]);

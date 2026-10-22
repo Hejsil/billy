@@ -185,8 +185,7 @@ test "a url no backend could read does not set the backend aside" {
     // Tavily is the only configured backend and it could not read the url, so
     // the url is read directly instead -- from the same mock.
     try run(.{ .url = mock.url }, gpa, &http_client, config, &health, &out.writer);
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     try std.testing.expectEqualStrings("<html>a page</html>", out.written());
     // Tavily answered, so it is not set aside: a search after this fetch still
@@ -214,8 +213,7 @@ test "a raw fetch reads the url directly, without any backend" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     try run(.{ .url = mock.url, .raw = true }, gpa, &http_client, .{ .backends = &.{} }, null, &out.writer);
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     try std.testing.expectEqualStrings(reply, out.written());
 }

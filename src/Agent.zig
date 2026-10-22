@@ -2179,8 +2179,7 @@ test "maybeCompact folds the conversation once it has filled the window" {
     var client = try agent.clientFor(&session);
     try std.testing.expect(try agent.maybeCompact(terminal.emitter(), &session, &client));
 
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     // The request carried the whole conversation, tool call and result included,
     // with the compacting prompt after it.
@@ -2296,8 +2295,7 @@ test "a compaction asked for now folds the conversation in whatever its size" {
     // conversation is folded whatever size it has grown to.
     var client = try agent.clientFor(&session);
     try std.testing.expect(try agent.fold(terminal.emitter(), &session, &client));
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     // The summary is folded in, and the pair reads as one line.
     try std.testing.expectEqual(4, session.messages.items.len);
@@ -2739,8 +2737,7 @@ test "a turn shows the tool it runs and then the answer" {
     var client = try agent.clientFor(&session);
     try turn(&agent, recorder.emitter(), &session, &client);
 
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     // The thinking the model sent with its call goes back to the provider on the
     // next request, with the assistant message it belongs to. A provider in
@@ -2833,8 +2830,7 @@ test "a reply with nothing is not kept, and the turn is asked again" {
     var client = try agent.clientFor(&session);
     try turn(&agent, recorder.emitter(), &session, &client);
 
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     // The answer is what the turn ends with, and the empty reply is not shown:
     // it carried no text, so asking again repeats nothing on screen.
@@ -3113,8 +3109,7 @@ test "the first turn names the session, and the naming is not part of it" {
     var terminal = testTerminal(.{ .out = &out.writer });
     try agent.ask(terminal.emitter(), &session, "the flaky test keeps failing, please fix it");
 
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     // The model's title is kept, and the session was saved with it.
     try std.testing.expectEqualStrings("Fix the flaky test", session.title().?);
@@ -3213,10 +3208,8 @@ test "a turn is sent to the model the session records when it begins" {
     try session.setModel("other/kimi-k2.7-code");
     try agent.ask(terminal.emitter(), &session, "the second question");
 
-    try deepseek.group.await(io);
-    if (deepseek.err) |err| return err;
-    try opencode.group.await(io);
-    if (opencode.err) |err| return err;
+    try deepseek.await();
+    try opencode.await();
 
     // Each server answered exactly the turn meant for it: the change was picked
     // up at the turn after it was made.
@@ -3261,8 +3254,7 @@ test "a session is sent where the choice it recorded points, not the configurati
     var terminal = testTerminal(.{ .out = &out.writer });
     try agent.ask(terminal.emitter(), &session, "a question");
 
-    try chosen.group.await(io);
-    if (chosen.err) |err| return err;
+    try chosen.await();
     try std.testing.expectEqual(@as(usize, 1), chosen.served);
     // The model it was sent is the one the session recorded, not the configured
     // one, which names a model of the provider nothing is listening on.

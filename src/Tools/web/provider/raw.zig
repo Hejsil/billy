@@ -29,8 +29,7 @@ test "a raw fetch reads the url directly, and keeps the bytes as they are" {
 
     const value = try fetch(gpa, &http_client, mock.url);
     defer gpa.free(value.text);
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     // No authorization went out: the url was read directly, not through a
     // service.
@@ -53,8 +52,7 @@ test "a raw fetch keeps a body of any size whole" {
 
     const value = try fetch(gpa, &http_client, mock.url);
     defer gpa.free(value.text);
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     try std.testing.expectEqual(reply.len, value.text.len);
 }

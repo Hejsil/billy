@@ -805,8 +805,7 @@ test "a request reaches the wire with the body the head promised" {
     defer collected.deinit();
     try collected.collect(stream);
 
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     // The head carried the counted length, and the bytes behind it are exactly
     // the body the counter measured, not something assembled separately.
@@ -842,8 +841,7 @@ test "a request names billy and carries the session it belongs to" {
     // finished with before it is checked.
     while (try stream.next()) |_| {}
 
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     // The HTTP client's own name is the library's, which a provider that
     // watches its traffic for abuse asks clients not to send, and the session
@@ -890,8 +888,7 @@ test "a streamed reply is read a delta at a time" {
     defer collected.deinit();
     try collected.collect(stream);
 
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     // The caller adds the deltas up into the reply it keeps. The model's
     // thinking arrives beside the answer and is kept apart from it, so the
@@ -964,8 +961,7 @@ test "a streamed reply that arrived compressed is read" {
     defer collected.deinit();
     try collected.collect(stream);
 
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     try std.testing.expectEqualStrings("hello", collected.content.items);
 }
@@ -1020,8 +1016,7 @@ test "a frame that arrives in pieces is joined" {
     defer collected.deinit();
     try collected.collect(stream);
 
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     try std.testing.expectEqualStrings(long, collected.content.items[0..long.len]);
     try std.testing.expectEqualStrings("the end", collected.content.items[long.len..]);
@@ -1071,8 +1066,7 @@ test "a payload that runs over more than one data line is joined" {
         if (delta.content) |piece| try content.appendSlice(gpa, piece);
     }
 
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     try std.testing.expectEqual(2, deltas);
     try std.testing.expectEqualStrings("hello", content.items);
@@ -1110,8 +1104,7 @@ test "the fields beside data carry nothing billy reads" {
     defer collected.deinit();
     try collected.collect(stream);
 
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     // The keepalives are not deltas, so they leave no trace in the reply.
     try std.testing.expectEqualStrings("hi there", collected.content.items);
@@ -1161,8 +1154,7 @@ test "a stream whose lines end with CRLF is read" {
     defer collected.deinit();
     try collected.collect(stream);
 
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     try std.testing.expectEqualStrings("hi", collected.content.items);
 }
@@ -1190,8 +1182,7 @@ test "a reply that is not a stream is reported, not read as a plain reply" {
         @as([]const NoTools, &.{}),
     ));
 
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 }
 
 test "a stream that carries no choices is an empty reply" {
@@ -1215,8 +1206,7 @@ test "a stream that carries no choices is an empty reply" {
     defer reply.deinit();
     try reply.collect(stream);
 
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     try std.testing.expectEqualStrings("", reply.content.items);
     try std.testing.expectEqualStrings("", reply.reasoning.items);
@@ -1257,8 +1247,7 @@ test "a tool call streamed in pieces is put back together" {
     defer collected.deinit();
     try collected.collect(stream);
 
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     // The id and name arrive once and the arguments a fragment at a time; the
     // caller puts them back into the one call the model meant.
@@ -1400,8 +1389,7 @@ test "a request that is rate limited is tried again and succeeds" {
     defer collected.deinit();
     try collected.collect(stream);
 
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     try std.testing.expectEqual(@as(usize, 3), mock.served);
     try std.testing.expectEqualStrings("made it", collected.content.items);
@@ -1424,8 +1412,7 @@ test "a request that keeps failing is given up on after max_attempts" {
 
     try std.testing.expectError(error.HttpStatus, client.complete(gpa, "01SESSION", &messages, @as([]const NoTools, &.{})));
 
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
     try std.testing.expectEqual(@as(usize, 3), mock.served);
 }
 
@@ -1476,8 +1463,7 @@ test "the HTTP client is kept, so requests reuse one connection" {
         try std.testing.expectEqualStrings("hi", collected.content.items);
     }
 
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
     try std.testing.expectEqual(@as(usize, 1), mock.connections);
     try std.testing.expectEqual(@as(usize, 2), mock.served);
 }

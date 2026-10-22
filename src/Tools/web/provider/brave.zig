@@ -67,8 +67,7 @@ test "a brave search sends the query in the url and reads the results back" {
 
     const value = try search(gpa, &http_client, "secret", mock.url, "zig lang", 3);
     defer gpa.free(value.text);
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     // The query is a GET, so nothing was posted; the key went out in Brave's own
     // header, and the reply rendered as the list the model reads.

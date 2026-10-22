@@ -146,8 +146,7 @@ test "a tavily search posts the query and reads the results back" {
     // list left behind is reported rather than hidden by an arena.
     const value = try search(gpa, &http_client, "secret", mock.url, "zig lang", 3);
     defer gpa.free(value.text);
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     // The query and the count went out as Tavily's body, the key as a bearer
     // token, and the reply became the numbered list the model reads.
@@ -177,8 +176,7 @@ test "a tavily extraction posts the url and reads its content back" {
 
     const value = try fetch(gpa, &http_client, "secret", mock.url, "https://ziglang.org");
     defer gpa.free(value.text);
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 
     // The url went out as Tavily's body and the key as a bearer token.
     try std.testing.expectEqualStrings("{\"urls\":[\"https://ziglang.org\"]}", mock.bodies.items[0]);
@@ -202,8 +200,7 @@ test "a url tavily could not read is not a failure of the backend" {
         error.UrlUnreadable,
         fetch(gpa, &http_client, "secret", mock.url, "https://nope.invalid"),
     );
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 }
 
 test "a wait the backend asked for comes back as one" {
@@ -228,6 +225,5 @@ test "a wait the backend asked for comes back as one" {
         error.RequestFailed,
         search(gpa, &http_client, "secret", mock.url, "zig lang", 3),
     );
-    try mock.group.await(io);
-    if (mock.err) |err| return err;
+    try mock.await();
 }
