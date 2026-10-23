@@ -9,8 +9,10 @@
 //!
 //! This is advice, not a limit: the worst a wrong wait costs is a backend left
 //! unused for an hour, so a file that cannot be read is left behind without a
-//! word, and an empty table. A file that cannot be written is another matter: it
-//! is reported, so a billy whose waits are not being kept says so.
+//! word, and an empty table. A file that cannot be written is said in the log
+//! and nothing more: a wait that cannot be kept is a hint lost, and failing the
+//! call that is holding the answer, to say so, would cost more than the hint was
+//! worth.
 
 const std = @import("std");
 
@@ -161,26 +163,40 @@ pub fn skips(self: *Health, name: []const u8, now_ms: i64) bool {
 /// Records that `name` failed, setting it aside until `now_ms` plus a wait: the
 /// one the backend itself asked for when it sent one, and otherwise one that
 /// doubles with each consecutive failure.
-pub fn record(self: *Health, name: []const u8, retry_after_ms: ?i64, now_ms: i64) !void {
+///
+/// Nothing here fails the caller, whoever it is: a table that cannot be added to,
+/// or a file that cannot be written, is a hint lost and not an answer. The call
+/// doing the recording is the one holding the answer -- a search that has
+/// already found its results -- so it is told in the log and carries on.
+pub fn record(self: *Health, name: []const u8, retry_after_ms: ?i64, now_ms: i64) void {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
 
-    const wait = try self.add(name);
+    const wait = self.add(name) catch |err| return lost("set aside", name, err);
     wait.failures += 1;
     wait.until_ms = now_ms + @min(retry_after_ms orelse waitFor(wait.failures), max_wait_ms);
-    try self.write();
+    self.write() catch |err| lost("keep the wait for", name, err);
 }
 
 /// Clears `name`, since it answered. Only a backend that had failed causes a
-/// write, so a run in which nothing fails writes nothing.
-pub fn clear(self: *Health, name: []const u8) !void {
+/// write, so a run in which nothing fails writes nothing, and a write that does
+/// fail leaves the caller with no reason to fail as well.
+pub fn clear(self: *Health, name: []const u8) void {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
 
     const wait = self.lookup(name) orelse return;
     if (wait.failures == 0 and wait.until_ms == 0) return;
     wait.* = .{};
-    try self.write();
+    self.write() catch |err| lost("clear", name, err);
+}
+
+/// Says in the log that the table could not be changed or written: a warning,
+/// because the run and the answer it is holding are both still here, and what is
+/// gone is a wait. Failing instead would end the turn that the wait was about.
+/// `what` is what could not be done with `name`, such as "clear".
+fn lost(what: []const u8, name: []const u8, err: anyerror) void {
+    std.log.warn("cannot {s} {s}: {s}", .{ what, name, @errorName(err) });
 }
 
 /// `skips` for a table that may be absent, as in a test: with none, nothing is
@@ -190,13 +206,13 @@ pub fn isSetAside(health: ?*Health, name: []const u8, now_ms: i64) bool {
 }
 
 /// `record` for a table that may be absent.
-pub fn recordFailure(health: ?*Health, name: []const u8, retry_after_ms: ?i64, now_ms: i64) !void {
-    try (health orelse return).record(name, retry_after_ms, now_ms);
+pub fn recordFailure(health: ?*Health, name: []const u8, retry_after_ms: ?i64, now_ms: i64) void {
+    (health orelse return).record(name, retry_after_ms, now_ms);
 }
 
 /// `clear` for a table that may be absent.
-pub fn recordAnswer(health: ?*Health, name: []const u8) !void {
-    try (health orelse return).clear(name);
+pub fn recordAnswer(health: ?*Health, name: []const u8) void {
+    (health orelse return).clear(name);
 }
 
 /// The wait held for `name`, or null when there is none. The name is looked up
@@ -343,7 +359,7 @@ test "a failed backend is skipped until its wait is over, and the wait is kept" 
 
     try std.testing.expect(!t.health.skips("a", 1000));
 
-    try t.health.record("a", null, 1000);
+    t.health.record("a", null, 1000);
     // Set aside from the moment it failed until the wait is up, and no longer.
     try std.testing.expect(t.health.skips("a", 1000));
     try std.testing.expect(t.health.skips("a", 1000 + base_wait_ms - 1));
@@ -362,10 +378,10 @@ test "a backend that answers is cleared, and the file with it" {
     var t = try Test.init(null);
     defer t.deinit();
 
-    try t.health.record("a", null, 1000);
+    t.health.record("a", null, 1000);
     try std.testing.expect(t.health.skips("a", 1000));
 
-    try t.health.clear("a");
+    t.health.clear("a");
     try std.testing.expect(!t.health.skips("a", 1000));
 
     // Nothing is left on disk for it either.
@@ -378,13 +394,13 @@ test "a backend that asks to be waited for is set aside for what it asked" {
     defer t.deinit();
 
     // The backend's own wait is used, not the backoff.
-    try t.health.record("a", 5_000, 0);
+    t.health.record("a", 5_000, 0);
     try std.testing.expect(t.health.skips("a", 4_999));
     try std.testing.expect(!t.health.skips("a", 5_000));
 
     // One longer than the cap is brought back to it, so a backend cannot set
     // billy aside for longer than the longest wait.
-    try t.health.record("a", max_wait_ms * 10, 0);
+    t.health.record("a", max_wait_ms * 10, 0);
     try std.testing.expect(t.health.skips("a", max_wait_ms - 1));
     try std.testing.expect(!t.health.skips("a", max_wait_ms));
 }
@@ -453,14 +469,14 @@ test "only a recorded name reaches the pool, and then only once" {
     // often it is asked, and neither does clearing one.
     try std.testing.expect(!t.health.skips("nope", 0));
     try std.testing.expect(!t.health.skips("nope", 0));
-    try t.health.clear("nope");
+    t.health.clear("nope");
     try std.testing.expectEqual(@as(usize, 0), t.health.strings.items.len);
     try std.testing.expectEqual(@as(usize, 0), t.health.entries.count());
 
     // Two names cost one copy each, and a repeated name costs none.
-    try t.health.record("tavily", null, 0);
-    try t.health.record("brave", null, 0);
-    try t.health.record("tavily", null, 0);
+    t.health.record("tavily", null, 0);
+    t.health.record("brave", null, 0);
+    t.health.record("tavily", null, 0);
     try std.testing.expectEqual(@as(usize, "tavily\x00brave\x00".len), t.health.strings.items.len);
     try std.testing.expectEqual(@as(usize, 2), t.health.entries.count());
     // A name that is in the pool is still found by the text it is held as, and
@@ -474,10 +490,10 @@ test "the file holds the waits of every backend that failed, by name" {
     var t = try Test.init(null);
     defer t.deinit();
 
-    try t.health.record("searxng", null, 0);
-    try t.health.record("brave", null, 0);
-    try t.health.clear("brave");
-    try t.health.record("tavily", 60_000, 0);
+    t.health.record("searxng", null, 0);
+    t.health.record("brave", null, 0);
+    t.health.clear("brave");
+    t.health.record("tavily", 60_000, 0);
 
     var buffer: [1 << 12]u8 = undefined;
     const written = try t.tmp.dir.readFile(std.testing.io, file_name, &buffer);
@@ -507,8 +523,8 @@ test "the file holds the waits in the order they were recorded" {
 
     // Written as the table holds them rather than sorted, since sorting is what
     // a copy of the table would be for. The names do not read in this order.
-    try t.health.record("tavily", null, 0);
-    try t.health.record("brave", null, 0);
+    t.health.record("tavily", null, 0);
+    t.health.record("brave", null, 0);
 
     var buffer: [1 << 12]u8 = undefined;
     const written = try t.tmp.dir.readFile(std.testing.io, file_name, &buffer);
@@ -519,7 +535,7 @@ test "the file holds the waits in the order they were recorded" {
     // not reshuffled by the next write.
     try t.reload();
 
-    try t.health.record("exa", null, 0);
+    t.health.record("exa", null, 0);
 
     var after: [1 << 12]u8 = undefined;
     const rewritten = try t.tmp.dir.readFile(std.testing.io, file_name, &after);
@@ -534,28 +550,47 @@ test "writing the waits allocates nothing" {
     var t = try Test.init(null);
     defer t.deinit();
 
-    try t.health.record("tavily", null, 0);
-    try t.health.record("brave", null, 0);
+    t.health.record("tavily", null, 0);
+    t.health.record("brave", null, 0);
 
     // A table that cannot allocate still writes, and still clears: the waits are
     // written out of what is held, rather than into a copy of them first.
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     t.health.gpa = failing.allocator();
-    try t.health.clear("brave");
-    try t.health.record("tavily", 60_000, 0);
+    t.health.clear("brave");
+    t.health.record("tavily", 60_000, 0);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
 }
 
 test "the optional helpers do nothing without a table, and act on one" {
     // No table: nothing is set aside and nothing is recorded.
     try std.testing.expect(!isSetAside(null, "a", 0));
-    try recordFailure(null, "a", null, 0);
-    try recordAnswer(null, "a");
+    recordFailure(null, "a", null, 0);
+    recordAnswer(null, "a");
 
     var t = try Test.init(null);
     defer t.deinit();
-    try recordFailure(&t.health, "a", null, 1000);
+    recordFailure(&t.health, "a", null, 1000);
     try std.testing.expect(isSetAside(&t.health, "a", 1000));
-    try recordAnswer(&t.health, "a");
+    recordAnswer(&t.health, "a");
     try std.testing.expect(!isSetAside(&t.health, "a", 1000));
+}
+
+test "a wait that cannot be written is still held, and fails nothing" {
+    var t = try Test.init(null);
+    defer t.deinit();
+
+    // Something in the way of the file the waits are written to, so the write
+    // fails however the disk is. What the run knows is still the table it reads:
+    // only the copy that outlives the run is what cannot be made.
+    try t.tmp.dir.createDirPath(std.testing.io, file_name);
+
+    // Neither call returns a failure. A wait is advice about a backend, and the
+    // failure it advises about is one the caller is still holding the answer to:
+    // ending that call, to say a hint could not be kept, costs the answer.
+    t.health.record("a", null, 1000);
+    try std.testing.expect(t.health.skips("a", 1000));
+
+    t.health.clear("a");
+    try std.testing.expect(!t.health.skips("a", 1000));
 }

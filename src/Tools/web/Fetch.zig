@@ -91,7 +91,7 @@ pub fn run(fetch: Fetch, gpa: std.mem.Allocator, http_client: *std.http.Client, 
                 unreadable = true;
                 continue;
             }
-            try Health.recordFailure(health, @tagName(backend.provider), null, now_ms);
+            Health.recordFailure(health, @tagName(backend.provider), null, now_ms);
             std.log.warn("fetch: {s} failed: {s}, trying the next", .{
                 @tagName(backend.provider), @errorName(err),
             });
@@ -101,11 +101,11 @@ pub fn run(fetch: Fetch, gpa: std.mem.Allocator, http_client: *std.http.Client, 
         switch (value) {
             .text => |text| {
                 defer gpa.free(text);
-                try Health.recordAnswer(health, @tagName(backend.provider));
+                Health.recordAnswer(health, @tagName(backend.provider));
                 return out.writeAll(text);
             },
             .retry_after_ms => |ms| {
-                try Health.recordFailure(health, @tagName(backend.provider), ms, now_ms);
+                Health.recordFailure(health, @tagName(backend.provider), ms, now_ms);
                 std.log.warn("fetch: {s} is set aside for {d}ms, trying the next", .{
                     @tagName(backend.provider), ms,
                 });

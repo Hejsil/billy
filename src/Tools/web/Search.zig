@@ -74,7 +74,7 @@ pub fn run(search: Search, gpa: std.mem.Allocator, http_client: *std.http.Client
         // down, rate-limited or out of credit is not asked again yet.
         if (Health.isSetAside(health, @tagName(backend.provider), now_ms)) continue;
         const value = searchBackend(gpa, http_client, backend, search.query, search_config.max_results) catch |err| {
-            try Health.recordFailure(health, @tagName(backend.provider), null, now_ms);
+            Health.recordFailure(health, @tagName(backend.provider), null, now_ms);
             std.log.warn("search: {s} failed: {s}, trying the next", .{
                 @tagName(backend.provider), @errorName(err),
             });
@@ -84,11 +84,11 @@ pub fn run(search: Search, gpa: std.mem.Allocator, http_client: *std.http.Client
         switch (value) {
             .text => |text| {
                 defer gpa.free(text);
-                try Health.recordAnswer(health, @tagName(backend.provider));
+                Health.recordAnswer(health, @tagName(backend.provider));
                 return out.writeAll(text);
             },
             .retry_after_ms => |ms| {
-                try Health.recordFailure(health, @tagName(backend.provider), ms, now_ms);
+                Health.recordFailure(health, @tagName(backend.provider), ms, now_ms);
                 std.log.warn("search: {s} is set aside for {d}ms, trying the next", .{
                     @tagName(backend.provider), ms,
                 });
@@ -330,8 +330,8 @@ test "a search with every backend set aside says so, without asking any" {
     var health = try Health.load(io, gpa, tmp.dir);
     defer health.deinit();
     const now = std.Io.Clock.real.now(io).toMilliseconds();
-    try health.record("tavily", null, now);
-    try health.record("brave", null, now);
+    health.record("tavily", null, now);
+    health.record("brave", null, now);
 
     const config: Config = .{
         .backends = &.{
