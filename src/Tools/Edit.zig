@@ -28,10 +28,8 @@ pub fn run(edit: Edit, gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, out:
         ),
         .applied => |*applied| {
             defer applied.text.deinit(gpa);
-            dir.writeFile(io, .{
-                .sub_path = edit.path,
-                .data = applied.text.items,
-            }) catch |err| return Tools.fail(out, "cannot write {s}: {s}", .{ edit.path, @errorName(err) });
+            Tools.writeFile(io, dir, edit.path, applied.text.items) catch |err|
+                return Tools.fail(out, "cannot write {s}: {s}", .{ edit.path, @errorName(err) });
 
             try out.print("replaced {d} occurrence(s) in {s}", .{ applied.count, edit.path });
         },

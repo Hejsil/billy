@@ -228,6 +228,39 @@ pub fn fail(out: *std.Io.Writer, comptime format: []const u8, args: anytype) !vo
     try out.print("error: " ++ format, args);
 }
 
+/// Writes `bytes` to `path` under `dir`, replacing the file in one step: the new
+/// contents are put in place once they are all there, so a kill or a full disk
+/// part way through leaves the old file whole rather than an empty one or half
+/// of the new.
+///
+/// A tool writes the user's own files, which are the one thing here that is not
+/// billy's to lose. The same is why a file that is already there keeps the
+/// permissions it had: an edit must not take the bit off a script that makes it
+/// run, nor open a file the user keeps to themselves. One that is not there is
+/// made with the usual permissions, which the umask decides.
+///
+/// A path that is a symbolic link is the one case treated differently from
+/// writing in place: the link is replaced, rather than the file it points at
+/// being written through it.
+pub fn writeFile(io: std.Io, dir: std.Io.Dir, path: []const u8, bytes: []const u8) !void {
+    const permissions: std.Io.File.Permissions = if (dir.statFile(io, path, .{})) |stat|
+        stat.permissions
+    else |_|
+        .default_file;
+
+    var atomic = try dir.createFileAtomic(io, path, .{
+        .permissions = permissions,
+        .replace = true,
+    });
+    defer atomic.deinit(io);
+
+    var buffer: [std.heap.page_size_min]u8 = undefined;
+    var file = atomic.file.writer(io, &buffer);
+    try file.interface.writeAll(bytes);
+    try file.end();
+    try atomic.replace(io);
+}
+
 /// Runs a parsed call, writing its result or the reason it could not run to `out`.
 fn dispatch(tools: *Tools, call: Call, out: *std.Io.Writer) !void {
     switch (call) {
@@ -789,6 +822,60 @@ test "the tools work in the directory they are given, wherever billy runs" {
         .arguments = "{\"command\":\"pwd\"}",
     } }, &result.writer);
     try std.testing.expect(std.mem.indexOf(u8, result.written(), "/project\n") != null);
+}
+
+test "a file a tool replaces keeps the permissions it had" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+    var tool_set = try Tools.init(.{
+        .io = io,
+        .dir = tmp.dir,
+        .gpa = gpa,
+        .http = &http_client,
+        .settings = .{ .bash_timeout_s = 120 },
+    });
+
+    // A file of the user's with a mode of its own, which is what a script is.
+    // Replacing the file to write it is what keeps a kill from truncating it,
+    // and the cost of that is that the new file has the permissions it was
+    // created with: taking the run off a script would be the worst kind of
+    // change a tool can make, one nobody asked for and no line of text shows.
+    try tmp.dir.writeFile(io, .{ .sub_path = "run.sh", .data = "#!/bin/sh\necho one\n" });
+    const user_only: std.Io.File.Permissions = @fromBackingInt(@intCast(0o700));
+    try tmp.dir.setFilePermissions(io, "run.sh", user_only, .{});
+
+    var sink: std.Io.Writer.Discarding = .init("");
+    _ = try runCall(arena, &tool_set, .{ .id = "1", .function = .{
+        .name = "edit",
+        .arguments = "{\"path\":\"run.sh\",\"old_string\":\"echo one\",\"new_string\":\"echo two\"}",
+    } }, &sink.writer);
+
+    // The edit is in the file, and the mode is the one it had.
+    const edited = try tmp.dir.readFileAlloc(io, "run.sh", arena, .limited(64));
+    try std.testing.expectEqualStrings("#!/bin/sh\necho two\n", edited);
+    var stat = try tmp.dir.statFile(io, "run.sh", .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), stat.permissions.toMode() & 0o777);
+
+    // A write replaces the whole file, and leaves the mode alone as well.
+    _ = try runCall(arena, &tool_set, .{ .id = "2", .function = .{
+        .name = "write",
+        .arguments = "{\"path\":\"run.sh\",\"content\":\"#!/bin/sh\\necho three\\n\"}",
+    } }, &sink.writer);
+
+    const written = try tmp.dir.readFileAlloc(io, "run.sh", arena, .limited(64));
+    try std.testing.expectEqualStrings("#!/bin/sh\necho three\n", written);
+    stat = try tmp.dir.statFile(io, "run.sh", .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), stat.permissions.toMode() & 0o777);
 }
 
 test "the limiting writer gathers writes, then passes on what fits" {

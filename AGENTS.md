@@ -49,7 +49,12 @@ least once. Read the rule, not the story; the story is in the review.
 - **Anything that replaces a file billy owns is written atomically** — `createFileAtomic`, write,
   `replace` — and anything that replaces a file billy does *not* own is written that way too, only
   more so. *`edit` and `write` truncated the user's source files in place while config, credentials,
-  sessions and health were all careful.*
+  sessions and health were all careful.* `Tools.writeFile` is the one to write through.
+- **Replacing a file is not the same as writing it.** The new file is a new inode, which carries the
+  permissions it was created with unless the old one's are read and given back — an edit must not
+  take the bit off a script, nor open a file the user keeps to themselves — it replaces a symbolic
+  link rather than writing through it, and it is the *directory* that has to be writable rather than
+  the file. The first is done for you; the other two are what replacing costs.
 - **A file a human may open is indented and versioned; a file only billy reads is compact and
   versioned.** When a version is bumped, the load path migrates the old shape; do not let a reader
   guess.

@@ -12,7 +12,7 @@ pub fn run(write: Write, io: std.Io, dir: std.Io.Dir, out: *std.Io.Writer) !void
             return Tools.fail(out, "cannot create {s}: {s}", .{ parent, @errorName(err) });
     }
 
-    dir.writeFile(io, .{ .sub_path = write.path, .data = write.content }) catch |err|
+    Tools.writeFile(io, dir, write.path, write.content) catch |err|
         return Tools.fail(out, "cannot write {s}: {s}", .{ write.path, @errorName(err) });
     try out.print("wrote {d} bytes to {s}", .{ write.content.len, write.path });
 }
