@@ -3,6 +3,7 @@
 //! fallback, so both are built here.
 
 const std = @import("std");
+const report = @import("report.zig");
 
 /// Directory under the base that holds billy's files.
 const app_dir = "billy";
@@ -41,7 +42,7 @@ pub fn dir(
 pub fn openDir(io: std.Io, path: []const u8, what: []const u8) !std.Io.Dir {
     return std.Io.Dir.cwd().createDirPathOpen(io, path, .{}) catch |err| {
         std.log.err("cannot use {s} for {s}: {s}", .{ path, what, @errorName(err) });
-        return err;
+        return report.Reported;
     };
 }
 
@@ -55,7 +56,7 @@ pub fn openDir(io: std.Io, path: []const u8, what: []const u8) !std.Io.Dir {
 pub fn openDirBuilt(io: std.Io, built: anytype, what: []const u8) !std.Io.Dir {
     const path = built catch |err| {
         std.log.err("cannot find where to store {s}: {s}", .{ what, @errorName(err) });
-        return err;
+        return report.Reported;
     };
     return openDir(io, path, what);
 }

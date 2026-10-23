@@ -14,6 +14,7 @@ pub const LineEditor = @import("LineEditor.zig");
 pub const llm = @import("llm.zig");
 pub const md = @import("md.zig");
 pub const models = @import("models.zig");
+pub const report = @import("report.zig");
 pub const Billy = @import("Billy.zig");
 pub const Session = @import("Session.zig");
 pub const Terminal = @import("Terminal.zig");

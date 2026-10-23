@@ -22,6 +22,7 @@ const Credentials = @import("Credentials.zig");
 const Endpoints = @import("Endpoints.zig");
 const Health = @import("Health.zig");
 const html = @import("html.zig");
+const report = @import("report.zig");
 const Session = @import("Session.zig");
 
 const Server = @This();
@@ -117,7 +118,7 @@ pub fn serve(server: *const Server, host: []const u8, port: u16) !void {
             "cannot listen on '{s}': {s}; give an address such as 127.0.0.1, 0.0.0.0 or 192.168.1.5",
             .{ host, @errorName(err) },
         );
-        return err;
+        return report.Reported;
     };
     var listener = try address.listen(server.io, .{ .reuse_address = true });
     defer listener.deinit(server.io);
@@ -275,7 +276,10 @@ fn handle(
     // possible: a reply that has begun has sent its head already.
     var r = Request{ .server = server, .request = &request };
     route(&r, registry, http_client) catch |err| {
-        std.log.err("cannot answer a request: {s}", .{@errorName(err)});
+        // A failure that already said what went wrong, in the log this task
+        // writes to, is not said again here: what is left is to answer the
+        // browser with a status rather than let the connection drop.
+        if (err != report.Reported) std.log.err("cannot answer a request: {s}", .{@errorName(err)});
         // Nothing has been sent, so the browser can be told what happened
         // rather than only watching the connection drop.
         if (!r.answered) request.respond("billy: internal error\n", .{

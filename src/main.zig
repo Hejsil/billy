@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const Billy = @import("billy").Billy;
+const report = @import("billy").report;
 const Server = @import("billy").Server;
 const Terminal = @import("billy").Terminal;
 const spaghet = @import("spaghet");
@@ -142,7 +143,16 @@ const Options = struct {
     };
 };
 
-pub fn main(init: std.process.Init) !void {
+/// Runs what the command line asked for, and returns the code the process exits
+/// with. A failure is answered where it happens, so what comes back here is
+/// either nothing, or a failure nobody has put into words yet.
+pub fn main(init: std.process.Init) u8 {
+    return run(init) catch |err| fail(err);
+}
+
+/// Everything the command line asked for, answering with the code it exits with:
+/// zero when it did what was asked.
+fn run(init: std.process.Init) !u8 {
     // Anything that lives as long as the process, including the conversation,
     // is allocated here.
     const arena = init.arena.allocator();
@@ -158,14 +168,16 @@ pub fn main(init: std.process.Init) !void {
     defer out.flush() catch {};
 
     const argv = try std.process.Args.toSlice(init.minimal.args, arena);
-    const options = parseArgsSlice(argv[1..]) catch |err| {
-        std.log.err("invalid arguments, try --help", .{});
-        return err;
+    const options = parseArgsSlice(argv[1..]) catch |err| switch (err) {
+        error.InvalidArgument => {
+            std.log.err("invalid arguments, try --help", .{});
+            return report.Reported;
+        },
     };
     // A usage is answered before anything is read, so it works even when billy's
     // own files cannot be: which of them asked is the command's own business, so
     // it is printed here rather than in each arm below.
-    if (try printAskedHelp(options, out)) return;
+    if (try printAskedHelp(options, out)) return 0;
 
     // Everything else needs billy's files, so they are read in once and each way
     // of running billy is a method on what came back.
@@ -173,12 +185,26 @@ pub fn main(init: std.process.Init) !void {
     defer billy.deinit();
 
     switch (options.command) {
-        .none => return billy.run(out, options.resume_id),
-        .serve => |serve| return billy.serve(serve.host, serve.port),
-        .config => |config| return billy.configSet(out, config.path.?, config.value.?),
-        .login => |login| return billy.login(out, login.service),
-        .sessions => return billy.listSessions(out),
+        .none => try billy.run(out, options.resume_id),
+        .serve => |serve| try billy.serve(serve.host, serve.port),
+        .config => |config| try billy.configSet(out, config.path.?, config.value.?),
+        .login => |login| try billy.login(out, login.service),
+        .sessions => try billy.listSessions(out),
     }
+    return 0;
+}
+
+/// Reports a failure that got as far as here, and gives the code the process
+/// exits with. A failure a command has already put into words is only counted:
+/// the user has read it, and repeating it is what makes a mistyped flag read as
+/// a crash. Anything else is one nobody explained, so it is named here, with
+/// where it came from.
+fn fail(err: anyerror) u8 {
+    if (err != report.Reported) {
+        std.log.err("{s}", .{@errorName(err)});
+        if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
+    }
+    return 1;
 }
 
 /// Prints the usage `options` asked for, and says whether it asked for one. A
@@ -553,4 +579,12 @@ test "every help message reads the same way" {
             std.mem.trimEnd(u8, text[options_at + "Options:\n".len ..], "\n"),
         );
     }
+}
+
+test "a failure a command has reported exits non-zero and is not said again" {
+    // This passes only because nothing is logged: the test runner counts an
+    // error line against the test that caused it, which is the property wanted
+    // here. The message was the command's, and the process says the rest with
+    // its exit code, for anything scripted around billy to read.
+    try std.testing.expectEqual(@as(u8, 1), fail(report.Reported));
 }

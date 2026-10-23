@@ -8,6 +8,7 @@ const llm = @import("llm.zig");
 const Tools = @import("Tools.zig");
 const Mock = @import("Mock.zig");
 const LineEditor = @import("LineEditor.zig");
+const report = @import("report.zig");
 const Session = @import("Session.zig");
 const Terminal = @import("Terminal.zig");
 
@@ -448,8 +449,11 @@ pub fn init(
     http_client: *std.http.Client,
 ) !Agent {
     var work_dir = std.Io.Dir.openDirAbsolute(io, cwd, .{}) catch |err| {
+        // A session whose directory is gone, which is what a resume after the
+        // project moved looks like. The path is the useful part, and only this
+        // has it, so the sentence is written here.
         std.log.err("cannot work in {s}: {s}", .{ cwd, @errorName(err) });
-        return err;
+        return report.Reported;
     };
     errdefer work_dir.close(io);
 

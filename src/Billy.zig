@@ -14,6 +14,7 @@ const Dirs = @import("Dirs.zig");
 const Endpoint = @import("Endpoint.zig");
 const Endpoints = @import("Endpoints.zig");
 const Health = @import("Health.zig");
+const report = @import("report.zig");
 const Session = @import("Session.zig");
 const Server = @import("Server.zig");
 const LineEditor = @import("LineEditor.zig");
@@ -59,12 +60,12 @@ pub fn open(init: std.process.Init, out: Terminal.Writer) !Billy {
 
     const store = Credentials.load(io, dirs.data, arena) catch |err| {
         std.log.err("cannot read the credentials: {s}", .{@errorName(err)});
-        return err;
+        return report.Reported;
     };
 
     var opened = Config.open(io, dirs.config, init.gpa) catch |err| {
         std.log.err("cannot read the configuration: {s}", .{@errorName(err)});
-        return err;
+        return report.Reported;
     };
     errdefer opened.config.deinit();
 
@@ -72,7 +73,7 @@ pub fn open(init: std.process.Init, out: Terminal.Writer) !Billy {
 
     const cwd = std.process.currentPathAlloc(io, arena) catch |err| {
         std.log.err("cannot find the working directory: {s}", .{@errorName(err)});
-        return err;
+        return report.Reported;
     };
 
     return .{
@@ -113,26 +114,26 @@ pub fn login(billy: *Billy, out: Terminal.Writer, service: ?[]const u8) !void {
                 " run `billy login` to list them, or name it under `providers` in the configuration",
             .{name},
         );
-        return error.UnknownService;
+        return report.Reported;
     }
 
     const purpose = Credentials.purposeOf(name) orelse name;
     const prompt = try std.fmt.allocPrint(billy.arena, "Enter {s}: ", .{purpose});
     const key = (try billy.readSecret(out, prompt)) orelse {
         std.log.err("no key read", .{});
-        return error.MissingCredential;
+        return report.Reported;
     };
     // An empty key would be stored as a credential that cannot work, which is
     // worse than having none: the service would be offered and always fail.
     if (key.len == 0) {
         std.log.err("no key given, nothing stored", .{});
-        return error.MissingCredential;
+        return report.Reported;
     }
 
     try billy.credentials.put(billy.arena, name, key);
     billy.credentials.save(billy.io, billy.dirs.data) catch |err| {
         std.log.err("cannot write the credentials: {s}", .{@errorName(err)});
-        return err;
+        return report.Reported;
     };
     try out.print("stored the {s} key\n", .{name});
 }
@@ -161,21 +162,21 @@ pub fn configSet(billy: *Billy, out: Terminal.Writer, path: []const u8, value: [
     billy.config.set(path, value) catch |err| switch (err) {
         error.UnknownOption => {
             std.log.err("'{s}' is not a configuration setting", .{path});
-            return err;
+            return report.Reported;
         },
         error.NotASection => {
             std.log.err("'{s}' names a section, not a setting", .{path});
-            return err;
+            return report.Reported;
         },
         error.InvalidValue => {
             std.log.err("'{s}' is not something {s} takes", .{ value, path });
-            return err;
+            return report.Reported;
         },
         else => |other| return other,
     };
     billy.config.save(billy.io, billy.dirs.config) catch |err| {
         std.log.err("cannot write the configuration: {s}", .{@errorName(err)});
-        return err;
+        return report.Reported;
     };
     try out.print("set {s} to {s}\n", .{ path, value });
 }
@@ -193,13 +194,13 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resume_id: ?[]const u8) !void {
     ) catch |err| switch (err) {
         error.SessionNotFound => {
             std.log.err("no session '{s}'", .{resume_id.?});
-            return err;
+            return report.Reported;
         },
         error.InvalidSessionId => {
             std.log.err("'{s}' cannot be used as a session name", .{resume_id.?});
-            return err;
+            return report.Reported;
         },
-        else => return err,
+        else => |other| return other,
     };
     defer session.deinit();
 
@@ -253,7 +254,7 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resume_id: ?[]const u8) !void {
 pub fn listSessions(billy: *Billy, out: Terminal.Writer) !void {
     const listed = Session.list(billy.io, billy.dirs.sessions, billy.gpa) catch |err| {
         std.log.err("cannot list the sessions: {s}", .{@errorName(err)});
-        return err;
+        return report.Reported;
     };
     defer {
         for (listed) |named| {
@@ -287,7 +288,12 @@ pub fn serve(billy: *Billy, host: []const u8, port: u16) !void {
 
     // The configured choice is resolved once here only to report a provider or a
     // key that is missing: each turn resolves its own target when it begins.
-    _ = try Endpoint.configured(&billy.config, &billy.credentials, arena);
+    _ = Endpoint.configured(&billy.config, &billy.credentials, arena) catch |err| switch (err) {
+        // Both are reported where they are found, and each names what to do
+        // about it; anything else is one nobody has explained.
+        error.UnknownProvider, error.MissingApiKey => return report.Reported,
+        else => |other| return other,
+    };
 
     const server = Server{
         .io = billy.io,

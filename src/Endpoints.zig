@@ -16,6 +16,7 @@ const Credentials = @import("Credentials.zig");
 const Endpoint = @import("Endpoint.zig");
 const Health = @import("Health.zig");
 const models = @import("models.zig");
+const report = @import("report.zig");
 const Session = @import("Session.zig");
 const Terminal = @import("Terminal.zig");
 const tools = @import("Tools.zig");
@@ -35,13 +36,13 @@ pub const Backends = struct {
         var search_failed: tools.web.Search.Provider = .tavily;
         const search_config = searchConfig(arena, store, config, &search_failed) catch |err| {
             reportSearchFailure(err, search_failed);
-            return err;
+            return report.Reported;
         };
 
         var fetch_failed: tools.web.Fetch.Provider = .raw;
         const fetch_config = fetchConfig(arena, store, config, &fetch_failed) catch |err| {
             reportFetchFailure(err, fetch_failed);
-            return err;
+            return report.Reported;
         };
 
         return .{ .search = search_config, .fetch = fetch_config };
@@ -167,7 +168,12 @@ fn reportSearchFailure(err: anyerror, provider: tools.web.Search.Provider) void 
             "set tools.web_search.{s}.url to your {s} instance, or clear tools.web_search in the configuration",
             .{ @tagName(provider), @tagName(provider) },
         ),
-        else => {},
+        // Nothing this function knows about: it is the last word on the
+        // failure, so it says what it has rather than nothing at all.
+        else => |other| std.log.err(
+            "cannot use the {s} search backend: {s}",
+            .{ @tagName(provider), @errorName(other) },
+        ),
     }
 }
 
@@ -182,7 +188,11 @@ fn reportFetchFailure(err: anyerror, provider: tools.web.Fetch.Provider) void {
                 .{ service, @tagName(provider) },
             );
         },
-        else => {},
+        // As in `reportSearchFailure`: this is the last word on it.
+        else => |other| std.log.err(
+            "cannot use the {s} fetch backend: {s}",
+            .{ @tagName(provider), @errorName(other) },
+        ),
     }
 }
 
