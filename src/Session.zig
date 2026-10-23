@@ -837,20 +837,35 @@ fn loadPromptAndMessages(
 
 /// Reads the compaction indices back against the conversation just loaded, so
 /// the sorted list a request and a transcript read is sound even if the file was
-/// written by hand: one past the end is dropped rather than trusted and the list
-/// is sorted. A migrated file's indices name the messages as they were stored, so
-/// each is shifted by the `lead` lifted out of the front of them.
+/// written by hand: one past the end is dropped rather than trusted, a repeat is
+/// folded into the one compaction it names, and the list is sorted. A migrated
+/// file's indices name the messages as they were stored, so each is shifted by
+/// the `lead` lifted out of the front of them.
 fn loadCompactions(session: *Session, stored: []const u32, lead: usize) !void {
     // A summary stands at a message, so with none there is nothing to point at.
     if (session.messages.items.len == 0) return;
 
-    try session.compactions.appendSlice(session.gpa, stored);
+    const last: u32 = @intCast(session.messages.items.len - 1);
+    try session.compactions.ensureTotalCapacity(session.gpa, stored.len);
+    for (stored) |stored_index| {
+        const index = std.math.sub(u32, stored_index, @intCast(lead)) catch 0;
+        // An index past the end names no message to stand in for. Moving it
+        // onto the last message instead would make it read as a summary of a
+        // conversation it never compacted.
+        if (index > last) continue;
+        session.compactions.appendAssumeCapacity(index);
+    }
     std.mem.sort(u32, session.compactions.items, {}, std.sort.asc(u32));
 
-    for (session.compactions.items) |*index| {
-        index.* = std.math.sub(u32, index.*, @intCast(lead)) catch 0;
-        index.* = @min(index.*, @as(u32, @intCast(session.messages.items.len - 1)));
+    // `compact` appends a message before recording its index, so a repeat can
+    // only come from a file written by hand; it names the one compaction.
+    var kept: usize = 0;
+    for (session.compactions.items) |index| {
+        if (kept > 0 and session.compactions.items[kept - 1] == index) continue;
+        session.compactions.items[kept] = index;
+        kept += 1;
     }
+    session.compactions.shrinkRetainingCapacity(kept);
 }
 
 /// Interns the stored tool definitions, so the set is one array and the
@@ -2136,7 +2151,7 @@ test "a compaction survives a save and resume" {
     try std.testing.expectEqualStrings("next", resumed.pool.get(resumed.messages.items[3].content).?);
 }
 
-test "the compaction list is sorted and clamped when a session is read" {
+test "the compaction list is sorted, deduplicated and dropped where it names nothing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2157,9 +2172,13 @@ test "the compaction list is sorted and clamped when a session is read" {
     defer session.deinit();
 
     try std.testing.expectEqualStrings("s", session.systemPrompt().?);
-    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 1, 2 }, session.compactions.items);
-    try std.testing.expectEqual(2, session.sentFrom());
+    // 99 is past the end and dropped, not moved onto the last message, where it
+    // would have read as a summary of "two"; the two 2s name one compaction.
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, session.compactions.items);
+    try std.testing.expectEqual(1, session.sentFrom());
     try std.testing.expect(session.isCompaction(1));
+    // The last message is not a summary, so a request carries the whole tail.
+    try std.testing.expect(!session.isCompaction(2));
 }
 
 test "compactions in a file with no messages are dropped" {
