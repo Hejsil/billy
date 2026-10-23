@@ -102,8 +102,9 @@ pub const Behaviour = struct {
 /// as it ends, so a frontend can show a slow command while it runs. A frontend
 /// that shows only finished work ignores the first.
 ///
-/// A reply's text also arrives in fragments through `Emitter.delta` while it is
-/// written, before the `answer` block that carries the whole of it.
+/// A reply's text and the model's reasoning also arrive in fragments through
+/// `Emitter.delta` while they are written, before the `answer` block that
+/// carries the whole reply.
 pub const Block = union(enum) {
     /// What the user typed.
     prompt: []const u8,
@@ -150,6 +151,10 @@ pub const Block = union(enum) {
 pub const Delta = struct {
     /// More of the reply's text.
     content: ?[]const u8 = null,
+    /// More of the model's reasoning, when the provider streams it. It comes
+    /// before the answer it leads to, and is for a frontend that shows it; the
+    /// answer's own fragments follow as `content`.
+    reasoning: ?[]const u8 = null,
 };
 
 /// Where a run's blocks go. The run says what happened and the emitter decides
@@ -163,9 +168,9 @@ pub const Emitter = struct {
         /// Shows one block. Blocks arrive in the order they happened, and a
         /// frontend gets each one whole; nothing is half-shown.
         block: *const fn (context: *anyopaque, block: Block) anyerror!void,
-        /// Shows a fragment of the answer as the model writes it. Optional: a
-        /// frontend that shows only whole blocks leaves it null, and the
-        /// `answer` block that follows carries the whole reply.
+        /// Shows a fragment of the answer or its reasoning as the model writes
+        /// it. Optional: a frontend that shows only whole blocks leaves it null,
+        /// and the `answer` block that follows carries the whole reply.
         delta: ?*const fn (context: *anyopaque, delta: Delta) anyerror!void = null,
     };
 
@@ -174,8 +179,8 @@ pub const Emitter = struct {
         return emitter.vtable.block(emitter.context, block);
     }
 
-    /// Shows one fragment of the answer. A frontend with no delta handler drops
-    /// it, since the whole answer follows as a block.
+    /// Shows one fragment of the answer or its reasoning. A frontend with no
+    /// delta handler drops it, since the whole answer follows as a block.
     pub fn showDelta(emitter: Emitter, delta: Delta) !void {
         if (emitter.vtable.delta) |show_delta| return show_delta(emitter.context, delta);
     }
@@ -941,11 +946,12 @@ fn blocksIn(session: *const Session, messages: []const Session.Message, index: u
     return if (calls == 0) 1 else calls;
 }
 
-/// Shows the text of a streamed delta to the frontend. The model's thinking is
-/// not shown: it is the provider's, and is carried back to it rather than to
-/// the screen. Tool call pieces are not shown either: a call is shown whole
-/// when it has been parsed, just before it runs.
+/// Shows the text of a streamed delta to the frontend: the model's reasoning
+/// first, when the provider sends it, then the answer's own text. Tool call
+/// pieces are not shown: a call is shown whole when it has been parsed, just
+/// before it runs.
 fn showDeltaText(emitter: Emitter, delta: llm.Delta) !void {
+    if (delta.reasoning) |text| try emitter.showDelta(.{ .reasoning = text });
     if (delta.content) |text| try emitter.showDelta(.{ .content = text });
 }
 
@@ -2620,6 +2626,9 @@ const Recorder = struct {
     /// frontend that streams shows them, and the `answer` block still follows
     /// with the whole text.
     deltas: std.ArrayList(Fragment) = .empty,
+    /// The reasoning's fragments, in the order they arrived, kept apart from
+    /// the answer's so a test can tell the two streams apart.
+    reasonings: std.ArrayList(Fragment) = .empty,
 
     const Seen = union(enum) {
         prompt: []const u8,
@@ -2659,6 +2668,9 @@ const Recorder = struct {
 
     fn showDelta(context: *anyopaque, delta: Delta) anyerror!void {
         const self = selfOf(context);
+        if (delta.reasoning) |text| try self.reasonings.append(self.gpa, .{
+            .text = try self.keeper(text),
+        });
         if (delta.content) |text| try self.deltas.append(self.gpa, .{
             .text = try self.keeper(text),
         });
@@ -2753,8 +2765,9 @@ test "a turn shows the tool it runs and then the answer" {
 
     // The answer reached the frontend while it was still being written, as the
     // pieces the model sent, before the block that carries the whole of it. The
-    // thinking that came with them was not among them: it is the provider's,
-    // and goes back to it rather than to the screen.
+    // thinking was sent as a stream of its own, ahead of the answer.
+    try std.testing.expectEqual(1, recorder.reasonings.items.len);
+    try std.testing.expectEqualStrings("I should run the command.", recorder.reasonings.items[0].text);
     try std.testing.expectEqual(2, recorder.deltas.items.len);
     try std.testing.expectEqualStrings("all ", recorder.deltas.items[0].text);
     try std.testing.expectEqualStrings("done", recorder.deltas.items[1].text);
@@ -2825,10 +2838,12 @@ test "a reply with nothing is not kept, and the turn is asked again" {
 
     try mock.await();
 
-    // The answer is what the turn ends with, and the empty reply is not shown:
-    // it carried no text, so asking again repeats nothing on screen.
+    // The answer is what the turn ends with. The empty reply is not shown as a
+    // block, though the reasoning it carried was streamed as it arrived.
     try std.testing.expectEqual(1, recorder.seen.items.len);
     try std.testing.expectEqualStrings("all done", recorder.seen.items[0].answer);
+    try std.testing.expectEqual(1, recorder.reasonings.items.len);
+    try std.testing.expectEqualStrings("thinking it over", recorder.reasonings.items[0].text);
     try std.testing.expectEqual(@as(usize, 1), recorder.deltas.items.len);
 
     // The second request is the first one again, byte for byte: the empty reply
@@ -2896,10 +2911,13 @@ test "a provider that keeps saying nothing ends the turn" {
     // What the turn ends with is a notice saying the model kept saying nothing,
     // which is not the notice a turn that ran out of turns shows: the model was
     // asked and did not answer, rather than getting as far as it was allowed.
-    // Nothing was shown while the requests were made, since an empty reply has
-    // nothing to show.
+    // The reasoning each empty reply carried was shown as it arrived; what it
+    // never had was an answer block to show.
     try std.testing.expectEqual(1, recorder.seen.items.len);
     try std.testing.expect(recorder.seen.items[0] == .notice);
+    try std.testing.expectEqual(max_retries, recorder.reasonings.items.len);
+    for (recorder.reasonings.items) |fragment|
+        try std.testing.expectEqualStrings("thinking it over", fragment.text);
     var expected: [96]u8 = undefined;
     try std.testing.expectEqualStrings(
         try std.fmt.bufPrint(&expected, "stopped after {d} replies in a row that said nothing", .{max_retries}),
@@ -2982,13 +3000,14 @@ test "a reply that says something starts the run of silence over" {
     // the mock waiting for one that is not coming.
     try mock.stop();
 
-    // The answer is reached, and the replies that said nothing left nothing on
-    // screen on the way: the call is shown as it runs, with its result, and then
-    // the answer.
+    // The answer is reached. The replies that said nothing were shown as the
+    // reasoning they carried, but left no answer block; the call is shown as it
+    // runs, with its result, and then the answer.
     try std.testing.expectEqual(3, recorder.seen.items.len);
     try std.testing.expectEqualStrings("bash", recorder.seen.items[0].tool_begin);
     try std.testing.expect(recorder.seen.items[2] == .answer);
     try std.testing.expectEqualStrings("all done", recorder.seen.items[2].answer);
+    try std.testing.expectEqual(3, recorder.reasonings.items.len);
     try std.testing.expectEqual(@as(usize, 5), mock.bodies.items.len);
 }
 

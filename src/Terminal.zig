@@ -25,31 +25,82 @@ scratch: std.mem.Allocator,
 /// the text again. Null when no fragment has arrived, in which case the answer
 /// is written whole by the block.
 stream: ?Markdown.Stream = null,
+/// Whether the model's reasoning is being shown, and whether its last write
+/// ended a line, so the blank line that closes the block is not doubled.
+reasoning: bool = false,
+reasoning_at_line_start: bool = true,
 
 pub fn emitter(self: *Terminal) agent.Emitter {
     return .{ .context = self, .vtable = &.{ .block = show, .delta = showDelta } };
 }
 
-/// Drops a streamed answer that will not be finished, so a run that ends early
-/// leaves nothing held.
+/// Drops a streamed answer or reasoning block that will not be finished, so a
+/// run that ends early leaves nothing held and the terminal is not left dim.
 pub fn deinit(self: *Terminal) void {
+    self.dropReasoning();
     self.dropStream();
 }
 
-/// Shows one fragment of an answer as the model writes it. The first fragment
-/// opens the answer block; the rest continue it. Each is flushed at once, which
-/// is what puts it on screen before the model has finished.
+/// Shows one fragment of an answer or its reasoning as the model writes it.
+///
+/// Reasoning is written dim under its own header, a fragment at a time, so it
+/// appears as it is thought. The first answer fragment ends it, opens the answer
+/// block, and continues there. Each fragment is flushed at once, which is what
+/// puts it on screen before the model has finished.
 fn showDelta(context: *anyopaque, delta: agent.Delta) anyerror!void {
     const self = selfOf(context);
+
+    if (delta.reasoning) |text| {
+        // Reasoning that arrives after the answer has begun would split the
+        // answer block, so it is left out; providers send it first.
+        if (self.stream == null and text.len > 0) try self.streamReasoning(text);
+    }
+
     const text = delta.content orelse return;
     if (text.len == 0) return;
 
+    try self.endReasoning();
     if (self.stream == null) {
         try marks.answer.header("answer", "", self.writer);
         self.stream = try Markdown.Stream.open(self.scratch, self.writer);
     }
     if (self.stream) |*stream| try stream.feed(text);
     try self.writer.flush();
+}
+
+/// Writes more of the model's reasoning under its header, dim and as it comes.
+fn streamReasoning(self: *Terminal, text: []const u8) !void {
+    if (!self.reasoning) {
+        try marks.reasoning.header("reasoning", "", self.writer);
+        // The code stays open across fragments, so the whole block is dim.
+        try self.writer.write(self.writer.dim());
+        self.reasoning = true;
+        self.reasoning_at_line_start = true;
+    }
+    try self.writer.write(text);
+    self.reasoning_at_line_start = text[text.len - 1] == '\n';
+    try self.writer.flush();
+}
+
+/// Ends the reasoning block, if one is open: turns the dim off and writes the
+/// blank line that sets the block off from what follows.
+fn endReasoning(self: *Terminal) !void {
+    if (!self.reasoning) return;
+    self.reasoning = false;
+
+    try self.writer.write(self.writer.reset());
+    if (!self.reasoning_at_line_start) try self.writer.write("\n");
+    try self.writer.write("\n");
+    try self.writer.flush();
+}
+
+/// Drops an open reasoning block without writing more of it, turning the dim
+/// off so the rest of the run is not left looking like reasoning.
+fn dropReasoning(self: *Terminal) void {
+    if (!self.reasoning) return;
+    self.reasoning = false;
+    self.writer.write(self.writer.reset()) catch {};
+    self.writer.flush() catch {};
 }
 
 /// Ends a streamed answer, if one is being written: writes its last line and
@@ -88,6 +139,7 @@ fn show(context: *anyopaque, block: agent.Block) anyerror!void {
         .prompt => |text| {
             // A prompt begins a turn, so nothing can still be streaming from the
             // last one.
+            try self.endReasoning();
             self.dropStream();
             try printPrompt(self.scratch, self.writer, text);
             // The prompt goes out as it is typed, before the request that
@@ -108,6 +160,7 @@ fn show(context: *anyopaque, block: agent.Block) anyerror!void {
         // before asking for the call is ended first, so the two read as the
         // separate blocks they are.
         .tool_begin => |call| {
+            _ = try self.endReasoning();
             _ = try self.endStream();
             try tool.printHead(self.scratch, call, self.writer);
             try self.writer.flush();
@@ -122,17 +175,20 @@ fn show(context: *anyopaque, block: agent.Block) anyerror!void {
         // The terminal stands the two in with one line rather than showing
         // them, which is what a compaction has always looked like here.
         .compacted => {
+            try self.endReasoning();
             self.dropStream();
             try printCompacted(self.writer);
         },
         // A notice can end a turn that had already streamed part of an answer,
         // so the answer is ended before the line that says why.
         .notice => |text| {
+            _ = try self.endReasoning();
             _ = try self.endStream();
             try self.writer.print("{s}\n\n", .{text});
             try self.writer.flush();
         },
         .elided => |count| {
+            try self.endReasoning();
             self.dropStream();
             try printElided(count, self.writer);
         },
@@ -193,6 +249,8 @@ fn printElided(count: usize, writer: Writer) !void {
 pub const marks = struct {
     pub const prompt = Writer.Mark{ .glyph = "»", .hue = .blue };
     pub const answer = Writer.Mark{ .glyph = "◆", .hue = .green };
+    /// The model's own thinking, shown dim before the answer it leads to.
+    pub const reasoning = Writer.Mark{ .glyph = "◇", .hue = .magenta };
     /// The line a compaction shows as, standing in for the prompt that asked for
     /// it and the summary it produced.
     pub const compacted = Writer.Mark{ .glyph = "⊟", .hue = .yellow };
@@ -242,6 +300,63 @@ test "a streamed answer is written as it arrives, and is not written again" {
     // so only the blank line that ends the block is left to write.
     try emit.show(.{ .answer = "hello\n**world**\n" });
     try std.testing.expectEqualStrings("◆ answer\nhello\nworld\n\n", out.written());
+}
+
+test "streamed reasoning is shown before the answer" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var terminal = Terminal{ .writer = .{ .out = &out.writer }, .io = undefined, .scratch = gpa };
+    defer terminal.deinit();
+    const emit = terminal.emitter();
+
+    // Reasoning opens its own block and is written as it comes, not held for a
+    // complete line the way markdown is.
+    try emit.showDelta(.{ .reasoning = "I should check.\n" });
+    try std.testing.expectEqualStrings("◇ reasoning\nI should check.\n", out.written());
+
+    // The first answer fragment closes it and opens the answer block. Its line
+    // is held until the paragraph ends, as a streamed answer's last line is.
+    try emit.showDelta(.{ .content = "hello\n" });
+    try std.testing.expectEqualStrings(
+        "◇ reasoning\nI should check.\n\n◆ answer\n",
+        out.written(),
+    );
+
+    try emit.show(.{ .answer = "hello\n" });
+    try std.testing.expectEqualStrings(
+        "◇ reasoning\nI should check.\n\n◆ answer\nhello\n\n",
+        out.written(),
+    );
+}
+
+test "reasoning is dim and the answer is not" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var terminal = Terminal{
+        .writer = .{ .style = .ansi, .out = &out.writer },
+        .io = undefined,
+        .scratch = gpa,
+    };
+    defer terminal.deinit();
+    const emit = terminal.emitter();
+
+    try emit.showDelta(.{ .reasoning = "think" });
+    try std.testing.expectEqualStrings(
+        "\x1b[35m◇\x1b[0m \x1b[1mreasoning\x1b[0m\n\x1b[2mthink",
+        out.written(),
+    );
+
+    // The dim is turned off before the blank line and the answer's header.
+    try emit.showDelta(.{ .content = "hi" });
+    try std.testing.expectEqualStrings(
+        "\x1b[35m◇\x1b[0m \x1b[1mreasoning\x1b[0m\n\x1b[2mthink\x1b[0m\n\n" ++
+            "\x1b[32m◆\x1b[0m \x1b[1manswer\x1b[0m\n",
+        out.written(),
+    );
 }
 
 test "an answer with no fragments is written whole" {
