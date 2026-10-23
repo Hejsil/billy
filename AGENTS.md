@@ -1,5 +1,7 @@
 # Working on billy
 
+**Update AGENTS.md with lessons learned.**
+
 Rules earned from a full review of this codebase. Each one is here because the code got it wrong at
 least once. Read the rule, not the story; the story is in the review.
 
