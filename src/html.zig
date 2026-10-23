@@ -4,9 +4,10 @@
 //! text and nowhere else, so every one of those is escaped before it is written.
 //! A `<` in a file billy read is a `<` on the page, not the start of a tag.
 //!
-//! The markdown a reply is written in is read as CommonMark by md4c, not by an
-//! approximation of it (`markdown`, and `md.zig`). Only the display changes: what
-//! a session stores and what the model is sent keep the markdown as written.
+//! The markdown a reply is written in is read as CommonMark by the same parser
+//! the terminal uses (`markdown`, and `md.zig`), not by an approximation of it.
+//! Only the display changes: what a session stores and what the model is sent
+//! keep the markdown as written.
 //!
 //! A tool call is a `<details>` a page shows collapsed, so a conversation with
 //! many calls stays readable: the summary is the call's head and the body is what
@@ -16,7 +17,6 @@ const std = @import("std");
 const agent = @import("Agent.zig");
 const diffing = @import("diff.zig");
 const md = @import("md.zig");
-const md4c = @import("md4c.zig");
 const models = @import("models.zig");
 const favicons = @import("web/favicons.zig");
 const Session = @import("Session.zig");
@@ -34,8 +34,8 @@ pub fn escape(text: []const u8, out: *std.Io.Writer) !void {
             '<' => "&lt;",
             '>' => "&gt;",
             '"' => "&quot;",
-            // The hex form, which is what md4c writes, so billy's own escaping
-            // and the markdown renderer's agree character for character.
+            // The hex form, which is what a CommonMark renderer writes for an
+            // apostrophe, so billy's escaping reads like any other renderer's.
             '\'' => "&#x27;",
             else => continue,
         };
@@ -85,24 +85,24 @@ const Escaping = struct {
 
 /// Writes the markdown of a reply or a prompt as HTML.
 ///
-/// Driving md4c's parser rather than its own renderer is what lets billy check a
-/// link's address before writing it: md4c renders a `javascript:` link as a link,
-/// and a reply must not be able to make one that runs code.
+/// Driving the parser's callbacks rather than handing the document to a renderer
+/// is what lets billy check a link's address before writing it: a renderer that
+/// writes a `javascript:` link as a link would let a reply run code.
 pub fn markdown(gpa: std.mem.Allocator, text: []const u8, out: *std.Io.Writer) !void {
     var render = Markdown{ .gpa = gpa, .out = out };
-    var parser = md4c.parser(Markdown);
-    try md.parse(text, &parser, &render);
+    var callbacks = md.parser(Markdown);
+    try md.parse(text, &callbacks, &render);
     // A callback cannot return an error, so a failed write is kept on the
-    // renderer and reported here, once md4c has stopped.
+    // renderer and reported here, once the parser has stopped.
     if (render.err) |err| return err;
 }
 
-/// Renders one document. It is the `userdata` md4c hands back to every callback,
-/// and holds the writer each piece goes to.
+/// Renders one document. It is the `userdata` the parser hands back to every
+/// callback, and holds the writer each piece goes to.
 ///
-/// md4c's callbacks say *what* a piece of the document is, and this writes the
-/// HTML for it: the tags are the ones a CommonMark renderer writes, so the page
-/// gets the markup it expects, with a link's address checked on the way
+/// The parser's callbacks say *what* a piece of the document is, and this writes
+/// the HTML for it: the tags are the ones a CommonMark renderer writes, so the
+/// page gets the markup it expects, with a link's address checked on the way
 /// (`safeAddress`).
 const Markdown = struct {
     gpa: std.mem.Allocator,
@@ -115,8 +115,8 @@ const Markdown = struct {
     image_depth: usize = 0,
 
     /// Writes `text` on, keeping the failure if there is one. Returns whether the
-    /// write worked, so a callback can stop the parse: md4c stops at the first
-    /// callback that returns non-zero.
+    /// write worked, so a callback can stop the parse: the parser stops at the
+    /// first callback that returns non-zero.
     fn put(self: *Markdown, text: []const u8) bool {
         self.out.writeAll(text) catch |err| {
             self.err = err;
@@ -146,7 +146,7 @@ const Markdown = struct {
 
     // ---- blocks ----
 
-    pub fn openBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
+    pub fn enterBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
         switch (block_type) {
             md.c.MD_BLOCK_DOC => {},
             md.c.MD_BLOCK_QUOTE => return self.put("<blockquote>\n"),
@@ -174,7 +174,7 @@ const Markdown = struct {
         return true;
     }
 
-    pub fn closeBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
+    pub fn leaveBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
         switch (block_type) {
             md.c.MD_BLOCK_DOC => {},
             md.c.MD_BLOCK_QUOTE => return self.put("</blockquote>\n"),
@@ -242,7 +242,7 @@ const Markdown = struct {
 
     // ---- spans ----
 
-    pub fn openSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) bool {
+    pub fn enterSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) bool {
         const inside_image = self.image_depth > 0;
         if (span_type == md.c.MD_SPAN_IMG) self.image_depth += 1;
         // Inside an image label only the text matters: it is the alt text, and a
@@ -255,7 +255,6 @@ const Markdown = struct {
             md.c.MD_SPAN_A => return self.openA(@ptrCast(@alignCast(detail.?))),
             md.c.MD_SPAN_IMG => return self.openImg(@ptrCast(@alignCast(detail.?))),
             md.c.MD_SPAN_CODE => return self.put("<code>"),
-            md.c.MD_SPAN_INS => return self.put("<ins>"),
             md.c.MD_SPAN_DEL => return self.put("<del>"),
             md.c.MD_SPAN_U => return self.put("<u>"),
             md.c.MD_SPAN_MARK => return self.put("<mark>"),
@@ -266,7 +265,7 @@ const Markdown = struct {
         return true;
     }
 
-    pub fn closeSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) bool {
+    pub fn leaveSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) bool {
         if (span_type == md.c.MD_SPAN_IMG) self.image_depth -= 1;
         if (self.image_depth > 0) return true;
 
@@ -276,7 +275,6 @@ const Markdown = struct {
             md.c.MD_SPAN_A => return self.put("</a>"),
             md.c.MD_SPAN_IMG => return self.closeImg(@ptrCast(@alignCast(detail.?))),
             md.c.MD_SPAN_CODE => return self.put("</code>"),
-            md.c.MD_SPAN_INS => return self.put("</ins>"),
             md.c.MD_SPAN_DEL => return self.put("</del>"),
             md.c.MD_SPAN_U => return self.put("</u>"),
             md.c.MD_SPAN_MARK => return self.put("</mark>"),
@@ -315,7 +313,7 @@ const Markdown = struct {
 
     // ---- text ----
 
-    pub fn writeRun(self: *Markdown, text_type: md.c.MD_TEXTTYPE, text: []const u8) bool {
+    pub fn writeText(self: *Markdown, text_type: md.c.MD_TEXTTYPE, text: []const u8) bool {
         switch (text_type) {
             // A NULL is replaced the way CommonMark says, rather than written.
             md.c.MD_TEXT_NULLCHAR => return self.put("\u{FFFD}"),
@@ -367,9 +365,9 @@ const Markdown = struct {
         return self.putEscaped(value.items);
     }
 
-    /// Reads an attribute into `value`, resolving the entities in it. md4c hands
-    /// an attribute over in runs, each of which is ordinary text, an entity or a
-    /// NULL character.
+    /// Reads an attribute into `value`, resolving the entities in it. The parser
+    /// hands an attribute over in runs, each of which is ordinary text, an entity
+    /// or a NULL character.
     fn decodeAttribute(self: *Markdown, attribute: *const md.c.MD_ATTRIBUTE, value: *std.ArrayList(u8)) !void {
         var i: usize = 0;
         while (attribute.substr_offsets[i] < attribute.size) : (i += 1) {
@@ -677,7 +675,8 @@ test "an image may be a data: image, but a link may not" {
 
 test "a reply cannot forge an address attribute" {
     // Raw HTML is off and text is escaped, so a reply that writes an attribute
-    // writes the text of one; only md4c's own attributes are checked.
+    // writes the text of one; only the markdown parser's own attributes are
+    // checked.
     try expectMarkdown(
         "<p>an &lt;a href=&quot;javascript:x&quot;&gt; tag</p>\n",
         "an <a href=\"javascript:x\"> tag\n",
@@ -710,70 +709,6 @@ test "the GitHub extensions a reply uses are on" {
 
 test "raw HTML in the text stays text" {
     try expectMarkdown("<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>\n", "<script>alert(1)</script>\n");
-}
-
-/// Documents the oracle test renders, covering everything billy's renderer is
-/// meant to handle. Every address is safe: billy neutralizes a dangerous one and
-/// md4c's own renderer does not, so those are checked by the tests above rather
-/// than by the oracle.
-const oracle_corpus = [_][]const u8{
-    "# Heading one\n\n## Heading two\n\n### h3\n\n#### h4\n\n##### h5\n\n###### h6\n",
-    "A paragraph with *emphasis*, **strong**, `code`, and ~~struck~~ text.\n",
-    "A second paragraph.\n\nAnd a third, spread\nover two lines.\n",
-    "- one\n- two\n- three\n",
-    "1. one\n2. two\n3. three\n",
-    "3. three\n4. four\n",
-    "- a\n  - nested a\n  - nested b\n- b\n",
-    "1. one\n   - nested\n2. two\n",
-    "1. one\n\n2. two\n",
-    "- [ ] todo\n- [x] done\n",
-    "> a quote\n> over two lines\n",
-    "> first\n>\n> second\n",
-    "---\n\nafter a rule\n",
-    "```zig\nconst x = 1 < 2;\nif (x) return;\n```\n",
-    "```\nplain code, a < b & c\n```\n",
-    "    an indented block\n    second line\n",
-    "| a | b |\n|---|---|\n| 1 | 2 |\n",
-    "| left | center | right |\n|:-----|:------:|------:|\n| 1 | 2 | 3 |\n",
-    "[link](https://example.com/a?b=1&c=2 \"Title\")\n",
-    "[relative](/docs)\n",
-    "[mail](mailto:a@example.com)\n",
-    "![image](https://example.com/x.png \"the title\")\n",
-    "A bare https://example.com autolink and an address <a@example.com>.\n",
-    "It's an apostrophe, an & ampersand, and a <tag>\n",
-    "Entities: &amp; &lt; &copy; &#65; &#x42; &unknown;\n",
-    "[title with entities](https://example.com \"a &quot; b &amp; c\")\n",
-    "A hard break here  \nand the next line.\n",
-    "A soft\nbreak.\n",
-    "Backslash escapes: \\*not emphasis\\* and \\`not code\\`.\n",
-    "* * *\n",
-    "Text with a `code <span>` span and a <raw> tag.\n",
-    "Term\n: not a definition list\n",
-    "A footnote[^1] reference.\n\n[^1]: the definition\n",
-};
-
-test "the renderer writes what md4c's own renderer writes" {
-    const gpa = std.testing.allocator;
-    for (oracle_corpus) |doc| {
-        var ours: std.Io.Writer.Allocating = .init(gpa);
-        defer ours.deinit();
-        try markdown(gpa, doc, &ours.writer);
-
-        var theirs: std.Io.Writer.Allocating = .init(gpa);
-        defer theirs.deinit();
-        try md.oracleHtml(doc, &theirs.writer);
-
-        // The two agree character for character: billy's own escaping writes a
-        // character the same way md4c's does (see `escape`), so this compares
-        // the bytes as they are.
-        if (!std.mem.eql(u8, ours.written(), theirs.written())) {
-            std.debug.print(
-                "\n=== document ===\n{s}\n=== billy ===\n{s}\n=== md4c ===\n{s}\n",
-                .{ doc, ours.written(), theirs.written() },
-            );
-        }
-        try std.testing.expectEqualStrings(theirs.written(), ours.written());
-    }
 }
 
 test "a diff is written as lines that name their side" {

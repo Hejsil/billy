@@ -19,9 +19,62 @@ writer: Writer,
 /// For what showing a block builds, such as an edit's diff. Each block frees
 /// what it takes, so nothing is kept between them.
 scratch: std.mem.Allocator,
+/// The answer the model is still writing, once its first fragment has arrived.
+/// Its text goes out as it comes, so the reply is on screen while it is made;
+/// the `answer` block that follows then only ends the block rather than writing
+/// the text again. Null when no fragment has arrived, in which case the answer
+/// is written whole by the block.
+stream: ?Markdown.Stream = null,
 
 pub fn emitter(self: *Terminal) agent.Emitter {
-    return .{ .context = self, .vtable = &.{ .block = show } };
+    return .{ .context = self, .vtable = &.{ .block = show, .delta = showDelta } };
+}
+
+/// Drops a streamed answer that will not be finished, so a run that ends early
+/// leaves nothing held.
+pub fn deinit(self: *Terminal) void {
+    self.dropStream();
+}
+
+/// Shows one fragment of an answer as the model writes it. The first fragment
+/// opens the answer block; the rest continue it. Each is flushed at once, which
+/// is what puts it on screen before the model has finished.
+fn showDelta(context: *anyopaque, delta: agent.Delta) anyerror!void {
+    const self = selfOf(context);
+    const text = delta.content orelse return;
+    if (text.len == 0) return;
+
+    if (self.stream == null) {
+        try marks.answer.header("answer", "", self.writer);
+        self.stream = try Markdown.Stream.open(self.scratch, self.writer);
+    }
+    if (self.stream) |*stream| try stream.feed(text);
+    try self.writer.flush();
+}
+
+/// Ends a streamed answer, if one is being written: writes its last line and
+/// closes it, then the blank line that sets the block off from what follows.
+/// Returns whether there was an answer being streamed.
+fn endStream(self: *Terminal) !bool {
+    if (self.stream == null) return false;
+    var stream = self.stream.?;
+    self.stream = null;
+
+    // `close` writes the rest of the reply and frees what the stream held,
+    // whichever way it goes, so the block is finished before the error is
+    // reported.
+    const closed = stream.close();
+    try self.writer.write("\n\n");
+    try self.writer.flush();
+    try closed;
+    return true;
+}
+
+/// Drops a streamed answer without writing the rest of it, for a run that ends
+/// without an answer.
+fn dropStream(self: *Terminal) void {
+    if (self.stream) |*stream| stream.deinit();
+    self.stream = null;
 }
 
 /// Shows one block. Each whole block ends with a blank line that sets it off
@@ -33,6 +86,9 @@ fn show(context: *anyopaque, block: agent.Block) anyerror!void {
     const self = selfOf(context);
     switch (block) {
         .prompt => |text| {
+            // A prompt begins a turn, so nothing can still be streaming from the
+            // last one.
+            self.dropStream();
             try printPrompt(self.scratch, self.writer, text);
             // The prompt goes out as it is typed, before the request that
             // answers it, so what was sent is on screen while the model
@@ -40,10 +96,19 @@ fn show(context: *anyopaque, block: agent.Block) anyerror!void {
             // or a tool call flushes it.
             try self.writer.flush();
         },
-        .answer => |content| try printAnswer(self.scratch, self.writer, content),
+        // A reply that was streamed is already on screen; only the blank line
+        // that ends its block is left. One that was not is written whole, which
+        // is how a replayed session shows it.
+        .answer => |content| {
+            if (try self.endStream()) return;
+            try printAnswer(self.scratch, self.writer, content);
+        },
         // The header goes out as the call begins, so a command that runs
-        // long has it on screen while it runs.
+        // long has it on screen while it runs. A reply that said something
+        // before asking for the call is ended first, so the two read as the
+        // separate blocks they are.
         .tool_begin => |call| {
+            _ = try self.endStream();
             try tool.printHead(self.scratch, call, self.writer);
             try self.writer.flush();
         },
@@ -56,12 +121,21 @@ fn show(context: *anyopaque, block: agent.Block) anyerror!void {
         },
         // The terminal stands the two in with one line rather than showing
         // them, which is what a compaction has always looked like here.
-        .compacted => try printCompacted(self.writer),
+        .compacted => {
+            self.dropStream();
+            try printCompacted(self.writer);
+        },
+        // A notice can end a turn that had already streamed part of an answer,
+        // so the answer is ended before the line that says why.
         .notice => |text| {
+            _ = try self.endStream();
             try self.writer.print("{s}\n\n", .{text});
             try self.writer.flush();
         },
-        .elided => |count| try printElided(count, self.writer),
+        .elided => |count| {
+            self.dropStream();
+            try printElided(count, self.writer);
+        },
     }
 }
 
@@ -142,4 +216,42 @@ test "a prompt is headed by the same block live and replayed" {
         "\x1b[34m»\x1b[0m \x1b[1mprompt\x1b[0m\n\x1b[1mhello\x1b[0m\n\n",
         out.written(),
     );
+}
+
+test "a streamed answer is written as it arrives, and is not written again" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var terminal = Terminal{ .writer = .{ .out = &out.writer }, .io = undefined, .scratch = gpa };
+    defer terminal.deinit();
+    const emit = terminal.emitter();
+
+    // The first fragment opens the block. Its text waits for a complete line,
+    // which is the smallest unit the streaming parser writes.
+    try emit.showDelta(.{ .content = "hel" });
+    try std.testing.expectEqualStrings("◆ answer\n", out.written());
+
+    // The newline lets the first line out. The line after it is held, because
+    // the parser cannot know yet whether it ends the paragraph, so it is written
+    // when the block ends.
+    try emit.showDelta(.{ .content = "lo\n**world**\n" });
+    try std.testing.expectEqualStrings("◆ answer\nhello", out.written());
+
+    // The answer block carries the whole reply, but it has already been shown,
+    // so only the blank line that ends the block is left to write.
+    try emit.show(.{ .answer = "hello\n**world**\n" });
+    try std.testing.expectEqualStrings("◆ answer\nhello\nworld\n\n", out.written());
+}
+
+test "an answer with no fragments is written whole" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var terminal = Terminal{ .writer = .{ .out = &out.writer }, .io = undefined, .scratch = gpa };
+    defer terminal.deinit();
+
+    try terminal.emitter().show(.{ .answer = "**hi**" });
+    try std.testing.expectEqualStrings("◆ answer\nhi\n\n", out.written());
 }

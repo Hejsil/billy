@@ -731,6 +731,7 @@ pub fn run(
     // The blocks of the run are shown on the terminal, the way billy has always
     // shown them, through the writer the frontend gave the run.
     var terminal = Terminal{ .writer = writer, .io = io, .scratch = gpa };
+    defer terminal.deinit();
     const emitter = terminal.emitter();
 
     // The header is rebuilt for every prompt, so it reflects the context size
@@ -796,6 +797,7 @@ pub fn printTranscript(
     // and it goes through the same emitter a live run does, so a prompt reads
     // the same whether it was just typed or stored.
     var terminal = Terminal{ .writer = writer, .io = io, .scratch = gpa };
+    defer terminal.deinit();
     try walk(gpa, session, blocks, terminal.emitter());
     try writer.flush();
 }

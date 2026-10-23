@@ -4,10 +4,6 @@
     .fingerprint = 0xc2a2b4ce8410c683, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        .md4c = .{
-            .url = "https://github.com/mity/md4c/archive/refs/tags/v0.6.0.tar.gz",
-            .hash = "N-V-__8AAEVDEgAtMuYZhXcl61grSDsy5AEXDjgWT0yKUDNs",
-        },
         .translate_c = .{
             .url = "git+https://codeberg.org/ziglang/translate-c?ref=2.0.0#0da7a16c3235b935b82421646076e0657cda21f6",
             .hash = "translate_c-2.0.0-Q_BUWltOBwA0229IE8wwSxxGzOxyRso3hvcb1nN8oJX_",
@@ -15,6 +11,10 @@
         .spaghet = .{
             .url = "git+https://github.com/Hejsil/spaghet#6b553c1f0e3e5d9073746ee21c1d8d99a030932e",
             .hash = "spaghet-0.0.0-qAWgUcgsAAA4Gq6pVEzCVoTKGVkkimB_V_e88TxaZkLf",
+        },
+        .mdflow = .{
+            .url = "git+https://github.com/cjccjj/mdflow#1efe344a7ee2344deef5db6c5e28ae33926fb235",
+            .hash = "N-V-__8AAJGdQQCZ3Ntfypknw_WEeHrzYWZae9YB27ZIfeVw",
         },
     },
     .paths = .{

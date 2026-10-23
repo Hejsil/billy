@@ -15,7 +15,6 @@
 
 const std = @import("std");
 const md = @import("../md.zig");
-const md4c = @import("../md4c.zig");
 const Writer = @import("Writer.zig");
 const Style = Writer.Style;
 const terminal_width = @import("width.zig");
@@ -75,7 +74,7 @@ image_depth: usize = 0,
 image_label: std.ArrayList(u8) = .empty,
 /// The address of the image being read, from its open to its close.
 image_url: []const u8 = "",
-/// The address of the link being written, from its open to its close: md4c
+/// The address of the link being written, from its open to its close: the parser
 /// reports it once, but a hyperlink is opened and closed around the text.
 link_url: []const u8 = "",
 
@@ -104,17 +103,91 @@ const Row = struct {
 /// Writes `text`, read as markdown, as the terminal shows it. The writer's style
 /// decides whether bold, colour and links are written as escape codes or left
 /// out, which is what makes a pipe to a file read as plain structured text.
+///
+/// All the text is here at once, so it goes through the parser's batch mode:
+/// a replayed reply, a prompt and the page's HTML are read the way CommonMark
+/// reads the whole document. A live reply is read by `Stream` instead, which is
+/// the same parser built in its streaming mode.
 pub fn write(gpa: std.mem.Allocator, text: []const u8, writer: Writer) !void {
     var render = Markdown{ .gpa = gpa, .writer = writer };
     defer render.deinit();
 
-    var p = md4c.parser(Markdown);
-    try md.parse(text, &p, &render);
+    var callbacks = md.parser(Markdown);
+    try md.parse(text, &callbacks, &render);
 
     // A callback cannot return an error, so a failed write is kept on the
-    // renderer and reported here, once md4c has stopped.
+    // renderer and reported here, once the parser has stopped.
     if (render.err) |err| return err;
 }
+
+/// A renderer and the streaming parser driving it, kept together so the parser's
+/// `userdata` pointer stays valid for as long as the document does.
+///
+/// A reply arrives a fragment at a time and is written as it does. The parser
+/// holds a line back until it is complete, and the last line of a paragraph
+/// until the paragraph ends, since markdown cannot always be read before then.
+/// A reply therefore shows at line and paragraph boundaries rather than word by
+/// word, and a one-line reply appears when it is complete. The renderer owns no
+/// width and does not redraw, so what is written stays in the terminal's
+/// scrollback.
+///
+/// This is the parser's streaming mode, so it carries its documented limits: a
+/// loose list's first item may be written tight, and a reference link is only a
+/// link once its definition has arrived. A whole reply is replayed through the
+/// batch parser (`write`), which resolves both the way CommonMark says.
+pub const Stream = struct {
+    gpa: std.mem.Allocator,
+    /// Owned here rather than held by value, because the parser keeps a pointer
+    /// to it and a value could be moved.
+    renderer: *Markdown,
+    stream: md.Stream,
+
+    /// Starts a document. The block header and the blank line after the answer
+    /// are the caller's; this writes only the markdown itself.
+    pub fn open(gpa: std.mem.Allocator, writer: Writer) !Stream {
+        const renderer = try gpa.create(Markdown);
+        errdefer gpa.destroy(renderer);
+        renderer.* = .{ .gpa = gpa, .writer = writer };
+        errdefer renderer.deinit();
+
+        var callbacks = md.parser(Markdown);
+        return .{
+            .gpa = gpa,
+            .renderer = renderer,
+            .stream = try md.Stream.init(&callbacks, renderer),
+        };
+    }
+
+    /// Writes more of the reply. A failed write is reported as the renderer's
+    /// own failure, which is the one the parser stopped on.
+    pub fn feed(self: *Stream, text: []const u8) !void {
+        self.stream.feed(text) catch |err| return self.renderer.err orelse err;
+    }
+
+    /// Ends the document, writing the last line and closing the blocks still
+    /// open, and frees what was held for it. The stream is unusable afterwards.
+    pub fn close(self: *Stream) !void {
+        // A document whose parse already stopped is not asked to flush the
+        // rest: the callback that stopped it may have left it part-written.
+        var failure = self.renderer.err;
+        if (!self.stream.failed and failure == null) {
+            self.stream.flush() catch |err| {
+                failure = self.renderer.err orelse err;
+            };
+        }
+        self.stream.deinit();
+        self.renderer.deinit();
+        self.gpa.destroy(self.renderer);
+        if (failure) |err| return err;
+    }
+
+    /// Drops a document that will not be finished, without writing more of it.
+    pub fn deinit(self: *Stream) void {
+        self.stream.deinit();
+        self.renderer.deinit();
+        self.gpa.destroy(self.renderer);
+    }
+};
 
 fn deinit(self: *Markdown) void {
     self.image_label.deinit(self.gpa);
@@ -186,7 +259,7 @@ fn writeIndent(self: *Markdown) bool {
 /// Writes `text` a line at a time, flushing the held newlines and writing the
 /// indent before each line's first character.
 fn put(self: *Markdown, text: []const u8) bool {
-    var rest = text;
+    var rest: []const u8 = text;
     while (rest.len > 0) {
         const cut = std.mem.indexOfScalar(u8, rest, '\n');
         const line = if (cut) |i| rest[0..i] else rest;
@@ -229,7 +302,7 @@ fn endBlock(self: *Markdown) void {
 
 // ---- blocks ----
 
-pub fn openBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
+pub fn enterBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
     switch (block_type) {
         md.c.MD_BLOCK_DOC => {},
         md.c.MD_BLOCK_QUOTE => {
@@ -279,7 +352,7 @@ pub fn openBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyop
     return true;
 }
 
-pub fn closeBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
+pub fn leaveBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
     _ = detail;
     switch (block_type) {
         md.c.MD_BLOCK_DOC => {},
@@ -511,7 +584,7 @@ fn freeTable(self: *Markdown) void {
 
 // ---- spans ----
 
-pub fn openSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) bool {
+pub fn enterSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) bool {
     if (span_type == md.c.MD_SPAN_IMG) {
         const img: *const md.c.MD_SPAN_IMG_DETAIL = @ptrCast(@alignCast(detail.?));
         self.image_url = attribute(img.src);
@@ -532,7 +605,7 @@ pub fn openSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaqu
     };
 }
 
-pub fn closeSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) bool {
+pub fn leaveSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) bool {
     _ = detail;
     if (span_type == md.c.MD_SPAN_IMG) return self.closeImg();
     if (self.table) return true;
@@ -593,7 +666,7 @@ fn closeImg(self: *Markdown) bool {
 
 // ---- text ----
 
-pub fn writeRun(self: *Markdown, text_type: md.c.MD_TEXTTYPE, text: []const u8) bool {
+pub fn writeText(self: *Markdown, text_type: md.c.MD_TEXTTYPE, text: []const u8) bool {
     // Inside an image label every run is the alt text, gathered for the close.
     if (self.image_depth > 0) {
         self.image_label.appendSlice(self.gpa, text) catch return self.fail();
@@ -638,7 +711,7 @@ fn fail(self: *Markdown) bool {
     return false;
 }
 
-/// The bytes of an md4c attribute, which is empty when it has no text.
+/// The bytes of a parser attribute, which is empty when it has no text.
 fn attribute(value: md.c.MD_ATTRIBUTE) []const u8 {
     if (value.text == null or value.size == 0) return "";
     return value.text[0..value.size];
@@ -773,4 +846,38 @@ test "a block is set off from the one before it" {
     try expectPlain("one\n\ntwo", "one\n\ntwo");
     // A heading is followed directly by what it heads, with no blank line.
     try expectPlain("Title\nthe body", "# Title\nthe body");
+}
+
+test "a reply read in pieces is laid out like one read whole" {
+    const gpa = std.testing.allocator;
+    const text =
+        "# Title\n" ++
+        "\n" ++
+        "Hello **world**, and `code`.\n" ++
+        "\n" ++
+        "- one\n" ++
+        "- two\n" ++
+        "\n" ++
+        "| name | age |\n" ++
+        "| --- | --- |\n" ++
+        "| ana | 3 |\n";
+
+    var whole: std.Io.Writer.Allocating = .init(gpa);
+    defer whole.deinit();
+    try write(gpa, text, .{ .out = &whole.writer });
+
+    // The pieces cut through words, lines and multibyte characters, which is
+    // what a streamed reply does.
+    var streamed: std.Io.Writer.Allocating = .init(gpa);
+    defer streamed.deinit();
+    var stream = try Stream.open(gpa, .{ .out = &streamed.writer });
+    var rest: []const u8 = text;
+    while (rest.len > 0) {
+        const count = @min(rest.len, 3);
+        try stream.feed(rest[0..count]);
+        rest = rest[count..];
+    }
+    try stream.close();
+
+    try std.testing.expectEqualStrings(whole.written(), streamed.written());
 }
