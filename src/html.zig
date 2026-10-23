@@ -818,7 +818,13 @@ fn pill(status: Status, out: *std.Io.Writer) !void {
 fn toolSummary(call: Tools.Call, result: []const u8, status: ?Status, out: *std.Io.Writer) !void {
     const head = Tools.Heading.of(call);
     try out.writeAll("<summary class=\"tool-head\">");
-    try out.print("<span class=\"name\">{s}</span>", .{head.name});
+    // The name is billy's own for a tool it implements, and the model's own for
+    // one it does not: a call naming a tool that is not there is headed by
+    // whatever it was called. So the name is text from outside, like the target
+    // under it, and is escaped the same way.
+    try out.writeAll("<span class=\"name\">");
+    try escape(head.name, out);
+    try out.writeAll("</span>");
     // What the call acts on. A bash call's heading carries the model's
     // description of what the command does, so a collapsed call says what it is
     // for. A call from before the tool asked for one has no description, so the
@@ -1014,6 +1020,47 @@ test "a tool call is rendered as a whole element, both halves" {
             "<div class=\"tool-body\"><pre class=\"result\">1\tconst x = 1;</pre>\n</div></details>\n",
         out.written(),
     );
+}
+
+test "a call naming a tool billy has not got is headed by its name as text" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // A call billy cannot run is headed by the name it named, which is the
+    // model's own string and not one of billy's. It is written as text, so a
+    // name holding markup is shown as the characters it is made of: a page puts
+    // this HTML in whole, and an unescaped name would be a page running a
+    // reply's script.
+    const unknown = Tools.parse(arena, .{ .id = "1", .function = .{
+        .name = "<img src=x onerror=alert(1)>",
+        .arguments = "{}",
+    } });
+    try block(gpa, .{ .tool_begin = unknown }, &out.writer);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        out.written(),
+        "<span class=\"name\">&lt;img src=x onerror=alert(1)&gt;</span>",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "<img") == null);
+    out.clearRetainingCapacity();
+
+    // A known tool whose arguments could not be read carries a name too, and it
+    // is the same string: escaped, whole, and with nothing of it a tag.
+    const malformed = Tools.parse(arena, .{ .id = "1", .function = .{
+        .name = "read\" onclick=\"x",
+        .arguments = "{",
+    } });
+    try block(gpa, .{ .tool_end = .{ .call = malformed, .result = "error: invalid arguments for read: SyntaxError" } }, &out.writer);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        out.written(),
+        "<span class=\"name\">read&quot; onclick=&quot;x</span>",
+    ) != null);
 }
 
 test "a bash call shows its exit status in the head and its streams in the body" {

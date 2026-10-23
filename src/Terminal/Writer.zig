@@ -145,6 +145,40 @@ fn hueCode(writer: Writer, hue: Color, comptime loud: bool) []const u8 {
     };
 }
 
+/// Writes `bytes` as text: the characters a terminal draws, and nothing else.
+///
+/// A block header carries a tool's name and what the call acted on. For a tool
+/// billy implements both are its own strings, but a call naming a tool it has
+/// not got is headed by whatever the model wrote, and a path or a query in a
+/// target is the model's too. A control character is how an escape sequence is
+/// spelled, so none is written: text that reaches a terminal as an instruction
+/// is text that runs one. A byte that is not part of a well-formed character is
+/// left out for the same reason -- a terminal reading it as a control would act
+/// on it -- and every character that is text is written whole, accent and all.
+fn writeText(writer: Writer, bytes: []const u8) !void {
+    var at: usize = 0;
+    while (at < bytes.len) {
+        const len: usize = std.unicode.utf8ByteSequenceLength(bytes[at]) catch {
+            at += 1;
+            continue;
+        };
+        if (at + len > bytes.len) break;
+        const codepoint = std.unicode.utf8Decode(bytes[at..][0..len]) catch {
+            at += 1;
+            continue;
+        };
+        at += len;
+        if (control(codepoint)) continue;
+        try writer.write(bytes[at - len .. at]);
+    }
+}
+
+/// Whether `codepoint` is one a terminal acts on rather than draws: the C0 and
+/// C1 control ranges and DEL, which is where an escape sequence lives.
+fn control(codepoint: u21) bool {
+    return codepoint < 0x20 or (codepoint >= 0x7f and codepoint <= 0x9f);
+}
+
 /// The mark a block header opens with: a glyph and the colour it is shown in, so
 /// a block is recognisable from its first character.
 pub const Mark = struct {
@@ -153,11 +187,17 @@ pub const Mark = struct {
 
     /// Writes a block header: `▸ read a.zig`.
     pub fn header(mark: Mark, name: []const u8, target: []const u8, writer: Writer) !void {
-        try writer.print("{s}{s}{s} {s}{s}{s}", .{
-            writer.color(mark.hue), mark.glyph, writer.reset(),
-            writer.bold(),          name,       writer.reset(),
+        try writer.print("{s}{s}{s} {s}", .{
+            writer.color(mark.hue), mark.glyph, writer.reset(), writer.bold(),
         });
-        if (target.len > 0) try writer.print(" {s}{s}{s}", .{ writer.dim(), target, writer.reset() });
+        try writeText(writer, name);
+        try writer.write(writer.reset());
+        if (target.len > 0) {
+            try writer.write(" ");
+            try writer.write(writer.dim());
+            try writeText(writer, target);
+            try writer.write(writer.reset());
+        }
         try writer.write("\n");
     }
 };
@@ -205,4 +245,44 @@ test "a block header is the same text in either style" {
         "\x1b[34m▸\x1b[0m \x1b[1mread\x1b[0m \x1b[2ma.zig\x1b[0m\n",
         ansi_out.written(),
     );
+}
+
+test "a header writes what a model named as text, so none of it is an instruction" {
+    const gpa = std.testing.allocator;
+    const mark: Mark = .{ .glyph = "▸", .hue = .blue };
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // A call naming a tool billy has not got is headed by the model's own
+    // string, and so is the path or query it acted on. A control character is
+    // how an escape sequence is spelled, so none of them reaches the terminal:
+    // the escape, the tab and DEL are taken out, and the codes around the header
+    // are still the writer's own.
+    const ansi: Writer = .{ .style = .ansi, .out = &out.writer };
+    try mark.header("re\x1b[31mad", "a\tb\x7fc", ansi);
+    try std.testing.expectEqualStrings(
+        "\x1b[34m▸\x1b[0m \x1b[1mre[31mad\x1b[0m \x1b[2mabc\x1b[0m\n",
+        out.written(),
+    );
+
+    // A control the terminal reads as one character in its own right, such as
+    // the C1 CSI, is a control too, and is dropped where it is decoded rather
+    // than where its bytes happen to be.
+    out.clearRetainingCapacity();
+    const plain: Writer = .{ .out = &out.writer };
+    try mark.header("x\u{9b}2Jy", "", plain);
+    try std.testing.expectEqualStrings("▸ x2Jy\n", out.written());
+
+    // A byte that is not part of a character is not text either, and a terminal
+    // that read it as a control would act on it.
+    out.clearRetainingCapacity();
+    try mark.header("a\xffb", "", plain);
+    try std.testing.expectEqualStrings("▸ ab\n", out.written());
+
+    // What is text is written whole: taking the controls out does not take out
+    // the accents, the wide characters or anything else a name may hold.
+    out.clearRetainingCapacity();
+    try mark.header("café", "日本", plain);
+    try std.testing.expectEqualStrings("▸ café 日本\n", out.written());
 }
