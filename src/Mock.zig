@@ -54,6 +54,9 @@ pub const Answer = struct {
     /// The `Content-Encoding` the body is sent as, or none for a body that is
     /// sent as it is.
     content_encoding: ?[]const u8 = null,
+    /// Headers to send beside the body's own, such as the `Retry-After` a
+    /// provider that is rate-limiting itself sends to say when to come back.
+    headers: []const std.http.Header = &.{},
 };
 
 /// Starts a mock listening on a free port, at `path` -- `/chat/completions` for
@@ -190,7 +193,7 @@ fn serveConnection(mock: *Mock, io: std.Io, stream: std.Io.net.Stream) !void {
 
         const answer = mock.answer(mock.served + 1, body);
         mock.served += 1;
-        var extra: [2]std.http.Header = undefined;
+        var extra: [8]std.http.Header = undefined;
         var extra_count: usize = 0;
         if (answer.content_type) |value| {
             extra[extra_count] = .{ .name = "content-type", .value = value };
@@ -198,6 +201,14 @@ fn serveConnection(mock: *Mock, io: std.Io, stream: std.Io.net.Stream) !void {
         }
         if (answer.content_encoding) |value| {
             extra[extra_count] = .{ .name = "content-encoding", .value = value };
+            extra_count += 1;
+        }
+        // What the answer asked to be sent beside its body, as many as there is
+        // room for: a test that wanted more would be answered with fewer rather
+        // than overrunning the array.
+        for (answer.headers) |one| {
+            if (extra_count == extra.len) break;
+            extra[extra_count] = one;
             extra_count += 1;
         }
         try request.respond(answer.body, .{

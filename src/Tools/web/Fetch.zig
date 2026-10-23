@@ -54,6 +54,10 @@ raw: bool = false,
 
 /// Fetches one url and writes its content as text. A page is extracted by a
 /// backend; `raw` reads the url directly, for an API or a file.
+///
+/// A url that cannot be read is written as the call's failure, like any other
+/// tool's: the model asked for something that is not there, and is told why so
+/// it can ask for another address, rather than the turn stopping under it.
 pub fn run(fetch: Fetch, gpa: std.mem.Allocator, http_client: *std.http.Client, config: ?Config, health: ?*Health, out: *std.Io.Writer) !void {
     if (fetch.url.len == 0) return tools.fail(out, "no url to fetch", .{});
 
@@ -66,11 +70,7 @@ pub fn run(fetch: Fetch, gpa: std.mem.Allocator, http_client: *std.http.Client, 
     const now_ms = std.Io.Clock.real.now(http_client.io).toMilliseconds();
 
     // A raw fetch asks for the url itself, so no backend is consulted.
-    if (fetch.raw) {
-        const value = try direct.fetch(gpa, http_client, fetch.url);
-        defer gpa.free(value.text);
-        return out.writeAll(value.text);
-    }
+    if (fetch.raw) return readDirectly(gpa, http_client, fetch.url, out);
 
     var failed: ?anyerror = null;
     // Set when a backend answered but could not read this url, which is not a
@@ -127,10 +127,28 @@ pub fn run(fetch: Fetch, gpa: std.mem.Allocator, http_client: *std.http.Client, 
 
 /// Reads `url` with no backend at all, which is what a fetch falls back to when
 /// no configured backend reads it, and what the `raw` provider does on its own.
+///
+/// Every way this can go wrong is the call's failure and not the run's, so
+/// nothing here is returned as an error: a url that cannot be reached, and one
+/// that asked to be waited before it is read again, both reach the model as the
+/// result of the call it made.
 fn readDirectly(gpa: std.mem.Allocator, http_client: *std.http.Client, url: []const u8, out: *std.Io.Writer) !void {
-    const value = try direct.fetch(gpa, http_client, url);
-    defer gpa.free(value.text);
-    return out.writeAll(value.text);
+    const answer = direct.fetch(gpa, http_client, url) catch |err|
+        return tools.fail(out, "cannot read {s}: {s}", .{ url, @errorName(err) });
+    switch (answer) {
+        .text => |text| {
+            defer gpa.free(text);
+            return out.writeAll(text);
+        },
+        // A provider that answered with a wait answered: it is not broken, and
+        // there is nothing for it to wait for here, since the next call reads
+        // the url afresh.
+        .retry_after_ms => |ms| return tools.fail(
+            out,
+            "{s} asked to be waited {d}ms before it is read again",
+            .{ url, ms },
+        ),
+    }
 }
 
 /// Fetches one url with one backend, whichever it is.
@@ -247,4 +265,93 @@ test "a fetch of an empty url is refused before any backend is asked" {
     defer out.deinit();
     try run(.{ .url = "" }, gpa, &http_client, .{ .backends = &.{} }, null, &out.writer);
     try std.testing.expectEqualStrings("error: no url to fetch", out.written());
+}
+
+/// An address nothing listens on, so a read of it fails the way a url that is
+/// not there does. The same one `Agent.TestSetup` points a provider at.
+const closed_port_url = "http://127.0.0.1:1/page";
+
+test "a raw fetch of a url that cannot be read fails as the call, not the run" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // Nothing is returned. A url that is not there is the call's result, written
+    // with the mark both readers branch on, so the model is told why and goes on
+    // to ask for another address instead of the turn ending under it.
+    try run(.{ .url = closed_port_url, .raw = true }, gpa, &http_client, .{ .backends = &.{} }, null, &out.writer);
+    try std.testing.expect(std.mem.startsWith(u8, out.written(), "error: cannot read " ++ closed_port_url ++ ": "));
+}
+
+test "a url neither a backend nor a direct read could reach is a failed call" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // The backend answers that it could not read the url, which is not a failure
+    // of the backend, so the url is read directly -- and that read fails too,
+    // since the url is a closed port. The fallback is part of the call's answer
+    // as much as the backend's was.
+    var mock = try Mock.start("/extract", 1, Mock.fixed(
+        "{\"results\":[],\"failed_results\":[{\"url\":\"x\",\"error\":\"not found\"}]}",
+    ));
+    defer mock.deinit();
+    try mock.serve();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    const config: Config = .{ .backends = &.{.{
+        .provider = .tavily,
+        .api_key = "secret",
+        .endpoint = mock.url,
+    }} };
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try run(.{ .url = closed_port_url }, gpa, &http_client, config, null, &out.writer);
+    try mock.await();
+
+    try std.testing.expect(std.mem.startsWith(u8, out.written(), "error: cannot read " ++ closed_port_url ++ ": "));
+}
+
+test "a url that asked to be waited is a failed call, and says how long for" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // A raw read of a url that is rate-limiting: it answered, so there is
+    // nothing to try next and nothing to wait for here, since the next call
+    // reads the url afresh. It is the call that is told, with the wait the url
+    // asked for.
+    var mock = try Mock.start("/page", 1, struct {
+        fn answer(_: usize, _: []const u8) Mock.Answer {
+            return .{
+                .status = .too_many_requests,
+                .body = "{}",
+                .headers = &.{.{ .name = "retry-after", .value = "2" }},
+            };
+        }
+    }.answer);
+    defer mock.deinit();
+    try mock.serve();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try run(.{ .url = mock.url, .raw = true }, gpa, &http_client, .{ .backends = &.{} }, null, &out.writer);
+    try mock.await();
+
+    const expected = try std.fmt.allocPrint(
+        gpa,
+        "error: {s} asked to be waited 2000ms before it is read again",
+        .{mock.url},
+    );
+    defer gpa.free(expected);
+    try std.testing.expectEqualStrings(expected, out.written());
 }

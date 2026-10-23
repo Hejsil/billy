@@ -1,4 +1,5 @@
 const std = @import("std");
+const Tools = @import("../Tools.zig");
 
 const Read = @This();
 
@@ -14,7 +15,7 @@ pub fn run(read: Read, gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, out:
         read.path,
         gpa,
         .limited(16 << 20),
-    ) catch |err| return out.print("cannot read {s}: {s}", .{ read.path, @errorName(err) });
+    ) catch |err| return Tools.fail(out, "cannot read {s}: {s}", .{ read.path, @errorName(err) });
     defer gpa.free(contents);
 
     // A trailing newline would otherwise read as a final empty line.
@@ -25,7 +26,10 @@ pub fn run(read: Read, gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, out:
     // `offset` is 1-based, and 0 is read as the first line.
     const first = @max(read.offset, 1);
     if (first > total) {
-        return out.print("offset {d} is past the end; {d} lines", .{ read.offset, total });
+        // The call asked for lines the file has not got, so it failed rather
+        // than answering: what it is given says how long the file is, which is
+        // what it needs to ask again.
+        return Tools.fail(out, "offset {d} is past the end; {d} lines", .{ read.offset, total });
     }
     const last = @min(total, first - 1 +| read.limit);
 
@@ -126,5 +130,27 @@ test "line numbers are padded to the width of the largest one shown" {
 }
 
 test "an offset past the end says how long the file is" {
-    try expectRead("a\nb\n", .{ .path = test_file, .offset = 3 }, "offset 3 is past the end; 2 lines");
+    // The call asked for a line the file has not got, so it is the call that
+    // failed, not the read: the mark says so, and what follows still tells it
+    // how long the file is.
+    try expectRead("a\nb\n", .{ .path = test_file, .offset = 3 }, "error: offset 3 is past the end; 2 lines");
+}
+
+test "a file that cannot be read is the call's failure, not the run's" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // Nothing is returned: a read that could not open its file is written as
+    // the call's result, beginning with the mark both readers branch on, so the
+    // terminal shows it as a failure and the page draws it as one rather than
+    // either reading it as the contents of a file.
+    try (Read{ .path = "missing.txt" }).run(gpa, io, tmp.dir, &out.writer);
+    try std.testing.expect(std.mem.startsWith(u8, out.written(), "error: cannot read missing.txt: "));
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "FileNotFound") != null);
 }
