@@ -942,13 +942,19 @@ const SessionEvent = struct { id: []const u8 };
 const Stream = struct {
     body: *std.http.BodyWriter,
     gpa: std.mem.Allocator,
+    /// The emitter the run shows through. It holds the count of what it showed,
+    /// which the run reads to say whether a failure stopped an answer that had
+    /// started. The page has no delta handler, so only whole blocks count.
+    interface: Agent.Emitter = .{ .vtable = &vtable },
 
-    fn emitter(self: *Stream) Agent.Emitter {
-        return .{ .context = self, .vtable = &.{ .block = show } };
+    const vtable: Agent.Emitter.VTable = .{ .block = show };
+
+    fn emitter(self: *Stream) *Agent.Emitter {
+        return &self.interface;
     }
 
-    fn show(context: *anyopaque, b: Agent.Block) anyerror!void {
-        const self: *Stream = @ptrCast(@alignCast(context));
+    fn show(e: *Agent.Emitter, b: Agent.Block) anyerror!void {
+        const self: *Stream = @alignCast(@fieldParentPtr("interface", e));
         var rendered: std.Io.Writer.Allocating = .init(self.gpa);
         defer rendered.deinit();
 

@@ -162,28 +162,37 @@ pub const Delta = struct {
 /// how it looks, which is what lets the same run be shown in a terminal or over
 /// the web without the run knowing which it is talking to.
 pub const Emitter = struct {
-    context: *anyopaque,
     vtable: *const VTable,
+    /// How many blocks and deltas this emitter has shown, which `ask` reads to
+    /// tell a failure that showed nothing from one that stopped half-way. The
+    /// count lives in the interface, which the frontend embeds and reaches
+    /// through `@fieldParentPtr`, so a run passes the emitter by pointer and
+    /// every block it shows is counted in one place.
+    shown: usize = 0,
 
     pub const VTable = struct {
         /// Shows one block. Blocks arrive in the order they happened, and a
         /// frontend gets each one whole; nothing is half-shown.
-        block: *const fn (context: *anyopaque, block: Block) anyerror!void,
+        block: *const fn (emitter: *Emitter, block: Block) anyerror!void,
         /// Shows a fragment of the answer or its reasoning as the model writes
         /// it. Optional: a frontend that shows only whole blocks leaves it null,
         /// and the `answer` block that follows carries the whole reply.
-        delta: ?*const fn (context: *anyopaque, delta: Delta) anyerror!void = null,
+        delta: ?*const fn (emitter: *Emitter, delta: Delta) anyerror!void = null,
     };
 
     /// Shows one block.
-    pub fn show(emitter: Emitter, block: Block) !void {
-        return emitter.vtable.block(emitter.context, block);
+    pub fn show(emitter: *Emitter, block: Block) !void {
+        try emitter.vtable.block(emitter, block);
+        emitter.shown += 1;
     }
 
     /// Shows one fragment of the answer or its reasoning. A frontend with no
-    /// delta handler drops it, since the whole answer follows as a block.
-    pub fn showDelta(emitter: Emitter, delta: Delta) !void {
-        if (emitter.vtable.delta) |show_delta| return show_delta(emitter.context, delta);
+    /// delta handler drops it, since the whole answer follows as a block, and a
+    /// dropped fragment is not counted: nothing was shown.
+    pub fn showDelta(emitter: *Emitter, delta: Delta) !void {
+        const show_delta = emitter.vtable.delta orelse return;
+        try show_delta(emitter, delta);
+        emitter.shown += 1;
     }
 };
 
@@ -575,7 +584,7 @@ pub const Waiting = union(enum) {
 /// Takes a line typed into `session` and does what it asks for, except asking the
 /// model, which is left to `ask`. A frontend need know nothing more of a line:
 /// commands, the first-prompt rules and compaction are all handled here.
-pub fn take(agent: *Agent, emitter: Emitter, session: *Session, line: []const u8) !Waiting {
+pub fn take(agent: *Agent, emitter: *Emitter, session: *Session, line: []const u8) !Waiting {
     // Compaction is a request of its own, made before the prompt is added, so the
     // client for the model the session records now is made before the line is
     // looked at.
@@ -629,7 +638,7 @@ const Compaction = enum { done, nothing, failed };
 /// failure is logged and the request goes out with the conversation as it is.
 fn compact(
     agent: *Agent,
-    emitter: Emitter,
+    emitter: *Emitter,
     session: *Session,
     client: *llm.Client,
     when: enum { when_needed, now },
@@ -666,7 +675,7 @@ fn refresh(agent: *Agent, session: *Session) void {
 /// and is the user's to try again, which a frontend shows and the run carries
 /// on from. Only a failure of the emitter itself, which is the frontend going
 /// away, is passed on to the caller.
-pub fn ask(agent: *Agent, emitter: Emitter, session: *Session, text: []const u8) !void {
+pub fn ask(agent: *Agent, emitter: *Emitter, session: *Session, text: []const u8) !void {
     // The client this turn is sent with is made here, from the model the session
     // records now, so the model it goes to is recorded before the prompt is
     // appended: the message and the provider it went to are written together.
@@ -684,10 +693,14 @@ pub fn ask(agent: *Agent, emitter: Emitter, session: *Session, text: []const u8)
     // is visible in the conversation rather than only in a log. The turn is
     // given up rather than retried: what went wrong is the provider's or the
     // network's, and asking again is the user's decision.
+    // Where the count stands before the turn: the prompt has just gone through
+    // the emitter, and only what the turn itself shows says whether a failure
+    // stopped an answer that had started.
+    const shown_before = emitter.shown;
     turn(agent, emitter, session, &client) catch |err| {
         std.log.err("a request failed: {s}", .{@errorName(err)});
         var notice: [256]u8 = undefined;
-        return emitter.show(.{ .notice = failureNotice(&notice, err) });
+        return emitter.show(.{ .notice = failureNotice(&notice, err, emitter.shown > shown_before) });
     };
 
     if (first_turn and agent.behaviour.title) {
@@ -698,14 +711,20 @@ pub fn ask(agent: *Agent, emitter: Emitter, session: *Session, text: []const u8)
 
 /// What a failed turn is reported as, written into `buffer`: the reason the
 /// request did not go through, so the user can tell a dropped connection from a
-/// provider that refused, and knows the turn is theirs to ask again.
+/// provider that refused, and knows the turn is theirs to ask again. `shown`
+/// says whether the turn had already put something on screen, since a reply that
+/// stopped half-way was not one that sent nothing.
 ///
 /// The buffer is the caller's, since the notice is shown as it is written and
 /// nothing keeps it: an allocation here would have to be freed after a call that
 /// cannot fail without losing the word the user needs.
-fn failureNotice(buffer: []u8, err: anyerror) []const u8 {
-    return std.fmt.bufPrint(buffer, "the request failed: {s} — nothing was sent, try again", .{@errorName(err)}) catch
-        "the request failed — nothing was sent, try again";
+fn failureNotice(buffer: []u8, err: anyerror, shown: bool) []const u8 {
+    const outcome = if (shown) "the turn stopped partway" else "nothing was sent";
+    return std.fmt.bufPrint(buffer, "the request failed: {s} — {s}, try again", .{ @errorName(err), outcome }) catch
+        (if (shown)
+            "the request failed, and the turn stopped partway — try again"
+        else
+            "the request failed — nothing was sent, try again");
 }
 
 /// Runs one session on the terminal, from `options`, until the input ends: each
@@ -822,7 +841,7 @@ pub fn printTranscript(
 /// `gpa` is for the scratch the parsed arguments of a call need, which is dropped
 /// between messages, so walking a long conversation costs no more than the largest
 /// message in it.
-pub fn walk(gpa: std.mem.Allocator, session: *const Session, blocks: usize, emitter: Emitter) !void {
+pub fn walk(gpa: std.mem.Allocator, session: *const Session, blocks: usize, emitter: *Emitter) !void {
     var scratch_state = std.heap.ArenaAllocator.init(gpa);
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
@@ -854,7 +873,7 @@ fn emitMessage(
     index: usize,
     message: Session.Message,
     skip: usize,
-    emitter: Emitter,
+    emitter: *Emitter,
 ) !void {
     // A compaction shows as the summary that stands in for the messages before
     // it, with the prompt that asked for it; the prompt shows nothing of its own.
@@ -954,7 +973,7 @@ fn blocksIn(session: *const Session, messages: []const Session.Message, index: u
 /// first, when the provider sends it, then the answer's own text. Tool call
 /// pieces are not shown: a call is shown whole when it has been parsed, just
 /// before it runs.
-fn showDeltaText(emitter: Emitter, delta: llm.Delta) !void {
+fn showDeltaText(emitter: *Emitter, delta: llm.Delta) !void {
     if (delta.reasoning) |text| try emitter.showDelta(.{ .reasoning = text });
     if (delta.content) |text| try emitter.showDelta(.{ .content = text });
 }
@@ -977,7 +996,7 @@ const max_retries: usize = 3;
 /// costs the session every turn after it. Such a reply is not kept: the turn is
 /// asked again, and that costs it one of its turns. A reply that says something
 /// is the turn getting somewhere, so the run of silence starts over from there.
-fn turn(agent: *Agent, emitter: Emitter, session: *Session, client: *llm.Client) !void {
+fn turn(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client) !void {
     // Holds the parsed call of each tool call the model asks for, which is read
     // until that call has been run and shown. Reset per call, so a turn that
     // makes many calls holds only the one it is on.
@@ -1071,7 +1090,7 @@ fn turn(agent: *Agent, emitter: Emitter, session: *Session, client: *llm.Client)
 /// used before then.
 fn runCalls(
     tool_set: *Tools,
-    emitter: Emitter,
+    emitter: *Emitter,
     scratch_state: *std.heap.ArenaAllocator,
     session: *Session,
     mode: Mode,
@@ -1254,7 +1273,7 @@ fn compactThreshold(agent: *const Agent, session: *const Session) usize {
 /// This is the automatic compaction, which waits for the threshold; a caller
 /// that wants the conversation folded now, whatever it has grown to, asks for
 /// `compact` instead.
-fn maybeCompact(agent: *Agent, emitter: Emitter, session: *Session, client: *llm.Client) !bool {
+fn maybeCompact(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client) !bool {
     // Nothing is compacted for a model whose window is unknown, since there is
     // then no threshold to measure the conversation against; and a conversation
     // that has not reached it is left alone for the next request to fold, if it
@@ -1275,7 +1294,7 @@ fn maybeCompact(agent: *Agent, emitter: Emitter, session: *Session, client: *llm
 /// which is what would have happened without compaction at all. The caller
 /// refreshes the session's prompt and tools when it did compact, which is why
 /// the answer is reported rather than swallowed.
-fn fold(agent: *Agent, emitter: Emitter, session: *Session, client: *llm.Client) !bool {
+fn fold(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client) !bool {
     // Nothing has been added since the last compaction, so there is nothing new
     // to fold in: compacting again would only summarize the summary, and would
     // do so on every request.
@@ -2633,6 +2652,9 @@ const Recorder = struct {
     /// The reasoning's fragments, in the order they arrived, kept apart from
     /// the answer's so a test can tell the two streams apart.
     reasonings: std.ArrayList(Fragment) = .empty,
+    /// The emitter the run shows through. It holds the count of what it showed,
+    /// and its callbacks reach this recorder through the field.
+    interface: Emitter = .{ .vtable = &vtable },
 
     const Seen = union(enum) {
         prompt: []const u8,
@@ -2646,12 +2668,14 @@ const Recorder = struct {
 
     const Fragment = struct { text: []const u8 };
 
-    fn emitter(self: *Recorder) Emitter {
-        return .{ .context = self, .vtable = &.{ .block = show, .delta = showDelta } };
+    const vtable: Emitter.VTable = .{ .block = show, .delta = showDelta };
+
+    fn emitter(self: *Recorder) *Emitter {
+        return &self.interface;
     }
 
-    fn show(context: *anyopaque, block: Block) anyerror!void {
-        const self = selfOf(context);
+    fn show(e: *Emitter, block: Block) anyerror!void {
+        const self = selfOf(e);
         const seen: Seen = switch (block) {
             .prompt => |text| .{ .prompt = try self.keeper(text) },
             .answer => |text| .{ .answer = try self.keeper(text) },
@@ -2670,8 +2694,8 @@ const Recorder = struct {
         try self.seen.append(self.gpa, seen);
     }
 
-    fn showDelta(context: *anyopaque, delta: Delta) anyerror!void {
-        const self = selfOf(context);
+    fn showDelta(e: *Emitter, delta: Delta) anyerror!void {
+        const self = selfOf(e);
         if (delta.reasoning) |text| try self.reasonings.append(self.gpa, .{
             .text = try self.keeper(text),
         });
@@ -2686,8 +2710,8 @@ const Recorder = struct {
         return self.gpa.dupe(u8, text);
     }
 
-    fn selfOf(context: *anyopaque) *Recorder {
-        return @ptrCast(@alignCast(context));
+    fn selfOf(e: *Emitter) *Recorder {
+        return @alignCast(@fieldParentPtr("interface", e));
     }
 };
 
@@ -2785,6 +2809,125 @@ test "a turn shows the tool it runs and then the answer" {
         "all done",
         session.contentOf(session.messages.items[session.messages.items.len - 1]).?,
     );
+}
+
+/// Checks the notice a failed turn is shown, written into a buffer the way a
+/// real one is.
+fn expectNotice(expected: []const u8, err: anyerror, shown: bool) !void {
+    var buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(expected, failureNotice(&buffer, err, shown));
+}
+
+test "a failure notice says whether the answer had started" {
+    // A turn that had shown part of the reply does not claim it sent nothing.
+    try expectNotice(
+        "the request failed: ApiError — the turn stopped partway, try again",
+        error.ApiError,
+        true,
+    );
+    try expectNotice(
+        "the request failed: HttpStatus — nothing was sent, try again",
+        error.HttpStatus,
+        false,
+    );
+}
+
+test "an emitter counts what it shows, and not a delta it drops" {
+    const silent = struct {
+        fn show(_: *Emitter, _: Block) anyerror!void {}
+    };
+    var emitter: Emitter = .{ .vtable = &.{ .block = silent.show } };
+
+    // A frontend that shows only whole blocks has seen nothing of a reply whose
+    // deltas were dropped, so the count does not move.
+    try emitter.showDelta(.{ .content = "half an answer" });
+    try std.testing.expectEqual(@as(usize, 0), emitter.shown);
+
+    // A block is shown whole whatever the frontend does, so it counts.
+    try emitter.show(.{ .notice = "something" });
+    try std.testing.expectEqual(@as(usize, 1), emitter.shown);
+}
+
+test "a turn that fails mid-answer has shown something" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    // A provider that streams the beginning of an answer and then fails.
+    var mock = try Mock.start("/chat/completions", 1, Mock.eventStream(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"half an answer\"}}]}\n\n" ++
+            "data: {\"error\":{\"message\":\"the rest failed\"}}\n\n",
+    ));
+    defer mock.deinit();
+    try mock.serve();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
+    setup.pointAt("test", mock.url);
+    var agent = try testAgent(io, gpa, setup, &http_client);
+    defer agent.deinit();
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+
+    var recorder = Recorder{ .gpa = arena_state.allocator() };
+    var client = try agent.clientFor(&session);
+    try std.testing.expectError(error.ApiError, turn(&agent, recorder.emitter(), &session, &client));
+    try mock.await();
+
+    // The delta reached the emitter, so the turn knows the user saw half of it.
+    try std.testing.expectEqual(@as(usize, 1), recorder.interface.shown);
+    try std.testing.expectEqual(1, recorder.deltas.items.len);
+    try std.testing.expectEqualStrings("half an answer", recorder.deltas.items[0].text);
+}
+
+test "a turn that fails before showing anything has shown nothing" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    // A refusal that is not worth retrying, so the turn fails before a delta.
+    const refusing = struct {
+        fn answer(_: usize, _: []const u8) Mock.Answer {
+            return .{ .body = "no", .status = .bad_request };
+        }
+    }.answer;
+    var mock = try Mock.start("/chat/completions", 1, refusing);
+    defer mock.deinit();
+    try mock.serve();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
+    setup.pointAt("test", mock.url);
+    var agent = try testAgent(io, gpa, setup, &http_client);
+    defer agent.deinit();
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+
+    var recorder = Recorder{ .gpa = arena_state.allocator() };
+    var client = try agent.clientFor(&session);
+    try std.testing.expectError(error.HttpStatus, turn(&agent, recorder.emitter(), &session, &client));
+    try mock.await();
+
+    try std.testing.expectEqual(@as(usize, 0), recorder.interface.shown);
+    try std.testing.expectEqual(0, recorder.deltas.items.len);
 }
 
 test "a reply with nothing is not kept, and the turn is asked again" {

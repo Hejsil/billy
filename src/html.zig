@@ -1392,13 +1392,18 @@ pub fn conversation(
 const Page = struct {
     gpa: std.mem.Allocator,
     out: *std.Io.Writer,
+    /// The emitter `walk` shows through. A written conversation is not watched,
+    /// so nothing reads its count; the interface holds it all the same.
+    interface: agent.Emitter = .{ .vtable = &vtable },
 
-    fn emitter(self: *Page) agent.Emitter {
-        return .{ .context = self, .vtable = &.{ .block = show } };
+    const vtable: agent.Emitter.VTable = .{ .block = show };
+
+    fn emitter(self: *Page) *agent.Emitter {
+        return &self.interface;
     }
 
-    fn show(context: *anyopaque, b: agent.Block) anyerror!void {
-        const page: *Page = @ptrCast(@alignCast(context));
+    fn show(e: *agent.Emitter, b: agent.Block) anyerror!void {
+        const page: *Page = @alignCast(@fieldParentPtr("interface", e));
         // A tool call is written from its `tool_end`, which is the whole call --
         // head, body and status. The `tool_begin` half exists only for a stream
         // that shows the head while the call runs, so a written conversation

@@ -40,8 +40,10 @@ least once. Read the rule, not the story; the story is in the review.
   non-zero for whatever is scripted around it.
   *Nineteen sites logged an error and then returned it, and `main` printed it again — so a typo in a
   flag produced two error lines and a stack trace, which reads as a crash.*
-- **Do not claim what you cannot know.** `failureNotice` said "nothing was sent" on every failure,
-  including one that happened after half the reply had streamed.
+- **Do not claim what you cannot know.** Gate the claim on what the layer that knows can tell you:
+  `failureNotice` says "nothing was sent" only when the turn's emitter count did not move, and says
+  the turn stopped partway when it had. *It said the first on every failure, including one that
+  happened after half the reply had streamed.*
 - **A silent `catch` is a decision: write it down.** `catch return`, `catch continue` and
   `catch {}` are fine where a comment says why the failure is not worth reporting (`Health.read`,
   `dirHas`, the terminal's restore). They are not fine by default.
@@ -117,7 +119,8 @@ least once. Read the rule, not the story; the story is in the review.
 - **Except a rule whose whole point is to log.** `std.testing` fails a test that logs at `err`, so a
   path that reports cannot be exercised from a test at all: check those by running the binary, and
   let the one test that does exist (`main.fail` returning 1 without logging) guard the end of the
-  path.
+  path. Test the mechanism on either side of the log instead: `failureNotice`'s wording and the
+  `Emitter` count are both tested without the `ask` path that logs.
 - **Tests live next to the code.** Fixtures shared by more than one file belong in one place, not
   copied; `Mock`, `TestServer` and `TestSetup` may only be used from a test, since they run on
   `std.testing.allocator`.

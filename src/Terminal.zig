@@ -29,9 +29,14 @@ stream: ?Markdown.Stream = null,
 /// ended a line, so the blank line that closes the block is not doubled.
 reasoning: bool = false,
 reasoning_at_line_start: bool = true,
+/// The emitter the run shows through. It holds the count of what it showed, and
+/// its callbacks reach this terminal through the field.
+interface: agent.Emitter = .{ .vtable = &vtable },
 
-pub fn emitter(self: *Terminal) agent.Emitter {
-    return .{ .context = self, .vtable = &.{ .block = show, .delta = showDelta } };
+const vtable: agent.Emitter.VTable = .{ .block = show, .delta = showDelta };
+
+pub fn emitter(self: *Terminal) *agent.Emitter {
+    return &self.interface;
 }
 
 /// Drops a streamed answer or reasoning block that will not be finished, so a
@@ -47,8 +52,8 @@ pub fn deinit(self: *Terminal) void {
 /// appears as it is thought. The first answer fragment ends it, opens the answer
 /// block, and continues there. Each fragment is flushed at once, which is what
 /// puts it on screen before the model has finished.
-fn showDelta(context: *anyopaque, delta: agent.Delta) anyerror!void {
-    const self = selfOf(context);
+fn showDelta(e: *agent.Emitter, delta: agent.Delta) anyerror!void {
+    const self = selfOf(e);
 
     if (delta.reasoning) |text| {
         // Reasoning that arrives after the answer has begun would split the
@@ -133,8 +138,8 @@ fn dropStream(self: *Terminal) void {
 /// editor's prompt has a row between it and the block above. A tool call is two
 /// blocks: the head ends with its own line alone, since the result continues
 /// it, and the result ends the call with the blank line.
-fn show(context: *anyopaque, block: agent.Block) anyerror!void {
-    const self = selfOf(context);
+fn show(e: *agent.Emitter, block: agent.Block) anyerror!void {
+    const self = selfOf(e);
     switch (block) {
         .prompt => |text| {
             // A prompt begins a turn, so nothing can still be streaming from the
@@ -195,8 +200,8 @@ fn show(context: *anyopaque, block: agent.Block) anyerror!void {
     }
 }
 
-fn selfOf(context: *anyopaque) *Terminal {
-    return @ptrCast(@alignCast(context));
+fn selfOf(e: *agent.Emitter) *Terminal {
+    return @alignCast(@fieldParentPtr("interface", e));
 }
 
 /// Prints a prompt as its own block: the `» prompt` header, the text laid out by
