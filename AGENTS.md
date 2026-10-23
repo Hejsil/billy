@@ -28,10 +28,11 @@ least once. Read the rule, not the story; the story is in the review.
   unanswered tool call in the session, and told the user the request failed. `read` wrote its error
   without the prefix, so a missing file showed up as a successful, grey result.*
 - **Report a failure once, at the layer that can say something useful.** A layer that cannot add
-  anything returns the error and says nothing. The layer that can explain it prints and returns
-  success.
-  *19 sites logged an error and then returned it, and `main` printed it again — so a typo in a flag
-  produced two error lines and a stack trace, which reads as a crash.*
+  anything returns the error and says nothing. The layer that can explain it prints, and returns
+  `report.Reported`: `main` counts that as a failure and stays quiet, so the process still exits
+  non-zero for whatever is scripted around it.
+  *Nineteen sites logged an error and then returned it, and `main` printed it again — so a typo in a
+  flag produced two error lines and a stack trace, which reads as a crash.*
 - **Do not claim what you cannot know.** `failureNotice` said "nothing was sent" on every failure,
   including one that happened after half the reply had streamed.
 - **A silent `catch` is a decision: write it down.** `catch return`, `catch continue` and
@@ -96,11 +97,22 @@ least once. Read the rule, not the story; the story is in the review.
 - **A rule that is stated in a comment gets a test.** The `error: ` prefix rule had one, in
   `Tools.zig`, and `read` still broke it — because the test only covered `web_fetch`. Test the rule
   per implementation, not once per rule.
+- **Except a rule whose whole point is to log.** `std.testing` fails a test that logs at `err`, so a
+  path that reports cannot be exercised from a test at all: check those by running the binary, and
+  let the one test that does exist (`main.fail` returning 1 without logging) guard the end of the
+  path.
 - **Tests live next to the code.** Fixtures shared by more than one file belong in one place, not
   copied; `Mock`, `TestServer` and `TestSetup` may only be used from a test, since they run on
   `std.testing.allocator`.
 - **Assert the thing the comment claims.** A test named after a behaviour that only checks a proxy
   for it (a `<span>` is present, a count is non-zero) is how the stale doc survives.
+
+## Checking by hand
+
+- **Point billy's directories somewhere disposable before running it.** `XDG_DATA_HOME`,
+  `XDG_CONFIG_HOME` and `XDG_CACHE_HOME` are what it reads and writes, and the real ones are the
+  user's: a `billy config` run to see a message changed a setting in their actual configuration.
+  Set all three at a temporary directory, and `HOME` with them.
 
 ## Style
 
