@@ -40,6 +40,10 @@ least once. Read the rule, not the story; the story is in the review.
   non-zero for whatever is scripted around it.
   *Nineteen sites logged an error and then returned it, and `main` printed it again — so a typo in a
   flag produced two error lines and a stack trace, which reads as a crash.*
+- **Nothing to try and everything tried are different answers.** An empty set is a configuration
+  mistake; a set that was asked and refused is a failure. `Search` told a user with no backend at
+  all that "every search backend is set aside after failing", so they were told to add another to a
+  list they had never filled. Say which state it is.
 - **Do not claim what you cannot know.** Gate the claim on what the layer that knows can tell you:
   `failureNotice` says "nothing was sent" only when the turn's emitter count did not move, and says
   the turn stopped partway when it had. *It said the first on every failure, including one that

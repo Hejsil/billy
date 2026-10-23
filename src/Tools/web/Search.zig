@@ -95,10 +95,16 @@ pub fn run(search: Search, gpa: std.mem.Allocator, http_client: *std.http.Client
             },
         }
     }
-    // Every backend was tried and failed. A search with none named is a
-    // configuration mistake rather than a failure of a backend, and a resumed
-    // session can carry the tool from a run that had one.
+    // Every backend that could be asked was tried and failed.
     if (failed) |err| return tools.fail(out, "search failed: {s}", .{@errorName(err)});
+    // A set with no backend in it names nothing to try, so nothing failed and
+    // nothing was set aside. Only a session carrying the tool from a run that
+    // had a backend reaches this.
+    if (search_config.backends.len == 0) return tools.fail(
+        out,
+        "no search backend is configured; add one to tools.web_search.providers",
+        .{},
+    );
     return tools.fail(
         out,
         "every search backend is set aside after failing; add another to tools.web_search.providers, or wait",
@@ -311,6 +317,24 @@ test "searxng results are capped at the most billy allows any backend" {
     try mock.await();
 
     try std.testing.expectEqual(@as(usize, 20), std.mem.count(u8, out.written(), "   u\n"));
+}
+
+test "a search with no backend named says one is not configured" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // An empty set is a configuration that names no backend: nothing was tried,
+    // so saying that every backend failed and was set aside would be a lie.
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try run(.{ .query = "zig lang" }, gpa, &http_client, .{ .backends = &.{}, .max_results = 3 }, null, &out.writer);
+    try std.testing.expectEqualStrings(
+        "error: no search backend is configured; add one to tools.web_search.providers",
+        out.written(),
+    );
 }
 
 test "a search with every backend set aside says so, without asking any" {
