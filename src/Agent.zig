@@ -471,13 +471,7 @@ pub fn init(
     };
     errdefer work_dir.close(io);
 
-    const tool_set = try Tools.init(.{
-        .io = io,
-        .dir = work_dir,
-        .gpa = gpa,
-        .http = http_client,
-        .settings = options.tools,
-    });
+    const tool_set = try Tools.init(io, work_dir, gpa, http_client, options.tools);
 
     return .{
         .io = io,
@@ -2602,13 +2596,7 @@ test "the terminal shows a tool call the way a replay does" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var tool_set = try Tools.init(.{
-        .io = io,
-        .dir = std.Io.Dir.cwd(),
-        .gpa = gpa,
-        .http = &http_client,
-        .settings = .{ .bash_timeout_s = 120 },
-    });
+    var tool_set = try Tools.init(io, std.Io.Dir.cwd(), gpa, &http_client, .{ .bash_timeout_s = 120 });
 
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",

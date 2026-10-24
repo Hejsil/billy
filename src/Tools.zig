@@ -43,24 +43,18 @@ io: std.Io,
 dir: std.Io.Dir,
 /// For temporary buffers.
 gpa: std.mem.Allocator,
-/// Longest a bash command may run before it is killed, in seconds.
-bash_timeout_s: usize,
-/// Null leaves `web_search` out of the tools offered, so the model is never given
-/// one that could not run.
-search: ?web.Search.Config,
-/// As `search`, for `web_fetch`.
-fetch: ?web.Fetch.Config,
 /// The run's one HTTP client, shared with the model requests so connections and
 /// scanned certificates are reused.
 http: *std.http.Client,
-/// Null runs without backend waits, which is what a test wants.
-health: ?*Health,
+/// The limits and backends it runs with, resolved by the frontend from the
+/// configuration and the credentials.
+settings: Settings,
 
 /// What a tool set runs with, beyond the plumbing of the run it belongs to: the
-/// limits it runs under, how its blocks are shown, and the backends it asks. A
-/// frontend resolves these from the configuration and the credentials, so neither
-/// frontend drifts from the other and the agent builds the set from what they
-/// agree on rather than from the configuration file itself.
+/// limits it runs under and the backends it asks. A frontend resolves these from
+/// the configuration and the credentials, so neither frontend drifts from the
+/// other and the agent builds the set from what they agree on rather than from
+/// the configuration file itself.
 pub const Settings = struct {
     /// No default: a missing timeout is worth catching at the call site.
     bash_timeout_s: usize,
@@ -73,38 +67,17 @@ pub const Settings = struct {
     health: ?*Health = null,
 };
 
-/// What a tool set is built from: the plumbing of the run it belongs to, and the
-/// settings it runs with. The fields of the set are those of both.
-pub const Options = struct {
-    io: std.Io,
-    /// The session's own directory, so a resumed session works where it started.
-    /// Every path a tool is given is relative to it.
-    dir: std.Io.Dir,
-    gpa: std.mem.Allocator,
-    /// The run's one HTTP client, shared with the model requests so connections
-    /// and scanned certificates are reused.
-    http: *std.http.Client,
-    settings: Settings,
-};
-
-pub fn init(options: Options) !Tools {
-    const settings = options.settings;
-    return .{
-        .io = options.io,
-        .dir = options.dir,
-        .gpa = options.gpa,
-        .bash_timeout_s = settings.bash_timeout_s,
-        .search = settings.search,
-        .fetch = settings.fetch,
-        .http = options.http,
-        .health = settings.health,
-    };
+/// A set of tools, from the four things the run owns and the settings it runs
+/// with. The four are the run's, not the frontend's: every tool works in `dir`
+/// and sends through `http`.
+pub fn init(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, http: *std.http.Client, settings: Settings) !Tools {
+    return .{ .io = io, .dir = dir, .gpa = gpa, .http = http, .settings = settings };
 }
 
 /// Whether any web tool is offered. A configuration may have search without
 /// fetch, or the reverse.
 pub fn hasWeb(tools: *const Tools) bool {
-    return tools.search != null or tools.fetch != null;
+    return tools.settings.search != null or tools.settings.fetch != null;
 }
 
 /// The definitions a session is given: the tools the mode allows, with the web
@@ -279,22 +252,22 @@ fn dispatch(tools: *Tools, call: Call, out: *std.Io.Writer) !void {
         .read => |read| try read.run(tools.gpa, tools.io, tools.dir, out),
         .write => |write| try write.run(tools.io, tools.dir, out),
         .bash => |bash| {
-            const timeout_s = std.math.cast(i64, tools.bash_timeout_s) orelse std.math.maxInt(i64);
+            const timeout_s = std.math.cast(i64, tools.settings.bash_timeout_s) orelse std.math.maxInt(i64);
             const timeout = std.Io.Duration.fromSeconds(timeout_s);
             try bash.run(tools.gpa, tools.io, tools.dir, timeout, out);
         },
         .web_search => |search| try search.run(
             tools.gpa,
             tools.http,
-            tools.search,
-            tools.health,
+            tools.settings.search,
+            tools.settings.health,
             out,
         ),
         .web_fetch => |fetch| try fetch.run(
             tools.gpa,
             tools.http,
-            tools.fetch,
-            tools.health,
+            tools.settings.fetch,
+            tools.settings.health,
             out,
         ),
         .unknown => |name| try fail(out, "unknown tool '{s}'", .{name}),
@@ -717,13 +690,7 @@ test "a bash command that outlives the timeout is killed and reported" {
 
     // A one-second limit kills a command that would otherwise run far longer,
     // and the model is told so rather than left waiting for it to finish.
-    var tool_set = try Tools.init(.{
-        .io = io,
-        .dir = std.Io.Dir.cwd(),
-        .gpa = gpa,
-        .http = &http_client,
-        .settings = .{ .bash_timeout_s = 1 },
-    });
+    var tool_set = try Tools.init(io, std.Io.Dir.cwd(), gpa, &http_client, .{ .bash_timeout_s = 1 });
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"sleep 30\"}",
@@ -783,21 +750,15 @@ test "parseCall splits known, unknown and malformed calls" {
 }
 
 fn testTools(with_search: bool) !Tools {
-    return Tools.init(.{
-        .io = std.testing.io,
-        .gpa = std.testing.allocator,
-        .dir = .cwd(),
-        // A web tool that actually makes a request needs a live client; the
-        // tests here only exercise the ones that refuse before any request, so
-        // this is never reached.
-        .http = undefined,
-        .settings = .{
-            .bash_timeout_s = 120,
-            .search = if (with_search) .{
-                .backends = &.{.{ .provider = .tavily, .api_key = "key" }},
-                .max_results = 3,
-            } else null,
-        },
+    // A web tool that actually makes a request needs a live client; the tests
+    // here only exercise the ones that refuse before any request, so this is
+    // never reached.
+    return Tools.init(std.testing.io, .cwd(), std.testing.allocator, undefined, .{
+        .bash_timeout_s = 120,
+        .search = if (with_search) .{
+            .backends = &.{.{ .provider = .tavily, .api_key = "key" }},
+            .max_results = 3,
+        } else null,
     });
 }
 
@@ -946,13 +907,7 @@ test "the tools work in the directory they are given, wherever billy runs" {
     defer log.deinit();
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var tool_set = try Tools.init(.{
-        .io = io,
-        .dir = work,
-        .gpa = gpa,
-        .http = &http_client,
-        .settings = .{ .bash_timeout_s = 120 },
-    });
+    var tool_set = try Tools.init(io, work, gpa, &http_client, .{ .bash_timeout_s = 120 });
 
     // A file written by the tool lands in that directory. The result is not
     // what this is about, so it is discarded.
@@ -989,13 +944,7 @@ test "a file a tool replaces keeps the permissions it had" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var tool_set = try Tools.init(.{
-        .io = io,
-        .dir = tmp.dir,
-        .gpa = gpa,
-        .http = &http_client,
-        .settings = .{ .bash_timeout_s = 120 },
-    });
+    var tool_set = try Tools.init(io, tmp.dir, gpa, &http_client, .{ .bash_timeout_s = 120 });
 
     // A file of the user's with a mode of its own, which is what a script is.
     // Replacing the file to write it is what keeps a kill from truncating it,
@@ -1121,13 +1070,7 @@ test "a result longer than the cap is cut and says what it lost" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var tool_set = try Tools.init(.{
-        .io = io,
-        .dir = tmp.dir,
-        .gpa = gpa,
-        .http = &http_client,
-        .settings = .{ .bash_timeout_s = 120 },
-    });
+    var tool_set = try Tools.init(io, tmp.dir, gpa, &http_client, .{ .bash_timeout_s = 120 });
 
     var result: std.Io.Writer.Allocating = .init(gpa);
     defer result.deinit();

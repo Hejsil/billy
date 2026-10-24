@@ -335,13 +335,7 @@ test "a bash block shows only the streams the command filled" {
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    var tool_set = try Tools.init(.{
-        .io = io,
-        .dir = std.Io.Dir.cwd(),
-        .gpa = gpa,
-        .http = &http_client,
-        .settings = .{ .bash_timeout_s = 120 },
-    });
+    var tool_set = try Tools.init(io, std.Io.Dir.cwd(), gpa, &http_client, .{ .bash_timeout_s = 120 });
     const cases = [_]struct { command: []const u8, expected: []const u8 }{
         // Nothing printed: the status is all there is.
         .{ .command = "true", .expected = "❯ bash true\ntrue\n✓ exit 0\n\n" },
@@ -516,13 +510,7 @@ test "run logs exactly what describe prints" {
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    var tool_set = try Tools.init(.{
-        .io = io,
-        .dir = std.Io.Dir.cwd(),
-        .gpa = gpa,
-        .http = &http_client,
-        .settings = .{ .bash_timeout_s = 120 },
-    });
+    var tool_set = try Tools.init(io, std.Io.Dir.cwd(), gpa, &http_client, .{ .bash_timeout_s = 120 });
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"true\"}",
