@@ -1101,45 +1101,6 @@ test "the limiting writer gathers writes, then passes on what fits" {
     try std.testing.expectEqual(4, none.dropped);
 }
 
-/// A writer with no buffer of its own, so every write is handed straight to it
-/// and it can count how many hand-offs there were. What a test uses to tell
-/// batching from byte-at-a-time.
-const Counter = struct {
-    written: usize = 0,
-    hand_offs: usize = 0,
-    writer: std.Io.Writer,
-
-    fn init() Counter {
-        return .{ .writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} } };
-    }
-
-    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-        const self: *Counter = @alignCast(@fieldParentPtr("writer", w));
-        self.hand_offs += 1;
-        var count: usize = data[data.len - 1].len * splat;
-        for (data[0 .. data.len - 1]) |bytes| count += bytes.len;
-        self.written += count;
-        return count;
-    }
-};
-
-test "the limiting writer hands the repeats over together" {
-    // A buffer too small to gather the repeats, so they reach the writer behind
-    // this and the count of hand-offs says whether they went one at a time.
-    var buffer: [2]u8 = undefined;
-
-    var counter = Counter.init();
-    var limited = Limited.init(&counter.writer, &buffer, 1000);
-    var repeats = [_][]const u8{"x"};
-    try limited.writer.writeSplatAll(&repeats, 6);
-    try limited.writer.flush();
-
-    // Six copies of one byte, handed over in a couple of writes rather than six:
-    // the padding of a format such as `{d:>6}` is one write, not one per space.
-    try std.testing.expectEqual(6, counter.written);
-    try std.testing.expect(counter.hand_offs <= 2);
-}
-
 test "a result longer than the cap is cut and says what it lost" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;

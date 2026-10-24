@@ -359,7 +359,8 @@ pub const SessionHeader = struct {
     /// the caller holds the buffer, which it already has for the line editor.
     pub fn format(self: SessionHeader, out: *std.Io.Writer) std.Io.Writer.Error!void {
         try out.print("billy · {s} · {s} · {s} · ", .{ @tagName(self.mode), self.id, self.model });
-        try displayPath(out, self.cwd, self.home);
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        try out.writeAll(displayPath(&path_buffer, self.cwd, self.home));
         if (self.context_window) |window| {
             try out.writeAll(" · ");
             try formatTokens(out, self.context_tokens);
@@ -402,20 +403,22 @@ pub fn formatPercent(out: *std.Io.Writer, used: usize, total: usize) !void {
     try out.print("{d}%", .{percent});
 }
 
-/// Writes the working directory as shown in the header: shortened to `~` when it
-/// is inside the home directory, so a long path stays readable. Shared with the
-/// web header.
-pub fn displayPath(out: *std.Io.Writer, cwd: []const u8, home: ?[]const u8) !void {
+/// The working directory as shown in the header: shortened to `~` when it is
+/// inside the home directory, so a long path stays readable, and otherwise
+/// returned as it is. The shortened form is written into `buffer`, which the
+/// caller owns; one too small leaves the path unshortened rather than cutting it.
+/// Shared with the web header, so the two show a path the same way.
+pub fn displayPath(buffer: []u8, cwd: []const u8, home: ?[]const u8) []const u8 {
     if (home) |dir| {
         // Require a component boundary, so `/home/user2` is not shortened by a
         // `/home/user` home directory.
         if (dir.len > 0 and std.mem.startsWith(u8, cwd, dir)) {
             const rest = cwd[dir.len..];
-            if (rest.len == 0) return out.writeAll("~");
-            if (rest[0] == '/') return out.print("~{s}", .{rest});
+            if (rest.len == 0) return "~";
+            if (rest[0] == '/') return std.fmt.bufPrint(buffer, "~{s}", .{rest}) catch cwd;
         }
     }
-    return out.writeAll(cwd);
+    return cwd;
 }
 
 /// A session being asked things: the model client and the tools it runs with.

@@ -46,43 +46,6 @@ pub fn escape(text: []const u8, out: *std.Io.Writer) !void {
     try out.writeAll(text[plain..]);
 }
 
-/// A writer that escapes everything written into it and passes it to another
-/// writer. It is for text that something else has to build: a path the header
-/// shortens, or any other value a helper writes rather than returns. Without it
-/// such text would reach the page as markup, since the helper that wrote it knows
-/// nothing about HTML.
-///
-/// Nothing is buffered, so every write is escaped as it comes. Escaping byte by
-/// byte is safe across calls because each byte is escaped on its own: no entity
-/// is ever split between one call and the next.
-const Escaping = struct {
-    inner: *std.Io.Writer,
-    writer: std.Io.Writer,
-
-    fn init(inner: *std.Io.Writer) Escaping {
-        return .{
-            .inner = inner,
-            .writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
-        };
-    }
-
-    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-        const self: *Escaping = @alignCast(@fieldParentPtr("writer", w));
-
-        // The last slice is the one repeated `splat` times, so it is written
-        // that many times; the rest are written once each. Everything offered is
-        // consumed, whether or not the escaping makes it longer.
-        for (data[0 .. data.len - 1]) |bytes| try escape(bytes, self.inner);
-        const pattern = data[data.len - 1];
-        var left = splat;
-        while (left > 0) : (left -= 1) try escape(pattern, self.inner);
-
-        var offered: usize = pattern.len * splat;
-        for (data[0 .. data.len - 1]) |bytes| offered += bytes.len;
-        return offered;
-    }
-};
-
 /// Writes the markdown of a reply or a prompt as HTML.
 ///
 /// Driving the parser's callbacks rather than handing the document to a renderer
@@ -1506,10 +1469,10 @@ pub fn header(h: Header, out: *std.Io.Writer) !void {
     try out.writeAll("<span class=\"sep\">·</span>");
     try part("model", h.model, out);
     try out.writeAll("<span class=\"sep\">·</span><span class=\"cwd\">");
-    // The directory is shortened by a helper that writes rather than returns, so
-    // its output is escaped on the way to the page.
-    var path = Escaping.init(out);
-    try Agent.displayPath(&path.writer, h.cwd, h.home);
+    // The directory is shortened by the same helper the terminal header uses,
+    // and escaped like every other value that reaches the page.
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    try escape(Agent.displayPath(&path_buffer, h.cwd, h.home), out);
     try out.writeAll("</span>");
 
     if (h.model_info) |info| {
