@@ -94,6 +94,11 @@ least once. Read the rule, not the story; the story is in the review.
   deny-list beside it: the offer and the permission are the same list, and a new destructive tool
   cannot be allowed in chat because nobody remembered. *`Mode.allows` duplicated the comptime
   filter.*
+- **A service is a row in the table, not a file of its own.** The five web providers repeated the same
+  request, auth header, retry and reply walk, and the two tools kept separate provider enums and
+  credential maps. One `web.Provider`, one descriptor table and one driver per tool leave the
+  per-provider file with the body and reply type that really are its own; a sixth service is a row,
+  not another control-flow branch.
 - **Two frontends show the same call the same way.** The fallback for a bash header with no
   description lived only in `html.zig`, so the terminal and the page disagreed. Shared vocabulary
   belongs in `Tools.Heading`.

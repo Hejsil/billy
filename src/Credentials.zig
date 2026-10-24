@@ -15,7 +15,6 @@
 
 const std = @import("std");
 const models = @import("models.zig");
-const Tools = @import("Tools.zig");
 
 const Credentials = @This();
 
@@ -56,27 +55,6 @@ pub fn purposeOf(name: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, service.name, name)) return service.purpose;
     }
     return null;
-}
-
-/// The service holding the key for the search backend `provider`, or null for
-/// one that needs no key. SearXNG is self-hosted, so the user's own.
-pub fn searchService(provider: Tools.web.Search.Provider) ?[]const u8 {
-    return switch (provider) {
-        .tavily => "tavily",
-        .exa => "exa",
-        .brave => "brave",
-        .searxng => null,
-    };
-}
-
-/// The service holding the key for the fetch backend `provider`. `raw` reads the
-/// url itself and asks no service, so it has none.
-pub fn fetchService(provider: Tools.web.Fetch.Provider) ?[]const u8 {
-    return switch (provider) {
-        .tavily => "tavily",
-        .exa => "exa",
-        .raw => null,
-    };
 }
 
 keys: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
@@ -583,17 +561,4 @@ test "load refuses a damaged or future credentials file" {
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{\"version\":99}" });
     try std.testing.expectError(error.UnsupportedCredentialsVersion, load(std.testing.io, tmp.dir, allocator));
-}
-
-test "a backend billy reaches has a service name, and a self-hosted one does not" {
-    // Every backend but SearXNG is reached with a key, which is what a service
-    // name is. SearXNG is the user's own, so it has none.
-    try std.testing.expectEqualStrings("tavily", searchService(.tavily).?);
-    try std.testing.expectEqualStrings("exa", searchService(.exa).?);
-    try std.testing.expectEqualStrings("brave", searchService(.brave).?);
-    try std.testing.expect(searchService(.searxng) == null);
-
-    try std.testing.expectEqualStrings("tavily", fetchService(.tavily).?);
-    try std.testing.expectEqualStrings("exa", fetchService(.exa).?);
-    try std.testing.expect(fetchService(.raw) == null);
 }

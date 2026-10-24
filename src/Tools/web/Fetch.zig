@@ -5,29 +5,14 @@ const std = @import("std");
 const Health = @import("../../Health.zig");
 const tools = @import("../../Tools.zig");
 const web = @import("../web.zig");
-const exa = @import("provider/exa.zig");
-const direct = @import("provider/raw.zig");
 const Mock = @import("../../Mock.zig");
-const tavily = @import("provider/tavily.zig");
 
 const Fetch = @This();
-
-/// The backends billy can read a url with. `raw` is the url itself, read
-/// directly: it is what a call that asks for the bytes as they are uses, and
-/// what is left when no service extracts a page.
-pub const Provider = enum {
-    raw,
-    tavily,
-    exa,
-
-    /// The names a configuration may hold, in the order a listing shows them.
-    pub const all: []const Provider = &.{ .raw, .tavily, .exa };
-};
 
 /// One backend to fetch with, and what it is asked with: the key, from the
 /// credential `billy login` stored or its environment variable.
 pub const Backend = struct {
-    provider: Provider,
+    provider: web.Provider,
     /// The key the backend is asked with. Empty for `raw`, which asks no one.
     api_key: []const u8 = "",
     /// Where the backend is reached, when it is not the address billy knows, as
@@ -133,7 +118,8 @@ pub fn run(fetch: Fetch, gpa: std.mem.Allocator, http_client: *std.http.Client, 
 /// that asked to be waited before it is read again, both reach the model as the
 /// result of the call it made.
 fn readDirectly(gpa: std.mem.Allocator, http_client: *std.http.Client, url: []const u8, out: *std.Io.Writer) !void {
-    const answer = direct.fetch(gpa, http_client, url) catch |err|
+    // The raw provider is the url itself: no service, no key, no extraction.
+    const answer = fetchBackend(gpa, http_client, .{ .provider = .raw }, url) catch |err|
         return tools.fail(out, "cannot read {s}: {s}", .{ url, @errorName(err) });
     switch (answer) {
         .text => |text| {
@@ -153,21 +139,102 @@ fn readDirectly(gpa: std.mem.Allocator, http_client: *std.http.Client, url: []co
 
 /// Fetches one url with one backend, whichever it is.
 fn fetchBackend(gpa: std.mem.Allocator, http_client: *std.http.Client, backend: Backend, url: []const u8) !web.Answer {
-    return switch (backend.provider) {
-        .tavily => tavily.fetch(gpa, http_client, backend.api_key, reach(backend), url),
-        .exa => exa.fetch(gpa, http_client, backend.api_key, reach(backend), url),
-        .raw => direct.fetch(gpa, http_client, url),
+    const descriptor = backend.provider.descriptor();
+    const spec = descriptor.fetch orelse return error.NotAFetchProvider;
+
+    // Raw reads the url of the call; a service is reached at its own address,
+    // or the instance the configuration named.
+    const base = if (spec.own_url)
+        url
+    else
+        backend.endpoint orelse descriptor.fetch_endpoint orelse return error.MissingFetchUrl;
+    const location = try web.address(
+        gpa,
+        base,
+        if (!spec.own_url and descriptor.fetch_endpoint == null) spec.configured_path else "",
+    );
+    defer gpa.free(location);
+
+    var payload: ?[]const u8 = null;
+    defer if (payload) |body| gpa.free(body);
+
+    const method: std.http.Method = switch (spec.request) {
+        .get => .GET,
+        .post => |build| post: {
+            payload = try build(gpa, url);
+            break :post .POST;
+        },
+    };
+
+    const answer = try web.providerRequest(
+        gpa,
+        http_client,
+        "fetch",
+        descriptor,
+        backend.api_key,
+        method,
+        location,
+        payload,
+    );
+    return switch (answer) {
+        .text => |text| text: {
+            // A provider with no mapping answers with the bytes as they are,
+            // which is what `raw` does.
+            const render = spec.render orelse break :text .{ .text = text };
+            defer gpa.free(text);
+            break :text .{ .text = try render(gpa, text) };
+        },
+        .retry_after_ms => |ms| .{ .retry_after_ms = ms },
     };
 }
 
-/// The address to send to: the one named for this backend, or the backend's own.
-fn reach(backend: Backend) []const u8 {
-    return backend.endpoint orelse switch (backend.provider) {
-        .tavily => tavily.fetch_endpoint,
-        .exa => exa.fetch_endpoint,
-        // Raw reads the url of the call, so it is never reached here.
-        .raw => unreachable,
-    };
+test "each fetch backend is asked the way its table says" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    // Tavily: the url as its JSON body, the key as a bearer token, and the
+    // reply as the url's content.
+    {
+        var mock = try Mock.start("/extract", 1, Mock.fixed(
+            "{\"results\":[{\"url\":\"https://ziglang.org\",\"raw_content\":\"# Zig\"}],\"failed_results\":[]}",
+        ));
+        defer mock.deinit();
+        try mock.serve();
+
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        try run(.{ .url = "https://ziglang.org" }, gpa, &http_client, .{
+            .backends = &.{.{ .provider = .tavily, .api_key = "secret", .endpoint = mock.url }},
+        }, null, &out.writer);
+        try mock.await();
+
+        try std.testing.expectEqualStrings("{\"urls\":[\"https://ziglang.org\"]}", mock.bodies.items[0]);
+        try std.testing.expectEqualStrings("Bearer secret", mock.header("authorization").?);
+        try std.testing.expectEqualStrings("# Zig", out.written());
+    }
+
+    // Exa: the same shape with its own key header and content field.
+    {
+        var mock = try Mock.start("/contents", 1, Mock.fixed(
+            "{\"results\":[{\"url\":\"https://ziglang.org\",\"text\":\"# Zig\"}]}",
+        ));
+        defer mock.deinit();
+        try mock.serve();
+
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        try run(.{ .url = "https://ziglang.org" }, gpa, &http_client, .{
+            .backends = &.{.{ .provider = .exa, .api_key = "secret", .endpoint = mock.url }},
+        }, null, &out.writer);
+        try mock.await();
+
+        try std.testing.expectEqualStrings("{\"urls\":[\"https://ziglang.org\"]}", mock.bodies.items[0]);
+        try std.testing.expectEqualStrings("secret", mock.header("x-api-key").?);
+        try std.testing.expectEqualStrings("# Zig", out.written());
+    }
 }
 
 test "a url no backend could read does not set the backend aside" {
@@ -234,6 +301,27 @@ test "a raw fetch reads the url directly, without any backend" {
     try mock.await();
 
     try std.testing.expectEqualStrings(reply, out.written());
+}
+
+test "a raw fetch keeps a body of any size whole" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Larger than the 1 MiB the read used to be cut to.
+    const reply: [(1 << 20) + 10]u8 = @splat('x');
+    var mock = try Mock.start("/big", 1, Mock.fixed(&reply));
+    defer mock.deinit();
+    try mock.serve();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try run(.{ .url = mock.url, .raw = true }, gpa, &http_client, .{ .backends = &.{} }, null, &out.writer);
+    try mock.await();
+
+    try std.testing.expectEqual(reply.len, out.written().len);
 }
 
 test "a fetch with no backend named says so rather than reading the url" {

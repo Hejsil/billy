@@ -1,88 +1,62 @@
-//! Tavily: a search and an extraction, both posted as JSON.
+//! Tavily's request bodies and replies: a search and an extraction, both posted
+//! as JSON. The address, the key and the method are the table's in `web.zig`;
+//! what stays here is the shape of a Tavily body and the reply it answers.
 
 const std = @import("std");
-const web = @import("../../web.zig");
-const Search = @import("../Search.zig");
-const Mock = @import("../../../Mock.zig");
-
-/// One Tavily search, posted to `endpoint`, which is the provider's own or a
-/// test server's. The request and the response are Tavily's shape; keeping the
-/// endpoint a parameter is what lets the wire format be tested without the
-/// network.
-pub fn search(
-    gpa: std.mem.Allocator,
-    http_client: *std.http.Client,
-    api_key: []const u8,
-    endpoint: []const u8,
-    query: []const u8,
-    max_results: usize,
-) !web.Answer {
-    const body = try std.json.Stringify.valueAlloc(gpa, Request{
-        .query = query,
-        .max_results = max_results,
-    }, .{ .emit_null_optional_fields = false });
-    defer gpa.free(body);
-
-    const auth = try bearer(gpa, api_key);
-    defer gpa.free(auth);
-
-    const reply = switch (try web.requestJson(Response, gpa, http_client, .POST, endpoint, body, &.{
-        .{ .name = "authorization", .value = auth },
-    }, "search")) {
-        .parsed => |parsed| parsed,
-        .retry_after_ms => |ms| return .{ .retry_after_ms = ms },
-    };
-    defer reply.deinit();
-
-    return .{ .text = try Search.Result.renderMapped(gpa, reply.value.results, "content") };
-}
-
-/// One Tavily extraction. The url's text is the backend's; a url the backend
-/// could not read comes back as `error.UrlUnreadable`, which is not a failure
-/// of the backend.
-pub fn fetch(
-    gpa: std.mem.Allocator,
-    http_client: *std.http.Client,
-    api_key: []const u8,
-    endpoint: []const u8,
-    url: []const u8,
-) !web.Answer {
-    const body = try std.json.Stringify.valueAlloc(gpa, ExtractRequest{
-        .urls = &.{url},
-    }, .{ .emit_null_optional_fields = false });
-    defer gpa.free(body);
-
-    const auth = try bearer(gpa, api_key);
-    defer gpa.free(auth);
-
-    const reply = switch (try web.requestJson(ExtractResponse, gpa, http_client, .POST, endpoint, body, &.{
-        .{ .name = "authorization", .value = auth },
-    }, "fetch")) {
-        .parsed => |parsed| parsed,
-        .retry_after_ms => |ms| return .{ .retry_after_ms = ms },
-    };
-    defer reply.deinit();
-
-    if (reply.value.results.len == 0) {
-        for (reply.value.failed_results) |failed| {
-            std.log.warn("fetch: {s}: {s}", .{ failed.url, failed.@"error" });
-        }
-        return error.UrlUnreadable;
-    }
-    return .{ .text = try gpa.dupe(u8, reply.value.results[0].raw_content) };
-}
-
-/// Tavily's own address for each kind of call.
-pub const search_endpoint = "https://api.tavily.com/search";
-pub const fetch_endpoint = "https://api.tavily.com/extract";
-
-fn bearer(gpa: std.mem.Allocator, api_key: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(gpa, "Bearer {s}", .{api_key});
-}
+const SearchResult = @import("../Search/Result.zig");
 
 /// The body a Tavily search is posted with. `basic` depth is the fast, cheaper
 /// one and is enough to rank sources; no synthesized answer is asked for, since
 /// the model reads the sources itself.
+pub fn searchBody(gpa: std.mem.Allocator, query: []const u8, max_results: usize) ![]const u8 {
+    return std.json.Stringify.valueAlloc(gpa, Request{
+        .query = query,
+        .max_results = max_results,
+    }, .{ .emit_null_optional_fields = false });
+}
+
+/// A Tavily search reply as the numbered list the model reads.
+pub fn renderSearch(gpa: std.mem.Allocator, reply: []const u8, _: usize) ![]const u8 {
+    const parsed = try parse(Response, gpa, reply);
+    defer parsed.deinit();
+    return SearchResult.renderMapped(gpa, parsed.value.results, "content");
+}
+
+/// The body a Tavily extraction is posted with.
+pub fn fetchBody(gpa: std.mem.Allocator, url: []const u8) ![]const u8 {
+    return std.json.Stringify.valueAlloc(gpa, ExtractRequest{
+        .urls = &.{url},
+    }, .{ .emit_null_optional_fields = false });
+}
+
+/// A Tavily extraction reply as the url's text. A url the backend could not read
+/// comes back as `error.UrlUnreadable`, which is not a failure of the backend.
+pub fn renderFetch(gpa: std.mem.Allocator, reply: []const u8) ![]const u8 {
+    const parsed = try parse(ExtractResponse, gpa, reply);
+    defer parsed.deinit();
+
+    if (parsed.value.results.len == 0) {
+        for (parsed.value.failed_results) |failed| {
+            std.log.warn("fetch: {s}: {s}", .{ failed.url, failed.@"error" });
+        }
+        return error.UrlUnreadable;
+    }
+    return gpa.dupe(u8, parsed.value.results[0].raw_content);
+}
+
+/// Parses a provider reply, which is the provider's own shape: a reply that does
+/// not parse is the provider's failure, reported as the shared one.
+fn parse(comptime T: type, gpa: std.mem.Allocator, reply: []const u8) !std.json.Parsed(T) {
+    return std.json.parseFromSlice(T, gpa, reply, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch |err| {
+        std.log.warn("tavily: cannot read the reply: {s}", .{@errorName(err)});
+        return error.BadReply;
+    };
+}
+
+/// The body a Tavily search is posted with.
 const Request = struct {
     query: []const u8,
     max_results: usize,
@@ -124,106 +98,36 @@ const ExtractFailure = struct {
     @"error": []const u8 = "",
 };
 
-test "a tavily search posts the query and reads the results back" {
+/// Answers `reply` and compares the text it becomes to `expected`.
+fn expectSearch(expected: []const u8, reply: []const u8) !void {
     const gpa = std.testing.allocator;
-    const io = std.testing.io;
+    const text = try renderSearch(gpa, reply, 3);
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings(expected, text);
+}
 
-    // A backend standing in for Tavily, answering with a fixed reply and
-    // recording what it was sent.
-    const reply =
+test "a tavily search reply becomes the numbered list" {
+    try expectSearch("1. Zig Programming Language\n   https://ziglang.org\n   A language.\n\n" ++
+        "2. Docs\n   https://ziglang.org/documentation\n",
         \\{"query":"zig lang","results":[
         \\ {"title":"Zig Programming Language","url":"https://ziglang.org","content":"A language."},
         \\ {"title":"Docs","url":"https://ziglang.org/documentation","content":""}]}
-    ;
-    var mock = try Mock.start("/search", 1, Mock.fixed(reply));
-    defer mock.deinit();
-    try mock.serve();
-
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
-    // Everything the provider is given is the testing allocator, so a reply or a
-    // list left behind is reported rather than hidden by an arena.
-    const value = try search(gpa, &http_client, "secret", mock.url, "zig lang", 3);
-    defer gpa.free(value.text);
-    try mock.await();
-
-    // The query and the count went out as Tavily's body, the key as a bearer
-    // token, and the reply became the numbered list the model reads.
-    try std.testing.expectEqualStrings(
-        "{\"query\":\"zig lang\",\"max_results\":3,\"search_depth\":\"basic\",\"include_answer\":false}",
-        mock.bodies.items[0],
-    );
-    try std.testing.expectEqualStrings("Bearer secret", mock.header("authorization").?);
-    try std.testing.expectEqualStrings(
-        "1. Zig Programming Language\n   https://ziglang.org\n   A language.\n\n" ++
-            "2. Docs\n   https://ziglang.org/documentation\n",
-        value.text,
     );
 }
 
-test "a tavily extraction posts the url and reads its content back" {
+test "a tavily extraction reply is the url's content" {
     const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    const reply = "{\"results\":[{\"url\":\"https://ziglang.org\",\"raw_content\":\"# Zig\\n\\nA language.\"}],\"failed_results\":[]}";
-    var mock = try Mock.start("/extract", 1, Mock.fixed(reply));
-    defer mock.deinit();
-    try mock.serve();
-
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
-    const value = try fetch(gpa, &http_client, "secret", mock.url, "https://ziglang.org");
-    defer gpa.free(value.text);
-    try mock.await();
-
-    // The url went out as Tavily's body and the key as a bearer token.
-    try std.testing.expectEqualStrings("{\"urls\":[\"https://ziglang.org\"]}", mock.bodies.items[0]);
-    try std.testing.expectEqualStrings("Bearer secret", mock.header("authorization").?);
-    try std.testing.expectEqualStrings("# Zig\n\nA language.", value.text);
+    const text = try renderFetch(
+        gpa,
+        "{\"results\":[{\"url\":\"https://ziglang.org\",\"raw_content\":\"# Zig\\n\\nA language.\"}],\"failed_results\":[]}",
+    );
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("# Zig\n\nA language.", text);
 }
 
 test "a url tavily could not read is not a failure of the backend" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    const reply = "{\"results\":[],\"failed_results\":[{\"url\":\"https://nope.invalid\",\"error\":\"not found\"}]}";
-    var mock = try Mock.start("/extract", 1, Mock.fixed(reply));
-    defer mock.deinit();
-    try mock.serve();
-
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
     try std.testing.expectError(
         error.UrlUnreadable,
-        fetch(gpa, &http_client, "secret", mock.url, "https://nope.invalid"),
+        renderFetch(std.testing.allocator, "{\"results\":[],\"failed_results\":[{\"url\":\"https://nope.invalid\",\"error\":\"not found\"}]}"),
     );
-    try mock.await();
-}
-
-test "a wait the backend asked for comes back as one" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    // A provider that is rate-limited: it answered, and said how long to wait.
-    var mock = try Mock.start("/search", 1, struct {
-        fn answer(_: usize, _: []const u8) Mock.Answer {
-            return .{ .status = .too_many_requests, .body = "{}" };
-        }
-    }.answer);
-    defer mock.deinit();
-    try mock.serve();
-
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
-    // No `Retry-After` header, so the answer is a plain failure rather than a
-    // wait: only what the provider asked for is honored.
-    try std.testing.expectError(
-        error.RequestFailed,
-        search(gpa, &http_client, "secret", mock.url, "zig lang", 3),
-    );
-    try mock.await();
 }

@@ -1,36 +1,24 @@
-//! SearXNG: a search against the user's own instance.
+//! SearXNG's reply: a search against the user's own instance. The instance, the
+//! path and the method are the table's in `web.zig`; the reply shape and the cap
+//! stay here.
 
 const std = @import("std");
-const web = @import("../../web.zig");
-const Search = @import("../Search.zig");
-const Mock = @import("../../../Mock.zig");
+const SearchResult = @import("../Search/Result.zig");
 
-/// One SearXNG search, sent as a GET to the instance the configuration names.
-/// SearXNG needs no key, and answers with the same shape of results whatever
-/// engines it searched. It takes no result count, so the cap is applied here.
-pub fn search(
-    gpa: std.mem.Allocator,
-    http_client: *std.http.Client,
-    base: []const u8,
-    query: []const u8,
-    max_results: usize,
-) !web.Answer {
-    const endpoint = try std.fmt.allocPrint(gpa, "{s}/search", .{
-        std.mem.trimEnd(u8, base, "/"),
-    });
-    defer gpa.free(endpoint);
-
-    const url = try web.queryUrl(gpa, endpoint, query, "&format=json", .{});
-    defer gpa.free(url);
-
-    const reply = switch (try web.requestJson(Response, gpa, http_client, .GET, url, null, &.{}, "search")) {
-        .parsed => |parsed| parsed,
-        .retry_after_ms => |ms| return .{ .retry_after_ms = ms },
+/// A SearXNG search reply as the numbered list the model reads. SearXNG takes no
+/// result count, so the cap is applied here.
+pub fn renderSearch(gpa: std.mem.Allocator, reply: []const u8, max_results: usize) ![]const u8 {
+    const parsed = std.json.parseFromSlice(Response, gpa, reply, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch |err| {
+        std.log.warn("searxng: cannot read the reply: {s}", .{@errorName(err)});
+        return error.BadReply;
     };
-    defer reply.deinit();
+    defer parsed.deinit();
 
-    const capped = reply.value.results[0..@min(reply.value.results.len, max_results)];
-    return .{ .text = try Search.Result.renderMapped(gpa, capped, "content") };
+    const capped = parsed.value.results[0..@min(parsed.value.results.len, max_results)];
+    return SearchResult.renderMapped(gpa, capped, "content");
 }
 
 /// The part of a SearXNG response billy uses, which is the same from every engine
@@ -46,29 +34,15 @@ const Result = struct {
     content: []const u8 = "",
 };
 
-test "a searxng search sends the query to the instance, and caps the results" {
+test "a searxng reply becomes the numbered list, capped at what was asked" {
     const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
     const reply = "{\"results\":[" ++
         "{\"title\":\"Zig\",\"url\":\"https://ziglang.org\",\"content\":\"A language.\"}," ++
         "{\"title\":\"Docs\",\"url\":\"https://ziglang.org/documentation\",\"content\":\"\"}]}";
-    // The instance is the mock's base, which SearXNG's `/search` is added to.
-    var mock = try Mock.start("", 1, Mock.fixed(reply));
-    defer mock.deinit();
-    try mock.serve();
 
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
-    // The cap is applied here, since SearXNG takes no result count: only the
-    // first of the two results is rendered.
-    const value = try search(gpa, &http_client, mock.url, "zig lang", 1);
-    defer gpa.free(value.text);
-    try mock.await();
-
-    // The query is a GET with no key: SearXNG is the user's own instance.
-    try std.testing.expectEqualStrings("", mock.bodies.items[0]);
-    try std.testing.expect(mock.header("authorization") == null);
-    try std.testing.expectEqualStrings("1. Zig\n   https://ziglang.org\n   A language.\n", value.text);
+    // SearXNG takes no result count, so the cap is applied here: only the first
+    // of the two results is rendered.
+    const text = try renderSearch(gpa, reply, 1);
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("1. Zig\n   https://ziglang.org\n   A language.\n", text);
 }

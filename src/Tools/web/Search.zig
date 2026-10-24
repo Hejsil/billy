@@ -6,37 +6,16 @@ const Health = @import("../../Health.zig");
 const tools = @import("../../Tools.zig");
 const Mock = @import("../../Mock.zig");
 const web = @import("../web.zig");
-const brave = @import("provider/brave.zig");
-const exa = @import("provider/exa.zig");
-const searxng = @import("provider/searxng.zig");
-const tavily = @import("provider/tavily.zig");
 
 pub const Result = @import("Search/Result.zig");
 
 const Search = @This();
 
-/// The backends billy can search with. The name is what the configuration holds,
-/// stored as the variant itself so an unknown name is refused when the file is
-/// read rather than carried around as a string.
-///
-/// A search provider takes a query and answers with results; a provider that can
-/// also read a url is listed in `Fetch.Provider` too, and is the same service
-/// either way.
-pub const Provider = enum {
-    tavily,
-    exa,
-    brave,
-    searxng,
-
-    /// The names a configuration may hold, in the order a listing shows them.
-    pub const all: []const Provider = &.{ .tavily, .exa, .brave, .searxng };
-};
-
 /// One backend to search with, and what it is asked with: the key, from the
 /// credential `billy login` stored or its environment variable, and the instance
 /// for a backend that is the user's own.
 pub const Backend = struct {
-    provider: Provider,
+    provider: web.Provider,
     /// The key the backend is asked with. Empty for one that needs none, which
     /// is SearXNG, whose instance the user runs.
     api_key: []const u8 = "",
@@ -122,23 +101,53 @@ fn searchBackend(
 ) !web.Answer {
     // The same cap for every backend, whatever the configuration says.
     const asked = @min(max_results, Result.result_limit);
-    return switch (backend.provider) {
-        .tavily => tavily.search(gpa, http_client, backend.api_key, reach(backend), query, asked),
-        .exa => exa.search(gpa, http_client, backend.api_key, reach(backend), query, asked),
-        .brave => brave.search(gpa, http_client, backend.api_key, reach(backend), query, asked),
-        // The instance is the configuration's, so it is always named.
-        .searxng => searxng.search(gpa, http_client, reach(backend), query, asked),
-    };
-}
 
-/// The address to send to: the one named for this backend, or the address billy
-/// knows the service by. SearXNG has none: the instance is always named.
-fn reach(backend: Backend) []const u8 {
-    return backend.endpoint orelse switch (backend.provider) {
-        .tavily => tavily.search_endpoint,
-        .exa => exa.search_endpoint,
-        .brave => brave.search_endpoint,
-        .searxng => unreachable,
+    const descriptor = backend.provider.descriptor();
+    const spec = descriptor.search orelse return error.NotASearchProvider;
+    const base = backend.endpoint orelse descriptor.search_endpoint orelse return error.MissingSearchUrl;
+    // A provider whose address the configuration names lives under a known path
+    // on that instance; one whose address the table gives is used whole.
+    const location = try web.address(gpa, base, if (descriptor.search_endpoint == null) spec.configured_path else "");
+    defer gpa.free(location);
+
+    // A GET asks in the url and a POST in a body; one of the two is built here.
+    var payload: ?[]const u8 = null;
+    defer if (payload) |body| gpa.free(body);
+    var asked_url: ?[]const u8 = null;
+    defer if (asked_url) |url| gpa.free(url);
+    var target = location;
+
+    const method: std.http.Method = switch (spec.request) {
+        .get => |kind| get: {
+            asked_url = switch (kind) {
+                .count => try web.queryUrl(gpa, location, query, "&count={d}", .{asked}),
+                .format_json => try web.queryUrl(gpa, location, query, "&format=json", .{}),
+            };
+            target = asked_url.?;
+            break :get .GET;
+        },
+        .post => |build| post: {
+            payload = try build(gpa, query, asked);
+            break :post .POST;
+        },
+    };
+
+    const answer = try web.providerRequest(
+        gpa,
+        http_client,
+        "search",
+        descriptor,
+        backend.api_key,
+        method,
+        target,
+        payload,
+    );
+    return switch (answer) {
+        .text => |text| text: {
+            defer gpa.free(text);
+            break :text .{ .text = try spec.render(gpa, text, asked) };
+        },
+        .retry_after_ms => |ms| .{ .retry_after_ms = ms },
     };
 }
 
@@ -287,6 +296,78 @@ test "brave is asked for no more results than billy allows any backend" {
     try mock.await();
 
     try std.testing.expectEqualStrings("/search?q=zig&count=20", mock.targets.items[0]);
+    // Brave is told the reply is JSON as well as being asked in its own header.
+    try std.testing.expectEqualStrings("application/json", mock.header("accept").?);
+}
+
+test "each provider is asked the way its table says" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    // Tavily: the query and the count as its JSON body, the key as a bearer
+    // token.
+    {
+        var mock = try Mock.start("/search", 1, Mock.fixed("{\"results\":[]}"));
+        defer mock.deinit();
+        try mock.serve();
+
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        try run(.{ .query = "zig lang" }, gpa, &http_client, .{
+            .backends = &.{.{ .provider = .tavily, .api_key = "secret", .endpoint = mock.url }},
+            .max_results = 3,
+        }, null, &out.writer);
+        try mock.await();
+
+        try std.testing.expectEqualStrings(
+            "{\"query\":\"zig lang\",\"max_results\":3,\"search_depth\":\"basic\",\"include_answer\":false}",
+            mock.bodies.items[0],
+        );
+        try std.testing.expectEqualStrings("Bearer secret", mock.header("authorization").?);
+    }
+
+    // Exa: its own camelCase body, and its key in `x-api-key`.
+    {
+        var mock = try Mock.start("/search", 1, Mock.fixed("{\"results\":[]}"));
+        defer mock.deinit();
+        try mock.serve();
+
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        try run(.{ .query = "zig lang" }, gpa, &http_client, .{
+            .backends = &.{.{ .provider = .exa, .api_key = "secret", .endpoint = mock.url }},
+            .max_results = 3,
+        }, null, &out.writer);
+        try mock.await();
+
+        try std.testing.expectEqualStrings(
+            "{\"query\":\"zig lang\",\"numResults\":3,\"contents\":{\"text\":{\"maxCharacters\":500}}}",
+            mock.bodies.items[0],
+        );
+        try std.testing.expectEqualStrings("secret", mock.header("x-api-key").?);
+    }
+
+    // SearXNG: a GET with no key, asking for JSON instead of a count.
+    {
+        var mock = try Mock.start("", 1, Mock.fixed("{\"results\":[]}"));
+        defer mock.deinit();
+        try mock.serve();
+
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        try run(.{ .query = "zig lang" }, gpa, &http_client, .{
+            .backends = &.{.{ .provider = .searxng, .endpoint = mock.url }},
+            .max_results = 3,
+        }, null, &out.writer);
+        try mock.await();
+
+        try std.testing.expectEqualStrings("/search?q=zig%20lang&format=json", mock.targets.items[0]);
+        try std.testing.expect(mock.header("authorization") == null);
+        try std.testing.expectEqualStrings("", mock.bodies.items[0]);
+    }
 }
 
 test "searxng results are capped at the most billy allows any backend" {

@@ -1,38 +1,22 @@
-//! Brave: a search, sent as a GET with the query in the url.
+//! Brave's reply: a search sent as a GET with the query in the url. The address,
+//! the key's header and the method are the table's in `web.zig`.
 
 const std = @import("std");
-const web = @import("../../web.zig");
-const Search = @import("../Search.zig");
-const Mock = @import("../../../Mock.zig");
+const SearchResult = @import("../Search/Result.zig");
 
-/// One Brave search, sent as a GET with the query in the url. Brave wants its
-/// key in `x-subscription-token`, not an auth header, and the reply's results
-/// sit under `web`.
-pub fn search(
-    gpa: std.mem.Allocator,
-    http_client: *std.http.Client,
-    api_key: []const u8,
-    endpoint: []const u8,
-    query: []const u8,
-    max_results: usize,
-) !web.Answer {
-    const url = try web.queryUrl(gpa, endpoint, query, "&count={d}", .{max_results});
-    defer gpa.free(url);
-
-    const reply = switch (try web.requestJson(Response, gpa, http_client, .GET, url, null, &.{
-        .{ .name = "x-subscription-token", .value = api_key },
-        .{ .name = "accept", .value = "application/json" },
-    }, "search")) {
-        .parsed => |parsed| parsed,
-        .retry_after_ms => |ms| return .{ .retry_after_ms = ms },
+/// A Brave search reply as the numbered list the model reads. The results sit
+/// under `web`, and each snippet is the `description` field.
+pub fn renderSearch(gpa: std.mem.Allocator, reply: []const u8, _: usize) ![]const u8 {
+    const parsed = std.json.parseFromSlice(Response, gpa, reply, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch |err| {
+        std.log.warn("brave: cannot read the reply: {s}", .{@errorName(err)});
+        return error.BadReply;
     };
-    defer reply.deinit();
-
-    return .{ .text = try Search.Result.renderMapped(gpa, reply.value.web.results, "description") };
+    defer parsed.deinit();
+    return SearchResult.renderMapped(gpa, parsed.value.web.results, "description");
 }
-
-/// Brave's own address.
-pub const search_endpoint = "https://api.search.brave.com/res/v1/web/search";
 
 /// The part of a Brave search response billy uses. The results sit under `web`,
 /// which a query that matched nothing leaves out, so it defaults to none.
@@ -51,41 +35,19 @@ const Result = struct {
     description: []const u8 = "",
 };
 
-test "a brave search sends the query in the url and reads the results back" {
+test "a brave search reply becomes the numbered list" {
     const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    const reply = "{\"web\":{\"results\":[" ++
-        "{\"title\":\"Zig\",\"url\":\"https://ziglang.org\",\"description\":\"A language.\"}," ++
-        "{\"title\":\"Docs\",\"url\":\"https://ziglang.org/documentation\"}]}}";
-    var mock = try Mock.start("/res/v1/web/search", 1, Mock.fixed(reply));
-    defer mock.deinit();
-    try mock.serve();
-
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
-    const value = try search(gpa, &http_client, "secret", mock.url, "zig lang", 3);
-    defer gpa.free(value.text);
-    try mock.await();
-
-    // The query is a GET, so nothing was posted; the key went out in Brave's own
-    // header, and the reply rendered as the list the model reads.
-    try std.testing.expectEqualStrings("", mock.bodies.items[0]);
-    try std.testing.expectEqualStrings("secret", mock.header("x-subscription-token").?);
-    try std.testing.expectEqualStrings("application/json", mock.header("accept").?);
+    const text = try renderSearch(
+        gpa,
+        "{\"web\":{\"results\":[" ++
+            "{\"title\":\"Zig\",\"url\":\"https://ziglang.org\",\"description\":\"A language.\"}," ++
+            "{\"title\":\"Docs\",\"url\":\"https://ziglang.org/documentation\"}]}}",
+        3,
+    );
+    defer gpa.free(text);
     try std.testing.expectEqualStrings(
         "1. Zig\n   https://ziglang.org\n   A language.\n\n" ++
             "2. Docs\n   https://ziglang.org/documentation\n",
-        value.text,
+        text,
     );
-}
-
-test "a query is percent-encoded into a url" {
-    const gpa = std.testing.allocator;
-    // A space, `&`, `/` and a non-ASCII character are all part of the query
-    // value, not the url around it.
-    const url = try web.queryUrl(gpa, "https://x/search", "a b&c/dé", "&count={d}", .{3});
-    defer gpa.free(url);
-    try std.testing.expectEqualStrings("https://x/search?q=a%20b%26c%2fd%c3%a9&count=3", url);
 }

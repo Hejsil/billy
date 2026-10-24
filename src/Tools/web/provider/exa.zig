@@ -1,71 +1,57 @@
-//! Exa: a search and a contents call, both posted as JSON.
+//! Exa's request bodies and replies: a search and a contents call, both posted
+//! as JSON. The address, the key and the method are the table's in `web.zig`.
 
 const std = @import("std");
-const web = @import("../../web.zig");
-const Search = @import("../Search.zig");
-const Mock = @import("../../../Mock.zig");
+const SearchResult = @import("../Search/Result.zig");
 
-/// One Exa search, posted to `endpoint`. Exa would return the whole page of each
-/// result, so the text is asked for capped: a search is a list of snippets, and
-/// a page is what `web_fetch` is for.
-pub fn search(
-    gpa: std.mem.Allocator,
-    http_client: *std.http.Client,
-    api_key: []const u8,
-    endpoint: []const u8,
-    query: []const u8,
-    max_results: usize,
-) !web.Answer {
-    const body = try std.json.Stringify.valueAlloc(gpa, Request{
+/// The body an Exa search is posted with. Exa would return the whole page of each
+/// result, so the text is asked for capped: a search is a list of snippets, and a
+/// page is what `web_fetch` is for.
+pub fn searchBody(gpa: std.mem.Allocator, query: []const u8, max_results: usize) ![]const u8 {
+    return std.json.Stringify.valueAlloc(gpa, Request{
         .query = query,
         .numResults = max_results,
-        .contents = .{ .text = .{ .maxCharacters = Search.Result.snippet_len } },
+        .contents = .{ .text = .{ .maxCharacters = SearchResult.snippet_len } },
     }, .{ .emit_null_optional_fields = false });
-    defer gpa.free(body);
-
-    const reply = switch (try web.requestJson(Response, gpa, http_client, .POST, endpoint, body, &.{
-        .{ .name = "x-api-key", .value = api_key },
-    }, "search")) {
-        .parsed => |parsed| parsed,
-        .retry_after_ms => |ms| return .{ .retry_after_ms = ms },
-    };
-    defer reply.deinit();
-
-    return .{ .text = try Search.Result.renderMapped(gpa, reply.value.results, "text") };
 }
 
-/// One Exa contents call, posted to `endpoint`. A url the backend could not read
-/// comes back as `error.UrlUnreadable`, which is not a failure of the backend.
-pub fn fetch(
-    gpa: std.mem.Allocator,
-    http_client: *std.http.Client,
-    api_key: []const u8,
-    endpoint: []const u8,
-    url: []const u8,
-) !web.Answer {
-    const body = try std.json.Stringify.valueAlloc(gpa, ContentsRequest{
+/// An Exa search reply as the numbered list the model reads.
+pub fn renderSearch(gpa: std.mem.Allocator, reply: []const u8, _: usize) ![]const u8 {
+    const parsed = try parse(Response, gpa, reply);
+    defer parsed.deinit();
+    return SearchResult.renderMapped(gpa, parsed.value.results, "text");
+}
+
+/// The body an Exa contents call is posted with.
+pub fn fetchBody(gpa: std.mem.Allocator, url: []const u8) ![]const u8 {
+    return std.json.Stringify.valueAlloc(gpa, ContentsRequest{
         .urls = &.{url},
     }, .{ .emit_null_optional_fields = false });
-    defer gpa.free(body);
-
-    const reply = switch (try web.requestJson(ContentsResponse, gpa, http_client, .POST, endpoint, body, &.{
-        .{ .name = "x-api-key", .value = api_key },
-    }, "fetch")) {
-        .parsed => |parsed| parsed,
-        .retry_after_ms => |ms| return .{ .retry_after_ms = ms },
-    };
-    defer reply.deinit();
-
-    if (reply.value.results.len == 0 or reply.value.results[0].text.len == 0) return error.UrlUnreadable;
-    return .{ .text = try gpa.dupe(u8, reply.value.results[0].text) };
 }
 
-/// Exa's own address for each kind of call.
-pub const search_endpoint = "https://api.exa.ai/search";
-pub const fetch_endpoint = "https://api.exa.ai/contents";
+/// An Exa contents reply as the url's text. A url it read no text for comes back
+/// as `error.UrlUnreadable`, which is not a failure of the backend.
+pub fn renderFetch(gpa: std.mem.Allocator, reply: []const u8) ![]const u8 {
+    const parsed = try parse(ContentsResponse, gpa, reply);
+    defer parsed.deinit();
 
-/// The body an Exa search is posted with. The text it returns is capped, so a
-/// result is a snippet rather than the whole page.
+    if (parsed.value.results.len == 0 or parsed.value.results[0].text.len == 0) return error.UrlUnreadable;
+    return gpa.dupe(u8, parsed.value.results[0].text);
+}
+
+/// Parses a provider reply, which is the provider's own shape: a reply that does
+/// not parse is the provider's failure, reported as the shared one.
+fn parse(comptime T: type, gpa: std.mem.Allocator, reply: []const u8) !std.json.Parsed(T) {
+    return std.json.parseFromSlice(T, gpa, reply, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch |err| {
+        std.log.warn("exa: cannot read the reply: {s}", .{@errorName(err)});
+        return error.BadReply;
+    };
+}
+
+/// The body an Exa search is posted with. Its field names are camelCase.
 const Request = struct {
     query: []const u8,
     numResults: usize,
@@ -107,79 +93,37 @@ const Content = struct {
     text: []const u8 = "",
 };
 
-test "an exa search posts the query and reads the results back" {
+test "an exa search reply becomes the numbered list" {
     const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    const reply =
+    const text = try renderSearch(
+        gpa,
         \\{"results":[
         \\ {"title":"Zig Programming Language","url":"https://ziglang.org","text":"A language."},
         \\ {"title":"Docs","url":"https://ziglang.org/documentation","text":""}]}
-    ;
-    var mock = try Mock.start("/search", 1, Mock.fixed(reply));
-    defer mock.deinit();
-    try mock.serve();
-
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
-    const value = try search(gpa, &http_client, "secret", mock.url, "zig lang", 3);
-    defer gpa.free(value.text);
-    try mock.await();
-
-    // The query, the count and the capped text went out as Exa's body (its field
-    // names are camelCase), the key as `x-api-key`, and the reply became the
-    // numbered list the model reads.
-    try std.testing.expectEqualStrings(
-        "{\"query\":\"zig lang\",\"numResults\":3,\"contents\":{\"text\":{\"maxCharacters\":500}}}",
-        mock.bodies.items[0],
+    ,
+        3,
     );
-    try std.testing.expectEqualStrings("secret", mock.header("x-api-key").?);
+    defer gpa.free(text);
     try std.testing.expectEqualStrings(
         "1. Zig Programming Language\n   https://ziglang.org\n   A language.\n\n" ++
             "2. Docs\n   https://ziglang.org/documentation\n",
-        value.text,
+        text,
     );
 }
 
-test "an exa contents call posts the url and reads its text back" {
+test "an exa contents reply is the url's text" {
     const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    const reply = "{\"results\":[{\"url\":\"https://ziglang.org\",\"text\":\"# Zig\\n\\nA language.\"}]}";
-    var mock = try Mock.start("/contents", 1, Mock.fixed(reply));
-    defer mock.deinit();
-    try mock.serve();
-
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
-    const value = try fetch(gpa, &http_client, "secret", mock.url, "https://ziglang.org");
-    defer gpa.free(value.text);
-    try mock.await();
-
-    try std.testing.expectEqualStrings("{\"urls\":[\"https://ziglang.org\"]}", mock.bodies.items[0]);
-    try std.testing.expectEqualStrings("secret", mock.header("x-api-key").?);
-    try std.testing.expectEqualStrings("# Zig\n\nA language.", value.text);
+    const text = try renderFetch(
+        gpa,
+        "{\"results\":[{\"url\":\"https://ziglang.org\",\"text\":\"# Zig\\n\\nA language.\"}]}",
+    );
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("# Zig\n\nA language.", text);
 }
 
 test "an exa url it read no text for is not a failure of the backend" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    // The call answered, and its result carries no text, so the url is one this
-    // backend cannot read.
-    const reply = "{\"results\":[{\"url\":\"https://nope.invalid\",\"text\":\"\"}]}";
-    var mock = try Mock.start("/contents", 1, Mock.fixed(reply));
-    defer mock.deinit();
-    try mock.serve();
-
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
     try std.testing.expectError(
         error.UrlUnreadable,
-        fetch(gpa, &http_client, "secret", mock.url, "https://nope.invalid"),
+        renderFetch(std.testing.allocator, "{\"results\":[{\"url\":\"https://nope.invalid\",\"text\":\"\"}]}"),
     );
-    try mock.await();
 }
