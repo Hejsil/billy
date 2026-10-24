@@ -2217,8 +2217,8 @@ test "maybeCompact compacts the conversation once it has filled the window" {
     // The prompt and the summary are added to the end of the session, which keeps
     // every message it had. The summary is a user message.
     try std.testing.expectEqual(6, session.messages.items.len);
-    try std.testing.expectEqualStrings("user", session.roleOf(session.messages.items[4]));
-    try std.testing.expectEqualStrings("user", session.roleOf(session.messages.items[5]));
+    try std.testing.expectEqualStrings("user", session.messages.items[4].role.name());
+    try std.testing.expectEqualStrings("user", session.messages.items[5].role.name());
     try std.testing.expectEqualStrings("the summary", session.contentOf(session.messages.items[5]).?);
     // A request now starts at the summary, skipping everything the summary stands
     // in for.
@@ -3004,7 +3004,7 @@ test "a reply with nothing is not kept, and the turn is asked again" {
     // them, so every request after this one carries a conversation a provider
     // takes.
     try std.testing.expectEqual(@as(usize, 2), session.messages.items.len);
-    try std.testing.expectEqualStrings("assistant", session.roleOf(session.messages.items[1]));
+    try std.testing.expectEqualStrings("assistant", session.messages.items[1].role.name());
     try std.testing.expectEqualStrings("all done", session.contentOf(session.messages.items[1]).?);
 }
 
@@ -3281,8 +3281,8 @@ test "the first turn names the session, and the naming is not part of it" {
     // The request that asked for the title is not part of the conversation, and
     // neither is its answer: the session holds the prompt and the reply alone.
     try std.testing.expectEqual(@as(usize, 2), session.messages.items.len);
-    try std.testing.expectEqualStrings("user", session.roleOf(session.messages.items[0]));
-    try std.testing.expectEqualStrings("assistant", session.roleOf(session.messages.items[1]));
+    try std.testing.expectEqualStrings("user", session.messages.items[0].role.name());
+    try std.testing.expectEqualStrings("assistant", session.messages.items[1].role.name());
     for (session.messages.items) |message| {
         const text = session.contentOf(message) orelse "";
         try std.testing.expect(std.mem.indexOf(u8, text, "short title") == null);

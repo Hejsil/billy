@@ -486,12 +486,6 @@ pub const Call = struct {
     arguments: []const u8,
 };
 
-/// The role of a message, which is the name the API knows it by.
-pub fn roleOf(session: *const Session, message: Message) []const u8 {
-    _ = session;
-    return message.role.name();
-}
-
 /// The content of a message, or null when it has none.
 pub fn contentOf(session: *const Session, message: Message) ?[]const u8 {
     return session.pool.get(message.content);
@@ -1391,7 +1385,7 @@ test "a new session is written out by its first message" {
     try std.testing.expect(resumed.systemPrompt() != null);
     try std.testing.expectEqualStrings("be terse", resumed.systemPrompt().?);
     try std.testing.expectEqual(1, resumed.messages.items.len);
-    try std.testing.expectEqualStrings("user", resumed.roleOf(resumed.messages.items[0]));
+    try std.testing.expectEqualStrings("user", resumed.messages.items[0].role.name());
     try std.testing.expectEqualStrings("hello", resumed.contentOf(resumed.messages.items[0]).?);
 }
 
@@ -1954,13 +1948,13 @@ test "a stored message reads back as its parts" {
 
     // What the transcript reads a message through, without building a message.
     const user = session.messages.items[0];
-    try std.testing.expectEqualStrings("user", session.roleOf(user));
+    try std.testing.expectEqualStrings("user", user.role.name());
     try std.testing.expectEqualStrings("hello", session.contentOf(user).?);
     try std.testing.expectEqual(0, user.tool_calls.len);
 
     // A message with no content reports none, rather than an empty string.
     const assistant = session.messages.items[1];
-    try std.testing.expectEqualStrings("assistant", session.roleOf(assistant));
+    try std.testing.expectEqualStrings("assistant", assistant.role.name());
     try std.testing.expect(session.contentOf(assistant) == null);
     try std.testing.expectEqual(2, assistant.tool_calls.len);
 
@@ -2083,7 +2077,7 @@ test "a version 2 file's system prompt is lifted into its own field" {
     // conversation is the user message alone.
     try std.testing.expectEqualStrings("old prompt", resumed.systemPrompt().?);
     try std.testing.expectEqual(1, resumed.messages.items.len);
-    try std.testing.expectEqualStrings("user", resumed.roleOf(resumed.messages.items[0]));
+    try std.testing.expectEqualStrings("user", resumed.messages.items[0].role.name());
     try std.testing.expectEqualStrings("hi", resumed.contentOf(resumed.messages.items[0]).?);
 
     // A resume keeps it rather than taking a newer one.
@@ -2109,9 +2103,9 @@ test "a compaction is appended and a request starts at its summary" {
     // reads it as context given to it.
     try session.appendCompaction("summarize this", "what happened so far");
     try std.testing.expectEqual(4, session.messages.items.len);
-    try std.testing.expectEqualStrings("user", session.roleOf(session.messages.items[2]));
+    try std.testing.expectEqualStrings("user", session.messages.items[2].role.name());
     try std.testing.expectEqualStrings("summarize this", session.contentOf(session.messages.items[2]).?);
-    try std.testing.expectEqualStrings("user", session.roleOf(session.messages.items[3]));
+    try std.testing.expectEqualStrings("user", session.messages.items[3].role.name());
     try std.testing.expectEqualStrings("what happened so far", session.contentOf(session.messages.items[3]).?);
 
     // A request now starts at the summary, skipping everything the summary stands
