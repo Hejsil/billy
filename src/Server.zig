@@ -1041,6 +1041,7 @@ const TestServer = struct {
         errdefer tmp.cleanup();
 
         const sessions = try tmp.dir.createDirPathOpen(std.testing.io, "sessions", .{});
+        errdefer sessions.close(std.testing.io);
         const config = try gpa.create(Config);
         errdefer gpa.destroy(config);
         config.* = Config.init(gpa);
