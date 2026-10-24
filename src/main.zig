@@ -348,18 +348,19 @@ fn parseSessions(args: *spaghet.Args) ParseError!Options.Sessions {
 }
 
 test "parseArgs" {
-    try expectOptions(.{}, try parseArgsSlice(&.{}));
-    try expectOptions(.{ .help = true }, try parseArgsSlice(&.{"--help"}));
-    try expectOptions(
-        .{ .resume_id = "20250131-120000" },
-        try parseArgsSlice(&.{ "--resume", "20250131-120000" }),
-    );
-    try expectOptions(.{ .resume_id = "dev" }, try parseArgsSlice(&.{ "-r", "dev" }));
-    try expectOptions(.{ .resume_id = "dev" }, try parseArgsSlice(&.{"--resume=dev"}));
-    try expectOptions(
-        .{ .help = true, .resume_id = "both" },
-        try parseArgsSlice(&.{ "--help", "--resume=both" }),
-    );
+    // The options a run takes, as the line that names them and what it reads as.
+    const cases = [_]struct { argv: []const []const u8, expected: Options }{
+        .{ .argv = &.{}, .expected = .{} },
+        .{ .argv = &.{"--help"}, .expected = .{ .help = true } },
+        .{ .argv = &.{ "--resume", "20250131-120000" }, .expected = .{ .resume_id = "20250131-120000" } },
+        .{ .argv = &.{ "-r", "dev" }, .expected = .{ .resume_id = "dev" } },
+        .{ .argv = &.{"--resume=dev"}, .expected = .{ .resume_id = "dev" } },
+        .{ .argv = &.{ "--help", "--resume=both" }, .expected = .{ .help = true, .resume_id = "both" } },
+    };
+    for (cases) |case| try expectOptions(case.expected, try parseArgsSlice(case.argv));
+
+    // A resume without a value, an option the run does not take, and a stray
+    // argument are refused.
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{"--resume"}));
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{"--nope"}));
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{"extra"}));

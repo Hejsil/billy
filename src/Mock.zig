@@ -1,5 +1,8 @@
 //! A stand-in provider for the tests: a real HTTP server a client can be pointed
 //! at instead of a live service.
+//!
+//! Only a test may use it: it runs on `std.testing.allocator` and `std.testing.io`,
+//! so nothing outside one may reach it.
 
 const std = @import("std");
 

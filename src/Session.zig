@@ -1214,6 +1214,10 @@ fn reopenTestSession(tmp: *std.testing.TmpDir, session_id: []const u8) !Session 
 /// the content, the model's thinking, the call a result answers, and every tool
 /// call. The text is compared by content, since two sessions number their
 /// strings differently; a role is the enum itself, so it is compared as one.
+///
+/// A field that is null and one that is empty are compared as the same, since a
+/// store that leaves a value out and one that writes nothing for it are both no
+/// text. A test that has to tell the two apart cannot use this helper.
 fn expectConvo(expected: []const llm.Message, actual: []const llm.Message) !void {
     try std.testing.expectEqual(expected.len, actual.len);
     for (expected, actual) |want, got| {

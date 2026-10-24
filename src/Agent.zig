@@ -1636,6 +1636,9 @@ fn testAgentIn(
 /// What a test builds an agent from: the configuration and the keys a turn's
 /// target is resolved from, and the settings the run reads.
 ///
+/// Only a test may build one: it runs on `std.testing.allocator` and
+/// `std.testing.io`, so nothing outside one may reach it.
+///
 /// The configuration names two providers, `test` and `other`, and stores a key for
 /// each. Both sit at a closed port until a test points one at the server it is
 /// listening on, so a request that went somewhere a test did not mean it to fails

@@ -1014,6 +1014,9 @@ const Stream = struct {
 /// credentials; a route needs none of that, only somewhere to keep sessions and
 /// a model to name. What it does not read is left empty, and nothing in the
 /// routes reaches for it.
+///
+/// Only a test may build one: it runs on `std.testing.allocator` and
+/// `std.testing.io`, so nothing outside one may reach it.
 const TestServer = struct {
     /// The server the routes are asked through: the same fields a served
     /// connection has, built once so a test drives what is really there.
