@@ -217,21 +217,29 @@ fn printAskedHelp(options: Options, out: Terminal.Writer) !bool {
     }
     switch (options.command) {
         .none => {},
-        .login => |login| if (login.help) {
-            try printHelp(out, "billy login [<service>]", login_about, null, command_options);
-            return true;
+        .login => |login| {
+            if (login.help) {
+                try printHelp(out, "billy login [<service>]", login_about, null, command_options);
+                return true;
+            }
         },
-        .config => |config| if (config.help) {
-            try printHelp(out, "billy config <setting> <value>", config_about, null, command_options);
-            return true;
+        .config => |config| {
+            if (config.help) {
+                try printHelp(out, "billy config <setting> <value>", config_about, null, command_options);
+                return true;
+            }
         },
-        .serve => |serve| if (serve.help) {
-            try printHelp(out, "billy serve [--port <port>] [--host <addr>]", serve_about, null, serve_options);
-            return true;
+        .serve => |serve| {
+            if (serve.help) {
+                try printHelp(out, "billy serve [--port <port>] [--host <addr>]", serve_about, null, serve_options);
+                return true;
+            }
         },
-        .sessions => |sessions| if (sessions.help) {
-            try printHelp(out, "billy sessions", sessions_about, null, command_options);
-            return true;
+        .sessions => |sessions| {
+            if (sessions.help) {
+                try printHelp(out, "billy sessions", sessions_about, null, command_options);
+                return true;
+            }
         },
     }
     return false;

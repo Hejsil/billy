@@ -185,7 +185,7 @@ const Markdown = struct {
         if (!self.put("<pre><code")) return false;
         if (detail.lang.text != null) {
             if (!self.put(" class=\"language-")) return false;
-            if (self.writeAttribute(&detail.lang, .text) == false) return false;
+            if (!self.writeAttribute(&detail.lang, .text)) return false;
             if (!self.put("\"")) return false;
         }
         return self.put(">");
@@ -934,7 +934,7 @@ pub fn block(gpa: std.mem.Allocator, b: Agent.Block, out: *std.Io.Writer) !void 
 /// reply.
 fn titled(gpa: std.mem.Allocator, glyph: []const u8, name: []const u8, text: []const u8, out: *std.Io.Writer) !void {
     try out.print("<div class=\"block {s}\"><div class=\"head\">", .{name});
-    try out.print("<span class=\"glyph\">", .{});
+    try out.writeAll("<span class=\"glyph\">");
     try escape(glyph, out);
     try out.writeAll("</span> <span class=\"name\">");
     try escape(name, out);

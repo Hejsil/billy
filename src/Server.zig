@@ -137,7 +137,7 @@ pub fn serve(server: *const Server, host: []const u8, port: u16) !void {
     var registry = Registry{ .io = server.io, .gpa = server.gpa };
     defer registry.deinit();
 
-    std.log.info("billy serve is listening on http://{s}:{d}/\n", .{
+    std.log.info("billy serve is listening on http://{s}:{d}/", .{
         host,
         listener.socket.address.getPort(),
     });

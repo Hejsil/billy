@@ -229,7 +229,7 @@ pub fn list(credentials: *const Credentials, out: *std.Io.Writer, providers: []c
         if (definedIn(name, providers)) continue;
         try printRow(out, name, dangling_purpose, name_width, purpose_width, true);
     }
-    try out.print("\n`billy login <service>` stores a key\n", .{});
+    try out.writeAll("\n`billy login <service>` stores a key\n");
 }
 
 /// Whether the configuration names `name` as one of its providers.

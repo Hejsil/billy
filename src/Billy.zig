@@ -69,7 +69,7 @@ pub fn open(init: std.process.Init, out: Terminal.Writer) !Billy {
     };
     errdefer opened.config.deinit();
 
-    if (opened.created) try out.print("wrote the default configuration\n", .{});
+    if (opened.created) try out.write("wrote the default configuration\n");
 
     const cwd = std.process.currentPathAlloc(io, arena) catch |err| {
         std.log.err("cannot find the working directory: {s}", .{@errorName(err)});
