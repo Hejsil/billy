@@ -85,7 +85,7 @@ pub const Behaviour = struct {
     /// window it fills before the conversation is folded into a summary, and whether
     /// it names the session. Where each turn is sent is resolved separately, as
     /// `sessionModel`, and what its tools run with as `toolSettings`.
-    pub fn fromConfig(config: Config) Behaviour {
+    pub fn fromConfig(config: *const Config) Behaviour {
         const stored = &config.stored;
         return .{
             .max_turns = stored.max_turns,

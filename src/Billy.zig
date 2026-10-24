@@ -218,10 +218,10 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resume_id: ?[]const u8) !void {
     const options = Agent.Options{
         .config = &billy.config,
         .store = &billy.credentials,
-        .behaviour = Agent.Behaviour.fromConfig(billy.config),
+        .behaviour = Agent.Behaviour.fromConfig(&billy.config),
         .tools = Endpoints.toolSettings(
-            billy.config,
-            try Endpoints.Backends.build(arena, billy.config, &billy.credentials),
+            &billy.config,
+            try Endpoints.Backends.build(arena, &billy.config, &billy.credentials),
             &billy.health,
         ),
         .home = billy.environ.get("HOME"),
@@ -300,12 +300,12 @@ pub fn serve(billy: *Billy, host: []const u8, port: u16) !void {
         .gpa = billy.gpa,
         .session_dir = billy.dirs.sessions,
         .config_dir = billy.dirs.config,
-        .config = billy.config,
+        .config = &billy.config,
         .store = billy.credentials,
         .health = &billy.health,
         .cwd = billy.cwd,
         .environ = billy.environ,
-        .backends = try Endpoints.Backends.build(arena, billy.config, &billy.credentials),
+        .backends = try Endpoints.Backends.build(arena, &billy.config, &billy.credentials),
     };
     return server.serve(host, port);
 }

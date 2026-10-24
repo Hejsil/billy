@@ -30,7 +30,7 @@ pub const Backends = struct {
     /// The backends the configuration names, reporting the one at fault when a
     /// backend it names cannot be built: the configuration asked for the tool,
     /// so leaving it out without a word would look like a bug.
-    pub fn build(arena: std.mem.Allocator, config: Config, store: *const Credentials) !Backends {
+    pub fn build(arena: std.mem.Allocator, config: *const Config, store: *const Credentials) !Backends {
         // Which backend each set is built from, remembered so the report can
         // name it: only the builder knows which provider it was on.
         var search_failed: tools.web.Search.Provider = .tavily;
@@ -54,7 +54,7 @@ pub const Backends = struct {
 /// none. A session keeps the choice it was started with, so the header names
 /// where it goes rather than where billy is pointed. The terminal's header is
 /// built from the same `Endpoint.modelOf`, so a page and a terminal agree.
-pub fn sessionModel(config: Config, session: *const Session) Endpoint.Model {
+pub fn sessionModel(config: *const Config, session: *const Session) Endpoint.Model {
     return Endpoint.modelOf(session.modelChoice(config.stored.model));
 }
 
@@ -64,7 +64,7 @@ pub fn sessionModel(config: Config, session: *const Session) Endpoint.Model {
 /// The run adds its own plumbing -- its I/O, the directory it works in, its
 /// allocator and its HTTP client -- when it builds the set, so neither frontend
 /// handles those and neither can offer a tool the others do not.
-pub fn toolSettings(config: Config, backends: Backends, health: ?*Health) tools.Settings {
+pub fn toolSettings(config: *const Config, backends: Backends, health: ?*Health) tools.Settings {
     const stored = &config.stored;
     return .{
         .bash_timeout_s = stored.tools.bash.timeout_s,
@@ -89,7 +89,7 @@ pub fn toolSettings(config: Config, backends: Backends, health: ?*Health) tools.
 fn searchConfig(
     arena: std.mem.Allocator,
     store: *const Credentials,
-    config: Config,
+    config: *const Config,
     failed: *tools.web.Search.Provider,
 ) !?tools.web.Search.Config {
     const web_config = config.stored.tools.web_search;
@@ -126,7 +126,7 @@ fn searchConfig(
 pub fn fetchConfig(
     arena: std.mem.Allocator,
     store: *const Credentials,
-    config: Config,
+    config: *const Config,
     failed: *tools.web.Fetch.Provider,
 ) !?tools.web.Fetch.Config {
     const web_config = config.stored.tools.web_fetch;
@@ -211,7 +211,7 @@ test "each backend resolves its own key, and SearXNG its instance" {
     var off = Config.init(gpa);
     defer off.deinit();
     var failed: tools.web.Search.Provider = .tavily;
-    try std.testing.expect((try searchConfig(arena, &store, off, &failed)) == null);
+    try std.testing.expect((try searchConfig(arena, &store, &off, &failed)) == null);
 
     // A backend billy knows is asked for a key, and one that is not set is an
     // error rather than a silent "no search".
@@ -219,7 +219,7 @@ test "each backend resolves its own key, and SearXNG its instance" {
     defer naming.deinit();
 
     naming.stored.tools.web_search.providers = &.{.tavily};
-    try std.testing.expectError(error.MissingApiKey, searchConfig(arena, &store, naming, &failed));
+    try std.testing.expectError(error.MissingApiKey, searchConfig(arena, &store, &naming, &failed));
     // The backend at fault is the one the report names.
     try std.testing.expectEqual(tools.web.Search.Provider.tavily, failed);
 
@@ -228,11 +228,11 @@ test "each backend resolves its own key, and SearXNG its instance" {
     defer searx.deinit();
 
     searx.stored.tools.web_search.providers = &.{.searxng};
-    try std.testing.expectError(error.MissingSearchUrl, searchConfig(arena, &store, searx, &failed));
+    try std.testing.expectError(error.MissingSearchUrl, searchConfig(arena, &store, &searx, &failed));
 
     // Every named backend becomes a backend to try, in the order named.
     searx.stored.tools.web_search.searxng.url = "https://searx.example.org";
-    const config = (try searchConfig(arena, &store, searx, &failed)).?;
+    const config = (try searchConfig(arena, &store, &searx, &failed)).?;
     try std.testing.expectEqual(@as(usize, 1), config.backends.len);
     try std.testing.expectEqual(tools.web.Search.Provider.searxng, config.backends[0].provider);
     try std.testing.expectEqualStrings("", config.backends[0].api_key);
@@ -255,7 +255,7 @@ test "a fetch backend is asked for its key, and raw for none" {
     defer raw.deinit();
 
     var failed: tools.web.Fetch.Provider = .raw;
-    const config = (try fetchConfig(arena, &store, raw, &failed)).?;
+    const config = (try fetchConfig(arena, &store, &raw, &failed)).?;
     try std.testing.expectEqual(@as(usize, 1), config.backends.len);
     try std.testing.expectEqual(tools.web.Fetch.Provider.raw, config.backends[0].provider);
     try std.testing.expectEqualStrings("", config.backends[0].api_key);
@@ -265,7 +265,7 @@ test "a fetch backend is asked for its key, and raw for none" {
     defer naming.deinit();
 
     naming.stored.tools.web_fetch.providers = &.{.tavily};
-    try std.testing.expectError(error.MissingApiKey, fetchConfig(arena, &store, naming, &failed));
+    try std.testing.expectError(error.MissingApiKey, fetchConfig(arena, &store, &naming, &failed));
     try std.testing.expectEqual(tools.web.Fetch.Provider.tavily, failed);
 
     // A set with nothing in it leaves `web_fetch` out of the request.
@@ -273,7 +273,7 @@ test "a fetch backend is asked for its key, and raw for none" {
     defer none.deinit();
 
     none.stored.tools.web_fetch.providers = &.{};
-    try std.testing.expect((try fetchConfig(arena, &store, none, &failed)) == null);
+    try std.testing.expect((try fetchConfig(arena, &store, &none, &failed)) == null);
 }
 
 test "a header names the model the session goes to, not the one billy is pointed at" {
@@ -296,7 +296,7 @@ test "a header names the model the session goes to, not the one billy is pointed
 
     // The choice is the session's own, provider and all, and the window is that
     // model's.
-    const recorded = sessionModel(opened.config, &session);
+    const recorded = sessionModel(&opened.config, &session);
     try std.testing.expectEqualStrings("opencode_go/kimi-k2.7-code", recorded.choice);
     try std.testing.expectEqual(@as(usize, 262_144), recorded.info.?.context_window);
     try std.testing.expectEqual(models.Provider.opencode_go, recorded.info.?.provider);
@@ -305,7 +305,7 @@ test "a header names the model the session goes to, not the one billy is pointed
     // that is what its header names.
     var older = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer older.deinit();
-    const configured = sessionModel(opened.config, &older);
+    const configured = sessionModel(&opened.config, &older);
     try std.testing.expectEqualStrings("deepseek/deepseek-flash", configured.choice);
     try std.testing.expectEqual(@as(usize, 1_000_000), configured.info.?.context_window);
 }

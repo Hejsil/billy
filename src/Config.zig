@@ -245,6 +245,10 @@ pub const Providers = struct {
 /// out of the file are kept in. The configuration owns it, so a caller frees the
 /// whole configuration with `deinit` rather than tracking each string, and every
 /// allocation `open` makes goes through it.
+///
+/// It is why a configuration is never copied: a copy would share this arena
+/// without owning it, and a `deinit` on each would free it twice. It is passed by
+/// pointer, and only the one `init` or `open` made is deinitialised.
 arena: std.heap.ArenaAllocator,
 stored: Stored = .default,
 

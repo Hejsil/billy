@@ -77,8 +77,10 @@ gpa: std.mem.Allocator,
 /// which joins every session's prompt. Both are billy's and outlive the server.
 session_dir: std.Io.Dir,
 config_dir: std.Io.Dir,
-/// The configuration, the keys and the waits every request is built from.
-config: Config,
+/// The configuration every request is built from. It is borrowed from the
+/// frontend that owns it, which outlives the server: a copy would share the
+/// arena, and a `deinit` on each would free it twice.
+config: *const Config,
 store: Credentials,
 health: *Health,
 /// Where billy was started, and the environment it was started in: the home
@@ -94,7 +96,7 @@ backends: Endpoints.Backends,
 /// settled, which a session asked before keeps over it.
 fn options(server: *const Server, mode: Agent.Mode) Agent.Options {
     return .{
-        .config = &server.config,
+        .config = server.config,
         .store = &server.store,
         .behaviour = Agent.Behaviour.fromConfig(server.config),
         .tools = Endpoints.toolSettings(server.config, server.backends, server.health),
@@ -1016,8 +1018,10 @@ const TestServer = struct {
     /// connection has, built once so a test drives what is really there.
     server: Server,
     tmp: std.testing.TmpDir,
-    /// The configuration the server points at, freed with it.
-    config: Config,
+    /// The configuration the server points at, owned here and freed with this
+    /// test server. Allocated, so the server points at a value that does not move
+    /// with this struct.
+    config: *Config,
     /// The environment the server reads, which a route asks for `HOME`. It is
     /// held by pointer and allocated, so the address the server was given stays
     /// the map's when this value is moved out of `init`.
@@ -1036,7 +1040,10 @@ const TestServer = struct {
         errdefer tmp.cleanup();
 
         const sessions = try tmp.dir.createDirPathOpen(std.testing.io, "sessions", .{});
-        const config = Config.init(gpa);
+        const config = try gpa.create(Config);
+        errdefer gpa.destroy(config);
+        config.* = Config.init(gpa);
+        errdefer config.deinit();
         const environ = try gpa.create(std.process.Environ.Map);
         errdefer gpa.destroy(environ);
         environ.* = .init(gpa);
@@ -1076,6 +1083,7 @@ const TestServer = struct {
         server.health.deinit();
         std.testing.allocator.destroy(server.health);
         server.config.deinit();
+        std.testing.allocator.destroy(server.config);
         server.environ.deinit();
         std.testing.allocator.destroy(server.environ);
         server.tmp.cleanup();
