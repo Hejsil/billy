@@ -33,18 +33,22 @@ pub const Backends = struct {
     /// backend it names cannot be built: the configuration asked for the tool,
     /// so leaving it out without a word would look like a bug.
     pub fn build(arena: std.mem.Allocator, config: *const Config, credentials: *const Credentials) !Backends {
-        // Which backend each set is built from, remembered so the report can
-        // name it: only the builder knows which provider it was on.
-        var search_failed: Tools.web.Provider = .tavily;
-        const search_config = searchConfig(arena, credentials, config, &search_failed) catch |err| {
-            reportSearchFailure(err, search_failed);
-            return report.Reported;
+        const search_config = switch (try searchConfig(arena, credentials, config)) {
+            .none => null,
+            .config => |settings| settings,
+            .failed => |failed| {
+                reportSearchFailure(failed.err, failed.provider);
+                return report.Reported;
+            },
         };
 
-        var fetch_failed: Tools.web.Provider = .raw;
-        const fetch_config = fetchConfig(arena, credentials, config, &fetch_failed) catch |err| {
-            reportFetchFailure(err, fetch_failed);
-            return report.Reported;
+        const fetch_config = switch (try fetchConfig(arena, credentials, config)) {
+            .none => null,
+            .config => |settings| settings,
+            .failed => |failed| {
+                reportFetchFailure(failed.err, failed.provider);
+                return report.Reported;
+            },
         };
 
         return .{ .search = search_config, .fetch = fetch_config };
@@ -80,73 +84,95 @@ pub fn toolSettings(config: *const Config, backends: Backends, health: ?*Health)
     };
 }
 
-/// The web search settings for a configuration that names a backend, or null
-/// when it names none. A backend named without its key is an error rather than a
-/// silent "no search": the configuration asked for the tool, and leaving it out
-/// without a word would look like a bug.
+/// What resolving one tool's backends came to: nothing configured, the settings,
+/// or the provider that could not be built and why. The failure carries the
+/// provider, so the caller can report it by name without an out-parameter.
+fn Resolution(comptime T: type) type {
+    return union(enum) {
+        none,
+        config: T,
+        failed: Failure,
+    };
+}
+
+const Failure = struct {
+    provider: Tools.web.Provider,
+    err: anyerror,
+};
+
+/// The web search settings for a configuration that names a backend, or `.none`
+/// when it names none. A backend named without its key is a failure rather than
+/// a silent "no search": the configuration asked for the tool, and leaving it
+/// out without a word would look like a bug.
 ///
-/// The report of what went wrong is written here rather than by the caller, so
-/// naming the backend that is at fault does not need an out-parameter: only this
-/// function knows which provider it was on.
+/// The failure carries the provider it was on, since only this function knows
+/// which one it was; the caller reports it by that name.
 fn searchConfig(
     arena: std.mem.Allocator,
     credentials: *const Credentials,
     config: *const Config,
-    failed: *Tools.web.Provider,
-) !?Tools.web.Search.Config {
+) !Resolution(Tools.web.Search.Config) {
     const web_config = config.stored.tools.web_search;
-    if (web_config.providers.len == 0) return null;
+    if (web_config.providers.len == 0) return .none;
 
     // Each backend resolves its own key, or, for the one that is self-hosted,
     // needs the instance named instead.
     const backends = try arena.alloc(Tools.web.Search.Backend, web_config.providers.len);
     for (web_config.providers, backends) |provider, *backend| {
-        failed.* = provider;
         const service = provider.service();
         backend.* = .{
             .provider = provider,
             .api_key = if (service) |name|
-                credentials.get(name) orelse return error.MissingApiKey
+                credentials.get(name) orelse return .{ .failed = .{
+                    .provider = provider,
+                    .err = error.MissingApiKey,
+                } }
             else blk: {
                 // A backend billy knows the address of needs only its key; one it
                 // does not, SearXNG, needs the instance named.
-                const url = web_config.searxng.url orelse
-                    return error.MissingSearchUrl;
-                if (url.len == 0) return error.MissingSearchUrl;
+                const url = web_config.searxng.url orelse return .{ .failed = .{
+                    .provider = provider,
+                    .err = error.MissingSearchUrl,
+                } };
+                if (url.len == 0) return .{ .failed = .{
+                    .provider = provider,
+                    .err = error.MissingSearchUrl,
+                } };
                 break :blk "";
             },
             // Only a self-hosted backend is reached somewhere billy does not know.
             .endpoint = if (service == null) web_config.searxng.url else null,
         };
     }
-    return .{ .backends = backends, .max_results = web_config.max_results };
+    return .{ .config = .{ .backends = backends, .max_results = web_config.max_results } };
 }
 
-/// The web fetch settings for a configuration that names a backend, or null when
-/// it names none. `raw` needs no key, so a configuration that holds only it
+/// The web fetch settings for a configuration that names a backend, or `.none`
+/// when it names none. `raw` needs no key, so a configuration that holds only it
 /// fetches without a service.
-pub fn fetchConfig(
+fn fetchConfig(
     arena: std.mem.Allocator,
     credentials: *const Credentials,
     config: *const Config,
-    failed: *Tools.web.Provider,
-) !?Tools.web.Fetch.Config {
+) !Resolution(Tools.web.Fetch.Config) {
     const web_config = config.stored.tools.web_fetch;
-    if (web_config.providers.len == 0) return null;
+    if (web_config.providers.len == 0) return .none;
 
     const backends = try arena.alloc(Tools.web.Fetch.Backend, web_config.providers.len);
     for (web_config.providers, backends) |provider, *backend| {
-        failed.* = provider;
         const service = provider.service();
         backend.* = .{
             .provider = provider,
             .api_key = if (service) |name|
-                credentials.get(name) orelse return error.MissingApiKey
+                credentials.get(name) orelse return .{ .failed = .{
+                    .provider = provider,
+                    .err = error.MissingApiKey,
+                } }
             else
                 "",
         };
     }
-    return .{ .backends = backends };
+    return .{ .config = .{ .backends = backends } };
 }
 
 /// Tells the user what to fix about the search backend that could not be built:
@@ -212,8 +238,7 @@ test "each backend resolves its own key, and SearXNG its instance" {
     // Nothing named is no search at all.
     var off = Config.init(gpa);
     defer off.deinit();
-    var failed: Tools.web.Provider = .tavily;
-    try std.testing.expect((try searchConfig(arena, &credentials, &off, &failed)) == null);
+    try std.testing.expect((try searchConfig(arena, &credentials, &off)) == .none);
 
     // A backend billy knows is asked for a key, and one that is not set is an
     // error rather than a silent "no search".
@@ -221,20 +246,26 @@ test "each backend resolves its own key, and SearXNG its instance" {
     defer naming.deinit();
 
     naming.stored.tools.web_search.providers = &.{.tavily};
-    try std.testing.expectError(error.MissingApiKey, searchConfig(arena, &credentials, &naming, &failed));
-    // The backend at fault is the one the report names.
-    try std.testing.expectEqual(Tools.web.Provider.tavily, failed);
+    // The backend at fault is the one the failure carries, for the report to
+    // name.
+    const missing_key = try searchConfig(arena, &credentials, &naming);
+    try std.testing.expect(missing_key == .failed);
+    try std.testing.expectEqual(error.MissingApiKey, missing_key.failed.err);
+    try std.testing.expectEqual(Tools.web.Provider.tavily, missing_key.failed.provider);
 
     // SearXNG needs no key, but needs the instance named.
     var searx = Config.init(gpa);
     defer searx.deinit();
 
     searx.stored.tools.web_search.providers = &.{.searxng};
-    try std.testing.expectError(error.MissingSearchUrl, searchConfig(arena, &credentials, &searx, &failed));
+    const missing_url = try searchConfig(arena, &credentials, &searx);
+    try std.testing.expect(missing_url == .failed);
+    try std.testing.expectEqual(error.MissingSearchUrl, missing_url.failed.err);
+    try std.testing.expectEqual(Tools.web.Provider.searxng, missing_url.failed.provider);
 
     // Every named backend becomes a backend to try, in the order named.
     searx.stored.tools.web_search.searxng.url = "https://searx.example.org";
-    const config = (try searchConfig(arena, &credentials, &searx, &failed)).?;
+    const config = (try searchConfig(arena, &credentials, &searx)).config;
     try std.testing.expectEqual(@as(usize, 1), config.backends.len);
     try std.testing.expectEqual(Tools.web.Provider.searxng, config.backends[0].provider);
     try std.testing.expectEqualStrings("", config.backends[0].api_key);
@@ -256,8 +287,7 @@ test "a fetch backend is asked for its key, and raw for none" {
     var raw = Config.init(gpa);
     defer raw.deinit();
 
-    var failed: Tools.web.Provider = .raw;
-    const config = (try fetchConfig(arena, &credentials, &raw, &failed)).?;
+    const config = (try fetchConfig(arena, &credentials, &raw)).config;
     try std.testing.expectEqual(@as(usize, 1), config.backends.len);
     try std.testing.expectEqual(Tools.web.Provider.raw, config.backends[0].provider);
     try std.testing.expectEqualStrings("", config.backends[0].api_key);
@@ -267,15 +297,17 @@ test "a fetch backend is asked for its key, and raw for none" {
     defer naming.deinit();
 
     naming.stored.tools.web_fetch.providers = &.{.tavily};
-    try std.testing.expectError(error.MissingApiKey, fetchConfig(arena, &credentials, &naming, &failed));
-    try std.testing.expectEqual(Tools.web.Provider.tavily, failed);
+    const missing_key = try fetchConfig(arena, &credentials, &naming);
+    try std.testing.expect(missing_key == .failed);
+    try std.testing.expectEqual(error.MissingApiKey, missing_key.failed.err);
+    try std.testing.expectEqual(Tools.web.Provider.tavily, missing_key.failed.provider);
 
     // A set with nothing in it leaves `web_fetch` out of the request.
     var none = Config.init(gpa);
     defer none.deinit();
 
     none.stored.tools.web_fetch.providers = &.{};
-    try std.testing.expect((try fetchConfig(arena, &credentials, &none, &failed)) == null);
+    try std.testing.expect((try fetchConfig(arena, &credentials, &none)) == .none);
 }
 
 test "a header names the model the session goes to, not the one billy is pointed at" {
