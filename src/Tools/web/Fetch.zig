@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const Health = @import("../../Health.zig");
-const tools = @import("../../Tools.zig");
+const Tools = @import("../../Tools.zig");
 const web = @import("../web.zig");
 const Mock = @import("../../Mock.zig");
 
@@ -44,9 +44,9 @@ raw: bool = false,
 /// tool's: the model asked for something that is not there, and is told why so
 /// it can ask for another address, rather than the turn stopping under it.
 pub fn run(fetch: Fetch, gpa: std.mem.Allocator, http_client: *std.http.Client, config: ?Config, health: ?*Health, out: *std.Io.Writer) !void {
-    if (fetch.url.len == 0) return tools.fail(out, "no url to fetch", .{});
+    if (fetch.url.len == 0) return Tools.fail(out, "no url to fetch", .{});
 
-    const fetch_config = config orelse return tools.fail(
+    const fetch_config = config orelse return Tools.fail(
         out,
         "web fetch is not configured",
         .{},
@@ -97,17 +97,17 @@ pub fn run(fetch: Fetch, gpa: std.mem.Allocator, http_client: *std.http.Client, 
             },
         }
     }
-    if (failed) |err| return tools.fail(out, "fetch failed: {s}", .{@errorName(err)});
+    if (failed) |err| return Tools.fail(out, "fetch failed: {s}", .{@errorName(err)});
     // A backend answered and could not read this url, so it is read directly: a
     // page billy can reach itself is still worth having. A set with no backend
     // in it asks for no extraction at all, so that is where it ends.
     if (unreadable) return readDirectly(gpa, http_client, fetch.url, out);
-    if (fetch_config.backends.len == 0) return tools.fail(
+    if (fetch_config.backends.len == 0) return Tools.fail(
         out,
         "no fetch backend is configured; add one to tools.web_fetch.providers, or pass raw",
         .{},
     );
-    return tools.fail(out, "every fetch backend is set aside after failing; wait", .{});
+    return Tools.fail(out, "every fetch backend is set aside after failing; wait", .{});
 }
 
 /// Reads `url` with no backend at all, which is what a fetch falls back to when
@@ -120,7 +120,7 @@ pub fn run(fetch: Fetch, gpa: std.mem.Allocator, http_client: *std.http.Client, 
 fn readDirectly(gpa: std.mem.Allocator, http_client: *std.http.Client, url: []const u8, out: *std.Io.Writer) !void {
     // The raw provider is the url itself: no service, no key, no extraction.
     const answer = fetchBackend(gpa, http_client, .{ .provider = .raw }, url) catch |err|
-        return tools.fail(out, "cannot read {s}: {s}", .{ url, @errorName(err) });
+        return Tools.fail(out, "cannot read {s}: {s}", .{ url, @errorName(err) });
     switch (answer) {
         .text => |text| {
             defer gpa.free(text);
@@ -129,7 +129,7 @@ fn readDirectly(gpa: std.mem.Allocator, http_client: *std.http.Client, url: []co
         // A provider that answered with a wait answered: it is not broken, and
         // there is nothing for it to wait for here, since the next call reads
         // the url afresh.
-        .retry_after_ms => |ms| return tools.fail(
+        .retry_after_ms => |ms| return Tools.fail(
             out,
             "{s} asked to be waited {d}ms before it is read again",
             .{ url, ms },

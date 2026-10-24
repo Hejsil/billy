@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const models = @import("models.zig");
-const toolset = @import("Tools.zig");
+const Tools = @import("Tools.zig");
 
 const Config = @This();
 
@@ -27,7 +27,7 @@ pub const Opened = struct {
 };
 
 /// Settings for the tools the agent can call, one group per tool.
-pub const Tools = struct {
+pub const ToolSettings = struct {
     bash: Bash = .{},
     web_search: WebSearch = .{},
     web_fetch: WebFetch = .{},
@@ -44,7 +44,7 @@ pub const WebFetch = struct {
     ///
     /// The key a backend needs is read from the credential `billy login` stored
     /// for it, or from its environment variable when none is stored.
-    providers: []const toolset.web.Provider = &.{.raw},
+    providers: []const Tools.web.Provider = &.{.raw},
 };
 
 /// Settings for the web search tool.
@@ -60,7 +60,7 @@ pub const WebSearch = struct {
     /// The key a backend needs is read from the credential `billy login` stored
     /// for it, or from its environment variable when none is stored, and never
     /// from this file, which is written to disk in the clear.
-    providers: []const toolset.web.Provider = &.{},
+    providers: []const Tools.web.Provider = &.{},
     /// Results asked for per query. The backend may return fewer, and billy caps
     /// it.
     max_results: usize = 5,
@@ -125,7 +125,7 @@ const Stored = struct {
     /// first turn, so the web frontend can list it by name. Off asks for none,
     /// and a session is then listed by its id.
     title: bool = true,
-    tools: Tools = .{},
+    tools: ToolSettings = .{},
 
     const default = Stored{};
 
@@ -553,7 +553,7 @@ test "open reads a self-hosted backend's instance from the file" {
     var opened = try openFrom(&tmp, "{\"tools\":{\"web_search\":{" ++
         "\"providers\":[\"searxng\"],\"searxng\":{\"url\":\"https://searx.example.org\"}}}}");
     defer opened.config.deinit();
-    try std.testing.expectEqual(toolset.web.Provider.searxng, opened.config.stored.tools.web_search.providers[0]);
+    try std.testing.expectEqual(Tools.web.Provider.searxng, opened.config.stored.tools.web_search.providers[0]);
     try std.testing.expectEqualStrings("https://searx.example.org", opened.config.stored.tools.web_search.searxng.url.?);
 
     var known = try openFrom(&tmp, "{\"tools\":{\"web_search\":{\"providers\":[\"exa\"]}}}");
@@ -570,7 +570,7 @@ test "open reads the web search backends and result count from the file" {
     var opened = try openFrom(&tmp, "{\"tools\":{\"web_search\":{" ++
         "\"providers\":[\"tavily\",\"brave\"],\"max_results\":3}}}");
     defer opened.config.deinit();
-    try std.testing.expectEqualSlices(toolset.web.Provider, &.{ .tavily, .brave }, opened.config.stored.tools.web_search.providers);
+    try std.testing.expectEqualSlices(Tools.web.Provider, &.{ .tavily, .brave }, opened.config.stored.tools.web_search.providers);
     try std.testing.expectEqual(3, opened.config.stored.tools.web_search.max_results);
 
     // The defaults leave it off, and the count ready for a backend to be named.
@@ -663,7 +663,7 @@ test "save round-trips a configured search backend" {
 
     var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
     defer opened.config.deinit();
-    try std.testing.expectEqual(toolset.web.Provider.tavily, opened.config.stored.tools.web_search.providers[0]);
+    try std.testing.expectEqual(Tools.web.Provider.tavily, opened.config.stored.tools.web_search.providers[0]);
     try std.testing.expectEqual(4, opened.config.stored.tools.web_search.max_results);
 }
 

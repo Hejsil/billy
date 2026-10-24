@@ -5,7 +5,7 @@ const llm = @import("llm.zig");
 const Health = @import("Health.zig");
 const Terminal = @import("Terminal.zig");
 const Session = @import("Session.zig");
-const agent = @import("Agent.zig");
+const Agent = @import("Agent.zig");
 const Bash = @import("Tools/Bash.zig");
 const Edit = @import("Tools/Edit.zig");
 const Read = @import("Tools/Read.zig");
@@ -109,7 +109,7 @@ pub fn hasWeb(tools: *const Tools) bool {
 
 /// The definitions a session is given: the tools the mode allows, with the web
 /// tools last when a backend is configured. Comptime strings, so nothing is built.
-pub fn definitions(tools: *const Tools, mode: agent.Mode) []const Session.Definition {
+pub fn definitions(tools: *const Tools, mode: Agent.Mode) []const Session.Definition {
     return switch (mode) {
         .general => if (tools.hasWeb()) &general_specs_with_web else &general_specs,
         .chat => if (tools.hasWeb()) &chat_specs_with_web else &chat_specs,
@@ -121,7 +121,7 @@ pub fn definitions(tools: *const Tools, mode: agent.Mode) []const Session.Defini
 /// A name the table does not hold is a tool billy does not implement, which the
 /// call reports as unknown; it is not refused here, so the model is told that
 /// rather than that the mode forbids it.
-pub fn allows(mode: agent.Mode, name: []const u8) bool {
+pub fn allows(mode: Agent.Mode, name: []const u8) bool {
     for (table) |tool| {
         if (std.mem.eql(u8, @tagName(tool.tag), name)) return tool.modes.contains(mode);
     }
@@ -507,7 +507,7 @@ const Tool = struct {
     web: bool = false,
     /// The modes that may offer and run the tool. Spelled out for every tool, so
     /// a destructive one cannot be allowed in chat by nobody remembering it.
-    modes: std.enums.EnumSet(agent.Mode),
+    modes: std.enums.EnumSet(Agent.Mode),
 };
 
 /// Every tool billy implements, in the order the model is offered them. A `Call`
@@ -656,7 +656,7 @@ fn specsCount(comptime with_web: bool) usize {
 /// result is the table's own strings and nothing is built at run time. Returned
 /// by value: a slice would point into a comptime local, which a global const may
 /// not hold.
-fn allowedSpecs(comptime with_web: bool, comptime mode: agent.Mode) [allowedCount(with_web, mode)]Session.Definition {
+fn allowedSpecs(comptime with_web: bool, comptime mode: Agent.Mode) [allowedCount(with_web, mode)]Session.Definition {
     var list: [allowedCount(with_web, mode)]Session.Definition = undefined;
     var n: usize = 0;
     for (specList(with_web)) |spec| {
@@ -668,7 +668,7 @@ fn allowedSpecs(comptime with_web: bool, comptime mode: agent.Mode) [allowedCoun
 }
 
 /// How many of `with_web` the mode allows.
-fn allowedCount(comptime with_web: bool, comptime mode: agent.Mode) usize {
+fn allowedCount(comptime with_web: bool, comptime mode: Agent.Mode) usize {
     var n: usize = 0;
     for (specList(with_web)) |spec| {
         if (tableForName(spec.name).modes.contains(mode)) n += 1;
@@ -904,7 +904,7 @@ test "the one table decides what each mode offers and runs" {
 
     // What a mode offers is exactly the table's rows it allows.
     var plain = try testTools(false);
-    for ([_]agent.Mode{ .general, .chat }) |mode| {
+    for ([_]Agent.Mode{ .general, .chat }) |mode| {
         var expected: usize = 0;
         for (table) |tool| {
             if (!tool.web and tool.modes.contains(mode)) expected += 1;

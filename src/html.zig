@@ -14,8 +14,8 @@
 //! it ran and what it produced.
 
 const std = @import("std");
-const agent = @import("Agent.zig");
-const diffing = @import("diff.zig");
+const Agent = @import("Agent.zig");
+const diff = @import("diff.zig");
 const md = @import("md.zig");
 const models = @import("models.zig");
 const favicons = @import("web/favicons.zig");
@@ -431,7 +431,7 @@ fn schemeOf(url: []const u8, buffer: []u8) []const u8 {
 }
 
 /// Writes an edit's diff as a `<pre>` of marked lines.
-pub fn diff(lines: []const diffing.Line, out: *std.Io.Writer) !void {
+pub fn diffLines(lines: []const diff.Line, out: *std.Io.Writer) !void {
     try out.writeAll("<pre class=\"diff\">");
     for (lines) |line| {
         switch (line.kind) {
@@ -713,12 +713,12 @@ test "raw HTML in the text stays text" {
 
 test "a diff is written as lines that name their side" {
     const gpa = std.testing.allocator;
-    const lines = try diffing.lines(gpa, "a\nb\nc", "a\nx\nc");
+    const lines = try diff.lines(gpa, "a\nb\nc", "a\nx\nc");
     defer gpa.free(lines);
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try diff(lines, &out.writer);
+    try diffLines(lines, &out.writer);
 
     try std.testing.expectEqualStrings(
         "<pre class=\"diff\">" ++
@@ -733,12 +733,12 @@ test "a diff is written as lines that name their side" {
 
 test "a diff of code is escaped like any other text" {
     const gpa = std.testing.allocator;
-    const lines = try diffing.lines(gpa, "if (a < b) {", "if (a > b) {");
+    const lines = try diff.lines(gpa, "if (a < b) {", "if (a > b) {");
     defer gpa.free(lines);
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try diff(lines, &out.writer);
+    try diffLines(lines, &out.writer);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "a &lt; b") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "a &gt; b") != null);
     // The tags of the diff itself are still tags.
@@ -768,7 +768,7 @@ const Status = union(enum) {
 };
 
 /// Whether `call` is a bash call, the only kind with an exit status to show.
-fn hasStatus(call: Tools.Call) bool {
+fn showsStatus(call: Tools.Call) bool {
     return switch (call) {
         .bash => true,
         else => false,
@@ -862,9 +862,9 @@ fn toolBody(gpa: std.mem.Allocator, call: Tools.Call, result: []const u8, out: *
         // The change the call means to make, from the call alone, so a replayed
         // session shows the same diff the run did.
         .edit => |args| {
-            const lines = try diffing.lines(gpa, args.old_string, args.new_string);
+            const lines = try diff.lines(gpa, args.old_string, args.new_string);
             defer gpa.free(lines);
-            if (lines.len > 0) try diff(lines, out);
+            if (lines.len > 0) try diffLines(lines, out);
         },
         // A bash call shows the command it runs, as the model wrote it. The
         // terminal lays it out with a format script; a page has no need of one.
@@ -922,7 +922,7 @@ fn toolResult(call: Tools.Call, result: []const u8, out: *std.Io.Writer) !void {
 ///
 /// `gpa` is for what showing a block builds, which is an edit's diff; it is the
 /// caller's, freed before this returns.
-pub fn block(gpa: std.mem.Allocator, b: agent.Block, out: *std.Io.Writer) !void {
+pub fn block(gpa: std.mem.Allocator, b: Agent.Block, out: *std.Io.Writer) !void {
     switch (b) {
         .prompt => |text| try titled(gpa, "»", "prompt", text, out),
         .answer => |text| try titled(gpa, "◆", "answer", text, out),
@@ -940,7 +940,7 @@ pub fn block(gpa: std.mem.Allocator, b: agent.Block, out: *std.Io.Writer) !void 
             // result replaces with the status when it arrives. Only bash has a
             // status, so any other tool shows no pill. A call has no result yet,
             // so a search shows no favicons while it runs.
-            try toolSummary(call, "", if (hasStatus(call)) .running else null, out);
+            try toolSummary(call, "", if (showsStatus(call)) .running else null, out);
             // What the call means to do is already known, so it is shown while
             // the call runs: the command a bash call is about to run, and the
             // change an edit means to make. Without it a long command would be
@@ -952,7 +952,7 @@ pub fn block(gpa: std.mem.Allocator, b: agent.Block, out: *std.Io.Writer) !void 
             try out.writeAll("</div></details>\n");
         },
         .tool_end => |tool| {
-            const status: ?Status = if (hasStatus(tool.call))
+            const status: ?Status = if (showsStatus(tool.call))
                 .{ .finished = if (Tools.bashOutput(tool.result)) |output| output.exit else null }
             else
                 null;
@@ -967,7 +967,7 @@ pub fn block(gpa: std.mem.Allocator, b: agent.Block, out: *std.Io.Writer) !void 
         // line the terminal shows it as.
         .compacted => try element("div", "compacted", "⊟ compacted", out),
         .notice => |text| try element("div", "notice", text, out),
-        .elided => |count| try out.print("<div class=\"elided\">… {d} earlier blocks</div>\n", .{count}),
+        .hidden => |count| try out.print("<div class=\"elided\">… {d} earlier blocks</div>\n", .{count}),
     }
 }
 
@@ -1360,7 +1360,7 @@ test "the blocks of a run are each rendered as what they are" {
     try std.testing.expectEqualStrings("<div class=\"notice\">stopped after 3 turns</div>\n", out.written());
     out.clearRetainingCapacity();
 
-    try block(gpa, .{ .elided = 7 }, &out.writer);
+    try block(gpa, .{ .hidden = 7 }, &out.writer);
     try std.testing.expectEqualStrings("<div class=\"elided\">… 7 earlier blocks</div>\n", out.written());
 }
 
@@ -1384,7 +1384,7 @@ pub fn conversation(
     out: *std.Io.Writer,
 ) !void {
     var page = Page{ .gpa = gpa, .out = out };
-    try agent.walk(gpa, session, blocks, page.emitter());
+    try Agent.walk(gpa, session, blocks, page.emitter());
 }
 
 /// Shows each block of a conversation as its element. It is the emitter `walk`
@@ -1394,15 +1394,15 @@ const Page = struct {
     out: *std.Io.Writer,
     /// The emitter `walk` shows through. A written conversation is not watched,
     /// so nothing reads its count; the interface holds it all the same.
-    interface: agent.Emitter = .{ .vtable = &vtable },
+    interface: Agent.Emitter = .{ .vtable = &vtable },
 
-    const vtable: agent.Emitter.VTable = .{ .block = show };
+    const vtable: Agent.Emitter.VTable = .{ .block = show };
 
-    fn emitter(self: *Page) *agent.Emitter {
+    fn emitter(self: *Page) *Agent.Emitter {
         return &self.interface;
     }
 
-    fn show(e: *agent.Emitter, b: agent.Block) anyerror!void {
+    fn show(e: *Agent.Emitter, b: Agent.Block) anyerror!void {
         const page: *Page = @alignCast(@fieldParentPtr("interface", e));
         // A tool call is written from its `tool_end`, which is the whole call --
         // head, body and status. The `tool_begin` half exists only for a stream
@@ -1513,16 +1513,16 @@ pub fn header(h: Header, out: *std.Io.Writer) !void {
     // The directory is shortened by a helper that writes rather than returns, so
     // its output is escaped on the way to the page.
     var path = Escaping.init(out);
-    try agent.displayPath(&path.writer, h.cwd, h.home);
+    try Agent.displayPath(&path.writer, h.cwd, h.home);
     try out.writeAll("</span>");
 
     if (h.model_info) |info| {
         try out.writeAll("<span class=\"sep\">·</span><span class=\"gauge\">");
-        try agent.formatTokens(out, h.context_tokens);
+        try Agent.formatTokens(out, h.context_tokens);
         try out.writeAll("/");
-        try agent.formatTokens(out, info.context_window);
+        try Agent.formatTokens(out, info.context_window);
         try out.writeAll(" (");
-        try agent.formatPercent(out, h.context_tokens, info.context_window);
+        try Agent.formatPercent(out, h.context_tokens, info.context_window);
         try out.writeAll(")</span>");
     }
     try out.writeAll("</div>\n");

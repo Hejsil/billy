@@ -2,7 +2,7 @@
 //! reply's markdown laid out by the built-in renderer, and the tools printed as
 //! they were written.
 const std = @import("std");
-const agent = @import("Agent.zig");
+const Agent = @import("Agent.zig");
 
 pub const tool = @import("Terminal/tool.zig");
 
@@ -31,11 +31,11 @@ reasoning: bool = false,
 reasoning_at_line_start: bool = true,
 /// The emitter the run shows through. It holds the count of what it showed, and
 /// its callbacks reach this terminal through the field.
-interface: agent.Emitter = .{ .vtable = &vtable },
+interface: Agent.Emitter = .{ .vtable = &vtable },
 
-const vtable: agent.Emitter.VTable = .{ .block = show, .delta = showDelta };
+const vtable: Agent.Emitter.VTable = .{ .block = show, .delta = showDelta };
 
-pub fn emitter(self: *Terminal) *agent.Emitter {
+pub fn emitter(self: *Terminal) *Agent.Emitter {
     return &self.interface;
 }
 
@@ -52,7 +52,7 @@ pub fn deinit(self: *Terminal) void {
 /// appears as it is thought. The first answer fragment ends it, opens the answer
 /// block, and continues there. Each fragment is flushed at once, which is what
 /// puts it on screen before the model has finished.
-fn showDelta(e: *agent.Emitter, delta: agent.Delta) anyerror!void {
+fn showDelta(e: *Agent.Emitter, delta: Agent.Delta) anyerror!void {
     const self = selfOf(e);
 
     if (delta.reasoning) |text| {
@@ -138,7 +138,7 @@ fn dropStream(self: *Terminal) void {
 /// editor's prompt has a row between it and the block above. A tool call is two
 /// blocks: the head ends with its own line alone, since the result continues
 /// it, and the result ends the call with the blank line.
-fn show(e: *agent.Emitter, block: agent.Block) anyerror!void {
+fn show(e: *Agent.Emitter, block: Agent.Block) anyerror!void {
     const self = selfOf(e);
     switch (block) {
         .prompt => |text| {
@@ -192,7 +192,7 @@ fn show(e: *agent.Emitter, block: agent.Block) anyerror!void {
             try self.writer.print("{s}\n\n", .{text});
             try self.writer.flush();
         },
-        .elided => |count| {
+        .hidden => |count| {
             try self.endReasoning();
             self.dropStream();
             try printElided(count, self.writer);
@@ -200,7 +200,7 @@ fn show(e: *agent.Emitter, block: agent.Block) anyerror!void {
     }
 }
 
-fn selfOf(e: *agent.Emitter) *Terminal {
+fn selfOf(e: *Agent.Emitter) *Terminal {
     return @alignCast(@fieldParentPtr("interface", e));
 }
 

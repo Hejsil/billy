@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const Health = @import("../../Health.zig");
-const tools = @import("../../Tools.zig");
+const Tools = @import("../../Tools.zig");
 const Mock = @import("../../Mock.zig");
 const web = @import("../web.zig");
 
@@ -40,7 +40,7 @@ query: []const u8,
 /// only when a resumed session carries the tool from a run that had one; the
 /// model is told so rather than the call failing outright.
 pub fn run(search: Search, gpa: std.mem.Allocator, http_client: *std.http.Client, config: ?Config, health: ?*Health, out: *std.Io.Writer) !void {
-    const search_config = config orelse return tools.fail(
+    const search_config = config orelse return Tools.fail(
         out,
         "web search is not configured",
         .{},
@@ -75,16 +75,16 @@ pub fn run(search: Search, gpa: std.mem.Allocator, http_client: *std.http.Client
         }
     }
     // Every backend that could be asked was tried and failed.
-    if (failed) |err| return tools.fail(out, "search failed: {s}", .{@errorName(err)});
+    if (failed) |err| return Tools.fail(out, "search failed: {s}", .{@errorName(err)});
     // A set with no backend in it names nothing to try, so nothing failed and
     // nothing was set aside. Only a session carrying the tool from a run that
     // had a backend reaches this.
-    if (search_config.backends.len == 0) return tools.fail(
+    if (search_config.backends.len == 0) return Tools.fail(
         out,
         "no search backend is configured; add one to tools.web_search.providers",
         .{},
     );
-    return tools.fail(
+    return Tools.fail(
         out,
         "every search backend is set aside after failing; add another to tools.web_search.providers, or wait",
         .{},

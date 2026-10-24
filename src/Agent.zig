@@ -46,11 +46,12 @@ const Target = Endpoint.Target;
 /// came from. What a run shows is written through the frontend's writer, which
 /// carries the style, so the run needs nothing here to be shown plainly.
 pub const Options = struct {
-    /// The configuration a session's model is resolved with, and the keys stored
-    /// for the providers it names. Borrowed from the frontend, which owns both and
-    /// outlives the run: resolving a target needs nothing else.
+    /// The configuration a session's model is resolved with. Borrowed from the
+    /// frontend, which owns it and outlives the run.
     config: *const Config,
-    store: *const Credentials,
+    /// The keys stored for the providers it names, borrowed on the same terms:
+    /// resolving a target needs nothing else.
+    credentials: *const Credentials,
     behaviour: Behaviour,
     tools: Tools.Settings,
     /// The mode the run starts in, which is the frontend's choice until the
@@ -66,7 +67,7 @@ pub const Options = struct {
 };
 
 /// How the agent behaves on a session: how many turns it gives the model before
-/// giving up, how full the window may get before the conversation is folded into
+/// giving up, how full the window may get before the conversation is compacted into
 /// a summary, and whether it asks the model for a name for the session.
 pub const Behaviour = struct {
     /// Model turns allowed for one request before the harness gives up on it.
@@ -82,7 +83,7 @@ pub const Behaviour = struct {
     title: bool = true,
 
     /// How a run's agent behaves: the turns it gives the model, the share of the
-    /// window it fills before the conversation is folded into a summary, and whether
+    /// window it fills before the conversation is compacted into a summary, and whether
     /// it names the session. Where each turn is sent is resolved separately, as
     /// `sessionModel`, and what its tools run with as `toolSettings`.
     pub fn fromConfig(config: *const Config) Behaviour {
@@ -124,7 +125,7 @@ pub const Block = union(enum) {
     /// How many blocks a shortened conversation left out, shown where they would
     /// have been. Zero is never shown, since a conversation with nothing left out
     /// has nothing to say.
-    elided: usize,
+    hidden: usize,
 
     pub const Tool = struct {
         /// The call as it was parsed, which is what a frontend shows to say what
@@ -263,7 +264,7 @@ fn projectInstructions(io: std.Io, out: *std.Io.Writer, dir: std.Io.Dir) !bool {
         if (try instructionsIn(io, out, current, &instruction_files, "The project's"))
             return true;
         // The repository root is the last directory searched.
-        if (dirHas(io, current, ".git")) return false;
+        if (holds(io, current, ".git")) return false;
 
         // The parent is opened rather than derived from a path, so the walk
         // keeps no path string and follows the filesystem's own notion of a
@@ -296,7 +297,7 @@ fn globalInstructions(io: std.Io, out: *std.Io.Writer, dir: std.Io.Dir) !bool {
 }
 
 /// Whether `dir` holds an entry named `name`.
-fn dirHas(io: std.Io, dir: std.Io.Dir, name: []const u8) bool {
+fn holds(io: std.Io, dir: std.Io.Dir, name: []const u8) bool {
     _ = dir.statFile(io, name, .{}) catch return false;
     return true;
 }
@@ -424,10 +425,11 @@ io: std.Io,
 gpa: std.mem.Allocator,
 /// How the agent behaves on the session, which is the configuration's say.
 behaviour: Behaviour,
-/// What a turn's target is resolved from: the providers the configuration names
-/// and the keys stored for them. Borrowed, and read before every turn.
+/// What a turn's target is resolved from: the providers the configuration names.
+/// Borrowed, and read before every turn.
 config: *const Config,
-store: *const Credentials,
+/// The keys stored for those providers, borrowed on the same terms.
+credentials: *const Credentials,
 /// The HTTP client every request of the run is sent over, borrowed from the
 /// frontend that owns it, so connections and certificates are shared.
 http: *std.http.Client,
@@ -479,7 +481,7 @@ pub fn init(
         .gpa = gpa,
         .behaviour = options.behaviour,
         .config = options.config,
-        .store = options.store,
+        .credentials = options.credentials,
         .http = http_client,
         .target_state = std.heap.ArenaAllocator.init(gpa),
         .instructions = options.instructions,
@@ -536,7 +538,7 @@ fn targetFor(agent: *Agent, session: *Session) !Target {
     _ = agent.target_state.reset(.retain_capacity);
     const choice = session.modelChoice(agent.config.stored.model);
     if (session.model() == null) try session.setModel(choice);
-    return Endpoint.targetFor(agent.config, agent.store, agent.target_state.allocator(), choice);
+    return Endpoint.targetFor(agent.config, agent.credentials, agent.target_state.allocator(), choice);
 }
 
 /// The client one turn is sent with, built from where the session's model points
@@ -573,7 +575,7 @@ pub const Started = union(enum) {
 /// What a line typed into a session came to.
 pub const Waiting = union(enum) {
     /// The line is asked of the model, with any mode command taken off.
-    ask: []const u8,
+    prompt: []const u8,
     /// The line named only a mode, so the session is set up and nothing is asked.
     ready,
     /// The line was a command, already run; what it had to say went out through
@@ -601,15 +603,15 @@ pub fn take(agent: *Agent, emitter: *Emitter, session: *Session, line: []const u
         return .ran;
     }
 
-    // Before the prompt is added, so the prompt is not folded into the summary
+    // Before the prompt is added, so the prompt is not compacted into the summary
     // it triggers.
     _ = agent.compact(emitter, session, &client, .when_needed);
 
     const started = try agent.start(session, line);
     return switch (started) {
-        .prompt => |text| .{ .ask = text },
+        .prompt => |text| .{ .prompt = text },
         .mode_only => .ready,
-        .asked_before => .{ .ask = line },
+        .asked_before => .{ .prompt = line },
     };
 }
 
@@ -645,7 +647,7 @@ fn compact(
 ) Compaction {
     const compacted = (switch (when) {
         .when_needed => agent.maybeCompact(emitter, session, client),
-        .now => agent.fold(emitter, session, client),
+        .now => agent.summarize(emitter, session, client),
     }) catch |err| {
         std.log.warn("compaction failed: {s}", .{@errorName(err)});
         return .failed;
@@ -791,7 +793,7 @@ pub fn run(
             continue;
         }
         const text = switch (waiting) {
-            .ask => |text| text,
+            .prompt => |text| text,
             else => continue,
         };
         // The line editor has erased the prompt it was typed behind, so the
@@ -848,7 +850,7 @@ pub fn walk(gpa: std.mem.Allocator, session: *const Session, blocks: usize, emit
 
     const trim = transcriptTrim(session, blocks);
     // A conversation with nothing left out has nothing to count.
-    if (trim.elided > 0) try emitter.show(.{ .elided = trim.elided });
+    if (trim.hidden > 0) try emitter.show(.{ .hidden = trim.hidden });
 
     for (session.messages.items[trim.index..], trim.index..) |message, index| {
         const skip = if (index == trim.index) trim.skip else 0;
@@ -919,14 +921,14 @@ const Trim = struct {
     /// How many of that message's leading tool calls to leave out.
     skip: usize,
     /// How many blocks were left out in all, for the count printed in their place.
-    elided: usize,
+    hidden: usize,
 };
 
 /// The trim that shows the last `blocks` blocks. Zero shows the whole session,
 /// and so does a count larger than the conversation: either way nothing is left
 /// out.
 fn transcriptTrim(session: *const Session, blocks: usize) Trim {
-    if (blocks == 0) return .{ .index = 0, .skip = 0, .elided = 0 };
+    if (blocks == 0) return .{ .index = 0, .skip = 0, .hidden = 0 };
 
     const messages = session.messages.items;
     var index = messages.len;
@@ -946,9 +948,9 @@ fn transcriptTrim(session: *const Session, blocks: usize) Trim {
         }
     }
 
-    var elided = skip;
-    for (0..index) |earlier| elided += blocksIn(session, messages, earlier);
-    return .{ .index = index, .skip = skip, .elided = elided };
+    var hidden = skip;
+    for (0..index) |earlier| hidden += blocksIn(session, messages, earlier);
+    return .{ .index = index, .skip = skip, .hidden = hidden };
 }
 
 /// How many blocks one message prints: a prompt or a reply is one, a
@@ -1271,20 +1273,20 @@ fn compactThreshold(agent: *const Agent, session: *const Session) usize {
 /// on the next request. Says whether it compacted.
 ///
 /// This is the automatic compaction, which waits for the threshold; a caller
-/// that wants the conversation folded now, whatever it has grown to, asks for
+/// that wants the conversation compacted now, whatever it has grown to, asks for
 /// `compact` instead.
 fn maybeCompact(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client) !bool {
     // Nothing is compacted for a model whose window is unknown, since there is
     // then no threshold to measure the conversation against; and a conversation
-    // that has not reached it is left alone for the next request to fold, if it
+    // that has not reached it is left alone for the next request to compact, if it
     // ever does.
     const threshold = agent.compactThreshold(session);
     if (threshold == 0 or session.context_tokens < threshold) return false;
-    return agent.fold(emitter, session, client);
+    return agent.summarize(emitter, session, client);
 }
 
 /// Compacts the conversation into a summary now, whatever it has grown to, and
-/// says whether there was anything to fold in.
+/// says whether there was anything to compact in.
 ///
 /// The summary is added to the end of the session and recorded in its list of
 /// compactions, and every request from then on carries only that summary and
@@ -1294,9 +1296,9 @@ fn maybeCompact(agent: *Agent, emitter: *Emitter, session: *Session, client: *ll
 /// which is what would have happened without compaction at all. The caller
 /// refreshes the session's prompt and tools when it did compact, which is why
 /// the answer is reported rather than swallowed.
-fn fold(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client) !bool {
+fn summarize(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client) !bool {
     // Nothing has been added since the last compaction, so there is nothing new
-    // to fold in: compacting again would only summarize the summary, and would
+    // to compact in: compacting again would only summarize the summary, and would
     // do so on every request.
     const sent_from = session.sentFrom();
     if (session.messages.items.len - sent_from <= 1) return false;
@@ -1648,7 +1650,7 @@ fn testAgentIn(
 const TestSetup = struct {
     arena: std.heap.ArenaAllocator,
     config: *Config,
-    store: *Credentials,
+    credentials: *Credentials,
     /// The provider entries the configuration names, which a test points at its
     /// servers.
     entries: []Config.Providers.Entry,
@@ -1669,10 +1671,10 @@ const TestSetup = struct {
         errdefer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        const store = try arena.create(Credentials);
-        store.* = .{};
-        try store.put(arena, "test", "k");
-        try store.put(arena, "other", "k");
+        const credentials = try arena.create(Credentials);
+        credentials.* = .{};
+        try credentials.put(arena, "test", "k");
+        try credentials.put(arena, "other", "k");
 
         const config = try arena.create(Config);
         config.* = Config.init(gpa);
@@ -1689,7 +1691,7 @@ const TestSetup = struct {
         return .{
             .arena = arena_state,
             .config = config,
-            .store = store,
+            .credentials = credentials,
             .entries = entries,
         };
     }
@@ -1711,7 +1713,7 @@ const TestSetup = struct {
     fn options(setup: TestSetup) Options {
         return .{
             .config = setup.config,
-            .store = setup.store,
+            .credentials = setup.credentials,
             .behaviour = setup.behaviour,
             .tools = setup.tools,
             .mode = setup.mode,
@@ -2158,7 +2160,7 @@ test "the compaction threshold is the configured share of the window, or off" {
     try std.testing.expectEqual(330_000, agent.compactThreshold(&session));
 }
 
-test "maybeCompact folds the conversation once it has filled the window" {
+test "maybeCompact compacts the conversation once it has filled the window" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -2281,7 +2283,7 @@ test "maybeCompact does nothing below the threshold, off, or with nothing new" {
     try std.testing.expectEqualStrings("", out.written());
 }
 
-test "a compaction asked for now folds the conversation in whatever its size" {
+test "a compaction asked for now compacts the conversation in whatever its size" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -2314,19 +2316,19 @@ test "a compaction asked for now folds the conversation in whatever its size" {
     defer out.deinit();
     var terminal = testTerminal(.{ .out = &out.writer });
     // Asked for now, so the threshold and the setting are ignored: the
-    // conversation is folded whatever size it has grown to.
+    // conversation is compacted whatever size it has grown to.
     var client = try agent.clientFor(&session);
-    try std.testing.expect(try agent.fold(terminal.emitter(), &session, &client));
+    try std.testing.expect(try agent.summarize(terminal.emitter(), &session, &client));
     try mock.await();
 
-    // The summary is folded in, and the pair reads as one line.
+    // The summary is compacted in, and the pair reads as one line.
     try std.testing.expectEqual(4, session.messages.items.len);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "compacted") != null);
 
     // Asking again does nothing: the summary is the last message, so there is
-    // nothing new to fold in, and a request would only re-summarize it.
+    // nothing new to compact in, and a request would only re-summarize it.
     out.clearRetainingCapacity();
-    try std.testing.expect(!try agent.fold(terminal.emitter(), &session, &client));
+    try std.testing.expect(!try agent.summarize(terminal.emitter(), &session, &client));
     try std.testing.expectEqualStrings("", out.written());
 }
 
@@ -2357,7 +2359,7 @@ test "maybeCompact does not compact a summary that stands alone" {
     defer setup.deinit();
 
     // Over the threshold, but the last message is the summary itself, so there is
-    // nothing new to fold in and a request would only re-summarize it.
+    // nothing new to compact in and a request would only re-summarize it.
     session.context_tokens = 900_000;
     // Nothing is listening there, so a request made where this should have
     // returned first would fail the test.
@@ -2663,7 +2665,7 @@ const Recorder = struct {
         tool_end: struct { name: []const u8, result: []const u8 },
         compacted: Block.Compacted,
         notice: []const u8,
-        elided: usize,
+        hidden: usize,
     };
 
     const Fragment = struct { text: []const u8 };
@@ -2689,7 +2691,7 @@ const Recorder = struct {
                 .summary = try self.keeper(compaction.summary),
             } },
             .notice => |text| .{ .notice = try self.keeper(text) },
-            .elided => |count| .{ .elided = count },
+            .hidden => |count| .{ .hidden = count },
         };
         try self.seen.append(self.gpa, seen);
     }

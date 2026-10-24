@@ -28,8 +28,8 @@ pub const Target = struct {
 };
 
 /// Where the configuration points: the target of the choice the file names.
-pub fn configured(config: *const Config, store: *const Credentials, arena: std.mem.Allocator) !Target {
-    return targetFor(config, store, arena, config.stored.model);
+pub fn configured(config: *const Config, credentials: *const Credentials, arena: std.mem.Allocator) !Target {
+    return targetFor(config, credentials, arena, config.stored.model);
 }
 
 /// Where `choice`, a provider and model as `<provider>/<model>`, is sent.
@@ -39,7 +39,7 @@ pub fn configured(config: *const Config, store: *const Credentials, arena: std.m
 /// into that pool survives no write to it, so nothing here may keep one.
 pub fn targetFor(
     config: *const Config,
-    store: *const Credentials,
+    credentials: *const Credentials,
     arena: std.mem.Allocator,
     choice: []const u8,
 ) !Target {
@@ -53,7 +53,7 @@ pub fn targetFor(
 
     return .{
         .url = try completionsUrl(arena, base_url),
-        .api_key = store.get(name) orelse return missingKey(name),
+        .api_key = credentials.get(name) orelse return missingKey(name),
         // The model is copied out rather than sliced from `choice`: the choice a
         // session passes is a slice of its own string pool, and a pointer into
         // that pool survives no write to it, so the next intern would leave the
@@ -131,18 +131,18 @@ test "a target carries the address, the key and the model of the choice it names
 
     var config = Config.init(gpa);
     defer config.deinit();
-    var store: Credentials = .{};
-    try store.put(arena, "deepseek", "k");
-    try store.put(arena, "opencode_go", "k");
+    var credentials: Credentials = .{};
+    try credentials.put(arena, "deepseek", "k");
+    try credentials.put(arena, "opencode_go", "k");
 
-    const flash = try targetFor(&config, &store, arena, "deepseek/deepseek-flash");
+    const flash = try targetFor(&config, &credentials, arena, "deepseek/deepseek-flash");
     try std.testing.expectEqualStrings("https://api.deepseek.com/chat/completions", flash.url);
     try std.testing.expectEqualStrings("k", flash.api_key);
     try std.testing.expectEqualStrings("deepseek-flash", flash.model);
     try std.testing.expectEqual(@as(?models.Provider, .deepseek), flash.provider);
 
     // Another provider is another address, and the key stored for that one.
-    const kimi = try targetFor(&config, &store, arena, "opencode_go/kimi-k2.7-code");
+    const kimi = try targetFor(&config, &credentials, arena, "opencode_go/kimi-k2.7-code");
     try std.testing.expectEqualStrings("https://opencode.ai/zen/go/v1/chat/completions", kimi.url);
     try std.testing.expectEqualStrings("kimi-k2.7-code", kimi.model);
     try std.testing.expectEqual(@as(?models.Provider, .opencode_go), kimi.provider);
@@ -161,10 +161,10 @@ test "a target is resolved through a provider the configuration defines itself" 
     config.stored.providers = .{ .entries = &.{
         .{ .name = "mine", .base_url = "http://localhost:8080/v1" },
     } };
-    var store: Credentials = .{};
-    try store.put(arena, "mine", "k");
+    var credentials: Credentials = .{};
+    try credentials.put(arena, "mine", "k");
 
-    const target = try targetFor(&config, &store, arena, "mine/qwen3-coder:30b");
+    const target = try targetFor(&config, &credentials, arena, "mine/qwen3-coder:30b");
     try std.testing.expectEqualStrings("http://localhost:8080/v1/chat/completions", target.url);
     try std.testing.expectEqualStrings("qwen3-coder:30b", target.model);
     // A provider billy knows nothing of is left to be found by its model's name.
@@ -266,9 +266,9 @@ test "the configured choice is the target the configuration points at" {
     defer config.deinit();
     try std.testing.expectEqualStrings("deepseek/deepseek-flash", config.stored.model);
 
-    var store: Credentials = .{};
-    try store.put(arena, "deepseek", "k");
-    const target = try configured(&config, &store, arena);
+    var credentials: Credentials = .{};
+    try credentials.put(arena, "deepseek", "k");
+    const target = try configured(&config, &credentials, arena);
     try std.testing.expectEqualStrings("https://api.deepseek.com/chat/completions", target.url);
     try std.testing.expectEqualStrings("deepseek-flash", target.model);
     try std.testing.expectEqual(@as(?models.Provider, .deepseek), target.provider);

@@ -5,7 +5,7 @@
 const std = @import("std");
 const Tools = @import("../Tools.zig");
 const llm = @import("../llm.zig");
-const diffing = @import("../diff.zig");
+const diff = @import("../diff.zig");
 const Writer = @import("Writer.zig");
 
 const max_block_lines = 5;
@@ -46,12 +46,12 @@ pub fn printHead(scratch: std.mem.Allocator, call: Tools.Call, writer: Writer) !
 /// intent and a replay recomputes the same one. An edit that changes nothing
 /// shows no diff at all.
 fn printDiff(scratch: std.mem.Allocator, old: []const u8, new: []const u8, writer: Writer) !void {
-    const diff = try diffing.lines(scratch, old, new);
-    defer scratch.free(diff);
-    if (diff.len == 0) return;
+    const lines = try diff.lines(scratch, old, new);
+    defer scratch.free(lines);
+    if (lines.len == 0) return;
 
     try printLabel("diff", writer);
-    try diffing.print(diff, writer);
+    try diff.print(lines, writer);
 }
 
 /// The mark in front of the labels that break a block into sections, such as

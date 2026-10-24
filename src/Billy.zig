@@ -12,7 +12,7 @@ const Config = @import("Config.zig");
 const Credentials = @import("Credentials.zig");
 const Dirs = @import("Dirs.zig");
 const Endpoint = @import("Endpoint.zig");
-const Endpoints = @import("Endpoints.zig");
+const Setup = @import("Setup.zig");
 const Health = @import("Health.zig");
 const report = @import("report.zig");
 const Session = @import("Session.zig");
@@ -58,7 +58,7 @@ pub fn open(init: std.process.Init, out: Terminal.Writer) !Billy {
     var dirs = try Dirs.open(io, arena, environ);
     errdefer dirs.deinit(io);
 
-    const store = Credentials.load(io, dirs.data, arena) catch |err| {
+    const credentials = Credentials.load(io, dirs.data, arena) catch |err| {
         std.log.err("cannot read the credentials: {s}", .{@errorName(err)});
         return report.Reported;
     };
@@ -82,7 +82,7 @@ pub fn open(init: std.process.Init, out: Terminal.Writer) !Billy {
         .arena = arena,
         .environ = environ,
         .dirs = dirs,
-        .credentials = store,
+        .credentials = credentials,
         .config = opened.config,
         .health = try Health.load(io, init.gpa, dirs.data),
         .cwd = cwd,
@@ -217,11 +217,11 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resume_id: ?[]const u8) !void {
     // session.
     const options = Agent.Options{
         .config = &billy.config,
-        .store = &billy.credentials,
+        .credentials = &billy.credentials,
         .behaviour = Agent.Behaviour.fromConfig(&billy.config),
-        .tools = Endpoints.toolSettings(
+        .tools = Setup.toolSettings(
             &billy.config,
-            try Endpoints.Backends.build(arena, &billy.config, &billy.credentials),
+            try Setup.Backends.build(arena, &billy.config, &billy.credentials),
             &billy.health,
         ),
         .home = billy.environ.get("HOME"),
@@ -301,11 +301,11 @@ pub fn serve(billy: *Billy, host: []const u8, port: u16) !void {
         .session_dir = billy.dirs.sessions,
         .config_dir = billy.dirs.config,
         .config = &billy.config,
-        .store = billy.credentials,
+        .credentials = billy.credentials,
         .health = &billy.health,
         .cwd = billy.cwd,
         .environ = billy.environ,
-        .backends = try Endpoints.Backends.build(arena, &billy.config, &billy.credentials),
+        .backends = try Setup.Backends.build(arena, &billy.config, &billy.credentials),
     };
     return server.serve(host, port);
 }

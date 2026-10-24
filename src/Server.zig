@@ -19,7 +19,7 @@ const std = @import("std");
 const Agent = @import("Agent.zig");
 const Config = @import("Config.zig");
 const Credentials = @import("Credentials.zig");
-const Endpoints = @import("Endpoints.zig");
+const Setup = @import("Setup.zig");
 const Health = @import("Health.zig");
 const html = @import("html.zig");
 const report = @import("report.zig");
@@ -81,7 +81,8 @@ config_dir: std.Io.Dir,
 /// frontend that owns it, which outlives the server: a copy would share the
 /// arena, and a `deinit` on each would free it twice.
 config: *const Config,
-store: Credentials,
+/// The keys every request is built from.
+credentials: Credentials,
 health: *Health,
 /// Where billy was started, and the environment it was started in: the home
 /// directory shown in the header, and what the model is told about itself.
@@ -89,7 +90,7 @@ cwd: []const u8,
 environ: *const std.process.Environ.Map,
 /// The backends its web tools ask, resolved before anything was served so a key
 /// that is missing is reported then rather than on the first thing asked.
-backends: Endpoints.Backends,
+backends: Setup.Backends,
 
 /// What a turn is given, resolved the same way a terminal run's is and laid out
 /// plainly rather than decorated for a terminal. The mode is the one the caller
@@ -97,9 +98,9 @@ backends: Endpoints.Backends,
 fn options(server: *const Server, mode: Agent.Mode) Agent.Options {
     return .{
         .config = server.config,
-        .store = &server.store,
+        .credentials = &server.credentials,
         .behaviour = Agent.Behaviour.fromConfig(server.config),
-        .tools = Endpoints.toolSettings(server.config, server.backends, server.health),
+        .tools = Setup.toolSettings(server.config, server.backends, server.health),
         .mode = mode,
         .home = server.environ.get("HOME"),
         // The user's own instructions live beside the configuration, and join
@@ -310,7 +311,7 @@ const Request = struct {
     /// Opens the session `id`, or answers why it could not be and returns null,
     /// so the caller has nothing more to do. Which status an id deserves is
     /// decided here, once, rather than by every route that opens one.
-    fn openSession(r: *Request, id: []const u8) !?Session {
+    fn open(r: *Request, id: []const u8) !?Session {
         return Session.open(r.server.io, r.server.session_dir, r.server.gpa, id, r.server.cwd) catch |err| switch (err) {
             // An id that could not be a session name is a bad request rather than
             // a missing session: what was asked for could never exist.
@@ -380,7 +381,7 @@ fn route(r: *Request, registry: *Registry, http_client: *std.http.Client) !void 
     };
 
     if (std.mem.eql(u8, path, "/api/sessions")) switch (r.request.head.method) {
-        .GET => return listSessions(r),
+        .GET => return writeListing(r),
         .POST => return createSession(r, registry, http_client),
         else => return r.replyNotAllowed(),
     };
@@ -457,7 +458,7 @@ fn renameSession(r: *Request, registry: *Registry, id: []const u8) !void {
     if (!try r.claim(registry, id)) return;
     defer registry.release(id);
 
-    var session = (try r.openSession(id)) orelse return;
+    var session = (try r.open(id)) orelse return;
     defer session.deinit();
     try session.setTitle(title);
     try session.save();
@@ -477,7 +478,7 @@ const Listed = struct {
 const Listing = struct { sessions: []const Listed };
 
 /// `GET /api/sessions`: every session on disk, newest written first.
-fn listSessions(r: *Request) !void {
+fn writeListing(r: *Request) !void {
     const gpa = r.server.gpa;
 
     // What is on disk. Each id and title is its own allocation, freed once the
@@ -805,7 +806,7 @@ fn askSession(r: *Request, registry: *Registry, http_client: *std.http.Client, i
     // The session is opened fresh for this turn and dropped at the end, so it is
     // always what is on disk; a session changed by another billy in between is
     // read rather than overwritten. It runs in the mode stored with it.
-    var session = (try r.openSession(id)) orelse return;
+    var session = (try r.open(id)) orelse return;
     defer session.deinit();
 
     try serveTurn(r, http_client, &session, r.server.options(session.mode), parsed.value.text, false);
@@ -901,7 +902,7 @@ fn serveTurn(
 
 /// Writes the header line the page shows above `session`'s conversation.
 fn writeHeader(server: *const Server, session: *const Session, out: *std.Io.Writer) !void {
-    const shown = Endpoints.sessionModel(server.config, session);
+    const shown = Setup.sessionModel(server.config, session);
     try html.header(.{
         .id = session.id(),
         .model = shown.choice,
@@ -1067,7 +1068,7 @@ const TestServer = struct {
                 .session_dir = sessions,
                 .config_dir = tmp.dir,
                 .config = config,
-                .store = .{},
+                .credentials = .{},
                 .health = health,
                 .cwd = ".",
                 .environ = environ,

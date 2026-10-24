@@ -23,7 +23,7 @@
 const std = @import("std");
 const llm = @import("llm.zig");
 const ulid = @import("ulid.zig");
-const agent = @import("Agent.zig");
+const Agent = @import("Agent.zig");
 const Pool = @import("Pool.zig");
 
 const Session = @This();
@@ -79,7 +79,7 @@ const Stored = struct {
     system_prompt: ?[]const u8 = null,
     /// The mode the session runs in, which fixes its prompt and its tools. A file
     /// saved before modes existed has none, and reads back as general.
-    mode: agent.Mode = .general,
+    mode: Agent.Mode = .general,
     /// The provider and model this session was started on, as `provider/model`,
     /// the same one string the configuration names it by.
     ///
@@ -203,7 +203,7 @@ pub const Message = struct {
 /// pool, and the arguments schema is the JSON text the request carries, so
 /// nothing here is a parsed document: the set is one array that frees with the
 /// pool and no per-tool walk to free it.
-pub const Tool = struct {
+pub const StoredDefinition = struct {
     name: StringIndex,
     description: StringIndex,
     /// The JSON Schema of the arguments, as the JSON text it is sent as.
@@ -245,7 +245,7 @@ messages: std.ArrayList(Message) = .empty,
 
 /// What the session may do and what its prompt says. Kept so a resume keeps the
 /// mode it started in rather than the default.
-mode: agent.Mode = .general,
+mode: Agent.Mode = .general,
 
 /// Indices into `messages` of the summaries a compaction produced
 compactions: std.ArrayList(u32) = .empty,
@@ -253,7 +253,7 @@ compactions: std.ArrayList(u32) = .empty,
 /// The tool definitions sent with every request. Stored in the session so a
 /// resume offers the model the same tools as the run it continues. The whole set
 /// is one array `deinit` frees; every string in it is interned in the pool.
-tools: []const Tool = &.{},
+tools: []const StoredDefinition = &.{},
 
 /// Tokens in the conversation as of the last request.
 context_tokens: usize = 0,
@@ -271,11 +271,11 @@ pub fn open(
     dir: std.Io.Dir,
     gpa: std.mem.Allocator,
     resume_id: ?[]const u8,
-    arg_cwd: []const u8,
+    start_cwd: []const u8,
 ) !Session {
     // A resume that fails part way leaves what it had read behind, since the
     // caller only gets the session on the way out.
-    var session = try named(io, dir, gpa, resume_id, arg_cwd);
+    var session = try named(io, dir, gpa, resume_id, start_cwd);
     errdefer session.deinit();
     if (resume_id != null) try session.load();
     return session;
@@ -288,13 +288,13 @@ pub fn open(
 /// it, and nothing is read because there is nothing to read. Nothing is written
 /// either, so the session comes into being with its first message; a run that
 /// is started and left alone leaves no file behind.
-pub fn create(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: []const u8, arg_cwd: []const u8) !Session {
-    return named(io, dir, gpa, named_id, arg_cwd);
+pub fn create(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: []const u8, start_cwd: []const u8) !Session {
+    return named(io, dir, gpa, named_id, start_cwd);
 }
 
 /// A session named `named_id`, or one given a fresh id when it is null, with
 /// nothing read from disk and nothing written.
-fn named(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: ?[]const u8, arg_cwd: []const u8) !Session {
+fn named(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: ?[]const u8, start_cwd: []const u8) !Session {
     var session: Session = .{ .io = io, .dir = dir, .gpa = gpa };
     errdefer session.deinit();
 
@@ -316,7 +316,7 @@ fn named(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: ?[]const
 
     // The session owns its directory rather than pointing into the caller's
     // memory, which it may outlive.
-    session.interned.cwd = try session.pool.intern(gpa, arg_cwd);
+    session.interned.cwd = try session.pool.intern(gpa, start_cwd);
     return session;
 }
 
@@ -623,7 +623,7 @@ pub fn setSystemPrompt(session: *Session, system_prompt: []const u8) !void {
 
 /// Records the mode the session runs in. Set once, when the session starts; the
 /// prompt and tools stored with it follow from the mode.
-pub fn setMode(session: *Session, mode: agent.Mode) void {
+pub fn setMode(session: *Session, mode: Agent.Mode) void {
     session.mode = mode;
 }
 
@@ -667,7 +667,7 @@ pub fn setTools(session: *Session, definitions: []const Definition) !void {
     // frees with the pool. Nothing is copied per string and there is no parsed
     // document to keep alive: the arguments schema is stored as the JSON text it
     // is sent as.
-    const tools = try session.gpa.alloc(Tool, definitions.len);
+    const tools = try session.gpa.alloc(StoredDefinition, definitions.len);
     errdefer session.gpa.free(tools);
     for (definitions, tools) |definition, *tool| {
         tool.* = .{
@@ -871,7 +871,7 @@ fn loadCompactions(session: *Session, stored: []const u32, lead: usize) !void {
 /// Interns the stored tool definitions, so the set is one array and the
 /// arguments schema becomes the JSON text the request sends it as.
 fn loadTools(session: *Session, stored: []const StoredTool) !void {
-    const tools = try session.gpa.alloc(Tool, stored.len);
+    const tools = try session.gpa.alloc(StoredDefinition, stored.len);
     errdefer session.gpa.free(tools);
     for (stored, tools) |stored_tool, *tool| {
         tool.* = .{

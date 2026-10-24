@@ -10,7 +10,7 @@
 //! value, so either frontend can build any of it where it is needed.
 
 const std = @import("std");
-const agent = @import("Agent.zig");
+const Agent = @import("Agent.zig");
 const Config = @import("Config.zig");
 const Credentials = @import("Credentials.zig");
 const Endpoint = @import("Endpoint.zig");
@@ -19,28 +19,30 @@ const models = @import("models.zig");
 const report = @import("report.zig");
 const Session = @import("Session.zig");
 const Terminal = @import("Terminal.zig");
-const tools = @import("Tools.zig");
+const Tools = @import("Tools.zig");
+
+const Setup = @This();
 
 /// The backends billy's web tools ask, in the order they are tried. A tool whose
 /// backend is null is left out of the ones the model is offered.
 pub const Backends = struct {
-    search: ?tools.web.Search.Config,
-    fetch: ?tools.web.Fetch.Config,
+    search: ?Tools.web.Search.Config,
+    fetch: ?Tools.web.Fetch.Config,
 
     /// The backends the configuration names, reporting the one at fault when a
     /// backend it names cannot be built: the configuration asked for the tool,
     /// so leaving it out without a word would look like a bug.
-    pub fn build(arena: std.mem.Allocator, config: *const Config, store: *const Credentials) !Backends {
+    pub fn build(arena: std.mem.Allocator, config: *const Config, credentials: *const Credentials) !Backends {
         // Which backend each set is built from, remembered so the report can
         // name it: only the builder knows which provider it was on.
-        var search_failed: tools.web.Provider = .tavily;
-        const search_config = searchConfig(arena, store, config, &search_failed) catch |err| {
+        var search_failed: Tools.web.Provider = .tavily;
+        const search_config = searchConfig(arena, credentials, config, &search_failed) catch |err| {
             reportSearchFailure(err, search_failed);
             return report.Reported;
         };
 
-        var fetch_failed: tools.web.Provider = .raw;
-        const fetch_config = fetchConfig(arena, store, config, &fetch_failed) catch |err| {
+        var fetch_failed: Tools.web.Provider = .raw;
+        const fetch_config = fetchConfig(arena, credentials, config, &fetch_failed) catch |err| {
             reportFetchFailure(err, fetch_failed);
             return report.Reported;
         };
@@ -64,7 +66,7 @@ pub fn sessionModel(config: *const Config, session: *const Session) Endpoint.Mod
 /// The run adds its own plumbing -- its I/O, the directory it works in, its
 /// allocator and its HTTP client -- when it builds the set, so neither frontend
 /// handles those and neither can offer a tool the others do not.
-pub fn toolSettings(config: *const Config, backends: Backends, health: ?*Health) tools.Settings {
+pub fn toolSettings(config: *const Config, backends: Backends, health: ?*Health) Tools.Settings {
     const stored = &config.stored;
     return .{
         .bash_timeout_s = stored.tools.bash.timeout_s,
@@ -88,23 +90,23 @@ pub fn toolSettings(config: *const Config, backends: Backends, health: ?*Health)
 /// function knows which provider it was on.
 fn searchConfig(
     arena: std.mem.Allocator,
-    store: *const Credentials,
+    credentials: *const Credentials,
     config: *const Config,
-    failed: *tools.web.Provider,
-) !?tools.web.Search.Config {
+    failed: *Tools.web.Provider,
+) !?Tools.web.Search.Config {
     const web_config = config.stored.tools.web_search;
     if (web_config.providers.len == 0) return null;
 
     // Each backend resolves its own key, or, for the one that is self-hosted,
     // needs the instance named instead.
-    const backends = try arena.alloc(tools.web.Search.Backend, web_config.providers.len);
+    const backends = try arena.alloc(Tools.web.Search.Backend, web_config.providers.len);
     for (web_config.providers, backends) |provider, *backend| {
         failed.* = provider;
         const service = provider.service();
         backend.* = .{
             .provider = provider,
             .api_key = if (service) |name|
-                store.get(name) orelse return error.MissingApiKey
+                credentials.get(name) orelse return error.MissingApiKey
             else blk: {
                 // A backend billy knows the address of needs only its key; one it
                 // does not, SearXNG, needs the instance named.
@@ -125,21 +127,21 @@ fn searchConfig(
 /// fetches without a service.
 pub fn fetchConfig(
     arena: std.mem.Allocator,
-    store: *const Credentials,
+    credentials: *const Credentials,
     config: *const Config,
-    failed: *tools.web.Provider,
-) !?tools.web.Fetch.Config {
+    failed: *Tools.web.Provider,
+) !?Tools.web.Fetch.Config {
     const web_config = config.stored.tools.web_fetch;
     if (web_config.providers.len == 0) return null;
 
-    const backends = try arena.alloc(tools.web.Fetch.Backend, web_config.providers.len);
+    const backends = try arena.alloc(Tools.web.Fetch.Backend, web_config.providers.len);
     for (web_config.providers, backends) |provider, *backend| {
         failed.* = provider;
         const service = provider.service();
         backend.* = .{
             .provider = provider,
             .api_key = if (service) |name|
-                store.get(name) orelse return error.MissingApiKey
+                credentials.get(name) orelse return error.MissingApiKey
             else
                 "",
         };
@@ -153,7 +155,7 @@ pub fn fetchConfig(
 ///
 /// A failure here is one the configuration asked for -- it named the backend --
 /// so leaving the tool out quietly would look like a bug rather than a choice.
-fn reportSearchFailure(err: anyerror, provider: tools.web.Provider) void {
+fn reportSearchFailure(err: anyerror, provider: Tools.web.Provider) void {
     switch (err) {
         error.MissingApiKey => {
             // A backend reached with a key is one of the services, since the one
@@ -179,7 +181,7 @@ fn reportSearchFailure(err: anyerror, provider: tools.web.Provider) void {
 
 /// Tells the user what to fix about the fetch backend that could not be built,
 /// on the same terms as `reportSearchFailure`.
-fn reportFetchFailure(err: anyerror, provider: tools.web.Provider) void {
+fn reportFetchFailure(err: anyerror, provider: Tools.web.Provider) void {
     switch (err) {
         error.MissingApiKey => {
             const service = provider.service().?;
@@ -205,13 +207,13 @@ test "each backend resolves its own key, and SearXNG its instance" {
 
     var environ: std.process.Environ.Map = .init(gpa);
     defer environ.deinit();
-    const store: Credentials = .{};
+    const credentials: Credentials = .{};
 
     // Nothing named is no search at all.
     var off = Config.init(gpa);
     defer off.deinit();
-    var failed: tools.web.Provider = .tavily;
-    try std.testing.expect((try searchConfig(arena, &store, &off, &failed)) == null);
+    var failed: Tools.web.Provider = .tavily;
+    try std.testing.expect((try searchConfig(arena, &credentials, &off, &failed)) == null);
 
     // A backend billy knows is asked for a key, and one that is not set is an
     // error rather than a silent "no search".
@@ -219,22 +221,22 @@ test "each backend resolves its own key, and SearXNG its instance" {
     defer naming.deinit();
 
     naming.stored.tools.web_search.providers = &.{.tavily};
-    try std.testing.expectError(error.MissingApiKey, searchConfig(arena, &store, &naming, &failed));
+    try std.testing.expectError(error.MissingApiKey, searchConfig(arena, &credentials, &naming, &failed));
     // The backend at fault is the one the report names.
-    try std.testing.expectEqual(tools.web.Provider.tavily, failed);
+    try std.testing.expectEqual(Tools.web.Provider.tavily, failed);
 
     // SearXNG needs no key, but needs the instance named.
     var searx = Config.init(gpa);
     defer searx.deinit();
 
     searx.stored.tools.web_search.providers = &.{.searxng};
-    try std.testing.expectError(error.MissingSearchUrl, searchConfig(arena, &store, &searx, &failed));
+    try std.testing.expectError(error.MissingSearchUrl, searchConfig(arena, &credentials, &searx, &failed));
 
     // Every named backend becomes a backend to try, in the order named.
     searx.stored.tools.web_search.searxng.url = "https://searx.example.org";
-    const config = (try searchConfig(arena, &store, &searx, &failed)).?;
+    const config = (try searchConfig(arena, &credentials, &searx, &failed)).?;
     try std.testing.expectEqual(@as(usize, 1), config.backends.len);
-    try std.testing.expectEqual(tools.web.Provider.searxng, config.backends[0].provider);
+    try std.testing.expectEqual(Tools.web.Provider.searxng, config.backends[0].provider);
     try std.testing.expectEqualStrings("", config.backends[0].api_key);
     try std.testing.expectEqualStrings("https://searx.example.org", config.backends[0].endpoint.?);
 }
@@ -247,17 +249,17 @@ test "a fetch backend is asked for its key, and raw for none" {
 
     var environ: std.process.Environ.Map = .init(gpa);
     defer environ.deinit();
-    const store: Credentials = .{};
+    const credentials: Credentials = .{};
 
     // The default holds only `raw`, which asks no service, so it resolves with
     // no key stored at all.
     var raw = Config.init(gpa);
     defer raw.deinit();
 
-    var failed: tools.web.Provider = .raw;
-    const config = (try fetchConfig(arena, &store, &raw, &failed)).?;
+    var failed: Tools.web.Provider = .raw;
+    const config = (try fetchConfig(arena, &credentials, &raw, &failed)).?;
     try std.testing.expectEqual(@as(usize, 1), config.backends.len);
-    try std.testing.expectEqual(tools.web.Provider.raw, config.backends[0].provider);
+    try std.testing.expectEqual(Tools.web.Provider.raw, config.backends[0].provider);
     try std.testing.expectEqualStrings("", config.backends[0].api_key);
 
     // A service needs its key, on the same terms as a search backend.
@@ -265,15 +267,15 @@ test "a fetch backend is asked for its key, and raw for none" {
     defer naming.deinit();
 
     naming.stored.tools.web_fetch.providers = &.{.tavily};
-    try std.testing.expectError(error.MissingApiKey, fetchConfig(arena, &store, &naming, &failed));
-    try std.testing.expectEqual(tools.web.Provider.tavily, failed);
+    try std.testing.expectError(error.MissingApiKey, fetchConfig(arena, &credentials, &naming, &failed));
+    try std.testing.expectEqual(Tools.web.Provider.tavily, failed);
 
     // A set with nothing in it leaves `web_fetch` out of the request.
     var none = Config.init(gpa);
     defer none.deinit();
 
     none.stored.tools.web_fetch.providers = &.{};
-    try std.testing.expect((try fetchConfig(arena, &store, &none, &failed)) == null);
+    try std.testing.expect((try fetchConfig(arena, &credentials, &none, &failed)) == null);
 }
 
 test "a header names the model the session goes to, not the one billy is pointed at" {
@@ -326,9 +328,9 @@ test "a target names bytes of its own, not a slice of the session's pool" {
     var opened = try Config.open(std.testing.io, tmp.dir, gpa);
     defer opened.config.deinit();
     // The key a request is sent with is the one stored under the provider's
-    // name, so the store has to hold it for the target to resolve at all.
-    var store: Credentials = .{};
-    try store.put(arena, "opencode_go", "k");
+    // name, so the credentials have to hold it for the target to resolve at all.
+    var credentials: Credentials = .{};
+    try credentials.put(arena, "opencode_go", "k");
 
     var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
@@ -337,7 +339,7 @@ test "a target names bytes of its own, not a slice of the session's pool" {
     // that is what it is sent to.
     const choice = session.modelChoice(opened.config.stored.model);
     try std.testing.expectEqualStrings("opencode_go/glm-5.3-flash", choice);
-    const target = try Endpoint.targetFor(&opened.config, &store, arena, choice);
+    const target = try Endpoint.targetFor(&opened.config, &credentials, arena, choice);
     // The model the session recorded is interned in its string pool, and a
     // pointer into that pool survives no write to it. Writing more strings, as
     // a turn does when it stores a message, must not leave the target naming
