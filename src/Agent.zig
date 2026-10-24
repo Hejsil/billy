@@ -1107,7 +1107,7 @@ fn runCalls(
         // a crafted request can still name one it is not allowed, so the call is
         // refused here as well as filtered out of the offer.
         const name = Tools.callName(parsed);
-        if (!mode.allows(name)) {
+        if (!Tools.allows(mode, name)) {
             try result.writer.print("error: the {s} mode does not allow the {s} tool", .{ @tagName(mode), name });
         } else {
             try tool_set.run(parsed, &result.writer);

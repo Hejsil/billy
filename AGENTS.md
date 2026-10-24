@@ -85,13 +85,15 @@ least once. Read the rule, not the story; the story is in the review.
 
 ## One source of truth
 
-- **A name that means something is spelled once.** A tool's name currently appears in the `Call`
-  union, in `parseCallNamed`'s hand-written tag list, in `Heading.of`, in `specs` and in
-  `Mode.allows`. The tag list is the dangerous one: a tool added to the union but not to the list is
-  never parsed, silently becomes `unknown`, and the model is told it does not exist while `specs`
-  offers it. Derive from `@typeInfo`.
-- **Two implementations of one policy drift.** `Mode.allows`'s deny-list duplicated the comptime
-  tool filter, so a new destructive tool would be allowed in chat mode unless somebody remembered.
+- **A name that means something is spelled once.** A tool's name is its `Call` tag: parsing walks
+  `@typeInfo`, and the one tool table refers to the tags, so the schema, the heading and the mode
+  filter cannot spell a tool differently. A union arm with no table row is a compile error.
+  *`parseCallNamed` walked a hand-written tuple, so a new tool silently became `unknown` while
+  `specs` offered it.*
+- **Two implementations of one policy drift.** A tool's modes are a column of the tool table, not a
+  deny-list beside it: the offer and the permission are the same list, and a new destructive tool
+  cannot be allowed in chat because nobody remembered. *`Mode.allows` duplicated the comptime
+  filter.*
 - **Two frontends show the same call the same way.** The fallback for a bash header with no
   description lived only in `html.zig`, so the terminal and the page disagreed. Shared vocabulary
   belongs in `Tools.Heading`.

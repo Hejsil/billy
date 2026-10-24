@@ -1,5 +1,6 @@
-//! The modes billy can run in: what its prompt says, whether the instruction
-//! files are read, and what it may do.
+//! The modes billy can run in: what its prompt says and whether the instruction
+//! files are read. Which tools a mode may use is the tool table's `modes` column,
+//! so the offer and the permission are one list.
 //!
 //! A mode is fixed when a session starts, because the system prompt and the tool
 //! set are stored with the session and reused byte for byte so a resume hits the
@@ -31,18 +32,6 @@ pub const Mode = enum {
         return switch (mode) {
             .general => true,
             .chat => false,
-        };
-    }
-
-    /// Whether the tool named `name` may run, or be offered to the model.
-    pub fn allows(mode: Mode, name: []const u8) bool {
-        return switch (mode) {
-            .general => true,
-            // Everything but the tools that change the system: `bash` runs a
-            // command, `write` replaces a file, and `edit` rewrites one.
-            .chat => !std.mem.eql(u8, name, "bash") and
-                !std.mem.eql(u8, name, "write") and
-                !std.mem.eql(u8, name, "edit"),
         };
     }
 
@@ -88,18 +77,6 @@ const general_prompt =
 /// Chat mode has no prompt of its own: the request is the conversation alone.
 /// The tools are what keep it read-only.
 const chat_prompt = "";
-
-test "chat allows the tools that read and search, and no others" {
-    try std.testing.expect(Mode.general.allows("bash"));
-    try std.testing.expect(Mode.general.allows("write"));
-    try std.testing.expect(Mode.general.allows("edit"));
-
-    try std.testing.expect(Mode.chat.allows("read"));
-    try std.testing.expect(Mode.chat.allows("web_search"));
-    try std.testing.expect(!Mode.chat.allows("bash"));
-    try std.testing.expect(!Mode.chat.allows("write"));
-    try std.testing.expect(!Mode.chat.allows("edit"));
-}
 
 test "chat has no prompt and does not read the instruction files" {
     try std.testing.expectEqualStrings("", Mode.chat.prompt());
