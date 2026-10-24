@@ -1,11 +1,14 @@
-//! Where the blocks of a run go, and the one place the escape codes billy writes
-//! are named: a style around the writer the text goes to.
+//! Where the blocks of a run go, and where the escape codes billy writes for
+//! decoration are named: a style around the writer the text goes to.
 //!
 //! Everything billy decorates itself is written through here -- a block header,
-//! the label over a section of one, the status of a command -- and nothing is
-//! printed with an escape code of its own. A printer is handed the writer rather
-//! than a writer and a style apart, so it cannot decorate anything the style does
-//! not cover, and nothing has to be told twice which style is in use.
+//! the label over a section of one, the status of a command -- and no printer
+//! writes a decoration code of its own. Cursor control is not decoration and is
+//! written where it is used, in the line editor; keeping the two apart is what
+//! lets a plain style drop every colour and attribute without taking the cursor
+//! with it. A printer is handed the writer rather than a writer and a style
+//! apart, so it cannot decorate anything the style does not cover, and nothing
+//! has to be told twice which style is in use.
 //!
 //! The style itself lives here too, along with the colours and the mark a block
 //! header opens with, since they are the vocabulary the writer decorates with.

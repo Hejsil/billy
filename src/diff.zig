@@ -3,10 +3,9 @@
 //! is computed from the two strings of the call alone and a replayed session
 //! shows the same diff as the run it continues.
 //!
-//! A configuration may run the diff through a script for better colours or
-//! word-level changes; billy's own rendering is a `-`/`+` block with a few lines
-//! of context. Either way the layout is presentation only: the file, the session
-//! and the model keep the text as it was written.
+//! The rendering is a `-`/`+` block with a few lines of context. The layout is
+//! presentation only: the file, the session and the model keep the text as it
+//! was written.
 
 const std = @import("std");
 const Terminal = @import("Terminal.zig");

@@ -14,11 +14,10 @@ pub const web = @import("Tools/web.zig");
 
 const Tools = @This();
 
-/// Longest result handed back to the model, so one command cannot flood the
-/// conversation.
+/// Longest result, in bytes, handed back to the model, so one command cannot
+/// flood the conversation.
 const max_result_len = 30_000;
-/// Lines of a result shown before the rest is summarized. The model still gets
-/// the whole result; only the display is cut short.
+
 /// A tool call parsed into the arguments of the tool it names.
 pub const Call = union(enum) {
     read: Read,

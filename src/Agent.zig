@@ -84,7 +84,7 @@ pub const Behaviour = struct {
     /// How a run's agent behaves: the turns it gives the model, the share of the
     /// window it fills before the conversation is folded into a summary, and whether
     /// it names the session. Where each turn is sent is resolved separately, as
-    /// `sessionTarget`, and what its tools run with as `toolSettings`.
+    /// `sessionModel`, and what its tools run with as `toolSettings`.
     pub fn fromConfig(config: Config) Behaviour {
         const stored = &config.stored;
         return .{

@@ -312,8 +312,9 @@ pub fn save(config: *const Config, io: std.Io, dir: std.Io.Dir) !void {
 /// to `value`, the text a user typed. The path names a field of the settings
 /// and, dot by dot, the sections it lives in; the value is read as that field's
 /// type, a string kept as it is and `null` clearing an optional setting. Every
-/// field the configuration declares is reachable, so a setting added to it is
-/// settable without anything here changing.
+/// field whose type can be read from one string is reachable, so a scalar added
+/// to the configuration is settable without anything here changing; a list, such
+/// as the web providers, is set in the file.
 ///
 /// The result is checked the way a file read is, and written into the
 /// configuration only once it passes, so a value that would make the
