@@ -395,8 +395,9 @@ pub const Heading = struct {
             // description of what the command does, which is what a reader wants
             // in front of a command it has not read. The command itself is shown
             // under the header, whole. A call from before the tool asked for a
-            // description has none, and its heading comes out with no target.
-            .bash => |args| .forTool(.bash, headerLine(args.description orelse "")),
+            // description has none, so the first line of the command stands in,
+            // and both frontends then show what it ran.
+            .bash => |args| .forTool(.bash, headerLine(args.description orelse args.command)),
             .web_search => |args| .forTool(.web_search, args.query),
             .web_fetch => |args| .forTool(.web_fetch, args.url),
             .unknown => |name| .marked(marks.unknown, name, ""),

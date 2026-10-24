@@ -826,13 +826,9 @@ fn toolSummary(call: Tools.Call, result: []const u8, status: ?Status, out: *std.
     try escape(head.name, out);
     try out.writeAll("</span>");
     // What the call acts on. A bash call's heading carries the model's
-    // description of what the command does, so a collapsed call says what it is
-    // for. A call from before the tool asked for one has no description, so the
-    // first line of the command stands in, which at least names something.
-    const target = if (head.target.len > 0) head.target else switch (call) {
-        .bash => |args| Tools.headerLine(args.command),
-        else => "",
-    };
+    // description of what the command does, or the command's first line when a
+    // call from before the tool asked for one has no description.
+    const target = head.target;
     if (target.len > 0) {
         try out.writeAll(" <span class=\"target\">");
         try escape(target, out);

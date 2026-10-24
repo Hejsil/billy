@@ -2634,7 +2634,7 @@ test "the terminal shows a tool call the way a replay does" {
     // The two paths show the same bytes, which is what keeps a run and a resume
     // of it reading alike. The header before the result is what a slow command
     // needs on screen while it runs.
-    try std.testing.expectEqualStrings("❯ bash\necho hi\n✓ exit 0\n▾ stdout\nhi\n\n", live.written());
+    try std.testing.expectEqualStrings("❯ bash echo hi\necho hi\n✓ exit 0\n▾ stdout\nhi\n\n", live.written());
     try std.testing.expectEqualStrings(replayed.written(), live.written());
 }
 

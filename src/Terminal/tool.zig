@@ -208,7 +208,7 @@ test "describe frames a call and its output" {
     );
     // The command of a bash call is printed whole.
     try expectDescribe(
-        "❯ bash\nls -la\n✓ exit 0\n\n",
+        "❯ bash ls -la\nls -la\n✓ exit 0\n\n",
         "bash",
         "{\"command\":\"ls -la\"}",
         "exit code: 0\n(no output)\n",
@@ -283,10 +283,11 @@ test "a bash call's description is shown in its header" {
         "exit code: 0\n",
         .plain,
     );
-    // A call from before the tool asked for a description has none, so the header
-    // names only the tool; the command is still shown under it.
+    // A call from before the tool asked for a description has none, so the
+    // command's first line stands in for it; the whole command is still shown
+    // under the header.
     try expectDescribe(
-        "❯ bash\ncargo test\n✓ exit 0\n\n",
+        "❯ bash cargo test\ncargo test\n✓ exit 0\n\n",
         "bash",
         "{\"command\":\"cargo test\"}",
         "exit code: 0\n",
@@ -305,7 +306,7 @@ test "a bash call's description is shown in its header" {
 test "the exit status of a bash call is shown green or red" {
     // A command that succeeded.
     try expectDescribe(
-        "\x1b[36m❯\x1b[0m \x1b[1mbash\x1b[0m\nmake\n\x1b[1;32m✓ exit 0\x1b[0m\n\x1b[1m▾ stdout\x1b[0m\n\x1b[2mbuilt\x1b[0m\n\n",
+        "\x1b[36m❯\x1b[0m \x1b[1mbash\x1b[0m \x1b[2mmake\x1b[0m\nmake\n\x1b[1;32m✓ exit 0\x1b[0m\n\x1b[1m▾ stdout\x1b[0m\n\x1b[2mbuilt\x1b[0m\n\n",
         "bash",
         "{\"command\":\"make\"}",
         "exit code: 0\nbuilt\n",
@@ -313,7 +314,7 @@ test "the exit status of a bash call is shown green or red" {
     );
     // One that did not, whose output the terminal still shows as it is.
     try expectDescribe(
-        "\x1b[36m❯\x1b[0m \x1b[1mbash\x1b[0m\nmake\n\x1b[1;31m✗ exit 2\x1b[0m\n\x1b[1m▾ stdout\x1b[0m\n\x1b[2mboom\x1b[0m\n\n",
+        "\x1b[36m❯\x1b[0m \x1b[1mbash\x1b[0m \x1b[2mmake\x1b[0m\nmake\n\x1b[1;31m✗ exit 2\x1b[0m\n\x1b[1m▾ stdout\x1b[0m\n\x1b[2mboom\x1b[0m\n\n",
         "bash",
         "{\"command\":\"make\"}",
         "exit code: 2\nboom\n",
@@ -343,15 +344,15 @@ test "a bash block shows only the streams the command filled" {
     });
     const cases = [_]struct { command: []const u8, expected: []const u8 }{
         // Nothing printed: the status is all there is.
-        .{ .command = "true", .expected = "❯ bash\ntrue\n✓ exit 0\n\n" },
+        .{ .command = "true", .expected = "❯ bash true\ntrue\n✓ exit 0\n\n" },
         // One stream: it follows the status under a label of its own.
-        .{ .command = "echo hi", .expected = "❯ bash\necho hi\n✓ exit 0\n▾ stdout\nhi\n\n" },
-        .{ .command = "echo oops >&2", .expected = "❯ bash\necho oops >&2\n✓ exit 0\n▾ stderr\noops\n\n" },
+        .{ .command = "echo hi", .expected = "❯ bash echo hi\necho hi\n✓ exit 0\n▾ stdout\nhi\n\n" },
+        .{ .command = "echo oops >&2", .expected = "❯ bash echo oops >&2\necho oops >&2\n✓ exit 0\n▾ stderr\noops\n\n" },
         // Both, each under its own label, standard output first.
-        .{ .command = "echo out; echo err >&2", .expected = "❯ bash\necho out; echo err >&2\n" ++
+        .{ .command = "echo out; echo err >&2", .expected = "❯ bash echo out; echo err >&2\necho out; echo err >&2\n" ++
             "✓ exit 0\n▾ stdout\nout\n▾ stderr\nerr\n\n" },
         // A command that failed is the same shape with the status in red.
-        .{ .command = "exit 3", .expected = "❯ bash\nexit 3\n✗ exit 3\n\n" },
+        .{ .command = "exit 3", .expected = "❯ bash exit 3\nexit 3\n✗ exit 3\n\n" },
     };
     var result: std.Io.Writer.Allocating = .init(gpa);
     defer result.deinit();
@@ -395,7 +396,7 @@ test "a bash result with no status line is shown as it is" {
     const shown: Writer = .{ .out = &out.writer };
     try describe(gpa, Tools.parse(arena, call), "built\nnothing to do", shown);
     try std.testing.expectEqualStrings(
-        "❯ bash\nmake\n▾ output\nbuilt\nnothing to do\n\n",
+        "❯ bash make\nmake\n▾ output\nbuilt\nnothing to do\n\n",
         out.written(),
     );
     // The split a frontend showing the status apart reads it with is null for
@@ -533,7 +534,7 @@ test "run logs exactly what describe prints" {
     const shown: Writer = .{ .out = &log.writer };
     try describe(gpa, parsed, result.written(), shown);
     try std.testing.expectEqualStrings(
-        "❯ bash\ntrue\n✓ exit 0\n\n",
+        "❯ bash true\ntrue\n✓ exit 0\n\n",
         log.written(),
     );
 }
