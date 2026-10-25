@@ -2363,7 +2363,7 @@ test "the provider and model a session was started on are saved and resumed" {
     defer session.deinit();
     // A fresh session records nothing, so a caller has to say where it is sent.
     try std.testing.expect(session.model() == null);
-    try session.setModel("opencode_go/glm-5.3-flash");
+    try session.setModel("opencode-go/glm-5.3-flash");
     try session.append(.{ .role = .user, .content = "hello" });
     try session.append(.{ .role = .assistant, .content = "hi" });
 
@@ -2374,7 +2374,7 @@ test "the provider and model a session was started on are saved and resumed" {
     // than following whatever the configuration now says, since the conversation
     // belongs to the model that produced it.
     try std.testing.expect(resumed.model() != null);
-    try std.testing.expectEqualStrings("opencode_go/glm-5.3-flash", resumed.modelChoice("deepseek/deepseek-flash"));
+    try std.testing.expectEqualStrings("opencode-go/glm-5.3-flash", resumed.modelChoice("deepseek/deepseek-flash"));
 }
 
 test "a session with no recorded model is read as the configured one" {
@@ -2416,8 +2416,8 @@ test "a session file written with an empty model reads as the configured one" {
     defer resumed.deinit();
     try std.testing.expect(resumed.model() == null);
     try std.testing.expectEqualStrings(
-        "opencode_go/glm-5.3-flash",
-        resumed.modelChoice("opencode_go/glm-5.3-flash"),
+        "opencode-go/glm-5.3-flash",
+        resumed.modelChoice("opencode-go/glm-5.3-flash"),
     );
 }
 

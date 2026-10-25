@@ -14,8 +14,6 @@ pub const source_url = "https://models.dev/api.json";
 /// The shape of the cache file. A file of another version is fetched again
 /// rather than guessed at.
 pub const format_version: u32 = 1;
-/// The largest response billy will read, so a wrong address cannot fill memory.
-const max_source_bytes = 64 << 20;
 
 /// The providers and models billy can send a request to. Loaded from the cache
 /// file; empty when it could not be fetched or read, which costs the context
@@ -23,15 +21,11 @@ const max_source_bytes = 64 << 20;
 pub const Catalog = struct {
     providers: []const Provider = &.{},
 
-    /// The provider called `name`. A provider is matched exactly first, then
-    /// with `-` and `_` taken as the same character, so the configuration's
-    /// `opencode_go` finds the catalog's `opencode-go`.
+    /// The provider called `name`, which is the spelling models.dev lists it
+    /// under: the configuration names a provider the way the catalog does.
     pub fn find(catalog: *const Catalog, name: []const u8) ?*const Provider {
         for (catalog.providers) |*provider| {
             if (std.mem.eql(u8, provider.name, name)) return provider;
-        }
-        for (catalog.providers) |*provider| {
-            if (sameName(provider.name, name)) return provider;
         }
         return null;
     }
@@ -61,16 +55,16 @@ pub const Catalog = struct {
     }
 };
 
-/// One service billy can call: where its OpenAI-compatible API lives, the
-/// variables a key may come from, and the models it offers.
+/// One service billy can call: where its OpenAI-compatible API lives, and the
+/// models it offers.
 pub const Provider = struct {
     /// The name a choice names it by, which is models.dev's provider id.
     name: []const u8,
     /// The base URL its completions path is appended to. Null for a provider
-    /// whose address only the configuration can name.
+    /// models.dev gives no address for -- OpenAI and xAI as it lists them today,
+    /// which leave the address to their SDK: a key can still be stored for one,
+    /// and the configuration can name where it is reached.
     base_url: ?[]const u8 = null,
-    /// Variables a key may be exported in, in the order models.dev lists them.
-    env: []const []const u8 = &.{},
     models: []const Model = &.{},
 
     fn model(provider: *const Provider, id: []const u8) ?*const Model {
@@ -115,9 +109,6 @@ const SourceProvider = struct {
     /// not. A provider it does not name is one billy cannot call.
     npm: ?[]const u8 = null,
     api: ?[]const u8 = null,
-    /// Optional because models.dev may leave a list it has nothing for out or
-    /// write it as `null`, and neither is a reason to lose the catalog.
-    env: ?[]const []const u8 = null,
     models: std.json.ArrayHashMap(SourceModel) = .{},
 };
 
@@ -125,7 +116,7 @@ const SourceModel = struct {
     /// The id a request sends, which is the key the model is listed under; the
     /// field is read because models.dev states it, and the key is the fallback.
     id: ?[]const u8 = null,
-    limit: ?SourceLimit = null,
+    limit: SourceLimit = .{},
 };
 
 const SourceLimit = struct {
@@ -197,7 +188,7 @@ pub fn refresh(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir) !Counts {
     defer client.deinit();
 
     var request = try client.request(.GET, try std.Uri.parse(source_url), .{
-        .headers = .{ .user_agent = .{ .override = "billy" } },
+        .headers = .{ .user_agent = .{ .override = http.user_agent } },
     });
     defer request.deinit();
     try request.sendBodiless();
@@ -205,12 +196,8 @@ pub fn refresh(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir) !Counts {
     var redirect_buffer: [8 * 1024]u8 = undefined;
     var response = try request.receiveHead(&redirect_buffer);
     if (response.head.status.class() != .success) return error.CatalogFetchFailed;
-    if (response.head.content_length) |length| {
-        if (length > max_source_bytes) return error.CatalogTooLarge;
-    }
     const body = try http.readBody(gpa, &response);
     defer gpa.free(body);
-    if (body.len > max_source_bytes) return error.CatalogTooLarge;
 
     return writeFrom(io, gpa, dir, body);
 }
@@ -233,55 +220,37 @@ fn writeFrom(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir, body: []const 
     defer providers.deinit(build);
     var model_count: usize = 0;
 
-    var it = source.map.iterator();
-    while (it.next()) |entry| {
-        const name = entry.key_ptr.*;
-        const provider = entry.value_ptr;
+    for (source.map.keys(), source.map.values()) |name, provider| {
         if (name.len == 0) continue;
         if (!openAiCompatible(provider.npm orelse continue)) continue;
 
         // A model without a window is left out, and a provider left with no
         // models is no endpoint: neither is a row.
         var models: std.ArrayList(Model) = .empty;
-        var models_it = provider.models.map.iterator();
-        while (models_it.next()) |model_entry| {
-            const model = model_entry.value_ptr;
-            const id = model.id orelse model_entry.key_ptr.*;
-            const limit = model.limit orelse continue;
-            const context = limit.context orelse continue;
+        for (provider.models.map.keys(), provider.models.map.values()) |key, model| {
+            const id = model.id orelse key;
+            const context = model.limit.context orelse continue;
             if (id.len == 0 or context == 0) continue;
             try models.append(build, .{ .id = id, .context = context });
         }
         if (models.items.len == 0) continue;
-        std.mem.sort(Model, models.items, {}, byModelId);
         model_count += models.items.len;
 
-        // Some providers -- OpenAI and xAI among them -- leave the address to
-        // their SDK, so models.dev has none. They are kept with no address: a
-        // key can be stored for them, and the configuration can name where they
-        // are reached.
+        // A provider models.dev gives no address for is still a row: a key can
+        // be stored for it, and the configuration can name where it is reached.
         try providers.append(build, .{
             .name = name,
             .base_url = provider.api,
-            .env = provider.env orelse &.{},
             .models = models.items,
         });
     }
     if (providers.items.len == 0) return error.EmptyCatalog;
 
-    std.mem.sort(Provider, providers.items, {}, byName);
-
-    var text: std.Io.Writer.Allocating = .init(gpa);
-    defer text.deinit();
-    try std.json.Stringify.value(Cache{
-        .providers = providers.items,
-    }, .{}, &text.writer);
-
     var atomic = try dir.createFileAtomic(io, cache_file, .{ .replace = true });
     defer atomic.deinit(io);
     var buffer: [std.heap.page_size_min]u8 = undefined;
     var file = atomic.file.writer(io, &buffer);
-    try file.interface.writeAll(text.written());
+    try std.json.Stringify.value(Cache{ .providers = providers.items }, .{}, &file.interface);
     try file.flush();
     try atomic.replace(io);
 
@@ -294,29 +263,6 @@ fn openAiCompatible(npm: []const u8) bool {
     return std.mem.eql(u8, npm, "@ai-sdk/openai-compatible") or
         std.mem.eql(u8, npm, "@ai-sdk/openai") or
         std.mem.eql(u8, npm, "@ai-sdk/xai");
-}
-
-fn byName(_: void, a: Provider, b: Provider) bool {
-    return std.mem.order(u8, a.name, b.name) == .lt;
-}
-
-fn byModelId(_: void, a: Model, b: Model) bool {
-    return std.mem.order(u8, a.id, b.id) == .lt;
-}
-
-/// Whether two provider names are the same with `-` and `_` taken as equal.
-fn sameName(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        if (x == y) continue;
-        if (isDash(x) and isDash(y)) continue;
-        return false;
-    }
-    return true;
-}
-
-fn isDash(c: u8) bool {
-    return c == '-' or c == '_';
 }
 
 /// A provider and the model of its that a run asks for, as the one string the
@@ -354,17 +300,21 @@ pub const Choice = struct {
 };
 
 /// A catalog for the tests, so they need no cache file. The real catalog is
-/// fetched at runtime; this is the two providers billy's tests name, with the
-/// windows they expect. Only a test may use it.
+/// fetched at runtime; this is the providers billy's tests name, with the windows
+/// they expect. Only a test may use it. `xai` is one only the catalog could
+/// name: billy ships no purpose for it.
 pub const test_catalog = Catalog{ .providers = &.{
-    .{ .name = "deepseek", .base_url = "https://api.deepseek.com", .env = &.{"DEEPSEEK_API_KEY"}, .models = &.{
+    .{ .name = "deepseek", .base_url = "https://api.deepseek.com", .models = &.{
         .{ .id = "deepseek-flash", .context = 1_000_000 },
         .{ .id = "deepseek-v4-pro", .context = 1_000_000 },
         .{ .id = "deepseek-v4-flash", .context = 1_000_000 },
     } },
-    .{ .name = "opencode-go", .base_url = "https://opencode.ai/zen/go/v1", .env = &.{"OPENCODE_API_KEY"}, .models = &.{
+    .{ .name = "opencode-go", .base_url = "https://opencode.ai/zen/go/v1", .models = &.{
         .{ .id = "kimi-k2.7-code", .context = 262_144 },
         .{ .id = "deepseek-flash", .context = 1_000_000 },
+    } },
+    .{ .name = "xai", .base_url = "https://api.x.ai/v1", .models = &.{
+        .{ .id = "grok-4", .context = 131_072 },
     } },
 } };
 
@@ -387,16 +337,16 @@ test "a choice names its provider before the slash and its model after it" {
     try std.testing.expect(!bare.isComplete());
 }
 
-test "the catalog finds a provider exactly, then with dashes and underscores" {
+test "the catalog finds a provider by the name models.dev lists it under" {
     const found = test_catalog.find("deepseek").?;
     try std.testing.expectEqualStrings("https://api.deepseek.com", found.base_url.?);
 
-    // The catalog calls it `opencode-go`; the configuration and a session call
-    // it `opencode_go`.
-    const opencode = test_catalog.find("opencode_go").?;
-    try std.testing.expectEqualStrings("opencode-go", opencode.name);
+    const opencode = test_catalog.find("opencode-go").?;
     try std.testing.expectEqualStrings("https://opencode.ai/zen/go/v1", opencode.base_url.?);
 
+    // A spelling of the user's own is a provider billy does not know, rather
+    // than one guessed at: the catalog itself says `opencode-go`.
+    try std.testing.expect(test_catalog.find("opencode_go") == null);
     try std.testing.expect(test_catalog.find("not-a-provider") == null);
 }
 
@@ -406,7 +356,7 @@ test "metadata is looked up at the provider, then among all providers" {
     try std.testing.expectEqual(1_000_000, flash.context_window);
 
     // The same model under another provider uses that provider's window.
-    const elsewhere = test_catalog.metadata("opencode_go", "kimi-k2.7-code").?;
+    const elsewhere = test_catalog.metadata("opencode-go", "kimi-k2.7-code").?;
     try std.testing.expectEqualStrings("opencode-go", elsewhere.provider);
     try std.testing.expectEqual(262_144, elsewhere.context_window);
 
@@ -447,7 +397,7 @@ test "the cache is filtered to OpenAI-compatible providers, and reads back" {
         \\  },
         \\  "xai": {
         \\    "id": "xai", "name": "xAI", "api": "https://api.x.ai/v1",
-        \\    "npm": "@ai-sdk/xai", "env": null,
+        \\    "npm": "@ai-sdk/xai",
         \\    "models": {"grok": {"id": "grok", "limit": {"context": 131072}}}
         \\  },
         \\  "openai": {
@@ -471,16 +421,12 @@ test "the cache is filtered to OpenAI-compatible providers, and reads back" {
     try std.testing.expect(catalog.find("anthropic") == null);
 
     const deepseek = catalog.find("deepseek").?;
-    try std.testing.expectEqualStrings("DEEPSEEK_API_KEY", deepseek.env[0]);
     try std.testing.expectEqual(@as(usize, 1), deepseek.models.len);
     try std.testing.expectEqualStrings("deepseek-flash", deepseek.models[0].id);
     try std.testing.expectEqual(@as(usize, 1_048_576), deepseek.models[0].context);
 
-    // xAI is kept, and a list of variables it did not give is an empty one, not
-    // a refusal.
     const xai = catalog.find("xai").?;
     try std.testing.expectEqual(@as(usize, 131_072), xai.models[0].context);
-    try std.testing.expectEqual(@as(usize, 0), xai.env.len);
 
     // A provider models.dev gives no address for is kept without one, so a key
     // can be stored for it and the configuration can say where it is reached.

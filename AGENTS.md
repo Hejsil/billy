@@ -64,6 +64,10 @@ least once. Read the rule, not the story; the story is in the review.
   `replace` — and anything that replaces a file billy does *not* own is written that way too, only
   more so. *`edit` and `write` truncated the user's source files in place while config, credentials,
   sessions and health were all careful.* `Tools.writeFile` is the one to write through.
+- **What is written is streamed onto the file's writer, not built in memory first.** Writing
+  allocates nothing, and a large file costs no second copy. *The catalog stringified into an
+  `Allocating` buffer to copy it into its atomic file, while `Config.save` beside it already wrote
+  straight through.*
 - **Replacing a file is not the same as writing it.** The new file is a new inode, which carries the
   permissions it was created with unless the old one's are read and given back — an edit must not
   take the bit off a script, nor open a file the user keeps to themselves — it replaces a symbolic
@@ -110,6 +114,11 @@ least once. Read the rule, not the story; the story is in the review.
   a tool differently. A union arm with no table row is a compile error.
   *`parseCallNamed` walked a hand-written tuple, so a new tool silently became `unknown` while
   `specs` offered it.*
+- **A name from a service is matched as the service spells it, not normalized.** `find` compared a
+  provider with `-` and `_` taken as equal, so a configured `opencode_go` reached the catalog's
+  `opencode-go` and there were two spellings of one provider in the configuration, the credentials
+  and the cache. The catalog already says how a provider is spelled; a name of the user's own is a
+  provider billy does not know, and is reported as one.
 - **A service is a row in the table, not a file of its own.** The five web providers repeated the same
   request, auth header, retry and reply walk, and the two tools kept separate provider enums and
   credential maps. One `web.Provider`, one descriptor table and one driver per tool leave the

@@ -93,7 +93,7 @@ pub const Bash = struct {
 const Stored = struct {
     version: u32 = 1,
     /// Which provider and model a new session asks for, as `provider/model`:
-    /// `deepseek/deepseek-v4-flash`, `opencode_go/glm-5.3-flash`.
+    /// `deepseek/deepseek-v4-flash`, `opencode-go/glm-5.3-flash`.
     ///
     /// It is one setting rather than two because the two halves are only
     /// meaningful together: a model id alone names no endpoint, and the model
@@ -674,10 +674,10 @@ test "the model setting names a provider and a model of it" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var opened = try openFrom(&tmp, "{\"model\":\"opencode_go/glm-5.3-flash\"}");
+    var opened = try openFrom(&tmp, "{\"model\":\"opencode-go/glm-5.3-flash\"}");
     defer opened.config.deinit();
     const choice = opened.config.stored.choice();
-    try std.testing.expectEqualStrings("opencode_go", choice.provider());
+    try std.testing.expectEqualStrings("opencode-go", choice.provider());
     try std.testing.expectEqualStrings("glm-5.3-flash", choice.model());
 
     // A model id may hold a slash of its own, so only the first one splits the
@@ -729,7 +729,7 @@ test "a model naming a provider the file does not define is refused" {
 
     // The provider is resolved at the request, against the catalog or the
     // configuration, so opening the file only checks the pair is complete.
-    var opened = try openFrom(&tmp, "{\"model\":\"opencode_go/glm-5.3-flash\"}");
+    var opened = try openFrom(&tmp, "{\"model\":\"opencode-go/glm-5.3-flash\"}");
     defer opened.config.deinit();
 }
 

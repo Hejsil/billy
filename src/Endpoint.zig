@@ -47,19 +47,16 @@ pub fn targetFor(
     choice: []const u8,
 ) !Target {
     const halves = models.Choice{ .text = choice };
-    const name = halves.provider();
+    const provider = halves.provider();
     // A session's own provider decides where it goes: a base URL the
     // configuration names, or the catalog's own when it knows the provider.
     const base_url = try resolveBaseUrl(config.stored.providers, catalog, choice);
-    const provider = catalog.find(name);
 
     return .{
         .url = try completionsUrl(arena, base_url),
-        // A key stored under the catalog's own name works for a choice that
-        // names the provider by one of its aliases.
-        .api_key = credentials.get(name) orelse
-            (if (provider) |known| credentials.get(known.name) else null) orelse
-            return missingKey(name),
+        // The key is stored under the provider the choice names, which is the
+        // catalog's own spelling of it.
+        .api_key = credentials.get(provider) orelse return missingKey(provider),
         // The model is copied out rather than sliced from `choice`: the choice a
         // session passes is a slice of its own string pool, and a pointer into
         // that pool survives no write to it, so the next intern would leave the
@@ -148,17 +145,15 @@ test "a target carries the address, the key and the model of the choice it names
     defer config.deinit();
     var credentials: Credentials = .{};
     try credentials.put(arena, "deepseek", "k");
-    try credentials.put(arena, "opencode_go", "k");
+    try credentials.put(arena, "opencode-go", "k");
 
     const flash = try targetFor(&config, &credentials, &models.test_catalog, arena, "deepseek/deepseek-flash");
     try std.testing.expectEqualStrings("https://api.deepseek.com/chat/completions", flash.url);
     try std.testing.expectEqualStrings("k", flash.api_key);
     try std.testing.expectEqualStrings("deepseek-flash", flash.model);
 
-    // Another provider is another address, and the key stored for that one. The
-    // choice spells the provider `opencode_go`, and the key stored under the
-    // catalog's own spelling is the one it is sent with.
-    const kimi = try targetFor(&config, &credentials, &models.test_catalog, arena, "opencode_go/kimi-k2.7-code");
+    // Another provider is another address, and the key stored for that one.
+    const kimi = try targetFor(&config, &credentials, &models.test_catalog, arena, "opencode-go/kimi-k2.7-code");
     try std.testing.expectEqualStrings("https://opencode.ai/zen/go/v1/chat/completions", kimi.url);
     try std.testing.expectEqualStrings("kimi-k2.7-code", kimi.model);
 }
@@ -186,8 +181,8 @@ test "a target is resolved through a provider the configuration defines itself" 
 
 test "a model as a header shows it carries the choice and the window of its model" {
     // A known model of a known provider has the window the catalog gives it.
-    const known = modelOf("opencode_go/kimi-k2.7-code", &models.test_catalog);
-    try std.testing.expectEqualStrings("opencode_go/kimi-k2.7-code", known.choice);
+    const known = modelOf("opencode-go/kimi-k2.7-code", &models.test_catalog);
+    try std.testing.expectEqualStrings("opencode-go/kimi-k2.7-code", known.choice);
     try std.testing.expectEqual(@as(usize, 262_144), known.info.?.context_window);
 
     // A bare model id is looked for among every provider the catalog holds, since the
@@ -204,14 +199,14 @@ test "the endpoint comes from the provider the choice names" {
     const none: Config.Providers = .{};
 
     // A provider the catalog holds decides its own endpoint, so a configured
-    // `opencode_go/glm-5.3-flash` reaches Go with no URL written anywhere.
+    // `opencode-go/glm-5.3-flash` reaches Go with no URL written anywhere.
     try std.testing.expectEqualStrings(
         "https://api.deepseek.com",
         baseUrlOf(none, &models.test_catalog, "deepseek/deepseek-flash").?,
     );
     try std.testing.expectEqualStrings(
         "https://opencode.ai/zen/go/v1",
-        baseUrlOf(none, &models.test_catalog, "opencode_go/glm-5.3-flash").?,
+        baseUrlOf(none, &models.test_catalog, "opencode-go/glm-5.3-flash").?,
     );
 
     // One the configuration defines does the same, which is how a proxy, a

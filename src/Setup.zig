@@ -326,12 +326,12 @@ test "a header names the model the session goes to, not the one billy is pointed
 
     var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
-    try session.setModel("opencode_go/kimi-k2.7-code");
+    try session.setModel("opencode-go/kimi-k2.7-code");
 
     // The choice is the session's own, provider and all, and the window is that
     // model's.
     const recorded = sessionModel(&opened.config, &models.test_catalog, &session);
-    try std.testing.expectEqualStrings("opencode_go/kimi-k2.7-code", recorded.choice);
+    try std.testing.expectEqualStrings("opencode-go/kimi-k2.7-code", recorded.choice);
     try std.testing.expectEqual(@as(usize, 262_144), recorded.info.?.context_window);
     try std.testing.expectEqual("opencode-go", recorded.info.?.provider);
 
@@ -355,14 +355,14 @@ test "a target names bytes of its own, not a slice of the session's pool" {
 
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = Config.file_name,
-        .data = "{\"model\":\"opencode_go/glm-5.3-flash\"}",
+        .data = "{\"model\":\"opencode-go/glm-5.3-flash\"}",
     });
     var opened = try Config.open(std.testing.io, tmp.dir, gpa);
     defer opened.config.deinit();
     // The key a request is sent with is the one stored under the provider's
     // name, so the credentials have to hold it for the target to resolve at all.
     var credentials: Credentials = .{};
-    try credentials.put(arena, "opencode_go", "k");
+    try credentials.put(arena, "opencode-go", "k");
 
     var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
@@ -370,7 +370,7 @@ test "a target names bytes of its own, not a slice of the session's pool" {
     // The choice a session that recorded none is given is the configured one, so
     // that is what it is sent to.
     const choice = session.modelChoice(opened.config.stored.model);
-    try std.testing.expectEqualStrings("opencode_go/glm-5.3-flash", choice);
+    try std.testing.expectEqualStrings("opencode-go/glm-5.3-flash", choice);
     const target = try Endpoint.targetFor(&opened.config, &credentials, &models.test_catalog, arena, choice);
     // The model the session recorded is interned in its string pool, and a
     // pointer into that pool survives no write to it. Writing more strings, as

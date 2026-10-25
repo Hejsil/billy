@@ -42,7 +42,7 @@ pub const Known = struct {
 /// The services billy knows, in the order the listing shows them.
 pub const known = [_]Known{
     .{ .name = "deepseek", .purpose = "DeepSeek API key" },
-    .{ .name = "opencode_go", .purpose = "OpenCode Go API key" },
+    .{ .name = "opencode-go", .purpose = "OpenCode Go API key" },
     .{ .name = "openai", .purpose = "OpenAI API key" },
     .{ .name = "tavily", .purpose = "Tavily web search API key" },
     .{ .name = "exa", .purpose = "Exa web search API key" },
@@ -429,7 +429,7 @@ test "the listing shows each service billy knows and whether a key is stored" {
 
     try std.testing.expectEqualStrings(
         \\deepseek     DeepSeek API key           stored
-        \\opencode_go  OpenCode Go API key        not set
+        \\opencode-go  OpenCode Go API key        not set
         \\openai       OpenAI API key             not set
         \\tavily       Tavily web search API key  not set
         \\exa          Exa web search API key     not set
@@ -452,7 +452,7 @@ test "the listing names a service that has no key of any kind" {
 
     try std.testing.expectEqualStrings(
         \\deepseek     DeepSeek API key           not set
-        \\opencode_go  OpenCode Go API key        not set
+        \\opencode-go  OpenCode Go API key        not set
         \\openai       OpenAI API key             not set
         \\tavily       Tavily web search API key  not set
         \\exa          Exa web search API key     not set
@@ -503,10 +503,10 @@ test "the listing names a catalog provider whose key is stored" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
 
-    // `opencode-go` is the catalog's spelling; billy's own services call it
-    // `opencode_go`, so this name is known only from the catalog.
+    // xAI is a provider the catalog names and billy ships no purpose for, so
+    // the catalog is the only thing that can say what the key is for.
     var credentials: Credentials = .{};
-    try credentials.put(allocator, "opencode-go", "k");
+    try credentials.put(allocator, "xai", "k");
 
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
@@ -530,7 +530,7 @@ test "a key is stored only for a name something will ask for" {
     // Anything else is a key no request would ever carry, so storing it would
     // only look like it worked.
     try std.testing.expect(!acceptable("mock", &.{}));
-    try std.testing.expect(!acceptable("deepseekk", &.{ "deepseek", "opencode_go" }));
+    try std.testing.expect(!acceptable("deepseekk", &.{ "deepseek", "opencode-go" }));
     try std.testing.expect(!acceptable("", &.{"mock"}));
 }
 
