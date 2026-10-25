@@ -119,6 +119,8 @@ least once. Read the rule, not the story; the story is in the review.
   `opencode-go` and there were two spellings of one provider in the configuration, the credentials
   and the cache. The catalog already says how a provider is spelled; a name of the user's own is a
   provider billy does not know, and is reported as one.
+- **A header every request carries is spelled once.** The user agent was `billy` to the catalog and
+  `billy/1.0` to a provider. Both are `http.user_agent`.
 - **A service is a row in the table, not a file of its own.** The five web providers repeated the same
   request, auth header, retry and reply walk, and the two tools kept separate provider enums and
   credential maps. One `web.Provider`, one descriptor table and one driver per tool leave the

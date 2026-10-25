@@ -1,6 +1,12 @@
-//! Reading a response body, which the model client and the web tools both do.
+//! The HTTP plumbing the model client, the web tools and the catalog share: what
+//! billy calls itself, and reading a response body.
 
 const std = @import("std");
+
+/// What billy calls itself to a service, rather than leaving the HTTP client's
+/// own name, which is the standard library's. A provider that watches its
+/// traffic for abuse asks to know what is talking to it.
+pub const user_agent = "billy/1.0";
 
 /// Reads the rest of `response`'s body, decompressed, into memory owned by `gpa`.
 /// It is read the way `std.http.Client.fetch` reads it, so a compressed reply still

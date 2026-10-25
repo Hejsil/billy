@@ -233,7 +233,7 @@ pub const Client = struct {
                 // Named rather than left to the HTTP client's own, which is the
                 // library's name; a provider that rate-limits or blocks generic
                 // SDK traffic has nothing to go on otherwise.
-                .user_agent = .{ .override = user_agent },
+                .user_agent = .{ .override = http.user_agent },
             },
             .extra_headers = &extra_headers,
         });
@@ -324,11 +324,6 @@ pub const Client = struct {
         return .fromMilliseconds(@intCast(half + std.mem.readInt(u64, &seed, .little) % (half + 1)));
     }
 };
-
-/// What billy calls itself to a provider, rather than leaving the HTTP client's
-/// own name, which is the standard library's. A provider that watches its
-/// traffic for abuse asks to know what is talking to it.
-const user_agent = "billy/1.0";
 
 /// The longest a backoff waits, so a long outage does not turn a retry into a
 /// wait measured in minutes.
@@ -849,7 +844,7 @@ test "a request names billy and carries the session it belongs to" {
     var found = std.StringHashMap([]const u8).init(gpa);
     defer found.deinit();
     for (mock.headers.items) |header| try found.put(header.name, header.value);
-    try std.testing.expectEqualStrings(user_agent, found.get("user-agent").?);
+    try std.testing.expectEqualStrings(http.user_agent, found.get("user-agent").?);
     try std.testing.expectEqualStrings("01ABC", found.get("x-opencode-session").?);
 }
 
