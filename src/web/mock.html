@@ -26,10 +26,6 @@
   </div>
   <form id="prompt">
     <textarea id="text" rows="1" placeholder="ask billy something (shift+enter for a newline)" autocomplete="off"></textarea>
-    <select id="mode" title="what a new session may do">
-      <option value="chat">chat</option>
-      <option value="general">general</option>
-    </select>
   </form>
 </main>
 <div id="backdrop"></div>
@@ -88,9 +84,9 @@ const history = [
 ].join('');
 
 const sessions = [
-  { id: '01HF7YAT000000000000000001', title: 'explain main.zig', blocks: history, mode: 'general' },
-  { id: '01HF7YAT000000000000000002', title: 'a very long session title that has to be cut off at the edge', blocks: prompt_('hi'), mode: 'chat' },
-  { id: '01HF7YAT000000000000000003', title: '', blocks: '', mode: 'chat' },
+  { id: '01HF7YAT000000000000000001', title: 'explain main.zig', blocks: history },
+  { id: '01HF7YAT000000000000000002', title: 'a very long session title that has to be cut off at the edge', blocks: prompt_('hi') },
+  { id: '01HF7YAT000000000000000003', title: '', blocks: '' },
 ];
 
 // Frames of one turn: [delay in ms, event, data].
@@ -129,13 +125,13 @@ window.fetch = async (url, opts = {}) => {
   if (url === '/api/sessions' && method === 'POST') {
     const body = JSON.parse(opts.body);
     const id = '01HF7YAT' + String(Date.now()).padStart(18, '0');
-    sessions.unshift({ id, title: '', blocks: '', mode: body.mode });
+    sessions.unshift({ id, title: '', blocks: '' });
     return stream(turn(body.text, true, id));
   }
   const session = sessions.find((s) => s.id === decodeURIComponent(parts[3] || ''));
   if (!session) return json({}, 404);
   if (parts[4] === 'message' && method === 'POST') return stream(turn(JSON.parse(opts.body).text, false, session.id));
-  if (method === 'GET') return json({ header: header(session.id), blocks: session.blocks, mode: session.mode });
+  if (method === 'GET') return json({ header: header(session.id), blocks: session.blocks });
   if (method === 'PATCH') { session.title = JSON.parse(opts.body).title; return json({}); }
   if (method === 'DELETE') { sessions.splice(sessions.indexOf(session), 1); return json({}); }
   return json({}, 405);

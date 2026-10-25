@@ -12,8 +12,6 @@ const report = @import("report.zig");
 const Session = @import("Session.zig");
 const Terminal = @import("Terminal.zig");
 
-pub const Mode = @import("Agent/mode.zig").Mode;
-
 const Agent = @This();
 
 /// A command a prompt can be on its own, which billy runs itself rather than
@@ -39,8 +37,8 @@ const Command = enum {
 const Target = Endpoint.Target;
 
 /// What a run is given, in one value: what each turn's target is resolved from,
-/// how its agent behaves on it, what its tools run with, the mode it starts in,
-/// and the home directory and instructions the run reads outside the session.
+/// how its agent behaves on it, what its tools run with, and the home directory
+/// and instructions the run reads outside the session.
 /// Each part is resolved by the frontend, from the configuration, the credentials
 /// and the environment, so the agent is handed the run rather than the file it
 /// came from. What a run shows is written through the frontend's writer, which
@@ -54,9 +52,6 @@ pub const Options = struct {
     credentials: *const Credentials,
     behaviour: Behaviour,
     tools: Tools.Settings,
-    /// The mode the run starts in, which is the frontend's choice until the
-    /// session's first prompt settles it.
-    mode: Mode = .general,
     /// Home directory, so the header can shorten a path inside it; null when unset.
     home: ?[]const u8 = null,
     /// Directory holding the user's own instructions file, read into every
@@ -316,14 +311,13 @@ fn sameDir(io: std.Io, a: std.Io.Dir, b: std.Io.Dir) bool {
 /// replayed session looks like the run it continues.
 const prompt = "> ";
 
-/// The line shown above the input prompt: the mode, the session id, the model,
-/// the working directory, and how much of the context window the conversation
-/// fills. Its fields are the values printed, so printing it needs nothing of the
+/// The line shown above the input prompt: the session id, the model, the working
+/// directory, and how much of the context window the conversation fills. Its
+/// fields are the values printed, so printing it needs nothing of the
 /// configuration. The id is shown so that a run can be named by what it prints,
 /// which is what `--resume` takes to continue it; the window size is not reported
 /// by the API, so it comes from the model table.
 pub const SessionHeader = struct {
-    mode: Mode,
     id: []const u8,
     /// The provider and model the session runs, as `<provider>/<model>`: the
     /// choice it recorded, which is what a request names and a page shows.
@@ -339,12 +333,11 @@ pub const SessionHeader = struct {
     /// which has no gauge.
     context_window: ?usize = null,
 
-    /// The header for `session`: what it holds -- its mode, id, directory and
-    /// size -- with the model it goes to and the window of that model, and the
-    /// `home` a path is shortened against, which the session keeps none of.
+    /// The header for `session`: what it holds -- its id, directory and size --
+    /// with the model it goes to and the window of that model, and the `home` a
+    /// path is shortened against, which the session keeps none of.
     pub fn of(session: *const Session, model: Endpoint.Model, home: ?[]const u8) SessionHeader {
         return .{
-            .mode = session.mode,
             .id = session.id(),
             .model = model.choice,
             .cwd = session.cwd(),
@@ -358,7 +351,7 @@ pub const SessionHeader = struct {
     /// caller writes it with `out.print("{f}", .{header})`. Nothing is allocated;
     /// the caller holds the buffer, which it already has for the line editor.
     pub fn format(self: SessionHeader, out: *std.Io.Writer) std.Io.Writer.Error!void {
-        try out.print("billy · {s} · {s} · {s} · ", .{ @tagName(self.mode), self.id, self.model });
+        try out.print("billy · {s} · {s} · ", .{ self.id, self.model });
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
         try out.writeAll(displayPath(&path_buffer, self.cwd, self.home));
         if (self.context_window) |window| {
@@ -443,10 +436,6 @@ target_state: std.heap.ArenaAllocator,
 /// ahead of the project's; null when there is no such file. Borrowed from the
 /// frontend, which owns it and outlives the agent.
 instructions: ?std.Io.Dir = null,
-/// What the session may do and what its prompt says, which is the frontend's
-/// choice until the session's first prompt settles it and the session's own
-/// from then on. See `mode.zig`.
-mode: Mode = .general,
 /// The directory the session works in. For a resumed session it is the one the
 /// session was started in.
 work_dir: std.Io.Dir,
@@ -482,7 +471,6 @@ pub fn init(
         .http = http_client,
         .target_state = std.heap.ArenaAllocator.init(gpa),
         .instructions = options.instructions,
-        .mode = options.mode,
         .work_dir = work_dir,
         .tool_set = tool_set,
     };
@@ -500,25 +488,12 @@ pub fn deinit(agent: *Agent) void {
 /// instructions come from the configuration directory and the project's from the
 /// session's directory.
 pub fn prepare(agent: *Agent, session: *Session) !void {
-    // A session with a conversation keeps the mode and prompt it was saved with;
-    // a new one takes the mode the frontend chose. Either way the agent's mode
-    // ends up the session's own.
-    if (session.messages.items.len > 0) {
-        agent.mode = session.mode;
-    } else {
-        session.setMode(agent.mode);
-        const prompt_text = try leadPrompt(
-            agent.io,
-            agent.gpa,
-            agent.work_dir,
-            agent.instructions,
-            agent.mode,
-        );
+    if (session.messages.items.len == 0 and session.systemPrompt() == null) {
+        const prompt_text = try leadPrompt(agent.io, agent.gpa, agent.work_dir, agent.instructions);
         defer agent.gpa.free(prompt_text);
-        // A mode with no prompt sends no system message.
-        if (prompt_text.len > 0) try session.setSystemPrompt(prompt_text);
+        try session.setSystemPrompt(prompt_text);
     }
-    try session.ensureTools(agent.tool_set.definitions(agent.mode));
+    try session.ensureTools(agent.tool_set.definitions());
 }
 
 /// Where `session` is sent right now, resolved from the model it records at this
@@ -559,22 +534,10 @@ fn sessionModel(agent: *const Agent, session: *const Session) Endpoint.Model {
     return Endpoint.modelOf(session.modelChoice(agent.config.stored.model));
 }
 
-/// What asking `agent` to start a session with a first prompt came to.
-pub const Started = union(enum) {
-    /// What to ask: the prompt with any mode command taken off.
-    prompt: []const u8,
-    /// The prompt named only a mode, so the session is set up for it and waits.
-    mode_only,
-    /// The session has been asked before, so it keeps the mode it was saved with.
-    asked_before,
-};
-
 /// What a line typed into a session came to.
 pub const Waiting = union(enum) {
-    /// The line is asked of the model, with any mode command taken off.
+    /// The line is asked of the model.
     prompt: []const u8,
-    /// The line named only a mode, so the session is set up and nothing is asked.
-    ready,
     /// The line was a command, already run; what it had to say went out through
     /// the emitter.
     ran,
@@ -582,7 +545,7 @@ pub const Waiting = union(enum) {
 
 /// Takes a line typed into `session` and does what it asks for, except asking the
 /// model, which is left to `ask`. A frontend need know nothing more of a line:
-/// commands, the first-prompt rules and compaction are all handled here.
+/// commands and compaction are handled here.
 pub fn take(agent: *Agent, emitter: *Emitter, session: *Session, line: []const u8) !Waiting {
     // Compaction is a request of its own, made before the prompt is added, so the
     // client for the model the session records now is made before the line is
@@ -604,28 +567,10 @@ pub fn take(agent: *Agent, emitter: *Emitter, session: *Session, line: []const u
     // it triggers.
     _ = agent.compact(emitter, session, &client, .when_needed);
 
-    const started = try agent.start(session, line);
-    return switch (started) {
-        .prompt => |text| .{ .prompt = text },
-        .mode_only => .ready,
-        .asked_before => .{ .prompt = line },
-    };
-}
-
-/// Settles the mode from a session's first prompt and gives a new session its
-/// system prompt and tools. This is the one place the first-prompt rules live:
-/// `/chat` and `/general` name the mode and the rest of the line is asked; a
-/// prompt naming only a mode asks nothing; anything else keeps the mode the run
-/// is in, which is the frontend's choice until now (see `Mode.start`). A session
-/// asked before keeps what it was saved with.
-pub fn start(agent: *Agent, session: *Session, text: []const u8) !Started {
-    if (session.messages.items.len > 0) return .asked_before;
-
-    const choice = Mode.start(text, agent.mode);
-    agent.mode = choice.mode;
-    try agent.prepare(session);
-    if (choice.text.len == 0) return .mode_only;
-    return .{ .prompt = choice.text };
+    // A session's first prompt is what gives it a prompt and tools; one asked
+    // before keeps what it was saved with.
+    if (session.messages.items.len == 0) try agent.prepare(session);
+    return .{ .prompt = line };
 }
 
 /// How a compaction went.
@@ -660,8 +605,7 @@ fn compact(
 /// that was not already being thrown away. A failure is logged and the session
 /// keeps what it had.
 fn refresh(agent: *Agent, session: *Session) void {
-    const mode = agent.mode;
-    refreshLead(agent, mode, agent.tool_set.definitions(mode), session) catch |err|
+    refreshLead(agent, agent.tool_set.definitions(), session) catch |err|
         std.log.warn("could not refresh the prompt and tools: {s}", .{@errorName(err)});
 }
 
@@ -769,9 +713,9 @@ pub fn run(
     while (true) {
         header.clearRetainingCapacity();
         // The header is built each pass, so it shows the session as it stands: the
-        // mode the first prompt may have set, the model it recorded, and the
-        // directory, which is read from the session since its pool has grown with
-        // the turn and moved every string taken from it before. The gauge is the
+        // model it recorded and the directory, which is read from the session
+        // since its pool has grown with the turn and moved every string taken
+        // from it before. The gauge is the
         // window of the model the session goes to now, so a model changed since
         // the last turn reads right at once.
         try header.writer.print("{f}", .{SessionHeader.of(
@@ -782,8 +726,7 @@ pub fn run(
         const line = (try editor.readLine(header.written(), prompt)) orelse break;
         if (line.len == 0) continue;
         // What the line came to is the agent's to decide: a command is run and
-        // reported through the emitter, a first prompt settles the mode, and
-        // anything else is what is asked.
+        // reported through the emitter, and anything else is what is asked.
         const waiting = try agent.take(emitter, session, line);
         if (waiting == .ran) {
             try writer.flush();
@@ -791,7 +734,7 @@ pub fn run(
         }
         const text = switch (waiting) {
             .prompt => |text| text,
-            else => continue,
+            .ran => continue,
         };
         // The line editor has erased the prompt it was typed behind, so the
         // prompt is written out now as the block a replay shows: the `> ` belongs
@@ -1057,7 +1000,7 @@ fn turn(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client
         // No calls means the model answered, which ends the turn.
         if (calls.len == 0) return emitter.show(.{ .answer = message.content orelse "" });
 
-        try runCalls(&agent.tool_set, emitter, &scratch_state, session, agent.mode, calls);
+        try runCalls(&agent.tool_set, emitter, &scratch_state, session, calls);
     }
     var buffer: [96]u8 = undefined;
     // Which bound stopped the loop says what went wrong. Out of retries means
@@ -1092,7 +1035,6 @@ fn runCalls(
     emitter: *Emitter,
     scratch_state: *std.heap.ArenaAllocator,
     session: *Session,
-    mode: Mode,
     calls: []const llm.ToolCall,
 ) !void {
     for (calls) |call| {
@@ -1102,15 +1044,7 @@ fn runCalls(
 
         var result: std.Io.Writer.Allocating = .init(tool_set.gpa);
         defer result.deinit();
-        // The mode's tools are what the model is offered, but a session file or
-        // a crafted request can still name one it is not allowed, so the call is
-        // refused here as well as filtered out of the offer.
-        const name = Tools.callName(parsed);
-        if (!Tools.allows(mode, name)) {
-            try result.writer.print("error: the {s} mode does not allow the {s} tool", .{ @tagName(mode), name });
-        } else {
-            try tool_set.run(parsed, &result.writer);
-        }
+        try tool_set.run(parsed, &result.writer);
 
         try session.append(.{
             .role = .tool,
@@ -1121,7 +1055,17 @@ fn runCalls(
     }
 }
 
-/// The system prompt a session runs with: billy's own, the user's own
+/// The base text of the system prompt: what billy is, and how it works. The
+/// user's and the project's instructions are added after it when the session is
+/// prepared.
+const base_prompt =
+    \\You are billy, a helpful assistant. Answer the user's questions directly.
+    \\Use the tools when they help with the task: read or change files, run a
+    \\command, or search the web. Inspect the code before you change it, and
+    \\reply in plain text when the work is done.
+;
+
+/// The system prompt a session runs with: `base_prompt`, the user's own
 /// instructions when the configuration directory holds any, and the project's
 /// instructions when it has them, which are read from the session's directory.
 /// The user's come first, then the project's, so the more particular rules are
@@ -1131,20 +1075,16 @@ fn runCalls(
 /// request and survives whatever context trimming happens later. That is what
 /// keeps the rules the user and the project care about from being dropped
 /// partway through a long session. The caller owns the text and frees it.
-fn leadPrompt(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir, user_dir: ?std.Io.Dir, mode: Mode) ![]u8 {
+fn leadPrompt(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir, user_dir: ?std.Io.Dir) ![]u8 {
     var text: std.Io.Writer.Allocating = .init(gpa);
     errdefer text.deinit();
 
-    // The mode's text first, then each section of instructions as it is found,
+    // The base prompt first, then each section of instructions as it is found,
     // so the whole prompt is written once into one buffer with no part of it
     // built apart and then copied in.
-    try text.writer.writeAll(mode.prompt());
-    // Ask mode answers questions rather than changing code, so the instruction
-    // files, which say how to change it, are left out.
-    if (mode.instructions()) {
-        if (user_dir) |config_dir| _ = try globalInstructions(io, &text.writer, config_dir);
-        _ = try projectInstructions(io, &text.writer, dir);
-    }
+    try text.writer.writeAll(base_prompt);
+    if (user_dir) |config_dir| _ = try globalInstructions(io, &text.writer, config_dir);
+    _ = try projectInstructions(io, &text.writer, dir);
     return text.toOwnedSlice();
 }
 
@@ -1161,7 +1101,6 @@ fn leadPrompt(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir, user_dir: ?st
 /// themselves.
 fn refreshLead(
     agent: *const Agent,
-    mode: Mode,
     definitions: []const Session.Definition,
     session: *Session,
 ) !void {
@@ -1170,7 +1109,6 @@ fn refreshLead(
         agent.gpa,
         agent.tool_set.dir,
         agent.instructions,
-        mode,
     );
     defer agent.gpa.free(prompt_text);
     if (prompt_text.len > 0) try session.setSystemPrompt(prompt_text);
@@ -1657,9 +1595,6 @@ const TestSetup = struct {
     /// How the agent behaves, which a test sets only what it is about.
     behaviour: Behaviour = .{ .max_turns = 10 },
     tools: Tools.Settings = .{ .bash_timeout_s = 120 },
-    /// The mode the run starts in, which is what a frontend passes before the
-    /// session's first prompt settles it.
-    mode: Mode = .general,
     home: ?[]const u8 = null,
     instructions: ?std.Io.Dir = null,
 
@@ -1716,7 +1651,6 @@ const TestSetup = struct {
             .credentials = setup.credentials,
             .behaviour = setup.behaviour,
             .tools = setup.tools,
-            .mode = setup.mode,
             .home = setup.home,
             .instructions = setup.instructions,
         };
@@ -1734,10 +1668,10 @@ fn testTerminal(writer: Terminal.Writer) Terminal {
 /// prints it, so the same id serves every test.
 const test_session_id = "01HF7YAT000000000000000000";
 
-/// A header for a test: the id they all share, the given model and directory, the
-/// mode they all run in, and nothing else, so a test sets only what it is about.
+/// A header for a test: the id they all share, the given model and directory,
+/// and nothing else, so a test sets only what it is about.
 fn testHeader(model: []const u8, cwd: []const u8) SessionHeader {
-    return .{ .mode = .general, .id = test_session_id, .model = model, .cwd = cwd };
+    return .{ .id = test_session_id, .model = model, .cwd = cwd };
 }
 
 /// Writes `header` and compares it to `expected`, so a header test reads as the
@@ -1759,29 +1693,23 @@ fn expectTokens(expected: []const u8, count: usize) !void {
 
 test "header names the session, the model and the working directory" {
     try expectHeader(
-        "billy · general · 01HF7YAT000000000000000000 · deepseek-flash · /work",
+        "billy · 01HF7YAT000000000000000000 · deepseek-flash · /work",
         testHeader("deepseek-flash", "/work"),
     );
-}
-
-test "header names the mode the session runs in" {
-    var header = testHeader("m", "/work");
-    header.mode = .chat;
-    try expectHeader("billy · chat · 01HF7YAT000000000000000000 · m · /work", header);
 }
 
 test "header shortens a path inside the home directory" {
     var header = testHeader("m", "/home/user/repo/billy");
     header.home = "/home/user";
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · ~/repo/billy", header);
+    try expectHeader("billy · 01HF7YAT000000000000000000 · m · ~/repo/billy", header);
 
     // The home directory itself becomes just `~`.
     header.cwd = "/home/user";
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · ~", header);
+    try expectHeader("billy · 01HF7YAT000000000000000000 · m · ~", header);
 
     // A sibling that merely shares the prefix is left alone.
     header.cwd = "/home/user2";
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /home/user2", header);
+    try expectHeader("billy · 01HF7YAT000000000000000000 · m · /home/user2", header);
 }
 
 test "header shows how full the context window is" {
@@ -1790,17 +1718,17 @@ test "header shows how full the context window is" {
     header.context_window = 128_000;
 
     // A fresh session has used nothing.
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 0/128k (0%)", header);
+    try expectHeader("billy · 01HF7YAT000000000000000000 · m · /work · 0/128k (0%)", header);
     // A rounded-to-zero percentage still shows the conversation is not empty.
     header.context_tokens = 500;
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 500/128k (<1%)", header);
+    try expectHeader("billy · 01HF7YAT000000000000000000 · m · /work · 500/128k (<1%)", header);
     header.context_tokens = 16_000;
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 16k/128k (12%)", header);
+    try expectHeader("billy · 01HF7YAT000000000000000000 · m · /work · 16k/128k (12%)", header);
     // A full window, and a count that rounds to a whole thousand.
     header.context_tokens = 128_000;
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 128k/128k (100%)", header);
+    try expectHeader("billy · 01HF7YAT000000000000000000 · m · /work · 128k/128k (100%)", header);
     header.context_tokens = 12_500;
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · m · /work · 13k/128k (9%)", header);
+    try expectHeader("billy · 01HF7YAT000000000000000000 · m · /work · 13k/128k (9%)", header);
 }
 
 test "token counts are whole" {
@@ -1820,7 +1748,7 @@ test "header leaves out the gauge for an unknown model" {
     // No window is known, so the gauge is left off whatever the count.
     var header = testHeader("who-knows", "/work");
     header.context_tokens = 5000;
-    try expectHeader("billy · general · 01HF7YAT000000000000000000 · who-knows · /work", header);
+    try expectHeader("billy · 01HF7YAT000000000000000000 · who-knows · /work", header);
 }
 
 test "a header is built from a session" {
@@ -1830,7 +1758,6 @@ test "a header is built from a session" {
 
     var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
-    session.mode = .chat;
     session.context_tokens = 100;
     try session.setModel("deepseek/deepseek-flash");
 
@@ -1842,14 +1769,14 @@ test "a header is built from a session" {
     };
     try out.writer.print("{f}", .{SessionHeader.of(&session, model, null)});
 
-    // The mode, the id, the model and the directory all come from the session; only
-    // the window it is measured against is passed in, since that is the model
+    // The id, the model and the directory all come from the session; only the
+    // window it is measured against is passed in, since that is the model
     // table's and not the session's. The model is the choice the session recorded,
     // provider and all, which is what a page shows too.
     var expected: std.Io.Writer.Allocating = .init(gpa);
     defer expected.deinit();
     try expected.writer.print(
-        "billy · chat · {s} · deepseek/deepseek-flash · /work · 100/128k (<1%)",
+        "billy · {s} · deepseek/deepseek-flash · /work · 100/128k (<1%)",
         .{session.id()},
     );
     try std.testing.expectEqualStrings(expected.written(), out.written());
@@ -2058,21 +1985,21 @@ test "the prompt is billy's own, the user's instructions, then the project's" {
 
     // With neither file, the prompt is billy's own text alone.
     {
-        const text = try leadPrompt(io, gpa, project.dir, config.dir, .general);
+        const text = try leadPrompt(io, gpa, project.dir, config.dir);
         defer gpa.free(text);
-        try std.testing.expectEqualStrings(Mode.general.prompt(), text);
+        try std.testing.expectEqualStrings(base_prompt, text);
     }
 
     // The user's instructions are read from the configuration directory and
     // joined after billy's own text, with no project file needed for them.
     try config.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "USER RULES" });
     {
-        const text = try leadPrompt(io, gpa, project.dir, config.dir, .general);
+        const text = try leadPrompt(io, gpa, project.dir, config.dir);
         defer gpa.free(text);
         const expected = try std.fmt.allocPrint(
             gpa,
             "{s}\n\nThe user's instructions follow, read from AGENTS.md.\n\nUSER RULES",
-            .{Mode.general.prompt()},
+            .{base_prompt},
         );
         defer gpa.free(expected);
         try std.testing.expectEqualStrings(expected, text);
@@ -2082,18 +2009,18 @@ test "the prompt is billy's own, the user's instructions, then the project's" {
     // last, and all three are there.
     try project.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "PROJECT RULES" });
     {
-        const text = try leadPrompt(io, gpa, project.dir, config.dir, .general);
+        const text = try leadPrompt(io, gpa, project.dir, config.dir);
         defer gpa.free(text);
         const user = std.mem.indexOf(u8, text, "USER RULES") orelse return error.TestUnexpectedResult;
         const local = std.mem.indexOf(u8, text, "PROJECT RULES") orelse return error.TestUnexpectedResult;
-        try std.testing.expect(std.mem.indexOf(u8, text, Mode.general.prompt()) != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, base_prompt) != null);
         try std.testing.expect(user < local);
     }
 
     // A project on its own still works, when the configuration holds no file.
     try config.dir.deleteFile(io, "AGENTS.md");
     {
-        const text = try leadPrompt(io, gpa, project.dir, null, .general);
+        const text = try leadPrompt(io, gpa, project.dir, null);
         defer gpa.free(text);
         try std.testing.expect(std.mem.indexOf(u8, text, "PROJECT RULES") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "USER RULES") == null);
@@ -2416,12 +2343,12 @@ test "refreshLead replaces the prompt, the project instructions and the tools" {
     var agent = try testAgentIn(io, gpa, setup, work_dir, null);
     defer agent.deinit();
 
-    try refreshLead(&agent, .general, &new_tools, &session);
+    try refreshLead(&agent, &new_tools, &session);
 
     // The prompt is the current one: billy's own text with the project's
     // instructions after it, and none of the old prompt left.
     const prompt_text = session.systemPrompt().?;
-    try std.testing.expect(std.mem.indexOf(u8, prompt_text, Mode.general.prompt()) != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt_text, base_prompt) != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt_text, "PROJECT RULES") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt_text, "OLD PROMPT") == null);
 
@@ -2467,79 +2394,11 @@ test "prepare gives a fresh session the user's instructions from the configurati
 
     // The prompt the session runs with carries the user's instructions, so the
     // configuration directory is read for every session and not only a project.
-    try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, Mode.general.prompt()) != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, base_prompt) != null);
     try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, "USER RULES") != null);
 }
 
-test "prepare gives a chat session no prompt and only the tools it allows" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    // A configuration directory with instructions, to check chat mode reads none:
-    // they say how to change code, which chat mode does not do.
-    var config_dir = std.testing.tmpDir(.{});
-    defer config_dir.cleanup();
-    try config_dir.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "USER RULES" });
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
-    defer session.deinit();
-
-    var setup = try TestSetup.init(gpa, "m");
-    defer setup.deinit();
-    setup.mode = .chat;
-    setup.instructions = config_dir.dir;
-    var agent = try testAgent(io, gpa, setup, null);
-    defer agent.deinit();
-
-    try agent.prepare(&session);
-
-    // The mode is recorded, no system prompt is set at all (a chat request is the
-    // conversation alone, so the instructions never reach it), and the tools
-    // stored are the ones chat allows.
-    try std.testing.expectEqual(Mode.chat, session.mode);
-    try std.testing.expect(session.systemPrompt() == null);
-
-    const defs = agent.tool_set.definitions(.chat);
-    try std.testing.expectEqual(@as(usize, 1), defs.len);
-    try std.testing.expectEqualStrings("read", defs[0].name);
-    try std.testing.expectEqual(defs.len, session.tools.len);
-}
-
-test "a first prompt names the mode and says what to ask" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    // A prompt that names no mode runs in the one the frontend asked for, and is
-    // asked as it was typed.
-    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
-    defer session.deinit();
-    var setup = try TestSetup.init(gpa, "m");
-    defer setup.deinit();
-    var agent = try testAgent(io, gpa, setup, null);
-    defer agent.deinit();
-
-    const plain = try agent.start(&session, "do the thing");
-    try std.testing.expectEqualStrings("do the thing", plain.prompt);
-    try std.testing.expectEqual(Mode.general, agent.mode);
-    // The session was prepared, so it now carries the tools it will offer.
-    try std.testing.expect(session.tools.len > 0);
-
-    // A first prompt may name the mode itself, which wins over what the frontend
-    // asked for, and the rest of the line is what is asked.
-    var named = try Session.open(io, tmp.dir, gpa, null, "/work");
-    defer named.deinit();
-    const chat = try agent.start(&named, "/chat what is a hash map?");
-    try std.testing.expectEqualStrings("what is a hash map?", chat.prompt);
-    try std.testing.expectEqual(Mode.chat, agent.mode);
-    try std.testing.expectEqual(Mode.chat, named.mode);
-}
-
-test "a first prompt that names only a mode asks nothing" {
+test "a first prompt gives the session its prompt and tools, and is asked as typed" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -2553,12 +2412,15 @@ test "a first prompt that names only a mode asks nothing" {
     var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
 
-    // `/chat` on its own opens that mode: the session is set up and ready, and
-    // there is nothing to send to the model yet.
-    const started = try agent.start(&session, "/chat");
-    try std.testing.expectEqual(Started.mode_only, started);
-    try std.testing.expectEqual(Mode.chat, session.mode);
-    // Set up anyway, so the next prompt is asked without being looked at again.
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var terminal = testTerminal(.{ .out = &out.writer });
+    const waiting = try agent.take(terminal.emitter(), &session, "do the thing");
+
+    // The line is what is asked, and the session now carries the prompt and the
+    // tools it will send.
+    try std.testing.expectEqualStrings("do the thing", waiting.prompt);
+    try std.testing.expect(session.systemPrompt() != null);
     try std.testing.expect(session.tools.len > 0);
 }
 
@@ -2576,15 +2438,21 @@ test "a prompt after the first leaves the session as it was set up" {
     var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
 
-    _ = try agent.start(&session, "the first thing");
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var terminal = testTerminal(.{ .out = &out.writer });
+
+    _ = try agent.take(terminal.emitter(), &session, "the first thing");
+    const prompt_text = try gpa.dupe(u8, session.systemPrompt().?);
+    defer gpa.free(prompt_text);
     try session.append(.{ .role = .assistant, .content = "done" });
 
-    // A session that has been asked something is not started again: its mode is
-    // the one it was saved with, and a mode command in a later prompt is part of
-    // what is asked rather than a command, since only the first prompt can name
-    // one.
-    const later = try agent.start(&session, "/chat is this a command?");
-    try std.testing.expectEqual(Started.asked_before, later);
+    // A session that has been asked something keeps the prompt it was set up
+    // with, and a line that starts with `/chat` is asked like any other: the only
+    // command left is `/compact`.
+    const later = try agent.take(terminal.emitter(), &session, "/chat is this a command?");
+    try std.testing.expectEqualStrings("/chat is this a command?", later.prompt);
+    try std.testing.expectEqualStrings(prompt_text, session.systemPrompt().?);
 }
 
 test "the terminal shows a tool call the way a replay does" {

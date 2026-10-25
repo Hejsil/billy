@@ -5,7 +5,6 @@ const llm = @import("llm.zig");
 const Health = @import("Health.zig");
 const Terminal = @import("Terminal.zig");
 const Session = @import("Session.zig");
-const Agent = @import("Agent.zig");
 const Bash = @import("Tools/Bash.zig");
 const Edit = @import("Tools/Edit.zig");
 const Read = @import("Tools/Read.zig");
@@ -80,29 +79,13 @@ pub fn hasWeb(tools: *const Tools) bool {
     return tools.settings.search != null or tools.settings.fetch != null;
 }
 
-/// The definitions a session is given: the tools the mode allows, with the web
-/// tools last when a backend is configured. Comptime strings, so nothing is built.
-pub fn definitions(tools: *const Tools, mode: Agent.Mode) []const Session.Definition {
-    return switch (mode) {
-        .general => if (tools.hasWeb()) &general_specs_with_web else &general_specs,
-        .chat => if (tools.hasWeb()) &chat_specs_with_web else &chat_specs,
-    };
+/// The definitions a session is given, with the web tools last when a backend
+/// is configured. Comptime strings, so nothing is built.
+pub fn definitions(tools: *const Tools) []const Session.Definition {
+    return if (tools.hasWeb()) &specs_with_web else &specs;
 }
 
-/// Whether `mode` may offer and run the tool named `name`.
-///
-/// A name the table does not hold is a tool billy does not implement, which the
-/// call reports as unknown; it is not refused here, so the model is told that
-/// rather than that the mode forbids it.
-pub fn allows(mode: Agent.Mode, name: []const u8) bool {
-    for (table) |tool| {
-        if (std.mem.eql(u8, @tagName(tool.tag), name)) return tool.modes.contains(mode);
-    }
-    return true;
-}
-
-/// The name of the tool `call` names, for checking it against a mode without
-/// showing the call.
+/// The name of the tool `call` names, without showing the call.
 pub fn callName(call: Call) []const u8 {
     return switch (call) {
         .unknown => |name| name,
@@ -467,9 +450,8 @@ pub fn bashOutput(result: []const u8) ?BashOutput {
 }
 
 /// One tool billy implements: the name the model calls it by, the schema it is
-/// offered with, the mark its block carries, and the modes that may offer and run
-/// it. This is the one place a tool is described: `Call`, parsing, the schema, the
-/// heading and the mode filter all read from here.
+/// offered with, and the mark its block carries. This is the one place a tool is
+/// described: `Call`, parsing, the schema and the heading all read from here.
 const Tool = struct {
     /// The `Call` tag, which is also the name the model uses.
     tag: std.meta.Tag(Call),
@@ -479,9 +461,6 @@ const Tool = struct {
     /// Offered only when a web backend is configured, since it can do nothing
     /// without one.
     web: bool = false,
-    /// The modes that may offer and run the tool. Spelled out for every tool, so
-    /// a destructive one cannot be allowed in chat by nobody remembering it.
-    modes: std.enums.EnumSet(Agent.Mode),
 };
 
 /// Every tool billy implements, in the order the model is offered them. A `Call`
@@ -491,7 +470,6 @@ const table = [_]Tool{
     .{
         .tag = .read,
         .mark = marks.read,
-        .modes = .init(.{ .general = true, .chat = true }),
         .description = "Read a file. Returns the lines with their line numbers.",
         .parameters = "{\"type\":\"object\",\"properties\":{" ++
             "\"path\":{\"type\":\"string\",\"description\":\"File to read.\"}," ++
@@ -502,7 +480,6 @@ const table = [_]Tool{
     .{
         .tag = .write,
         .mark = marks.write,
-        .modes = .init(.{ .general = true, .chat = false }),
         .description = "Write a file, creating parent directories and replacing any existing content.",
         .parameters = "{\"type\":\"object\",\"properties\":{" ++
             "\"path\":{\"type\":\"string\",\"description\":\"File to write.\"}," ++
@@ -512,7 +489,6 @@ const table = [_]Tool{
     .{
         .tag = .edit,
         .mark = marks.edit,
-        .modes = .init(.{ .general = true, .chat = false }),
         .description = "Replace text in a file. The text is matched exactly when it can be and ignoring whitespace otherwise, so a copied line need not be perfect. Fails unless it is found exactly once, unless replace_all is true.",
         .parameters = "{\"type\":\"object\",\"properties\":{" ++
             "\"path\":{\"type\":\"string\",\"description\":\"File to edit.\"}," ++
@@ -524,7 +500,6 @@ const table = [_]Tool{
     .{
         .tag = .bash,
         .mark = marks.bash,
-        .modes = .init(.{ .general = true, .chat = false }),
         .description = "Run a shell command with bash -c and return its output and exit code. " ++
             "Give a short description of what the command does, so the user can see the intent at a glance.",
         .parameters = "{\"type\":\"object\",\"properties\":{" ++
@@ -536,7 +511,6 @@ const table = [_]Tool{
         .tag = .web_search,
         .mark = marks.search,
         .web = true,
-        .modes = .init(.{ .general = true, .chat = true }),
         .description = "Search the web and return the top results: a title, a url and a snippet for each.",
         .parameters = "{\"type\":\"object\",\"properties\":{" ++
             "\"query\":{\"type\":\"string\",\"description\":\"What to search for.\"}}," ++
@@ -546,7 +520,6 @@ const table = [_]Tool{
         .tag = .web_fetch,
         .mark = marks.fetch,
         .web = true,
-        .modes = .init(.{ .general = true, .chat = true }),
         .description = "Fetch a url and return its content. A page comes back as markdown; set raw for an API or a file, whose bytes are returned as they are.",
         .parameters = "{\"type\":\"object\",\"properties\":{" ++
             "\"url\":{\"type\":\"string\",\"description\":\"The url to fetch.\"}," ++
@@ -626,36 +599,8 @@ fn specsCount(comptime with_web: bool) usize {
     return n;
 }
 
-/// The specs of `with_web` that the mode allows, filtered at comptime so the
-/// result is the table's own strings and nothing is built at run time. Returned
-/// by value: a slice would point into a comptime local, which a global const may
-/// not hold.
-fn allowedSpecs(comptime with_web: bool, comptime mode: Agent.Mode) [allowedCount(with_web, mode)]Session.Definition {
-    var list: [allowedCount(with_web, mode)]Session.Definition = undefined;
-    var n: usize = 0;
-    for (specList(with_web)) |spec| {
-        if (!tableForName(spec.name).modes.contains(mode)) continue;
-        list[n] = spec;
-        n += 1;
-    }
-    return list;
-}
-
-/// How many of `with_web` the mode allows.
-fn allowedCount(comptime with_web: bool, comptime mode: Agent.Mode) usize {
-    var n: usize = 0;
-    for (specList(with_web)) |spec| {
-        if (tableForName(spec.name).modes.contains(mode)) n += 1;
-    }
-    return n;
-}
-
 const specs = specList(false);
 const specs_with_web = specList(true);
-const general_specs = allowedSpecs(false, .general);
-const general_specs_with_web = allowedSpecs(true, .general);
-const chat_specs = allowedSpecs(false, .chat);
-const chat_specs_with_web = allowedSpecs(true, .chat);
 
 test "a bash result splits into its status and its streams" {
     // The status is the code and whether it means success, and the two streams
@@ -811,7 +756,7 @@ test "the definitions cover every tool the loop dispatches" {
 
     // The names are exactly the tools the loop can dispatch, in the order the
     // model receives them, so it is never offered one that does not run.
-    const offered = tool_set.definitions(.general);
+    const offered = tool_set.definitions();
     const expected = [_][]const u8{ "read", "write", "edit", "bash" };
     try std.testing.expectEqual(expected.len, offered.len);
     for (offered, expected) |definition, name| {
@@ -829,7 +774,7 @@ test "the web tools are offered only when a backend is configured" {
     // With nothing configured neither web tool is offered at all, and the tools
     // every session has come first so the set only grows.
     var plain = try testTools(false);
-    const without = plain.definitions(.general);
+    const without = plain.definitions();
     try std.testing.expectEqual(specs.len, without.len);
     for (without) |definition| {
         try std.testing.expect(!std.mem.eql(u8, definition.name, "web_search"));
@@ -840,50 +785,10 @@ test "the web tools are offered only when a backend is configured" {
     // fetch that reads what it found -- so a session that gains them keeps the
     // tools it had.
     var searched = try testTools(true);
-    const with = searched.definitions(.general);
+    const with = searched.definitions();
     try std.testing.expectEqual(specs_with_web.len, with.len);
     try std.testing.expectEqualStrings("web_search", with[with.len - 2].name);
     try std.testing.expectEqualStrings("web_fetch", with[with.len - 1].name);
-}
-
-test "the one table decides what each mode offers and runs" {
-    // The mode filter is the table's column, so a tool's offer and its
-    // permission cannot disagree. General runs everything; chat only the tools
-    // that change nothing.
-    try std.testing.expect(allows(.general, "bash"));
-    try std.testing.expect(allows(.general, "write"));
-    try std.testing.expect(allows(.general, "edit"));
-    try std.testing.expect(allows(.chat, "read"));
-    try std.testing.expect(allows(.chat, "web_search"));
-    try std.testing.expect(allows(.chat, "web_fetch"));
-    try std.testing.expect(!allows(.chat, "bash"));
-    try std.testing.expect(!allows(.chat, "write"));
-    try std.testing.expect(!allows(.chat, "edit"));
-
-    // A name the table does not hold is dispatch's to refuse as unknown, not
-    // the mode's to forbid.
-    try std.testing.expect(allows(.chat, "not a tool"));
-
-    // What a mode offers is exactly the table's rows it allows.
-    var plain = try testTools(false);
-    for ([_]Agent.Mode{ .general, .chat }) |mode| {
-        var expected: usize = 0;
-        for (table) |tool| {
-            if (!tool.web and tool.modes.contains(mode)) expected += 1;
-        }
-        try std.testing.expectEqual(expected, plain.definitions(mode).len);
-        for (plain.definitions(mode)) |definition|
-            try std.testing.expect(allows(mode, definition.name));
-    }
-
-    // With a backend, chat gains the two tools that read the web and nothing
-    // that changes the system.
-    var searched = try testTools(true);
-    const offered = searched.definitions(.chat);
-    try std.testing.expectEqual(@as(usize, 3), offered.len);
-    try std.testing.expectEqualStrings("read", offered[0].name);
-    try std.testing.expectEqualStrings("web_search", offered[1].name);
-    try std.testing.expectEqualStrings("web_fetch", offered[2].name);
 }
 
 test "the tools work in the directory they are given, wherever billy runs" {

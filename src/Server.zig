@@ -93,15 +93,13 @@ environ: *const std.process.Environ.Map,
 backends: Setup.Backends,
 
 /// What a turn is given, resolved the same way a terminal run's is and laid out
-/// plainly rather than decorated for a terminal. The mode is the one the caller
-/// settled, which a session asked before keeps over it.
-fn options(server: *const Server, mode: Agent.Mode) Agent.Options {
+/// plainly rather than decorated for a terminal.
+fn options(server: *const Server) Agent.Options {
     return .{
         .config = server.config,
         .credentials = &server.credentials,
         .behaviour = Agent.Behaviour.fromConfig(server.config),
         .tools = Setup.toolSettings(server.config, server.backends, server.health),
-        .mode = mode,
         .home = server.environ.get("HOME"),
         // The user's own instructions live beside the configuration, and join
         // every session's prompt. The server owns the directory and outlives
@@ -509,9 +507,6 @@ fn writeListing(r: *Request) !void {
 const Opened = struct {
     header: []const u8,
     blocks: []const u8,
-    /// The mode the session runs in, so the page can show it. It is fixed once
-    /// the session has a conversation, which the page reads off `blocks`.
-    mode: []const u8,
 };
 
 /// `GET /api/sessions/{id}`: a session as the page shows it.
@@ -559,22 +554,17 @@ fn writeSession(
     defer blocks.deinit();
     try html.conversation(gpa, &session, server.config.stored.web_blocks, &blocks.writer);
 
-    try writeOpened(out, header.written(), blocks.written(), @tagName(session.mode));
+    try writeOpened(out, header.written(), blocks.written());
     return true;
 }
 
 /// Writes the two halves of a session's page as the JSON object the page reads.
-fn writeOpened(out: *std.Io.Writer, header: []const u8, blocks: []const u8, session_mode: []const u8) !void {
+fn writeOpened(out: *std.Io.Writer, header: []const u8, blocks: []const u8) !void {
     try std.json.Stringify.value(Opened{
         .header = header,
         .blocks = blocks,
-        .mode = session_mode,
     }, .{}, out);
 }
-
-/// The mode a web session starts in, so a new one opens in ask unless the first
-/// prompt says otherwise. The terminal keeps general as its own default.
-const default_mode: Agent.Mode = .chat;
 
 /// What a reply is, so the browser is told how to read it.
 const ContentType = enum {
@@ -633,17 +623,16 @@ test "a session's page is written as the JSON the page reads" {
 
     // The two halves are HTML, so the quotes and newlines in them are escaped
     // into the JSON rather than ending the string early.
-    try writeOpened(&out.writer, "<div class=\"header\">hi</div>\n", "<p>one</p>\n", "chat");
+    try writeOpened(&out.writer, "<div class=\"header\">hi</div>\n", "<p>one</p>\n");
     try std.testing.expectEqualStrings(
-        "{\"header\":\"<div class=\\\"header\\\">hi</div>\\n\",\"blocks\":\"<p>one</p>\\n\",\"mode\":\"chat\"}",
+        "{\"header\":\"<div class=\\\"header\\\">hi</div>\\n\",\"blocks\":\"<p>one</p>\\n\"}",
         out.written(),
     );
-    // The page reads this back as the two strings it wrote, and the mode.
+    // The page reads this back as the two strings it wrote.
     const parsed = try std.json.parseFromSlice(Opened, gpa, out.written(), .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("<div class=\"header\">hi</div>\n", parsed.value.header);
     try std.testing.expectEqualStrings("<p>one</p>\n", parsed.value.blocks);
-    try std.testing.expectEqualStrings("chat", parsed.value.mode);
 }
 
 test "a parsed prompt is copied, so the body it came from can be freed" {
@@ -653,7 +642,7 @@ test "a parsed prompt is copied, so the body it came from can be freed" {
     // in for the request body being freed. A borrowed string would follow the
     // overwrite and read as the overwrites; a copied one is unaffected.
     var buffer: [64]u8 = @splat(' ');
-    const json = "{\"text\":\"hello\",\"mode\":\"chat\"}";
+    const json = "{\"text\":\"hello\"}";
     @memcpy(buffer[0..json.len], json);
 
     const parsed = try parsePrompt(gpa, buffer[0..json.len]);
@@ -661,7 +650,6 @@ test "a parsed prompt is copied, so the body it came from can be freed" {
     @memset(buffer[0..json.len], 'x');
 
     try std.testing.expectEqualStrings("hello", parsed.value.text);
-    try std.testing.expectEqual(Agent.Mode.chat, parsed.value.mode.?);
 }
 
 test "the page the browser is given is the one that was written" {
@@ -723,12 +711,9 @@ test "the address to listen on is read from what was asked for" {
     try std.testing.expectError(error.InvalidHost, listenAddress("", 8787));
 }
 
-/// The prompt a page sends: what the user typed, and the mode the page chose for
-/// a new session. `mode` is null for a session that already has a conversation,
-/// whose mode is fixed on the session.
+/// The prompt a page sends: what the user typed.
 const Prompt = struct {
     text: []const u8,
-    mode: ?Agent.Mode = null,
 };
 
 /// Reads the prompt a POST carries, or replies with why it could not and returns
@@ -780,15 +765,10 @@ fn createSession(r: *Request, registry: *Registry, http_client: *std.http.Client
     if (!try r.claim(registry, session.id())) return;
     defer registry.release(session.id());
 
-    // The mode the page chose, or a `/chat`/`/general` command in the prompt,
-    // which wins over the choice. It is settled here rather than by the agent so
-    // that a prompt naming only a mode -- which asks nothing -- is answered with
-    // a status, which a stream that has already begun cannot carry.
-    const choice = Agent.Mode.start(parsed.value.text, parsed.value.mode orelse default_mode);
-    if (choice.text.len == 0)
+    if (parsed.value.text.len == 0)
         return r.reply(.text, "the prompt is empty\n", .bad_request);
 
-    try serveTurn(r, http_client, &session, r.server.options(choice.mode), choice.text, true);
+    try serveTurn(r, http_client, &session, r.server.options(), parsed.value.text, true);
 }
 
 /// `POST /api/sessions/{id}/message`: asks the session `text`, answering with the
@@ -807,11 +787,11 @@ fn askSession(r: *Request, registry: *Registry, http_client: *std.http.Client, i
 
     // The session is opened fresh for this turn and dropped at the end, so it is
     // always what is on disk; a session changed by another billy in between is
-    // read rather than overwritten. It runs in the mode stored with it.
+    // read rather than overwritten.
     var session = (try r.open(id)) orelse return;
     defer session.deinit();
 
-    try serveTurn(r, http_client, &session, r.server.options(session.mode), parsed.value.text, false);
+    try serveTurn(r, http_client, &session, r.server.options(), parsed.value.text, false);
 }
 
 /// Answers one prompt as the run happens: the run's blocks as the events of a
@@ -835,8 +815,8 @@ fn serveTurn(
     const gpa = r.server.gpa;
     var agent = try Agent.init(r.server.io, gpa, run_options, session.cwd(), http_client);
     defer agent.deinit();
-    // The session is prepared from the mode the caller settled, which is the
-    // session's own once it has been asked something.
+    // A resumed session keeps the prompt and tools it was saved with; a new one
+    // gets them when its first line is taken.
     try agent.prepare(session);
 
     // The head of the reply goes out before the run starts, so the page can read
@@ -860,9 +840,6 @@ fn serveTurn(
     // on a page with a session that has nothing to fold must leave the page with
     // no new session to show. Anything that is not a command is a turn, and the
     // page is told the session's id first so it can add it to the list.
-    // The line as it was typed, in the mode the caller settled: a mode command
-    // was already taken off the text by `createSession`, so `take` sees none and
-    // the mode stands. A session that has been asked something keeps its own.
     const waiting = try agent.take(emitter, session, text);
     if (waiting == .ran) {
         try r.server.sendHeader(gpa, session, &stream);
@@ -882,14 +859,6 @@ fn serveTurn(
     if (session.messages.items.len == 0) {
         _ = try Agent.nameFromPrompt(session, text);
         if (session.title()) |title| try stream.send("title", TitleEvent{ .title = title });
-    }
-
-    // A line that named only a mode asks nothing, so there is no turn to run and
-    // the session is already set up for the mode it named.
-    if (waiting == .ready) {
-        try r.server.sendHeader(gpa, session, &stream);
-        try stream.done();
-        return;
     }
 
     // A request that failed has been reported through the emitter by `ask`,
@@ -1255,13 +1224,12 @@ test "one session is opened as the page the frontend reads" {
     var opened = try server.exchange(.GET, path, null);
     defer opened.deinit();
     try std.testing.expectEqualStrings("HTTP/1.1 200 OK", opened.statusLine());
-    // The three things the page reads: the header, the blocks, and the mode.
+    // The two things the page reads: the header and the blocks.
     try std.testing.expect(opened.contains("\"header\":"));
     // The header names the model the session is sent to, provider and all, which
     // is the same choice the terminal header shows.
     try std.testing.expect(opened.contains("deepseek/deepseek-flash"));
     try std.testing.expect(opened.contains("\"blocks\":"));
-    try std.testing.expect(opened.contains("\"mode\":"));
     // The conversation is in the blocks, as the page shows it.
     try std.testing.expect(opened.contains("hello"));
 }

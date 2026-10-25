@@ -93,14 +93,10 @@ least once. Read the rule, not the story; the story is in the review.
 ## One source of truth
 
 - **A name that means something is spelled once.** A tool's name is its `Call` tag: parsing walks
-  `@typeInfo`, and the one tool table refers to the tags, so the schema, the heading and the mode
-  filter cannot spell a tool differently. A union arm with no table row is a compile error.
+  `@typeInfo`, and the one tool table refers to the tags, so the schema and the heading cannot spell
+  a tool differently. A union arm with no table row is a compile error.
   *`parseCallNamed` walked a hand-written tuple, so a new tool silently became `unknown` while
   `specs` offered it.*
-- **Two implementations of one policy drift.** A tool's modes are a column of the tool table, not a
-  deny-list beside it: the offer and the permission are the same list, and a new destructive tool
-  cannot be allowed in chat because nobody remembered. *`Mode.allows` duplicated the comptime
-  filter.*
 - **A service is a row in the table, not a file of its own.** The five web providers repeated the same
   request, auth header, retry and reply walk, and the two tools kept separate provider enums and
   credential maps. One `web.Provider`, one descriptor table and one driver per tool leave the

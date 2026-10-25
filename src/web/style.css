@@ -78,14 +78,12 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 /* anywhere: a long url or hash must wrap rather than scroll the page sideways. */
 #conversation { flex: 1; overflow-y: auto; overflow-wrap: anywhere; padding: 16px; }
 #prompt { display: flex; padding: 12px 16px; border-top: 1px solid var(--line); }
-#text, #mode {
+#text {
   background: var(--panel); border: 1px solid var(--line); color: var(--text);
   border-radius: 6px; padding: 8px 10px; font: inherit;
 }
 #text { flex: 1; resize: none; overflow-y: auto; min-height: 0; max-height: 40vh; }
-#mode { flex: none; align-self: flex-end; margin-left: 8px; cursor: pointer; }
-#text:disabled, #mode:disabled, #prompt.working :is(#text, #mode) { color: var(--dim); }
-#mode:disabled { cursor: default; }
+#text:disabled, #prompt.working #text { color: var(--dim); }
 
 /* Blocks of markdown. */
 .block { margin-bottom: 16px; }
@@ -197,5 +195,5 @@ body.offscreen #latest { display: inline-flex; }
   #header { padding: 8px 12px; }
   #conversation { padding: 12px; }
   #prompt { padding: 10px; }
-  #text, #mode { font-size: 16px; }
+  #text { font-size: 16px; }
 }

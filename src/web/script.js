@@ -4,7 +4,6 @@ const headerBox = document.getElementById('header');
 const conversation = document.getElementById('conversation');
 const form = document.getElementById('prompt');
 const input = document.getElementById('text');
-const modeSelect = document.getElementById('mode');
 const menuButton = document.getElementById('menu');
 const backdrop = document.getElementById('backdrop');
 const latestButton = document.getElementById('latest');
@@ -106,9 +105,6 @@ async function open(id) {
   }
   // A turn that ended on a tool call has no later block to close its fold.
   if (fold) closeFold();
-  modeSelect.value = body.mode;
-  // The mode is fixed once there is a conversation.
-  modeSelect.disabled = body.blocks.trim() !== '';
   openCall = null;
   scrollToEnd(true);
   input.focus();
@@ -157,7 +153,6 @@ async function send(text) {
   working = true;
   form.classList.add('working');
   input.disabled = true;
-  modeSelect.disabled = true;
   input.value = '';
   grow();
   stick = true;
@@ -167,7 +162,7 @@ async function send(text) {
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text: text, mode: modeSelect.value }),
+      body: JSON.stringify({ text: text }),
     });
     if (res.status === 409 || !res.ok) {
       // Nothing was asked, so what was typed is given back.
@@ -343,8 +338,6 @@ function newDraft() {
   fold = null;
   headerBox.innerHTML = '';
   conversation.innerHTML = '';
-  modeSelect.value = 'chat';
-  modeSelect.disabled = false;
   input.value = '';
   grow();
   stick = true;

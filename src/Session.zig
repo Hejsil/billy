@@ -77,9 +77,6 @@ const Stored = struct {
     /// conversation alone, so that the prompt and the tools can be replaced at a
     /// compaction without rewriting the conversation the model has seen.
     system_prompt: ?[]const u8 = null,
-    /// The mode the session runs in, which fixes its prompt and its tools. A file
-    /// saved before modes existed has none, and reads back as general.
-    mode: Agent.Mode = .general,
     /// The provider and model this session was started on, as `provider/model`,
     /// the same one string the configuration names it by.
     ///
@@ -242,10 +239,6 @@ tool_calls: std.ArrayList(ToolCall) = .empty,
 /// sent at the front of every request, from `interned.system_prompt`, and kept
 /// out of the conversation so the two can be replaced apart from each other.
 messages: std.ArrayList(Message) = .empty,
-
-/// What the session may do and what its prompt says. Kept so a resume keeps the
-/// mode it started in rather than the default.
-mode: Agent.Mode = .general,
 
 /// Indices into `messages` of the summaries a compaction produced
 compactions: std.ArrayList(u32) = .empty,
@@ -615,12 +608,6 @@ pub fn setSystemPrompt(session: *Session, system_prompt: []const u8) !void {
     session.interned.system_prompt = try session.pool.intern(session.gpa, system_prompt);
 }
 
-/// Records the mode the session runs in. Set once, when the session starts; the
-/// prompt and tools stored with it follow from the mode.
-pub fn setMode(session: *Session, mode: Agent.Mode) void {
-    session.mode = mode;
-}
-
 /// Records the provider and model the session is sent to.
 ///
 /// Where a session goes is resolved from this before every turn, so setting it is
@@ -728,9 +715,6 @@ pub fn write(session: *const Session, writer: *std.Io.Writer) !void {
         try json.write(prompt);
     }
 
-    try json.objectField("mode");
-    try json.write(session.mode);
-
     // Written only when the session has one: a session that records no model is
     // sent to the configured choice, and a file without the field is what says
     // it recorded none. A session resumed from an older file takes the
@@ -793,7 +777,6 @@ fn load(session: *Session) !void {
     if (stored.title) |stored_title|
         try session.setTitle(stored_title);
 
-    session.mode = stored.mode;
     if (stored.model) |stored_model| {
         // An empty field is a file written without one rather than a session
         // sent to no model, so it is left unset and read as the fallback.
