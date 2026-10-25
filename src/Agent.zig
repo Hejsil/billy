@@ -19,6 +19,10 @@ const Agent = @This();
 /// sending to the model. A command is the whole line, and its argument where it
 /// takes one, so a prompt that merely starts with one is still a prompt.
 ///
+/// The union is also the list of commands: an arm's name is what is typed after
+/// the slash, and its type is whether it takes an argument. A new command is a
+/// new arm, which `take` refuses to compile without handling.
+///
 /// Private: a frontend hands the agent what was typed and is told what came of
 /// it, so which commands there are and what they do is the agent's own business.
 const Command = union(enum) {
@@ -30,15 +34,35 @@ const Command = union(enum) {
 
     /// Reads `text` as a command, or null when it is an ordinary prompt.
     pub fn of(text: []const u8) ?Command {
-        const line = std.mem.trim(u8, text, " \t\r\n");
-        if (std.mem.eql(u8, line, "/compact")) return .compact;
-        const rest = std.mem.cutPrefix(u8, line, "/model") orelse return null;
-        // The argument is set off by whitespace, so a line that only starts with
-        // the command is a prompt like any other.
-        if (rest.len > 0 and !std.ascii.isWhitespace(rest[0])) return null;
-        const asked = std.mem.trim(u8, rest, " \t\r\n");
-        if (asked.len == 0) return .{ .model = null };
-        return .{ .model = asked };
+        // What separates a command from its argument, and what a pasted line is
+        // trimmed of at either end.
+        const spaces = " \t\r\n";
+
+        const line = std.mem.trim(u8, text, spaces);
+        const typed = std.mem.cutPrefix(u8, line, "/") orelse return null;
+        const split = std.mem.indexOfAny(u8, typed, spaces) orelse typed.len;
+        const name = typed[0..split];
+        const argument = std.mem.trim(u8, typed[split..], spaces);
+
+        // The union's own tags are the names a command is typed by, and the arm's
+        // type is how it takes an argument, so no second list has to be kept in
+        // step with the first.
+        const fields = @typeInfo(Command).@"union";
+        inline for (fields.field_names, fields.field_types) |field_name, argument_type| {
+            if (std.mem.eql(u8, name, field_name)) {
+                return switch (argument_type) {
+                    // A command with no argument is the whole line, so
+                    // `/compact this` is a prompt that happens to start with one.
+                    void => if (argument.len == 0) @unionInit(Command, field_name, {}) else null,
+                    // A command with one takes the rest of the line, and null when
+                    // there was none: it is how the command asks which one to act
+                    // on.
+                    ?[]const u8 => @unionInit(Command, field_name, if (argument.len == 0) null else argument),
+                    else => @compileError("a command takes no argument or one optional one"),
+                };
+            }
+        }
+        return null;
     }
 };
 
@@ -2342,10 +2366,12 @@ test "a command is read from the whole line, and takes its argument with it" {
     try std.testing.expect(Command.of("/model   ").?.model == null);
 
     // Only the whole line is a command: a prompt that starts with one is a
-    // prompt, and so is anything else.
+    // prompt, and so is anything else, a slash alone and a second slash included.
     try std.testing.expect(Command.of("/compact this") == null);
     try std.testing.expect(Command.of("/modelling it") == null);
     try std.testing.expect(Command.of("/modeler") == null);
+    try std.testing.expect(Command.of("//model x") == null);
+    try std.testing.expect(Command.of("/") == null);
     try std.testing.expect(Command.of("hello") == null);
     try std.testing.expect(Command.of("/chat") == null);
 }

@@ -118,6 +118,11 @@ least once. Read the rule, not the story; the story is in the review.
   a tool differently. A union arm with no table row is a compile error.
   *`parseCallNamed` walked a hand-written tuple, so a new tool silently became `unknown` while
   `specs` offered it.*
+- **A command is its arm, and how it takes an argument is the arm's type.** `Command.of` walks the
+  union, so a command is typed as `/<tag>` and takes the rest of the line exactly when its payload
+  says so, and `take`'s switch refuses to compile until a new arm is handled.
+  *`of` compared the line against `/compact` and then cut a `/model` prefix by hand, so a third
+  command would have been a third branch and a fourth another.*
 - **A name from a service is matched as the service spells it, not normalized.** `find` compared a
   provider with `-` and `_` taken as equal, so a configured `opencode_go` reached the catalog's
   `opencode-go` and there were two spellings of one provider in the configuration, the credentials
