@@ -16,19 +16,29 @@ const Terminal = @import("Terminal.zig");
 const Agent = @This();
 
 /// A command a prompt can be on its own, which billy runs itself rather than
-/// sending to the model. A command is the whole line, so a prompt that merely
-/// starts with one is still a prompt.
+/// sending to the model. A command is the whole line, and its argument where it
+/// takes one, so a prompt that merely starts with one is still a prompt.
 ///
 /// Private: a frontend hands the agent what was typed and is told what came of
 /// it, so which commands there are and what they do is the agent's own business.
-const Command = enum {
+const Command = union(enum) {
     /// Fold the conversation into a summary now, whatever its size.
     compact,
+    /// Send the session to the provider and model named, or say where it is sent
+    /// when the command is on its own.
+    model: ?[]const u8,
 
     /// Reads `text` as a command, or null when it is an ordinary prompt.
     pub fn of(text: []const u8) ?Command {
-        if (std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "/compact")) return .compact;
-        return null;
+        const line = std.mem.trim(u8, text, " \t\r\n");
+        if (std.mem.eql(u8, line, "/compact")) return .compact;
+        const rest = std.mem.cutPrefix(u8, line, "/model") orelse return null;
+        // The argument is set off by whitespace, so a line that only starts with
+        // the command is a prompt like any other.
+        if (rest.len > 0 and !std.ascii.isWhitespace(rest[0])) return null;
+        const asked = std.mem.trim(u8, rest, " \t\r\n");
+        if (asked.len == 0) return .{ .model = null };
+        return .{ .model = asked };
     }
 };
 
@@ -555,21 +565,26 @@ pub const Waiting = union(enum) {
 /// model, which is left to `ask`. A frontend need know nothing more of a line:
 /// commands and compaction are handled here.
 pub fn take(agent: *Agent, emitter: *Emitter, session: *Session, line: []const u8) !Waiting {
-    // Compaction is a request of its own, made before the prompt is added, so the
-    // client for the model the session records now is made before the line is
-    // looked at.
-    var client = try agent.clientFor(session);
-
-    // A command is run rather than asked.
+    // A command is run rather than asked, and before any client is made: a
+    // session on a model that cannot be reached is exactly the one `/model` has
+    // to be able to move.
     if (Command.of(line)) |cmd| {
         switch (cmd) {
             .compact => {
+                // Compaction is a request of its own, at the model the session
+                // records now, so it needs the client the rest of the turn does.
+                var client = try agent.clientFor(session);
                 if (agent.compact(emitter, session, &client, .now) != .done)
                     try emitter.show(.{ .notice = "nothing to compact" });
             },
+            .model => |choice| try agent.selectModel(emitter, session, choice),
         }
         return .ran;
     }
+
+    // The client is made before the prompt is added, so what this turn is sent
+    // with and what the session records are the same model.
+    var client = try agent.clientFor(session);
 
     // Before the prompt is added, so the prompt is not compacted into the summary
     // it triggers.
@@ -579,6 +594,43 @@ pub fn take(agent: *Agent, emitter: *Emitter, session: *Session, line: []const u
     // before keeps what it was saved with.
     if (session.messages.items.len == 0) try agent.prepare(session);
     return .{ .prompt = line };
+}
+
+/// Runs `/model`: says which model the session goes to, or records the one named
+/// so the next turn is sent there.
+///
+/// Nothing is resolved here, so a session on a provider that cannot be reached
+/// can still be moved off it. Where the choice points is resolved afresh from the
+/// session's model when the next turn begins, which is the one place a choice
+/// that names no reachable endpoint is reported.
+fn selectModel(agent: *Agent, emitter: *Emitter, session: *Session, choice: ?[]const u8) !void {
+    var notice: [256]u8 = undefined;
+    const asked = choice orelse {
+        const current = session.modelChoice(agent.config.stored.model);
+        return emitter.show(.{ .notice = std.fmt.bufPrint(
+            &notice,
+            "the model is {s}; use /model <provider>/<model> to change it",
+            .{current},
+        ) catch "use /model <provider>/<model> to change the model" });
+    };
+
+    // A model is named the way a choice is, so the two halves can be resolved
+    // against the configuration, the catalog and the keys.
+    if (!(models.Choice{ .text = asked }).isComplete()) {
+        return emitter.show(.{ .notice = "a model is named as <provider>/<model>, such as /model deepseek/deepseek-flash" });
+    }
+
+    try session.setModel(asked);
+    // A session that has messages is a file already, and the model it goes to is
+    // part of it, so the move is written down now rather than at the next turn. A
+    // session with none is brought into being by its first message, which writes
+    // this with it. A file that cannot be written is a warning: the session goes
+    // where it was told for as long as the run lasts either way.
+    if (session.messages.items.len > 0) session.save() catch |err|
+        std.log.warn("could not write the session: {s}", .{@errorName(err)});
+
+    return emitter.show(.{ .notice = std.fmt.bufPrint(&notice, "the model is now {s}", .{asked}) catch
+        "the model is set" });
 }
 
 /// How a compaction went.
@@ -2271,13 +2323,29 @@ test "a compaction asked for now compacts the conversation in whatever its size"
     try std.testing.expectEqualStrings("", out.written());
 }
 
-test "the compact command is read from a prompt" {
+test "a command is read from the whole line, and takes its argument with it" {
     try std.testing.expectEqual(Command.compact, Command.of("/compact").?);
     // The whitespace around a pasted line does not matter.
     try std.testing.expectEqual(Command.compact, Command.of("  /compact\n").?);
+
+    // The model command carries the choice it was given, and nothing when it was
+    // given none: on its own it asks where the session is sent.
+    try std.testing.expectEqualStrings(
+        "deepseek/deepseek-flash",
+        Command.of("/model deepseek/deepseek-flash").?.model.?,
+    );
+    try std.testing.expectEqualStrings(
+        "deepseek/deepseek-flash",
+        Command.of("  /model  deepseek/deepseek-flash \n").?.model.?,
+    );
+    try std.testing.expect(Command.of("/model").?.model == null);
+    try std.testing.expect(Command.of("/model   ").?.model == null);
+
     // Only the whole line is a command: a prompt that starts with one is a
     // prompt, and so is anything else.
     try std.testing.expect(Command.of("/compact this") == null);
+    try std.testing.expect(Command.of("/modelling it") == null);
+    try std.testing.expect(Command.of("/modeler") == null);
     try std.testing.expect(Command.of("hello") == null);
     try std.testing.expect(Command.of("/chat") == null);
 }
@@ -2460,11 +2528,115 @@ test "a prompt after the first leaves the session as it was set up" {
     try session.append(.{ .role = .assistant, .content = "done" });
 
     // A session that has been asked something keeps the prompt it was set up
-    // with, and a line that starts with `/chat` is asked like any other: the only
-    // command left is `/compact`.
+    // with, and a line that starts with `/chat` is asked like any other: only the
+    // commands are commands.
     const later = try agent.take(terminal.emitter(), &session, "/chat is this a command?");
     try std.testing.expectEqualStrings("/chat is this a command?", later.prompt);
     try std.testing.expectEqualStrings(prompt_text, session.systemPrompt().?);
+}
+
+test "the model command says where the session is sent, and moves it there" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
+    var agent = try testAgent(io, gpa, setup, null);
+    defer agent.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var terminal = testTerminal(.{ .out = &out.writer });
+
+    // A session that recorded no model is sent to the configured one, which is
+    // what the command on its own reports.
+    const asked = try agent.take(terminal.emitter(), &session, "/model");
+    try std.testing.expect(asked == .ran);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "the model is test/m") != null);
+    try std.testing.expect(session.model() == null);
+
+    // Naming another model records it, which is where the next turn is sent.
+    const moved = try agent.take(terminal.emitter(), &session, "/model other/other-model");
+    try std.testing.expect(moved == .ran);
+    try std.testing.expectEqualStrings("other/other-model", session.model().?);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "the model is now other/other-model") != null);
+
+    // A name that is not a choice says so, and leaves the session where it was.
+    const refused = try agent.take(terminal.emitter(), &session, "/model other-model");
+    try std.testing.expect(refused == .ran);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "a model is named as <provider>/<model>") != null);
+    try std.testing.expectEqualStrings("other/other-model", session.model().?);
+}
+
+test "a model chosen mid-session is the one the session is resumed with" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
+    var agent = try testAgent(io, gpa, setup, null);
+    defer agent.deinit();
+
+    // A session with a message is a file, so the model chosen here reaches it
+    // without waiting for the next turn to write the session out.
+    try session.append(.{ .role = .user, .content = "hello" });
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var terminal = testTerminal(.{ .out = &out.writer });
+
+    const moved = try agent.take(terminal.emitter(), &session, "/model other/other-model");
+    try std.testing.expect(moved == .ran);
+
+    // Read after the move: recording a model interns a string, which can move
+    // the pool the id was a slice of.
+    const id = try gpa.dupe(u8, session.id());
+    defer gpa.free(id);
+    var resumed = try Session.open(io, tmp.dir, gpa, id, "/work");
+    defer resumed.deinit();
+    try std.testing.expectEqualStrings("other/other-model", resumed.model().?);
+}
+
+test "the model command can move a session off a model that cannot be reached" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
+    var agent = try testAgent(io, gpa, setup, null);
+    defer agent.deinit();
+
+    // A model neither the configuration nor the catalog names, so a turn for it
+    // has no endpoint to be resolved to: the command that moves the session off
+    // it cannot be one that needs a target itself.
+    try session.setModel("who-knows/m");
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var terminal = testTerminal(.{ .out = &out.writer });
+
+    const asked = try agent.take(terminal.emitter(), &session, "/model");
+    try std.testing.expect(asked == .ran);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "the model is who-knows/m") != null);
+
+    const moved = try agent.take(terminal.emitter(), &session, "/model test/m");
+    try std.testing.expect(moved == .ran);
+    try std.testing.expectEqualStrings("test/m", session.model().?);
 }
 
 test "the terminal shows a tool call the way a replay does" {

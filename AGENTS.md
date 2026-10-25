@@ -46,6 +46,10 @@ least once. Read the rule, not the story; the story is in the review.
   non-zero for whatever is scripted around it.
   *Nineteen sites logged an error and then returned it, and `main` printed it again — so a typo in a
   flag produced two error lines and a stack trace, which reads as a crash.*
+- **A way out of a state is not gated on the state it is leaving.** A command that changes where a
+  turn goes has to run before anything resolves where turns go. *`take` made the session's client
+  before it read the line, so a session left on a provider that no longer resolved could not be
+  moved off it with `/model` — the one command that existed to fix it.*
 - **Nothing to try and everything tried are different answers.** An empty set is a configuration
   mistake; a set that was asked and refused is a failure. `Search` told a user with no backend at
   all that "every search backend is set aside after failing", so they were told to add another to a
