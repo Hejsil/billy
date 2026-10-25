@@ -184,12 +184,13 @@ fn listenAddress(host: []const u8, port: u16) !std.Io.net.IpAddress {
     return std.Io.net.IpAddress.parse(host, port) catch error.InvalidHost;
 }
 
-/// What the server knows about sessions that their files do not say.
+/// What the server knows about sessions beyond their files: the ids a turn is
+/// running for right now, so a session can only be asked one thing at a time.
 ///
-/// A session is not written out until it is first asked something, so a new one
-/// exists only as an id until then. This holds those ids: without it a session
-/// just started would not be in the listing and its page would have nothing to
-/// open.
+/// A session is written by its first message, so until then it exists only as
+/// the id a turn is running for: it is not in the listing, and its page is a
+/// 404. The page learns the id from the `session` event and asks for the list
+/// again once that turn has written the file.
 ///
 /// Every connection runs on its own task, so this is reached from several at
 /// once and a lock guards it.
@@ -515,9 +516,10 @@ const Opened = struct {
 
 /// `GET /api/sessions/{id}`: a session as the page shows it.
 ///
-/// A session with no file yet is one that has been started and not asked
-/// anything, which is what a page should show: an empty conversation rather than
-/// a failure. Any other missing id is a 404.
+/// A session is written by its first message, so an id a turn has just handed
+/// out and not yet written is a 404, like any other missing id. The page learns
+/// the id from the `session` event and lists the session once that turn has
+/// written it; it does not open one that has no file yet.
 fn openSession(r: *Request, id: []const u8) !void {
     const gpa = r.server.gpa;
 
@@ -525,8 +527,8 @@ fn openSession(r: *Request, id: []const u8) !void {
     defer body.deinit();
     const opened = r.server.writeSession(gpa, id, &body.writer) catch |err| switch (err) {
         // An id that could not be a session name is a bad request, not a missing
-        // session. A session with no file is not an error here: it is one that
-        // has been started and not asked anything, which the page shows empty.
+        // session; an id with no file is a missing session, whether nothing was
+        // ever handed out under it or its turn has not written it yet.
         error.InvalidSessionId => return r.reply(.text, "bad session id\n", .bad_request),
         else => return err,
     };
@@ -535,8 +537,8 @@ fn openSession(r: *Request, id: []const u8) !void {
 }
 
 /// Writes the JSON a session's page is built from, and says whether the session
-/// was there at all: false for an id that names no session and was never handed
-/// out.
+/// was there at all: false for an id with no file, which includes one a turn has
+/// handed out and not yet written.
 fn writeSession(
     server: *const Server,
     gpa: std.mem.Allocator,
