@@ -101,8 +101,9 @@ const Stored = struct {
     /// guessed from one. A session keeps the choice it was started with, so
     /// changing this affects new sessions and not the ones in progress.
     model: []const u8 = "deepseek/deepseek-flash",
-    /// The endpoints billy talks to that its own table does not name: a proxy, a
-    /// server of the user's own, or a stand-in a test points a run at. Each is
+    /// The endpoints billy talks to that the model catalog does not name, or
+    /// names differently: a proxy, a server of the user's own, or a stand-in a
+    /// test points a run at. Each is
     /// written as a provider name with the base URL its completions path is
     /// appended to, and named in `model` like any other provider.
     ///
@@ -155,20 +156,12 @@ const Stored = struct {
         }
     }
 
-    /// Whether the model setting names a provider billy can reach and a model of
-    /// it. A model of a provider billy does not know is refused here rather than
-    /// at the request, where it would fail as an endpoint it never had.
+    /// Whether the model setting names both a provider and a model. Whether the
+    /// provider is one billy can reach is not known here: it is resolved against
+    /// the configuration and the model catalog when a request is made, and
+    /// refused there with the catalog's own report.
     fn validateModel(stored: Stored) !void {
-        // Both halves are checked before either is judged: an empty setting has
-        // no provider to be unknown, and saying so is less confusing than
-        // calling the empty string a provider billy does not know.
         if (!stored.choice().isComplete()) return error.InvalidConfig;
-        const name = stored.providerName();
-        // A provider billy ships, or one the file defines itself: anything else
-        // names no endpoint, and would fail at the request as one it never had.
-        if (std.meta.stringToEnum(models.Provider, name) != null) return;
-        if (stored.providers.has(name)) return;
-        return error.UnknownProvider;
     }
 
     /// Whether every provider the file defines is one a request could be sent
@@ -178,11 +171,6 @@ const Stored = struct {
             if (entry.name.len == 0) return error.InvalidConfig;
             if (entry.base_url.len == 0) return error.InvalidConfig;
         }
-    }
-
-    /// The provider half of the model setting, before the first `/`.
-    fn providerName(stored: Stored) []const u8 {
-        return stored.choice().provider();
     }
 
     /// What the model setting asks for, as the pair of halves it holds.
@@ -699,14 +687,13 @@ test "the model setting names a provider and a model of it" {
     try std.testing.expectEqualStrings("model/variant", nested.model());
 }
 
-test "a model setting billy cannot use is refused, not read as another endpoint" {
+test "a model setting with half of it missing is refused" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A provider billy does not know names no endpoint it can send to.
-    try std.testing.expectError(error.UnknownProvider, openFrom(&tmp, "{\"model\":\"who-knows/m\"}"));
     // A model with no provider in front of it, or a provider with no model
-    // after it, names a pair with a missing half rather than an unknown one.
+    // after it, names a pair with a missing half. Whether the provider exists is
+    // resolved against the catalog at the request, not here.
     try std.testing.expectError(error.InvalidConfig, openFrom(&tmp, "{\"model\":\"deepseek-flash\"}"));
     try std.testing.expectError(error.InvalidConfig, openFrom(&tmp, "{\"model\":\"deepseek/\"}"));
     try std.testing.expectError(error.InvalidConfig, openFrom(&tmp, "{\"model\":\"\"}"));
@@ -740,12 +727,10 @@ test "a model naming a provider the file does not define is refused" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A provider billy ships needs no definition.
-    var known = try openFrom(&tmp, "{\"model\":\"opencode_go/glm-5.3-flash\"}");
-    defer known.config.deinit();
-
-    // One it does not, and the file does not either, names no endpoint.
-    try std.testing.expectError(error.UnknownProvider, openFrom(&tmp, "{\"model\":\"mock/m\"}"));
+    // The provider is resolved at the request, against the catalog or the
+    // configuration, so opening the file only checks the pair is complete.
+    var opened = try openFrom(&tmp, "{\"model\":\"opencode_go/glm-5.3-flash\"}");
+    defer opened.config.deinit();
 }
 
 test "a provider entry with no name or no url is refused" {

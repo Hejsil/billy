@@ -1,52 +1,373 @@
-//! What is known about the provider and model in use.
-//!
-//! The API reports how many tokens a request used, but not how large the
-//! context window is. That is kept here and looked up by provider and model, so
-//! the header can show how full the window is. The numbers come from the
-//! providers' documentation and have to be updated by hand when they change.
+//! The model catalog: the providers billy can talk to, the models each offers,
+//! and the context window of each. Nothing is compiled in. The catalog is
+//! fetched from models.dev into the cache directory the first time a run needs
+//! it, and `billy models --refresh` fetches it again.
 
 const std = @import("std");
+const http = @import("http.zig");
 
-/// A provider whose models are known.
-pub const Provider = enum {
-    deepseek,
-    opencode_go,
+/// The cache file, under billy's cache directory.
+pub const cache_file = "models.json";
+/// Where the catalog is fetched from: one document holding every provider and
+/// model models.dev knows.
+pub const source_url = "https://models.dev/api.json";
+/// The shape of the cache file. A file of another version is fetched again
+/// rather than guessed at.
+pub const format_version: u32 = 1;
+/// The largest response billy will read, so a wrong address cannot fill memory.
+const max_source_bytes = 64 << 20;
 
-    /// Every provider in the table, for looking a model up without one.
-    pub fn all() []const Provider {
-        return std.enums.values(Provider);
+/// The providers and models billy can send a request to. Loaded from the cache
+/// file; empty when it could not be fetched or read, which costs the context
+/// gauge and compaction but leaves a configured provider usable.
+pub const Catalog = struct {
+    providers: []const Provider = &.{},
+
+    /// The provider called `name`. A provider is matched exactly first, then
+    /// with `-` and `_` taken as the same character, so the configuration's
+    /// `opencode_go` finds the catalog's `opencode-go`.
+    pub fn find(catalog: *const Catalog, name: []const u8) ?*const Provider {
+        for (catalog.providers) |*provider| {
+            if (std.mem.eql(u8, provider.name, name)) return provider;
+        }
+        for (catalog.providers) |*provider| {
+            if (sameName(provider.name, name)) return provider;
+        }
+        return null;
     }
 
-    /// The name the provider is written and configured under, which is the
-    /// variant's own.
-    pub fn name(provider: Provider) []const u8 {
-        return @tagName(provider);
+    /// What is known about `model` at `provider`, or among all providers when
+    /// the provider is unknown or not named. Null when the model is not in the
+    /// catalog.
+    pub fn metadata(catalog: *const Catalog, provider: ?[]const u8, model: []const u8) ?Metadata {
+        if (provider) |name| {
+            if (catalog.find(name)) |known| {
+                const entry = known.model(model) orelse return null;
+                return .{ .provider = known.name, .context_window = entry.context };
+            }
+        }
+        for (catalog.providers) |*known| {
+            const entry = known.model(model) orelse continue;
+            return .{ .provider = known.name, .context_window = entry.context };
+        }
+        return null;
     }
 
-    /// The provider called `text`, or null when it is not one billy knows.
-    pub fn fromName(text: []const u8) ?Provider {
-        return std.meta.stringToEnum(Provider, text);
-    }
-
-    /// Where the provider's API lives, as the base URL its completions path is
-    /// appended to.
-    pub fn baseUrl(provider: Provider) []const u8 {
-        return switch (provider) {
-            .deepseek => "https://api.deepseek.com",
-            .opencode_go => "https://opencode.ai/zen/go/v1",
-        };
+    /// How many models the catalog holds, for a command to report.
+    pub fn modelCount(catalog: *const Catalog) usize {
+        var count: usize = 0;
+        for (catalog.providers) |provider| count += provider.models.len;
+        return count;
     }
 };
+
+/// One service billy can call: where its OpenAI-compatible API lives, the
+/// variables a key may come from, and the models it offers.
+pub const Provider = struct {
+    /// The name a choice names it by, which is models.dev's provider id.
+    name: []const u8,
+    /// The base URL its completions path is appended to. Null for a provider
+    /// whose address only the configuration can name.
+    base_url: ?[]const u8 = null,
+    /// Variables a key may be exported in, in the order models.dev lists them.
+    env: []const []const u8 = &.{},
+    models: []const Model = &.{},
+
+    fn model(provider: *const Provider, id: []const u8) ?*const Model {
+        for (provider.models) |*entry| {
+            if (std.mem.eql(u8, entry.id, id)) return entry;
+        }
+        return null;
+    }
+};
+
+/// One model a provider offers.
+pub const Model = struct {
+    /// The id a request sends.
+    id: []const u8,
+    /// Tokens the context window holds.
+    context: usize,
+    /// Tokens the model may answer with, or zero when models.dev does not say.
+    output: usize = 0,
+    tools: bool = false,
+    reasoning: bool = false,
+};
+
+/// What is known about a model: the provider it was found under, and its window.
+pub const Metadata = struct {
+    provider: []const u8,
+    context_window: usize,
+};
+
+/// The shape the cache file is written and read as.
+const Cache = struct {
+    version: u32 = format_version,
+    providers: []const Provider = &.{},
+};
+
+/// Reads the catalog from `dir`, into `arena`. A missing file is
+/// `error.FileNotFound`, which `ensure` uses to fetch one; a file that cannot
+/// be read is `error.CorruptCatalog`.
+pub fn load(io: std.Io, arena: std.mem.Allocator, dir: std.Io.Dir) !Catalog {
+    const text = try dir.readFileAlloc(io, cache_file, arena, .unlimited);
+    const cache = std.json.parseFromSliceLeaky(Cache, arena, text, .{
+        .ignore_unknown_fields = true,
+        // The text is in `arena`, which outlives the parsed value, so the
+        // strings may point into it.
+        .allocate = .alloc_if_needed,
+    }) catch return error.CorruptCatalog;
+    if (cache.version != format_version) return error.UnsupportedCatalogVersion;
+    if (cache.providers.len == 0) return error.CorruptCatalog;
+    return .{ .providers = cache.providers };
+}
+
+/// Reads the cached catalog, fetching one first when there is none or the one
+/// there cannot be used. A failure to fetch is reported and leaves an empty
+/// catalog: a run with a configured provider still works, without a gauge.
+pub fn ensure(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator, dir: std.Io.Dir) Catalog {
+    return load(io, arena, dir) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.log.info("fetching the model catalog", .{});
+            _ = refresh(io, gpa, dir) catch |fetch_err| {
+                std.log.warn("could not fetch the model catalog: {s}", .{@errorName(fetch_err)});
+                return .{};
+            };
+            return load(io, arena, dir) catch |load_err| {
+                std.log.warn("could not read the model catalog: {s}", .{@errorName(load_err)});
+                return .{};
+            };
+        },
+        // A file that is half written, from another version or edited by hand is
+        // fetched again rather than left to blind the run until the user runs
+        // the refresh command.
+        error.CorruptCatalog, error.UnsupportedCatalogVersion => {
+            std.log.warn("the model catalog cannot be used ({s}); fetching it again", .{@errorName(err)});
+            _ = refresh(io, gpa, dir) catch |fetch_err| {
+                std.log.warn("could not fetch the model catalog: {s}", .{@errorName(fetch_err)});
+                return .{};
+            };
+            return load(io, arena, dir) catch |load_err| {
+                std.log.warn("could not read the model catalog: {s}", .{@errorName(load_err)});
+                return .{};
+            };
+        },
+        else => {
+            std.log.warn("could not read the model catalog: {s}", .{@errorName(err)});
+            return .{};
+        },
+    };
+}
+
+/// What a refresh wrote, so the command can say how much it got.
+pub const Counts = struct { providers: usize, models: usize };
+
+/// Fetches models.dev and writes the providers billy can call to the cache file
+/// under `dir`. The response is filtered to OpenAI-compatible providers and the
+/// fields billy uses, so the cache stays small and the reader simple.
+pub fn refresh(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir) !Counts {
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
+
+    var request = try client.request(.GET, try std.Uri.parse(source_url), .{
+        .headers = .{ .user_agent = .{ .override = "billy" } },
+    });
+    defer request.deinit();
+    try request.sendBodiless();
+
+    var redirect_buffer: [8 * 1024]u8 = undefined;
+    var response = try request.receiveHead(&redirect_buffer);
+    if (response.head.status.class() != .success) return error.CatalogFetchFailed;
+    if (response.head.content_length) |length| {
+        if (length > max_source_bytes) return error.CatalogTooLarge;
+    }
+    const body = try http.readBody(gpa, &response);
+    defer gpa.free(body);
+    if (body.len > max_source_bytes) return error.CatalogTooLarge;
+
+    return writeFrom(io, gpa, dir, body);
+}
+
+/// Filters `body`, the models.dev document, into the cache file under `dir`.
+/// Split from `refresh` so the filtering can be tested without the network.
+fn writeFrom(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir, body: []const u8) !Counts {
+    var build_state = std.heap.ArenaAllocator.init(gpa);
+    defer build_state.deinit();
+    const build = build_state.allocator();
+
+    const root = std.json.parseFromSliceLeaky(std.json.Value, build, body, .{
+        .allocate = .alloc_if_needed,
+    }) catch return error.CorruptCatalog;
+    const catalog = switch (root) {
+        .object => |object| object,
+        else => return error.CorruptCatalog,
+    };
+
+    var providers: std.ArrayList(Provider) = .empty;
+    defer providers.deinit(build);
+    var model_count: usize = 0;
+
+    var it = catalog.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const value = entry.value_ptr.*;
+        if (name.len == 0) continue;
+        const provider = switch (value) {
+            .object => |object| object,
+            else => continue,
+        };
+        const npm = stringField(provider, "npm") orelse continue;
+        if (!openAiCompatible(npm)) continue;
+        // Some providers -- OpenAI and xAI among them -- leave the address to
+        // their SDK, so models.dev has none. They are kept with no address: a
+        // key can be stored for them, and the configuration can name where they
+        // are reached.
+        const base_url = stringField(provider, "api");
+        const models_value = provider.get("models") orelse continue;
+        const models_object = switch (models_value) {
+            .object => |object| object,
+            else => continue,
+        };
+
+        var models: std.ArrayList(Model) = .empty;
+        var models_it = models_object.iterator();
+        while (models_it.next()) |model_entry| {
+            const model = switch (model_entry.value_ptr.*) {
+                .object => |object| object,
+                else => continue,
+            };
+            const id = stringField(model, "id") orelse model_entry.key_ptr.*;
+            if (id.len == 0) continue;
+            const limit = model.get("limit") orelse continue;
+            const limit_object = switch (limit) {
+                .object => |object| object,
+                else => continue,
+            };
+            const context = intField(limit_object, "context") orelse continue;
+            if (context == 0) continue;
+            try models.append(build, .{
+                .id = id,
+                .context = context,
+                .output = intField(limit_object, "output") orelse 0,
+                .tools = boolField(model, "tool_call"),
+                .reasoning = boolField(model, "reasoning"),
+            });
+        }
+        if (models.items.len == 0) continue;
+        std.mem.sort(Model, models.items, {}, byModelId);
+        model_count += models.items.len;
+
+        const env = try envOf(build, provider);
+        try providers.append(build, .{
+            .name = name,
+            .base_url = base_url,
+            .env = env,
+            .models = models.items,
+        });
+    }
+    if (providers.items.len == 0) return error.EmptyCatalog;
+
+    std.mem.sort(Provider, providers.items, {}, byName);
+
+    var text: std.Io.Writer.Allocating = .init(gpa);
+    defer text.deinit();
+    try std.json.Stringify.value(Cache{
+        .providers = providers.items,
+    }, .{}, &text.writer);
+
+    var atomic = try dir.createFileAtomic(io, cache_file, .{ .replace = true });
+    defer atomic.deinit(io);
+    var buffer: [std.heap.page_size_min]u8 = undefined;
+    var file = atomic.file.writer(io, &buffer);
+    try file.interface.writeAll(text.written());
+    try file.flush();
+    try atomic.replace(io);
+
+    return .{ .providers = providers.items.len, .models = model_count };
+}
+
+/// Whether a models.dev provider speaks the OpenAI chat-completions wire
+/// format, which is the only one billy sends.
+fn openAiCompatible(npm: []const u8) bool {
+    return std.mem.eql(u8, npm, "@ai-sdk/openai-compatible") or
+        std.mem.eql(u8, npm, "@ai-sdk/openai") or
+        std.mem.eql(u8, npm, "@ai-sdk/xai");
+}
+
+fn stringField(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {
+    const value = object.get(name) orelse return null;
+    return switch (value) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn intField(object: std.json.ObjectMap, name: []const u8) ?usize {
+    const value = object.get(name) orelse return null;
+    return switch (value) {
+        .integer => |number| if (number > 0) @intCast(number) else null,
+        else => null,
+    };
+}
+
+fn boolField(object: std.json.ObjectMap, name: []const u8) bool {
+    const value = object.get(name) orelse return false;
+    return switch (value) {
+        .bool => |flag| flag,
+        else => false,
+    };
+}
+
+fn envOf(arena: std.mem.Allocator, provider: std.json.ObjectMap) ![]const []const u8 {
+    const value = provider.get("env") orelse return &.{};
+    const list = switch (value) {
+        .array => |array| array,
+        else => return &.{},
+    };
+    const names = try arena.alloc([]const u8, list.items.len);
+    var count: usize = 0;
+    for (list.items) |item| {
+        const name = switch (item) {
+            .string => |text| text,
+            else => continue,
+        };
+        names[count] = name;
+        count += 1;
+    }
+    return names[0..count];
+}
+
+fn byName(_: void, a: Provider, b: Provider) bool {
+    return std.mem.order(u8, a.name, b.name) == .lt;
+}
+
+fn byModelId(_: void, a: Model, b: Model) bool {
+    return std.mem.order(u8, a.id, b.id) == .lt;
+}
+
+/// Whether two provider names are the same with `-` and `_` taken as equal.
+fn sameName(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (x == y) continue;
+        if (isDash(x) and isDash(y)) continue;
+        return false;
+    }
+    return true;
+}
+
+fn isDash(c: u8) bool {
+    return c == '-' or c == '_';
+}
 
 /// A provider and the model of its that a run asks for, as the one string the
 /// configuration and a session store: `provider/model`, such as
 /// `deepseek/deepseek-v4-flash`.
 ///
-/// Kept as the string it is read from rather than resolved to a `Provider` and a
-/// model id here, so a session file can name a provider a later billy adds to
-/// its table without this having to be edited, and so a session that names one
-/// billy does not know is refused where it can be reported rather than silently
-/// read as some other endpoint.
+/// Kept as the string it is read from rather than resolved to a provider and a
+/// model id here, so a session file can name a provider a later catalog adds
+/// without this having to be edited, and so a session that names one billy does
+/// not know is refused where it can be reported rather than silently read as
+/// some other endpoint.
 pub const Choice = struct {
     /// The whole string, as configured. It is what a session stores and what an
     /// error names, so the two halves are not kept apart from it.
@@ -72,124 +393,20 @@ pub const Choice = struct {
     }
 };
 
-/// The model metadata the API does not report.
-pub const Metadata = struct {
-    provider: Provider,
-    /// Tokens the context window holds.
-    context_window: usize,
-};
-
-/// A model offered by a provider.
-const Entry = struct {
-    /// The model id to send.
-    id: []const u8,
-    /// Tokens the context window holds.
-    context_window: usize,
-    /// Older names the API still accepts for the same model.
-    aliases: []const []const u8 = &.{},
-};
-
-/// The models of every known provider.
-const table = struct {
-    // https://api-docs.deepseek.com/quick_start/pricing
-    const deepseek = [_]Entry{
-        .{
-            .id = "deepseek-flash",
-            .context_window = 1_000_000,
-            .aliases = &.{ "deepseek-v4-flash", "deepseek-v4-flash-vision-exp" },
-        },
-        .{
-            .id = "deepseek-v4-pro",
-            .context_window = 1_000_000,
-        },
-    };
-
-    // https://opencode.ai/docs/go -- the OpenAI-compatible models only. The Go
-    // endpoint also serves models on Anthropic's `/v1/messages` (MiniMax, Qwen)
-    // and on OpenAI's `/v1/responses` (Grok, the Luna pair, Muse Spark); billy
-    // speaks neither, so listing them would offer a model it cannot call.
-    //
-    // The windows come from models.dev, which publishes what the Go page does
-    // not; the ids are the ones `GET /zen/go/v1/models` returns now, which runs
-    // slightly ahead of that catalog.
-    const opencode_go = [_]Entry{
-        .{ .id = "glm-5.3-flash", .context_window = 1_000_000 },
-        .{ .id = "glm-5.3", .context_window = 1_000_000 },
-        .{ .id = "glm-5.2", .context_window = 1_000_000 },
-        .{ .id = "glm-5.1", .context_window = 1_000_000 },
-        .{ .id = "kimi-k3", .context_window = 1_048_576 },
-        .{ .id = "kimi-k2.7-code", .context_window = 262_144 },
-        .{ .id = "kimi-k2.6", .context_window = 262_144 },
-        .{ .id = "deepseek-v4.1-flash", .context_window = 1_000_000 },
-        .{ .id = "deepseek-v4-pro", .context_window = 1_000_000 },
-        .{ .id = "deepseek-v4-flash", .context_window = 1_000_000 },
-        .{ .id = "deepseek-v4-flash-vision-exp", .context_window = 1_000_000 },
-        // The Go endpoint accepts this id too, at the same window, so a session
-        // started on DeepSeek keeps its gauge when it is sent there.
-        .{ .id = "deepseek-flash", .context_window = 1_000_000 },
-        .{ .id = "mimo-v2.6-flash", .context_window = 1_048_576 },
-        .{ .id = "mimo-v2.6-pro", .context_window = 1_048_576 },
-        .{ .id = "mimo-v2.5", .context_window = 1_000_000 },
-        .{ .id = "mimo-v2.5-pro", .context_window = 1_048_576 },
-        .{ .id = "longcat-2.0", .context_window = 1_000_000 },
-        .{ .id = "longcat-2.5-preview-free", .context_window = 1_000_000 },
-        .{ .id = "step-5-preview-free", .context_window = 1_000_000 },
-        .{ .id = "hy4-preview", .context_window = 1_024_000 },
-        .{ .id = "hy3", .context_window = 256_000 },
-        .{ .id = "space-bunny", .context_window = 1_048_576 },
-    };
-};
-
-/// The models of `provider`.
-fn entries(provider: Provider) []const Entry {
-    return switch (provider) {
-        .deepseek => &table.deepseek,
-        .opencode_go => &table.opencode_go,
-    };
-}
-
-/// The host name of `url`, without the scheme, port or path.
-pub fn hostOf(url: []const u8) ?[]const u8 {
-    const after_scheme = if (std.mem.indexOf(u8, url, "://")) |i| url[i + 3 ..] else url;
-    const end = std.mem.indexOfAny(u8, after_scheme, "/:") orelse after_scheme.len;
-    const host = after_scheme[0..end];
-    if (host.len == 0) return null;
-    return host;
-}
-
-/// What is known about `model`, looked up at `provider` when it is known and
-/// among all providers otherwise, so a model behind an unrecognized endpoint is
-/// still recognized. Null when the model is not in the table, in which case the
-/// header leaves the context gauge out.
-pub fn lookup(provider: ?Provider, model: []const u8) ?Metadata {
-    if (provider) |known| {
-        for (entries(known)) |entry| {
-            if (matches(entry, model)) return metadataOf(known, entry);
-        }
-        return null;
-    }
-    for (Provider.all()) |candidate| {
-        for (entries(candidate)) |entry| {
-            if (matches(entry, model)) return metadataOf(candidate, entry);
-        }
-    }
-    return null;
-}
-
-fn matches(entry: Entry, model: []const u8) bool {
-    if (std.mem.eql(u8, entry.id, model)) return true;
-    for (entry.aliases) |alias| {
-        if (std.mem.eql(u8, alias, model)) return true;
-    }
-    return false;
-}
-
-fn metadataOf(provider: Provider, entry: Entry) Metadata {
-    return .{
-        .provider = provider,
-        .context_window = entry.context_window,
-    };
-}
+/// A catalog for the tests, so they need no cache file. The real catalog is
+/// fetched at runtime; this is the two providers billy's tests name, with the
+/// windows they expect. Only a test may use it.
+pub const test_catalog = Catalog{ .providers = &.{
+    .{ .name = "deepseek", .base_url = "https://api.deepseek.com", .env = &.{"DEEPSEEK_API_KEY"}, .models = &.{
+        .{ .id = "deepseek-flash", .context = 1_000_000, .tools = true },
+        .{ .id = "deepseek-v4-pro", .context = 1_000_000, .tools = true },
+        .{ .id = "deepseek-v4-flash", .context = 1_000_000, .tools = true },
+    } },
+    .{ .name = "opencode-go", .base_url = "https://opencode.ai/zen/go/v1", .env = &.{"OPENCODE_API_KEY"}, .models = &.{
+        .{ .id = "kimi-k2.7-code", .context = 262_144, .tools = true },
+        .{ .id = "deepseek-flash", .context = 1_000_000, .tools = true },
+    } },
+} };
 
 test "a choice names its provider before the slash and its model after it" {
     const flash = Choice{ .text = "deepseek/deepseek-flash" };
@@ -203,35 +420,120 @@ test "a choice names its provider before the slash and its model after it" {
     try std.testing.expectEqualStrings("vendor", variant.provider());
     try std.testing.expectEqualStrings("model/variant", variant.model());
 
-    // A bare model id names no provider, so it is sent as it is: it is what a run
-    // against a proxy or a local server names, and it is not a complete choice.
+    // A bare model id names no provider.
     const bare = Choice{ .text = "qwen3-coder:30b" };
     try std.testing.expectEqualStrings("", bare.provider());
     try std.testing.expectEqualStrings("qwen3-coder:30b", bare.model());
     try std.testing.expect(!bare.isComplete());
 }
 
-test "hostOf strips the scheme, port and path" {
-    try std.testing.expectEqualStrings("api.deepseek.com", hostOf("https://api.deepseek.com/chat/completions").?);
-    try std.testing.expectEqualStrings("api.deepseek.com", hostOf("https://api.deepseek.com").?);
-    try std.testing.expectEqualStrings("localhost", hostOf("http://localhost:8080/v1/chat/completions").?);
-    try std.testing.expectEqualStrings("example.com", hostOf("example.com/v1").?);
-    try std.testing.expect(hostOf("https://") == null);
+test "the catalog finds a provider exactly, then with dashes and underscores" {
+    const found = test_catalog.find("deepseek").?;
+    try std.testing.expectEqualStrings("https://api.deepseek.com", found.base_url.?);
+
+    // The catalog calls it `opencode-go`; the configuration and a session call
+    // it `opencode_go`.
+    const opencode = test_catalog.find("opencode_go").?;
+    try std.testing.expectEqualStrings("opencode-go", opencode.name);
+    try std.testing.expectEqualStrings("https://opencode.ai/zen/go/v1", opencode.base_url.?);
+
+    try std.testing.expect(test_catalog.find("not-a-provider") == null);
 }
 
-test "lookup finds a model by name, alias and without a provider" {
-    const flash = lookup(.deepseek, "deepseek-flash").?;
+test "metadata is looked up at the provider, then among all providers" {
+    const flash = test_catalog.metadata("deepseek", "deepseek-flash").?;
+    try std.testing.expectEqualStrings("deepseek", flash.provider);
     try std.testing.expectEqual(1_000_000, flash.context_window);
 
-    // An alias resolves to the model it names.
-    const aliased = lookup(.deepseek, "deepseek-v4-flash").?;
-    try std.testing.expectEqual(flash.context_window, aliased.context_window);
+    // The same model under another provider uses that provider's window.
+    const elsewhere = test_catalog.metadata("opencode_go", "kimi-k2.7-code").?;
+    try std.testing.expectEqualStrings("opencode-go", elsewhere.provider);
+    try std.testing.expectEqual(262_144, elsewhere.context_window);
 
-    // Without a provider, the model is still found.
-    const discovered = lookup(null, "deepseek-v4-pro").?;
-    try std.testing.expectEqual(Provider.deepseek, discovered.provider);
+    // Without a provider, the model is found among all of them.
+    const discovered = test_catalog.metadata(null, "deepseek-flash").?;
+    try std.testing.expectEqual(1_000_000, discovered.context_window);
+
+    // A model the provider does not offer is not looked up elsewhere.
+    try std.testing.expect(test_catalog.metadata("deepseek", "kimi-k2.7-code") == null);
 
     // An unknown model has no metadata, so the header shows no gauge.
-    try std.testing.expect(lookup(.deepseek, "gpt-4o") == null);
-    try std.testing.expect(lookup(null, "who-knows") == null);
+    try std.testing.expect(test_catalog.metadata(null, "who-knows") == null);
+}
+
+test "the cache is filtered to OpenAI-compatible providers, and reads back" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A small models.dev-shaped document: one provider billy can call, one it
+    // cannot, and one OpenAI-compatible provider whose model has no window.
+    const body =
+        \\{
+        \\  "deepseek": {
+        \\    "id": "deepseek", "name": "DeepSeek", "api": "https://api.deepseek.com",
+        \\    "env": ["DEEPSEEK_API_KEY"], "npm": "@ai-sdk/openai-compatible",
+        \\    "models": {
+        \\      "deepseek-flash": {"id": "deepseek-flash", "tool_call": true, "reasoning": true,
+        \\        "limit": {"context": 1048576, "output": 393216}},
+        \\      "no-window": {"id": "no-window"}
+        \\    }
+        \\  },
+        \\  "xai": {
+        \\    "id": "xai", "name": "xAI", "api": "https://api.x.ai/v1",
+        \\    "npm": "@ai-sdk/xai",
+        \\    "models": {"grok": {"id": "grok", "limit": {"context": 131072}}}
+        \\  },
+        \\  "anthropic": {
+        \\    "id": "anthropic", "name": "Anthropic", "api": "https://api.anthropic.com",
+        \\    "npm": "@ai-sdk/anthropic",
+        \\    "models": {"claude": {"id": "claude", "limit": {"context": 200000}}}
+        \\  }
+        \\}
+    ;
+
+    const counts = try writeFrom(std.testing.io, gpa, tmp.dir, body);
+    try std.testing.expectEqual(@as(usize, 2), counts.providers);
+    try std.testing.expectEqual(@as(usize, 2), counts.models);
+
+    const catalog = try load(std.testing.io, arena, tmp.dir);
+    // Anthropic is not an OpenAI-compatible provider, so it was left out.
+    try std.testing.expect(catalog.find("anthropic") == null);
+
+    const deepseek = catalog.find("deepseek").?;
+    try std.testing.expectEqualStrings("DEEPSEEK_API_KEY", deepseek.env[0]);
+    try std.testing.expectEqual(@as(usize, 1), deepseek.models.len);
+    try std.testing.expect(deepseek.models[0].tools);
+    try std.testing.expect(deepseek.models[0].reasoning);
+    try std.testing.expectEqual(@as(usize, 393216), deepseek.models[0].output);
+    try std.testing.expectEqual(@as(usize, 1_048_576), deepseek.models[0].context);
+
+    // A provider whose address is not known is left out as well; xAI is kept.
+    const xai = catalog.find("xai").?;
+    try std.testing.expectEqual(@as(usize, 131_072), xai.models[0].context);
+}
+
+test "a missing cache is a miss, and a damaged one is refused" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.testing.expectError(error.FileNotFound, load(std.testing.io, arena, tmp.dir));
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = cache_file, .data = "not json" });
+    try std.testing.expectError(error.CorruptCatalog, load(std.testing.io, arena, tmp.dir));
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = cache_file,
+        .data = "{\"version\":99,\"providers\":[{\"name\":\"x\",\"models\":[{\"id\":\"m\",\"context\":1}]}]}",
+    });
+    try std.testing.expectError(error.UnsupportedCatalogVersion, load(std.testing.io, arena, tmp.dir));
 }

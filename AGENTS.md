@@ -72,6 +72,10 @@ least once. Read the rule, not the story; the story is in the review.
 - **A file a human may open is indented and versioned; a file only billy reads is compact and
   versioned.** When a version is bumped, the load path migrates the old shape; do not let a reader
   guess.
+- **A catalog is fetched into the cache, not compiled in.** It changes without a release, so a
+  snapshot in the binary is stale by the time it ships. Fetch it when a run first needs it, version
+  the file, and give the user a command to fetch it again; a failed fetch leaves an empty catalog
+  and a run that still works, not a start that fails.
 - **An index read back from a file is checked against what it indexes.** Drop one that names
   nothing rather than clamping it onto the nearest element, which invents a reference the writer
   never made; collapse a repeat too, since a list documented as one entry per thing is not one.

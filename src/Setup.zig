@@ -14,8 +14,8 @@ const Agent = @import("Agent.zig");
 const Config = @import("Config.zig");
 const Credentials = @import("Credentials.zig");
 const Endpoint = @import("Endpoint.zig");
-const Health = @import("Health.zig");
 const models = @import("models.zig");
+const Health = @import("Health.zig");
 const report = @import("report.zig");
 const Session = @import("Session.zig");
 const Terminal = @import("Terminal.zig");
@@ -60,8 +60,8 @@ pub const Backends = struct {
 /// none. A session keeps the choice it was started with, so the header names
 /// where it goes rather than where billy is pointed. The terminal's header is
 /// built from the same `Endpoint.modelOf`, so a page and a terminal agree.
-pub fn sessionModel(config: *const Config, session: *const Session) Endpoint.Model {
-    return Endpoint.modelOf(session.modelChoice(config.stored.model));
+pub fn sessionModel(config: *const Config, catalog: *const models.Catalog, session: *const Session) Endpoint.Model {
+    return Endpoint.modelOf(session.modelChoice(config.stored.model), catalog);
 }
 
 /// How a run's tools are built: how their blocks are laid out, the limits they
@@ -330,16 +330,16 @@ test "a header names the model the session goes to, not the one billy is pointed
 
     // The choice is the session's own, provider and all, and the window is that
     // model's.
-    const recorded = sessionModel(&opened.config, &session);
+    const recorded = sessionModel(&opened.config, &models.test_catalog, &session);
     try std.testing.expectEqualStrings("opencode_go/kimi-k2.7-code", recorded.choice);
     try std.testing.expectEqual(@as(usize, 262_144), recorded.info.?.context_window);
-    try std.testing.expectEqual(models.Provider.opencode_go, recorded.info.?.provider);
+    try std.testing.expectEqual("opencode-go", recorded.info.?.provider);
 
     // A session that recorded none is sent where the configuration points, so
     // that is what its header names.
     var older = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer older.deinit();
-    const configured = sessionModel(&opened.config, &older);
+    const configured = sessionModel(&opened.config, &models.test_catalog, &older);
     try std.testing.expectEqualStrings("deepseek/deepseek-flash", configured.choice);
     try std.testing.expectEqual(@as(usize, 1_000_000), configured.info.?.context_window);
 }
@@ -371,7 +371,7 @@ test "a target names bytes of its own, not a slice of the session's pool" {
     // that is what it is sent to.
     const choice = session.modelChoice(opened.config.stored.model);
     try std.testing.expectEqualStrings("opencode_go/glm-5.3-flash", choice);
-    const target = try Endpoint.targetFor(&opened.config, &credentials, arena, choice);
+    const target = try Endpoint.targetFor(&opened.config, &credentials, &models.test_catalog, arena, choice);
     // The model the session recorded is interned in its string pool, and a
     // pointer into that pool survives no write to it. Writing more strings, as
     // a turn does when it stores a message, must not leave the target naming

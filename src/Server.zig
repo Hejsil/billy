@@ -21,6 +21,7 @@ const Config = @import("Config.zig");
 const Credentials = @import("Credentials.zig");
 const Setup = @import("Setup.zig");
 const Health = @import("Health.zig");
+const models = @import("models.zig");
 const html = @import("html.zig");
 const report = @import("report.zig");
 const Session = @import("Session.zig");
@@ -81,6 +82,9 @@ config_dir: std.Io.Dir,
 /// frontend that owns it, which outlives the server: a copy would share the
 /// arena, and a `deinit` on each would free it twice.
 config: *const Config,
+/// The providers and models every request is built from: the catalog fetched
+/// into the cache at startup, borrowed from billy.
+catalog: *const models.Catalog,
 /// The keys every request is built from.
 credentials: Credentials,
 health: *Health,
@@ -98,6 +102,7 @@ fn options(server: *const Server) Agent.Options {
     return .{
         .config = server.config,
         .credentials = &server.credentials,
+        .catalog = server.catalog,
         .behaviour = Agent.Behaviour.fromConfig(server.config),
         .tools = Setup.toolSettings(server.config, server.backends, server.health),
         .home = server.environ.get("HOME"),
@@ -877,7 +882,7 @@ fn serveTurn(
 
 /// Writes the header line the page shows above `session`'s conversation.
 fn writeHeader(server: *const Server, session: *const Session, out: *std.Io.Writer) !void {
-    const shown = Setup.sessionModel(server.config, session);
+    const shown = Setup.sessionModel(server.config, server.catalog, session);
     try html.header(.{
         .id = session.id(),
         .model = shown.choice,
@@ -1047,6 +1052,7 @@ const TestServer = struct {
                 .session_dir = sessions,
                 .config_dir = tmp.dir,
                 .config = config,
+                .catalog = &models.test_catalog,
                 .credentials = .{},
                 .health = health,
                 .cwd = ".",

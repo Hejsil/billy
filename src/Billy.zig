@@ -4,7 +4,9 @@
 //!
 //! It is opened once, by `main`, and every way of running billy is a method on
 //! it. Nothing else holds one: a part of billy that needs to write a session, or
-//! to send a request, is handed the one thing it needs rather than this.
+//! to send a request, is handed the one thing it needs rather than this. The
+//! model catalog is the exception: it is read the first time a run needs it, so
+//! a command that never asks a model does not fetch it.
 
 const std = @import("std");
 const Agent = @import("Agent.zig");
@@ -18,6 +20,7 @@ const report = @import("report.zig");
 const Session = @import("Session.zig");
 const Server = @import("Server.zig");
 const LineEditor = @import("LineEditor.zig");
+const models = @import("models.zig");
 const Terminal = @import("Terminal.zig");
 
 const Billy = @This();
@@ -40,6 +43,9 @@ config: Config,
 /// Which backends are worth trying, so one that just failed is set aside until
 /// the wait it was given is over.
 health: Health,
+/// The providers and models a request can be sent to, read from the cache the
+/// first time a run needs it.
+catalog: models.Catalog = .{},
 
 /// Where billy was started. A new session records it, so a session continues
 /// where it was started rather than wherever it is picked up.
@@ -98,20 +104,24 @@ pub fn deinit(billy: *Billy) void {
 /// Stores a key for `service`, or lists the services and the keys they have, so
 /// a run need not have it exported.
 ///
-/// The providers the configuration defines are the names a key can be stored for
-/// beside the services billy ships; one it names nothing of is one no request
-/// will ever ask for, so such a key is refused rather than stored.
+/// The providers the configuration defines, and the ones the model catalog
+/// holds, are the names a key can be stored for beside the services billy ships;
+/// one none of them names is one no request will ever ask for, so such a key is
+/// refused rather than stored.
 pub fn login(billy: *Billy, out: Terminal.Writer, service: ?[]const u8) !void {
+    billy.ensureCatalog();
     var provider_names: std.ArrayList([]const u8) = .empty;
     for (billy.config.stored.providers.entries) |entry| {
         try provider_names.append(billy.arena, entry.name);
     }
 
-    const name = service orelse return billy.credentials.list(out.out, provider_names.items);
-    if (!Credentials.acceptable(name, provider_names.items)) {
+    const name = service orelse return billy.credentials.list(out.out, provider_names.items, &billy.catalog);
+    // A provider from the catalog is a service like any other: a key stored for
+    // it is what a request to it asks for.
+    if (!Credentials.acceptable(name, provider_names.items) and billy.catalog.find(name) == null) {
         std.log.err(
             "'{s}' is neither a service billy knows nor a provider the configuration names;" ++
-                " run `billy login` to list them, or name it under `providers` in the configuration",
+                " run `billy models` to list the catalog, or name it under `providers` in the configuration",
             .{name},
         );
         return report.Reported;
@@ -183,6 +193,7 @@ pub fn configSet(billy: *Billy, out: Terminal.Writer, path: []const u8, value: [
 
 /// Runs one session in the terminal, resuming `resume_id` or starting a new one.
 pub fn run(billy: *Billy, out: Terminal.Writer, resume_id: ?[]const u8) !void {
+    billy.ensureCatalog();
     // A resumed session keeps the directory it was saved with, so a session
     // continues where it was started rather than wherever it is picked up.
     var session = Session.open(
@@ -218,6 +229,7 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resume_id: ?[]const u8) !void {
     const options = Agent.Options{
         .config = &billy.config,
         .credentials = &billy.credentials,
+        .catalog = &billy.catalog,
         .behaviour = Agent.Behaviour.fromConfig(&billy.config),
         .tools = Setup.toolSettings(
             &billy.config,
@@ -243,6 +255,38 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resume_id: ?[]const u8) !void {
         );
     }
     try Agent.run(billy.io, billy.gpa, out, options, &session);
+}
+
+/// Reads the model catalog from the cache, fetching it first when there is none.
+///
+/// A catalog that cannot be fetched or read is reported and left empty: a
+/// provider the configuration names still works, without a context gauge or a
+/// compaction threshold for its models.
+fn ensureCatalog(billy: *Billy) void {
+    if (billy.catalog.providers.len > 0) return;
+    billy.catalog = models.ensure(billy.io, billy.arena, billy.gpa, billy.dirs.cache);
+}
+
+/// Fetches the model catalog, or says what the cached one holds.
+pub fn showModels(billy: *Billy, out: Terminal.Writer, refresh: bool) !void {
+    if (refresh) {
+        const counts = models.refresh(billy.io, billy.gpa, billy.dirs.cache) catch |err| {
+            std.log.err("cannot refresh the model catalog: {s}", .{@errorName(err)});
+            return report.Reported;
+        };
+        billy.catalog = models.load(billy.io, billy.arena, billy.dirs.cache) catch |err| {
+            std.log.err("the model catalog was fetched but cannot be read: {s}", .{@errorName(err)});
+            return report.Reported;
+        };
+        try out.print("fetched {d} providers and {d} models\n", .{ counts.providers, counts.models });
+        return;
+    }
+
+    billy.ensureCatalog();
+    try out.print("{d} providers, {d} models\n", .{
+        billy.catalog.providers.len,
+        models.Catalog.modelCount(&billy.catalog),
+    });
 }
 
 /// Lists the sessions billy has kept, the one written to most recently first,
@@ -278,6 +322,7 @@ fn printSessions(out: Terminal.Writer, listed: []const Session.Named) !void {
 /// Runs billy as a server with a web frontend, on `host` at `port`, until the
 /// process is stopped.
 pub fn serve(billy: *Billy, host: []const u8, port: u16) !void {
+    billy.ensureCatalog();
     // What a request is sent to, and the backends it asks, are resolved before
     // anything is served, since a server that cannot send a request has nothing
     // to do: a key that is missing is reported here rather than on the first thing
@@ -288,7 +333,7 @@ pub fn serve(billy: *Billy, host: []const u8, port: u16) !void {
 
     // The configured choice is resolved once here only to report a provider or a
     // key that is missing: each turn resolves its own target when it begins.
-    _ = Endpoint.configured(&billy.config, &billy.credentials, arena) catch |err| switch (err) {
+    _ = Endpoint.configured(&billy.config, &billy.credentials, &billy.catalog, arena) catch |err| switch (err) {
         // Both are reported where they are found, and each names what to do
         // about it; anything else is one nobody has explained.
         error.UnknownProvider, error.MissingApiKey => return report.Reported,
@@ -301,6 +346,7 @@ pub fn serve(billy: *Billy, host: []const u8, port: u16) !void {
         .session_dir = billy.dirs.sessions,
         .config_dir = billy.dirs.config,
         .config = &billy.config,
+        .catalog = &billy.catalog,
         .credentials = billy.credentials,
         .health = &billy.health,
         .cwd = billy.cwd,

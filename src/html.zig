@@ -1507,7 +1507,7 @@ test "the header carries the model, the directory and the gauge" {
         .home = "/home/user",
         .context_tokens = 16_000,
         .model_info = .{
-            .provider = .deepseek,
+            .provider = "deepseek",
             .context_window = 128_000,
         },
     }, &out.writer);

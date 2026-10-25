@@ -187,6 +187,9 @@ pub fn acceptable(name: []const u8, providers: []const []const u8) bool {
 /// named it knows what it is for, so what it is for is not the thing to say.
 const configured_purpose = "a provider the configuration names";
 
+/// What a stored key for a provider the model catalog holds is listed as.
+const catalog_purpose = "a provider in the model catalog";
+
 /// What a name neither billy nor the configuration knows is listed as. A key is
 /// still shown for it, since it is in the file, but nothing reads it.
 const dangling_purpose = "a service billy does not know";
@@ -195,7 +198,12 @@ const dangling_purpose = "a service billy does not know";
 /// billy ships, the providers the configuration names, and any other name a key
 /// is stored under. The last are listed rather than hidden, so a file written by
 /// hand or by a billy whose configuration has since changed is not a mystery.
-pub fn list(credentials: *const Credentials, out: *std.Io.Writer, providers: []const []const u8) !void {
+pub fn list(
+    credentials: *const Credentials,
+    out: *std.Io.Writer,
+    providers: []const []const u8,
+    catalog: *const models.Catalog,
+) !void {
     // Every row that will be printed decides the columns, so a long name of the
     // user's own widens them all rather than running past the end.
     var name_width: usize = 0;
@@ -211,7 +219,8 @@ pub fn list(credentials: *const Credentials, out: *std.Io.Writer, providers: []c
     for (credentials.names()) |name| {
         name_width = @max(name_width, name.len);
         if (purposeOf(name) == null and !definedIn(name, providers)) {
-            purpose_width = @max(purpose_width, dangling_purpose.len);
+            const purpose = if (catalog.find(name) != null) catalog_purpose else dangling_purpose;
+            purpose_width = @max(purpose_width, purpose.len);
         }
     }
 
@@ -227,7 +236,8 @@ pub fn list(credentials: *const Credentials, out: *std.Io.Writer, providers: []c
     for (credentials.names()) |name| {
         if (purposeOf(name) != null) continue;
         if (definedIn(name, providers)) continue;
-        try printRow(out, name, dangling_purpose, name_width, purpose_width, true);
+        const purpose = if (catalog.find(name) != null) catalog_purpose else dangling_purpose;
+        try printRow(out, name, purpose, name_width, purpose_width, true);
     }
     try out.writeAll("\n`billy login <service>` stores a key\n");
 }
@@ -415,7 +425,7 @@ test "the listing shows each service billy knows and whether a key is stored" {
 
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try credentials.list(&sink.writer, &.{});
+    try credentials.list(&sink.writer, &.{}, &models.test_catalog);
 
     try std.testing.expectEqualStrings(
         \\deepseek     DeepSeek API key           stored
@@ -438,7 +448,7 @@ test "the listing names a service that has no key of any kind" {
     const credentials: Credentials = .{};
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try credentials.list(&sink.writer, &.{});
+    try credentials.list(&sink.writer, &.{}, &models.test_catalog);
 
     try std.testing.expectEqualStrings(
         \\deepseek     DeepSeek API key           not set
@@ -466,7 +476,7 @@ test "the listing shows a stored name billy does not know" {
 
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try credentials.list(&sink.writer, &.{});
+    try credentials.list(&sink.writer, &.{}, &models.test_catalog);
 
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -485,6 +495,25 @@ test "the listing shows a stored name billy does not know" {
         sink.written(),
         "deepseek                   DeepSeek API key               not set",
     ) != null);
+}
+
+test "the listing names a catalog provider whose key is stored" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    // `opencode-go` is the catalog's spelling; billy's own services call it
+    // `opencode_go`, so this name is known only from the catalog.
+    var credentials: Credentials = .{};
+    try credentials.put(allocator, "opencode-go", "k");
+
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try credentials.list(&sink.writer, &.{}, &models.test_catalog);
+
+    try std.testing.expect(std.mem.indexOf(u8, sink.written(), "a provider in the model catalog") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sink.written(), "a service billy does not know") == null);
 }
 
 test "a key is stored only for a name something will ask for" {
@@ -513,7 +542,7 @@ test "the listing names the providers the configuration defines" {
     const credentials: Credentials = .{};
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try credentials.list(&sink.writer, &.{"mock"});
+    try credentials.list(&sink.writer, &.{"mock"}, &models.test_catalog);
 
     // A provider the configuration names is one a key can be stored for, so the
     // listing shows it: `billy login` with no service is where a user looks to
@@ -542,7 +571,7 @@ test "the listing shows a key under a name nothing names any more" {
 
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try credentials.list(&sink.writer, &.{"mock"});
+    try credentials.list(&sink.writer, &.{"mock"}, &models.test_catalog);
 
     try std.testing.expect(std.mem.indexOf(u8, sink.written(), "gone") != null);
     try std.testing.expect(std.mem.indexOf(u8, sink.written(), "a service billy does not know") != null);

@@ -33,6 +33,13 @@ const serve_about =
     \\so only listen where that is meant.
 ;
 
+/// What the `models` subcommand is for, shown in its help.
+const models_about =
+    \\Show how many providers and models the cached catalog holds, or fetch it
+    \\again from models.dev. The catalog is fetched automatically the first time
+    \\a run needs it.
+;
+
 /// What the `sessions` subcommand is for, shown in its help.
 const sessions_about =
     \\List the sessions billy has kept, the one written to most recently first,
@@ -46,6 +53,7 @@ const billy_commands =
     \\  login [<service>]         store an API key, or list the services
     \\  config <setting> <value>  set a configuration setting by its path
     \\  sessions                  list the sessions, newest first
+    \\  models [--refresh]        show the model catalog, or fetch it again
     \\  serve                     run the web frontend
 ;
 
@@ -53,6 +61,12 @@ const billy_commands =
 const run_options =
     \\  -r, --resume <session>  continue the session with this id
     \\  -h, --help              print this message
+;
+
+/// The options the `models` subcommand takes.
+const models_options =
+    \\      --refresh   fetch the catalog from models.dev again
+    \\  -h, --help      print this message
 ;
 
 /// The options a subcommand takes, when it takes none but the usage itself.
@@ -107,10 +121,18 @@ const Options = struct {
         config: Config,
         serve: Serve,
         sessions: Sessions,
+        models: Models,
     };
 
     const Login = struct {
         service: ?[]const u8 = null,
+        /// Whether the user asked for this subcommand's usage.
+        help: bool = false,
+    };
+
+    const Models = struct {
+        /// Whether to fetch the catalog again instead of reading the cache.
+        refresh: bool = false,
         /// Whether the user asked for this subcommand's usage.
         help: bool = false,
     };
@@ -190,6 +212,7 @@ fn run(init: std.process.Init) !u8 {
         .config => |config| try billy.configSet(out, config.path.?, config.value.?),
         .login => |login| try billy.login(out, login.service),
         .sessions => try billy.listSessions(out),
+        .models => |models| try billy.showModels(out, models.refresh),
     }
     return 0;
 }
@@ -241,6 +264,12 @@ fn printAskedHelp(options: Options, out: Terminal.Writer) !bool {
                 return true;
             }
         },
+        .models => |models| {
+            if (models.help) {
+                try printHelp(out, "billy models [--refresh]", models_about, null, models_options);
+                return true;
+            }
+        },
     }
     return false;
 }
@@ -279,6 +308,8 @@ fn parseCommand(args: *spaghet.Args, command: []const u8) ParseError!Options.Com
         return .{ .serve = try parseServe(args) };
     if (std.mem.eql(u8, command, "sessions"))
         return .{ .sessions = try parseSessions(args) };
+    if (std.mem.eql(u8, command, "models"))
+        return .{ .models = try parseModels(args) };
     return error.InvalidArgument;
 }
 
@@ -333,6 +364,21 @@ fn parseServe(args: *spaghet.Args) ParseError!Options.Serve {
             return error.InvalidArgument;
     }
     return serve;
+}
+
+/// Reads the arguments of the `models` subcommand: whether to fetch again, and
+/// its own usage.
+fn parseModels(args: *spaghet.Args) ParseError!Options.Models {
+    var models: Options.Models = .{};
+    while (args.next()) {
+        if (args.flag(&.{ "-h", "--help" }))
+            models.help = true;
+        if (args.flag(&.{"--refresh"}))
+            models.refresh = true;
+        if (args.positional()) |_|
+            return error.InvalidArgument;
+    }
+    return models;
 }
 
 /// Reads the arguments of the `sessions` subcommand: nothing but its own usage.
@@ -457,6 +503,19 @@ test "parseArgs reads the config subcommand on its own" {
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "config", "max_turns", "1", "extra" }));
 }
 
+test "parseArgs reads the models subcommand on its own" {
+    // Reading the cache is the default; `--refresh` asks for a fetch.
+    try expectOptions(.{ .command = .{ .models = .{} } }, try parseArgsSlice(&.{"models"}));
+    try expectOptions(.{ .command = .{ .models = .{ .refresh = true } } }, try parseArgsSlice(&.{ "models", "--refresh" }));
+
+    // The subcommand has its own usage.
+    try expectOptions(.{ .command = .{ .models = .{ .help = true } } }, try parseArgsSlice(&.{ "models", "-h" }));
+    try expectOptions(.{ .command = .{ .models = .{ .help = true } } }, try parseArgsSlice(&.{ "models", "--help" }));
+
+    // It takes no argument besides the flag.
+    try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "models", "extra" }));
+}
+
 test "parseArgs reads the sessions subcommand on its own" {
     // It takes nothing, so the line is just the command.
     try expectOptions(.{ .command = .{ .sessions = .{} } }, try parseArgsSlice(&.{"sessions"}));
@@ -512,6 +571,11 @@ fn expectOptions(expected: Options, actual: Options) !void {
             }
         },
         .sessions => |sessions| try std.testing.expectEqual(sessions.help, actual.command.sessions.help),
+        .models => |models| {
+            const actual_models = actual.command.models;
+            try std.testing.expectEqual(models.refresh, actual_models.refresh);
+            try std.testing.expectEqual(models.help, actual_models.help);
+        },
     }
 }
 
@@ -546,6 +610,12 @@ const help_messages = [_]struct {
         .description = sessions_about,
         .commands = null,
         .options = command_options,
+    },
+    .{
+        .invocation = "billy models [--refresh]",
+        .description = models_about,
+        .commands = null,
+        .options = models_options,
     },
 };
 

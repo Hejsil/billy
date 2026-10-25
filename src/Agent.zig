@@ -5,6 +5,7 @@ const Config = @import("Config.zig");
 const Credentials = @import("Credentials.zig");
 const Endpoint = @import("Endpoint.zig");
 const llm = @import("llm.zig");
+const models = @import("models.zig");
 const Tools = @import("Tools.zig");
 const Mock = @import("Mock.zig");
 const LineEditor = @import("LineEditor.zig");
@@ -50,6 +51,9 @@ pub const Options = struct {
     /// The keys stored for the providers it names, borrowed on the same terms:
     /// resolving a target needs nothing else.
     credentials: *const Credentials,
+    /// The providers and models a target and a header are resolved against.
+    /// Borrowed from the frontend, which loads it once and outlives the run.
+    catalog: *const models.Catalog,
     behaviour: Behaviour,
     tools: Tools.Settings,
     /// Home directory, so the header can shorten a path inside it; null when unset.
@@ -316,7 +320,7 @@ const prompt = "> ";
 /// fields are the values printed, so printing it needs nothing of the
 /// configuration. The id is shown so that a run can be named by what it prints,
 /// which is what `--resume` takes to continue it; the window size is not reported
-/// by the API, so it comes from the model table.
+/// by the API, so it comes from the model catalog.
 pub const SessionHeader = struct {
     id: []const u8,
     /// The provider and model the session runs, as `<provider>/<model>`: the
@@ -424,6 +428,9 @@ behaviour: Behaviour,
 /// What a turn's target is resolved from: the providers the configuration names.
 /// Borrowed, and read before every turn.
 config: *const Config,
+/// The catalog the provider and model are looked up in, borrowed from the
+/// frontend on the same terms.
+catalog: *const models.Catalog,
 /// The keys stored for those providers, borrowed on the same terms.
 credentials: *const Credentials,
 /// The HTTP client every request of the run is sent over, borrowed from the
@@ -468,6 +475,7 @@ pub fn init(
         .behaviour = options.behaviour,
         .config = options.config,
         .credentials = options.credentials,
+        .catalog = options.catalog,
         .http = http_client,
         .target_state = std.heap.ArenaAllocator.init(gpa),
         .instructions = options.instructions,
@@ -510,7 +518,7 @@ fn targetFor(agent: *Agent, session: *Session) !Target {
     _ = agent.target_state.reset(.retain_capacity);
     const choice = session.modelChoice(agent.config.stored.model);
     if (session.model() == null) try session.setModel(choice);
-    return Endpoint.targetFor(agent.config, agent.credentials, agent.target_state.allocator(), choice);
+    return Endpoint.targetFor(agent.config, agent.credentials, agent.catalog, agent.target_state.allocator(), choice);
 }
 
 /// The client one turn is sent with, built from where the session's model points
@@ -531,7 +539,7 @@ fn clientFor(agent: *Agent, session: *Session) !llm.Client {
 /// The model `session` goes to, as a header shows it: the choice it recorded, or
 /// the configured one for a session that recorded none.
 fn sessionModel(agent: *const Agent, session: *const Session) Endpoint.Model {
-    return Endpoint.modelOf(session.modelChoice(agent.config.stored.model));
+    return Endpoint.modelOf(session.modelChoice(agent.config.stored.model), agent.catalog);
 }
 
 /// What a line typed into a session came to.
@@ -1595,6 +1603,9 @@ const TestSetup = struct {
     /// How the agent behaves, which a test sets only what it is about.
     behaviour: Behaviour = .{ .max_turns = 10 },
     tools: Tools.Settings = .{ .bash_timeout_s = 120 },
+    /// The catalog the run is resolved against. Tests use the small fixture;
+    /// nothing here is fetched.
+    catalog: *const models.Catalog = &models.test_catalog,
     home: ?[]const u8 = null,
     instructions: ?std.Io.Dir = null,
 
@@ -1649,6 +1660,7 @@ const TestSetup = struct {
         return .{
             .config = setup.config,
             .credentials = setup.credentials,
+            .catalog = setup.catalog,
             .behaviour = setup.behaviour,
             .tools = setup.tools,
             .home = setup.home,
@@ -1765,7 +1777,7 @@ test "a header is built from a session" {
     defer out.deinit();
     const model: Endpoint.Model = .{
         .choice = "deepseek/deepseek-flash",
-        .info = .{ .provider = .deepseek, .context_window = 128_000 },
+        .info = .{ .provider = "deepseek", .context_window = 128_000 },
     };
     try out.writer.print("{f}", .{SessionHeader.of(&session, model, null)});
 

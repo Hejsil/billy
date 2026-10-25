@@ -4,7 +4,6 @@
 
 const std = @import("std");
 const html = @import("../html.zig");
-const models = @import("../models.zig");
 const Search = @import("../Tools/web/Search.zig");
 
 /// Writes the favicons of a web search: one small round bubble per result,
@@ -24,12 +23,21 @@ pub fn write(result: []const u8, out: *std.Io.Writer) !void {
     }
 }
 
+/// The host name of `url`, without the scheme, port or path.
+fn hostOf(url: []const u8) ?[]const u8 {
+    const after_scheme = if (std.mem.indexOf(u8, url, "://")) |i| url[i + 3 ..] else url;
+    const end = std.mem.indexOfAny(u8, after_scheme, "/:") orelse after_scheme.len;
+    const host = after_scheme[0..end];
+    if (host.len == 0) return null;
+    return host;
+}
+
 /// Writes one favicon bubble: the source's favicon, filling the round bubble and
 /// cropping to it, with the source's first letter behind it so a site that has no
 /// favicon still reads as a small bubble rather than a broken image. The host is
 /// the bubble's tooltip, and the whole bubble opens the result.
 fn bubble(found: Search.Result, origin: []const u8, out: *std.Io.Writer) !void {
-    const host = models.hostOf(found.url) orelse return;
+    const host = hostOf(found.url) orelse return;
     try out.writeAll("<a class=\"fav\" href=\"");
     try html.escape(found.url, out);
     try out.writeAll("\" title=\"");
@@ -87,4 +95,12 @@ test "text that is not a list of results is given no bubbles" {
     defer out.deinit();
     try write("(no results)", &out.writer);
     try std.testing.expectEqual(@as(usize, 0), out.written().len);
+}
+
+test "hostOf strips the scheme, port and path" {
+    try std.testing.expectEqualStrings("api.deepseek.com", hostOf("https://api.deepseek.com/chat/completions").?);
+    try std.testing.expectEqualStrings("api.deepseek.com", hostOf("https://api.deepseek.com").?);
+    try std.testing.expectEqualStrings("localhost", hostOf("http://localhost:8080/v1/chat/completions").?);
+    try std.testing.expectEqualStrings("example.com", hostOf("example.com/v1").?);
+    try std.testing.expect(hostOf("https://") == null);
 }
