@@ -82,6 +82,9 @@ least once. Read the rule, not the story; the story is in the review.
   parsed on every start for no reader. *The catalog walked models.dev through `stringField`,
   `intField`, `boolField` and `envOf`, and every model in the 632 KB cache carried `output`, `tools`
   and `reasoning` that nothing read; typed, and with only the window kept, it is 336 KB.*
+- **A value the layer below can resolve itself is not carried down.** `Target.provider` was copied
+  out of the catalog for a window lookup that asks the catalog by the choice instead, so the field
+  was read by no one and its doc said it was what the gauge measured against.
 - **An index read back from a file is checked against what it indexes.** Drop one that names
   nothing rather than clamping it onto the nearest element, which invents a reference the writer
   never made; collapse a repeat too, since a list documented as one entry per thing is not one.

@@ -22,10 +22,6 @@ pub const Target = struct {
     api_key: []const u8,
     /// The model id to send, which is the half of the choice after the provider.
     model: []const u8,
-    /// The catalog provider the endpoint belongs to, or null for one only the
-    /// configuration names, such as a proxy. It is what the model's window is
-    /// looked up by.
-    provider: ?[]const u8,
 };
 
 /// Where the configuration points: the target of the choice the file names.
@@ -70,10 +66,6 @@ pub fn targetFor(
         // target naming freed bytes. The URL is allocated here for the same
         // reason.
         .model = try arena.dupe(u8, halves.model()),
-        // Which provider answers, which is what the model's window is looked up
-        // by. Null for a proxy, which leaves the model to be found among all the
-        // providers the catalog holds.
-        .provider = if (provider) |known| known.name else null,
     };
 }
 
@@ -162,13 +154,13 @@ test "a target carries the address, the key and the model of the choice it names
     try std.testing.expectEqualStrings("https://api.deepseek.com/chat/completions", flash.url);
     try std.testing.expectEqualStrings("k", flash.api_key);
     try std.testing.expectEqualStrings("deepseek-flash", flash.model);
-    try std.testing.expectEqual(@as(?[]const u8, "deepseek"), flash.provider);
 
-    // Another provider is another address, and the key stored for that one.
+    // Another provider is another address, and the key stored for that one. The
+    // choice spells the provider `opencode_go`, and the key stored under the
+    // catalog's own spelling is the one it is sent with.
     const kimi = try targetFor(&config, &credentials, &models.test_catalog, arena, "opencode_go/kimi-k2.7-code");
     try std.testing.expectEqualStrings("https://opencode.ai/zen/go/v1/chat/completions", kimi.url);
     try std.testing.expectEqualStrings("kimi-k2.7-code", kimi.model);
-    try std.testing.expectEqual(@as(?[]const u8, "opencode-go"), kimi.provider);
 }
 
 test "a target is resolved through a provider the configuration defines itself" {
@@ -190,8 +182,6 @@ test "a target is resolved through a provider the configuration defines itself" 
     const target = try targetFor(&config, &credentials, &models.test_catalog, arena, "mine/qwen3-coder:30b");
     try std.testing.expectEqualStrings("http://localhost:8080/v1/chat/completions", target.url);
     try std.testing.expectEqualStrings("qwen3-coder:30b", target.model);
-    // A provider the catalog does not hold is left to be found by its model's name.
-    try std.testing.expect(target.provider == null);
 }
 
 test "a model as a header shows it carries the choice and the window of its model" {
@@ -294,5 +284,4 @@ test "the configured choice is the target the configuration points at" {
     const target = try configured(&config, &credentials, &models.test_catalog, arena);
     try std.testing.expectEqualStrings("https://api.deepseek.com/chat/completions", target.url);
     try std.testing.expectEqualStrings("deepseek-flash", target.model);
-    try std.testing.expectEqual(@as(?[]const u8, "deepseek"), target.provider);
 }
