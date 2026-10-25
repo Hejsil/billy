@@ -9,8 +9,8 @@ const Mock = @import("../../Mock.zig");
 
 const Fetch = @This();
 
-/// One backend to fetch with, and what it is asked with: the key, from the
-/// credential `billy login` stored or its environment variable.
+/// One backend to fetch with, and what it is asked with: the key `billy login`
+/// stored for it.
 pub const Backend = struct {
     provider: web.Provider,
     /// The key the backend is asked with. Empty for `raw`, which asks no one.

@@ -11,9 +11,8 @@ pub const Result = @import("Search/Result.zig");
 
 const Search = @This();
 
-/// One backend to search with, and what it is asked with: the key, from the
-/// credential `billy login` stored or its environment variable, and the instance
-/// for a backend that is the user's own.
+/// One backend to search with, and what it is asked with: the key `billy login`
+/// stored for it, and the instance for a backend that is the user's own.
 pub const Backend = struct {
     provider: web.Provider,
     /// The key the backend is asked with. Empty for one that needs none, which

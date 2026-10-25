@@ -42,8 +42,7 @@ pub const WebFetch = struct {
     /// for the bytes as they are uses; a fresh configuration holds only that, so
     /// fetching works without a service to extract a page.
     ///
-    /// The key a backend needs is read from the credential `billy login` stored
-    /// for it, or from its environment variable when none is stored.
+    /// The key a backend needs is the credential `billy login` stored for it.
     providers: []const Tools.web.Provider = &.{.raw},
 };
 
@@ -57,9 +56,8 @@ pub const WebSearch = struct {
     /// one billy does not know, or one that cannot search, is refused rather
     /// than reading as "no search".
     ///
-    /// The key a backend needs is read from the credential `billy login` stored
-    /// for it, or from its environment variable when none is stored, and never
-    /// from this file, which is written to disk in the clear.
+    /// The key a backend needs is the credential `billy login` stored for it,
+    /// and never this file, which is written to disk in the clear.
     providers: []const Tools.web.Provider = &.{},
     /// Results asked for per query. The backend may return fewer, and billy caps
     /// it.

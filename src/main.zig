@@ -11,9 +11,8 @@ const billy_about = "A small fast AI agent that works in your terminal.";
 
 /// What the `login` subcommand is for, shown in its help.
 const login_about =
-    \\Store an API key for a service, so it need not be exported before every
-    \\run. With no service, list the services billy needs a key for and where
-    \\each key comes from.
+    \\Store an API key for a service. With no service, list the services billy
+    \\needs a key for and whether one is stored.
 ;
 
 /// What the `config` subcommand is for, shown in its help.

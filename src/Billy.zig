@@ -101,8 +101,7 @@ pub fn deinit(billy: *Billy) void {
     billy.dirs.deinit(billy.io);
 }
 
-/// Stores a key for `service`, or lists the services and the keys they have, so
-/// a run need not have it exported.
+/// Stores a key for `service`, or lists the services and the keys they have.
 ///
 /// The providers the configuration defines, and the ones the model catalog
 /// holds, are the names a key can be stored for beside the services billy ships;
