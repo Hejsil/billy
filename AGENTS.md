@@ -180,6 +180,11 @@ least once. Read the rule, not the story; the story is in the review.
   credential maps. One `web.Provider`, one descriptor table and one driver per tool leave the
   per-provider file with the body and reply type that really are its own; a sixth service is a row,
   not another control-flow branch.
+- **What is derived from the session is derived again when the session moves.** `/cwd` records
+  the directory, reopens the tools' handle onto it and reads the prompt's instructions from it,
+  because a session's directory is not a label: the tools run in it and the project's instructions
+  come from it. *A move that changed only the path the header shows would leave the run working
+  where the user was told it was not.*
 - **A frontend is told what a turn did, not left to work it out.** `take` names a session from
   its first line and reports the name with the prompt, so the page announces it and the terminal
   ignores it. *`Server` used to call `Agent.nameFromPrompt` itself and test "first turn" on its own

@@ -96,8 +96,8 @@ const Stored = struct {
     /// It is one setting rather than two because the two halves are only
     /// meaningful together: a model id alone names no endpoint, and the model
     /// ids of two providers do not overlap enough for the provider to be
-    /// guessed from one. A session keeps the choice it was started with, so
-    /// changing this affects new sessions and not the ones in progress.
+    /// guessed from one. A session keeps the choice it recorded, so changing
+    /// this affects new sessions and not the ones in progress.
     model: []const u8 = "deepseek/deepseek-flash",
     /// The endpoints billy talks to that the model catalog does not name, or
     /// names differently: a proxy, a server of the user's own, or a stand-in a

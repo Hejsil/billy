@@ -23,8 +23,8 @@ pub fn run(
 
     const result = std.process.run(gpa, io, .{
         .argv = &.{ "bash", "-c", bash.command },
-        // The command runs where the session's tools do, so a resumed session
-        // runs it in the directory the session was started in.
+        // The command runs where the session's tools do, which is the session's
+        // own directory rather than the one billy was started in.
         .cwd = .{ .dir = dir },
         .stdout_limit = .limited(max_command_output),
         .stderr_limit = .limited(max_command_output),

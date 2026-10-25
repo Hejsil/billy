@@ -57,8 +57,8 @@ pub const Backends = struct {
 
 /// The model a session is sent to, as the header above its conversation shows
 /// it: the choice it recorded, or the configured one for a session that recorded
-/// none. A session keeps the choice it was started with, so the header names
-/// where it goes rather than where billy is pointed. The terminal's header is
+/// none. A session keeps the choice it recorded, so the header names where it
+/// goes rather than where billy is pointed. The terminal's header is
 /// built from the same `Endpoint.modelOf`, so a page and a terminal agree.
 pub fn sessionModel(config: *const Config, catalog: *const models.Catalog, session: *const Session) Endpoint.Model {
     return Endpoint.modelOf(session.modelChoice(config.stored.model), catalog);

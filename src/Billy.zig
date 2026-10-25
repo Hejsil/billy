@@ -47,8 +47,9 @@ health: Health,
 /// first time a run needs it.
 catalog: models.Catalog = .{},
 
-/// Where billy was started. A new session records it, so a session continues
-/// where it was started rather than wherever it is picked up.
+/// Where billy was started. A new session records it; a resumed one keeps the
+/// directory it saved, so a session continues where it was left rather than
+/// wherever it is picked up.
 cwd: []const u8,
 
 /// Reads the configuration, the credentials and the directories billy keeps its
@@ -192,7 +193,7 @@ pub fn configSet(billy: *Billy, out: Terminal.Writer, path: []const u8, value: [
 
 /// Which session a run continues, when it continues one.
 pub const Resume = union(enum) {
-    /// The session with this id, wherever it was started.
+    /// The session with this id, in whatever directory it works.
     id: []const u8,
     /// The session written to most recently in the directory billy runs in,
     /// which is what `--resume` asks for when it names none.
@@ -207,7 +208,7 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resuming: ?Resume) !void {
     const resume_id = try billy.resumeId(resuming);
     billy.ensureCatalog();
     // A resumed session keeps the directory it was saved with, so a session
-    // continues where it was started rather than wherever it is picked up.
+    // continues where it was left rather than wherever it is picked up.
     var session = Session.open(
         billy.io,
         billy.dirs.sessions,

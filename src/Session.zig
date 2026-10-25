@@ -104,8 +104,8 @@ const Stored = struct {
     /// Tokens in the conversation as of the last request, which is what the
     /// context window gauge shows.
     context_tokens: usize = 0,
-    /// The directory the session was started in. Empty for a session saved
-    /// before it was recorded, which is read as the directory billy runs in.
+    /// The directory the session works in. Empty for a session saved before it
+    /// was recorded, which is read as the directory billy runs in.
     cwd: ?[]const u8 = null,
 
     const default = Stored{};
@@ -123,7 +123,8 @@ const Interned = struct {
     id: StringIndex = .none,
     /// The id with the file extension: the name of the session file.
     name: StringIndex = .none,
-    /// The directory the session was started in.
+    /// The directory the session works in, which is the one it was started in
+    /// until it is moved.
     cwd: StringIndex = .none,
     /// The system prompt sent at the front of every request.
     system_prompt: StringIndex = .none,
@@ -255,7 +256,7 @@ context_tokens: usize = 0,
 ///
 /// `cwd` is the directory billy is running in. A new session records it; a
 /// resumed one keeps the directory it was saved with, so a session continues
-/// where it was started.
+/// where it was left.
 ///
 /// Fails with `error.SessionNotFound` when the session is missing, and with
 /// `error.InvalidSessionId` when `resume_id` is not a usable name.
@@ -615,6 +616,14 @@ pub fn setSystemPrompt(session: *Session, system_prompt: []const u8) !void {
 /// every turn after it, until it is changed again.
 pub fn setModel(session: *Session, choice: []const u8) !void {
     session.interned.model = try session.pool.intern(session.gpa, choice);
+}
+
+/// Records the directory the session works in, which is where its tools run and
+/// where the project's instructions are read from.
+///
+/// It reaches the file with the next save, like the model and the prompt.
+pub fn setCwd(session: *Session, directory: []const u8) !void {
+    session.interned.cwd = try session.pool.intern(session.gpa, directory);
 }
 
 /// The provider and model the session is sent to, or null for one saved before

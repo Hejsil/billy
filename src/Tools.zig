@@ -37,7 +37,7 @@ pub const Call = union(enum) {
 };
 
 io: std.Io,
-/// The session's own directory, so a resumed session works where it started.
+/// The session's own directory, so a resumed session works where it was left.
 /// Every path a tool is given is relative to it.
 dir: std.Io.Dir,
 /// For temporary buffers.

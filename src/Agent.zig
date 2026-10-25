@@ -31,6 +31,9 @@ const Command = union(enum) {
     /// Send the session to the provider and model named, or say where it is sent
     /// when the command is on its own.
     model: ?[]const u8,
+    /// Work in the directory named, which is read from the one the session works
+    /// in now, or say which directory that is when the command is on its own.
+    cwd: ?[]const u8,
 
     /// Reads `text` as a command, or null when it is an ordinary prompt.
     pub fn of(text: []const u8) ?Command {
@@ -477,8 +480,9 @@ target_state: std.heap.ArenaAllocator,
 /// ahead of the project's; null when there is no such file. Borrowed from the
 /// frontend, which owns it and outlives the agent.
 instructions: ?std.Io.Dir = null,
-/// The directory the session works in. For a resumed session it is the one the
-/// session was started in.
+/// The directory the session works in, which is where its tools run and where the
+/// project's instructions are read from. For a resumed session it is the one the
+/// session recorded, and `/cwd` moves it.
 work_dir: std.Io.Dir,
 /// The tools, working in `work_dir`.
 tool_set: Tools,
@@ -620,6 +624,7 @@ pub fn take(agent: *Agent, emitter: *Emitter, session: *Session, line: []const u
                     try emitter.show(.{ .notice = "nothing to compact" });
             },
             .model => |choice| try agent.selectModel(emitter, session, choice),
+            .cwd => |path| try agent.changeCwd(emitter, session, path),
         }
         return .ran;
     }
@@ -708,6 +713,67 @@ fn selectModel(agent: *Agent, emitter: *Emitter, session: *Session, choice: ?[]c
         "the model is set" });
 }
 
+/// Runs `/cwd`: says which directory the session works in, or moves it to the one
+/// named so the next turn works there.
+///
+/// The directory is recorded on the session, which is what the header shows and
+/// what a resume works in; the tools move with it, and the prompt is read again
+/// from it, since a directory's instructions are part of working in it. The
+/// conversation itself is left alone.
+fn changeCwd(agent: *Agent, emitter: *Emitter, session: *Session, asked: ?[]const u8) !void {
+    // Long enough for a path, since a notice names one.
+    var notice: [std.Io.Dir.max_path_bytes]u8 = undefined;
+
+    const wanted = asked orelse {
+        const current = session.cwd();
+        return emitter.show(.{ .notice = std.fmt.bufPrint(
+            &notice,
+            "the session works in {s}; use /cwd <directory> to move it",
+            .{current},
+        ) catch "use /cwd <directory> to move the session" });
+    };
+
+    // Read from the directory the session works in now, so `/cwd ..` is the
+    // parent of where it was moved to rather than of where billy was started,
+    // and recorded as the filesystem names it, so the header, a resume and `pwd`
+    // agree.
+    const path = agent.work_dir.realPathFileAlloc(agent.io, wanted, agent.gpa) catch |err|
+        return cwdNotice(emitter, &notice, wanted, err);
+    defer agent.gpa.free(path);
+
+    // Opened before the old one is let go, so a directory that cannot be opened
+    // leaves the session working where it was.
+    const moved = std.Io.Dir.openDirAbsolute(agent.io, path, .{}) catch |err|
+        return cwdNotice(emitter, &notice, wanted, err);
+
+    agent.work_dir.close(agent.io);
+    agent.work_dir = moved;
+    agent.tool_set.dir = moved;
+    try session.setCwd(path);
+
+    // A session that has been asked something carries a prompt read from the
+    // directory it worked in then, so that is read again -- which writes the
+    // session out, the move with it. One that has not is given its prompt by its
+    // first turn, from wherever it works by then.
+    if (session.messages.items.len > 0) agent.refresh(session);
+
+    return emitter.show(.{ .notice = std.fmt.bufPrint(
+        &notice,
+        "the session works in {s}",
+        .{path},
+    ) catch "the session works in the new directory" });
+}
+
+/// Shows why the session could not be moved to `path` -- the text the user typed
+/// -- and leaves it working where it was.
+fn cwdNotice(emitter: *Emitter, buffer: []u8, path: []const u8, err: anyerror) !void {
+    return emitter.show(.{ .notice = std.fmt.bufPrint(
+        buffer,
+        "cannot work in {s}: {s}",
+        .{ path, @errorName(err) },
+    ) catch "cannot work in that directory" });
+}
+
 /// How a compaction went.
 const Compaction = enum { done, nothing, failed };
 
@@ -736,9 +802,10 @@ fn compact(
 
 /// Re-reads the prompt and tools into the session, so one that has been running
 /// a while picks up a changed prompt, instruction file or tool set. Done at a
-/// compaction, the one moment replacing the front of a request costs no cache
-/// that was not already being thrown away. A failure is logged and the session
-/// keeps what it had.
+/// compaction, where replacing the front of a request costs no cache that was not
+/// already being thrown away, and when the session moves to another directory,
+/// whose instructions the prompt has to be read from. A failure is logged and the
+/// session keeps what it had.
 fn refresh(agent: *Agent, session: *Session) void {
     refreshLead(agent, agent.tool_set.definitions(), session) catch |err|
         std.log.warn("could not refresh the prompt and tools: {s}", .{@errorName(err)});
@@ -2477,6 +2544,10 @@ test "a command is read from the whole line, and takes its argument with it" {
     try std.testing.expect(Command.of("/model").?.model == null);
     try std.testing.expect(Command.of("/model   ").?.model == null);
 
+    // The directory command takes a path the same way.
+    try std.testing.expectEqualStrings("/tmp", Command.of("/cwd /tmp").?.cwd.?);
+    try std.testing.expect(Command.of("/cwd").?.cwd == null);
+
     // Only the whole line is a command: a prompt that starts with one is a
     // prompt, and so is anything else, a slash alone and a second slash included.
     try std.testing.expect(Command.of("/compact this") == null);
@@ -2747,6 +2818,122 @@ test "a model chosen mid-session is the one the session is resumed with" {
     var resumed = try Session.open(io, tmp.dir, gpa, id, "/work");
     defer resumed.deinit();
     try std.testing.expectEqualStrings("other/other-model", resumed.model().?);
+}
+
+test "the cwd command moves the session, its tools and its prompt" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A project holding a directory of its own, each with instructions, and a
+    // repository root so neither search walks above the temporary directory.
+    try tmp.dir.createDirPath(io, ".git");
+    try tmp.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "ROOT RULES" });
+    try tmp.dir.createDirPath(io, "sub");
+    try tmp.dir.writeFile(io, .{ .sub_path = "sub/AGENTS.md", .data = "SUB RULES" });
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const sub = try tmp.dir.realPathFileAlloc(io, "sub", gpa);
+    defer gpa.free(sub);
+
+    var session = try Session.open(io, tmp.dir, gpa, null, root);
+    defer session.deinit();
+
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
+    var agent = try testAgentIn(io, gpa, setup, root, null);
+    defer agent.deinit();
+
+    // The session starts in the root, and its prompt is read there.
+    try agent.prepare(&session);
+    try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, "ROOT RULES") != null);
+    try session.append(.{ .role = .user, .content = "hello" });
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var terminal = testTerminal(.{ .out = &out.writer });
+
+    // On its own it says where the session works.
+    const asked = try agent.take(terminal.emitter(), &session, "/cwd");
+    try std.testing.expect(asked == .ran);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), root) != null);
+
+    // A relative path is read from there, and recorded as the filesystem names
+    // it, so a header, a resume and `pwd` say the same.
+    const moved = try agent.take(terminal.emitter(), &session, "/cwd sub");
+    try std.testing.expect(moved == .ran);
+    try std.testing.expectEqualStrings(sub, session.cwd());
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), sub) != null);
+
+    // The prompt is the one of the directory the session works in now.
+    try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, "SUB RULES") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, "ROOT RULES") == null);
+
+    // The tools moved with it: a path they are given is relative to the new
+    // directory, and nothing lands in the old one.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var written: std.Io.Writer.Allocating = .init(gpa);
+    defer written.deinit();
+    try agent.tool_set.run(
+        Tools.parseCallNamed(arena_state.allocator(), "write", "{\"path\":\"note.txt\",\"content\":\"hi\"}"),
+        &written.writer,
+    );
+    const note = try tmp.dir.readFileAlloc(io, "sub/note.txt", gpa, .unlimited);
+    defer gpa.free(note);
+    try std.testing.expectEqualStrings("hi", note);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(io, "note.txt", gpa, .unlimited));
+
+    // The session was written out with the move, so a resume works there.
+    const id = try gpa.dupe(u8, session.id());
+    defer gpa.free(id);
+    var resumed = try Session.open(io, tmp.dir, gpa, id, "/elsewhere");
+    defer resumed.deinit();
+    try std.testing.expectEqualStrings(sub, resumed.cwd());
+
+    // A directory that is not there is reported, and leaves the session working
+    // where it was.
+    const missing = try agent.take(terminal.emitter(), &session, "/cwd nowhere");
+    try std.testing.expect(missing == .ran);
+    try std.testing.expectEqualStrings(sub, session.cwd());
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "cannot work in nowhere") != null);
+}
+
+test "the cwd command writes no session that has not been asked anything" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "sub");
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const sub = try tmp.dir.realPathFileAlloc(io, "sub", gpa);
+    defer gpa.free(sub);
+
+    var session = try Session.open(io, tmp.dir, gpa, null, root);
+    defer session.deinit();
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
+    var agent = try testAgentIn(io, gpa, setup, root, null);
+    defer agent.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var terminal = testTerminal(.{ .out = &out.writer });
+
+    const moved = try agent.take(terminal.emitter(), &session, "/cwd sub");
+    try std.testing.expect(moved == .ran);
+    try std.testing.expectEqualStrings(sub, session.cwd());
+
+    // A session comes into being with its first message, so a move of one that
+    // has none leaves no file behind.
+    var name_buf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, "{s}.json", .{session.id()});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, name, .{}));
 }
 
 test "the model command can move a session off a model that cannot be reached" {
