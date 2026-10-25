@@ -579,10 +579,23 @@ fn sessionModel(agent: *const Agent, session: *const Session) Endpoint.Model {
 /// What a line typed into a session came to.
 pub const Waiting = union(enum) {
     /// The line is asked of the model.
-    prompt: []const u8,
+    prompt: Prompt,
     /// The line was a command, already run; what it had to say went out through
     /// the emitter.
     ran,
+
+    /// The prompt a line came to, and what taking it did to the session.
+    pub const Prompt = struct {
+        /// What was typed, which is the line the turn is asked with.
+        text: []const u8,
+        /// The name the session was given from this line, when it had none: the
+        /// first line names it, so a frontend that lists sessions shows a name
+        /// before the model has answered. Null when it was named already.
+        ///
+        /// Read from the session after taking the line, since it is named from a
+        /// string the session's own pool holds.
+        title: ?[]const u8,
+    };
 };
 
 /// Takes a line typed into `session` and does what it asks for, except asking the
@@ -614,10 +627,23 @@ pub fn take(agent: *Agent, emitter: *Emitter, session: *Session, line: []const u
     // it triggers.
     _ = agent.compact(emitter, session, &client, .when_needed);
 
+    // The line names the session when nothing has named it yet, so a frontend
+    // that lists sessions has a name for it as soon as it is asked something.
+    // `ask` names it the same way, for a caller that did not come through here.
+    const named = try nameFromPrompt(session, line);
+
     // A session's first prompt is what gives it a prompt and tools; one asked
     // before keeps what it was saved with.
     if (session.messages.items.len == 0) try agent.prepare(session);
-    return .{ .prompt = line };
+
+    return .{
+        .prompt = .{
+            .text = line,
+            // Read after preparing, which interns the prompt and the tools and moves
+            // every string the pool held before.
+            .title = if (named) session.title() else null,
+        },
+    };
 }
 
 /// Runs `/model`: says which model the session goes to, or records the one named
@@ -817,7 +843,7 @@ pub fn run(
             continue;
         }
         const text = switch (waiting) {
-            .prompt => |text| text,
+            .prompt => |asked| asked.text,
             .ran => continue,
         };
         // The line editor has erased the prompt it was typed behind, so the
@@ -1254,10 +1280,12 @@ fn provisionalTitle(text: []const u8) []const u8 {
 /// so a session is named the moment it starts rather than only once the model has
 /// answered. Returns whether it named it.
 ///
-/// This is the name the model's title later replaces; a frontend calls it at the
-/// start of the first turn, so its list shows a name at once, and `ask` calls it
-/// too so a session named anywhere is named the same way.
-pub fn nameFromPrompt(session: *Session, text: []const u8) !bool {
+/// This is the name the model's title later replaces. `take` calls it for a line
+/// that is asked, and hands the name back with the prompt, which is how a
+/// frontend that lists sessions can show one before the turn has run; `ask` calls
+/// it too, so a session asked without going through `take` is named the same
+/// way.
+fn nameFromPrompt(session: *Session, text: []const u8) !bool {
     if (session.title() != null) return false;
     try session.setTitle(provisionalTitle(text));
     return true;
@@ -2524,8 +2552,10 @@ test "a first prompt gives the session its prompt and tools, and is asked as typ
     const waiting = try agent.take(terminal.emitter(), &session, "do the thing");
 
     // The line is what is asked, and the session now carries the prompt and the
-    // tools it will send.
-    try std.testing.expectEqualStrings("do the thing", waiting.prompt);
+    // tools it will send, and the name taken from the line.
+    try std.testing.expectEqualStrings("do the thing", waiting.prompt.text);
+    try std.testing.expectEqualStrings("do the thing", waiting.prompt.title.?);
+    try std.testing.expectEqualStrings("do the thing", session.title().?);
     try std.testing.expect(session.systemPrompt() != null);
     try std.testing.expect(session.tools.len > 0);
 }
@@ -2557,7 +2587,9 @@ test "a prompt after the first leaves the session as it was set up" {
     // with, and a line that starts with `/chat` is asked like any other: only the
     // commands are commands.
     const later = try agent.take(terminal.emitter(), &session, "/chat is this a command?");
-    try std.testing.expectEqualStrings("/chat is this a command?", later.prompt);
+    try std.testing.expectEqualStrings("/chat is this a command?", later.prompt.text);
+    // The session was named by the first line, so this one names it nothing.
+    try std.testing.expect(later.prompt.title == null);
     try std.testing.expectEqualStrings(prompt_text, session.systemPrompt().?);
 }
 

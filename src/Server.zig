@@ -857,14 +857,11 @@ fn serveTurn(
     // copying it before, and it is the same id either way.
     if (announce) try stream.send("session", SessionEvent{ .id = session.id() });
 
-    // A session asked for the first time is named at once, from what was asked,
-    // so the page's list shows a name before the model has answered; the model's
-    // own title, if it gives one, arrives with the list the page refreshes when
-    // the turn ends.
-    if (session.messages.items.len == 0) {
-        _ = try Agent.nameFromPrompt(session, text);
-        if (session.title()) |title| try stream.send("title", TitleEvent{ .title = title });
-    }
+    // A session the agent named from this line is announced by that name, so the
+    // page's list shows it before the model has answered. The model's own title,
+    // if it gives one, arrives with the list the page refreshes when the turn
+    // ends.
+    if (waiting.prompt.title) |title| try stream.send("title", TitleEvent{ .title = title });
 
     // A request that failed has been reported through the emitter by `ask`,
     // which is the same notice the terminal shows. Only a failure of the stream

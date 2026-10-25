@@ -141,6 +141,11 @@ least once. Read the rule, not the story; the story is in the review.
   credential maps. One `web.Provider`, one descriptor table and one driver per tool leave the
   per-provider file with the body and reply type that really are its own; a sixth service is a row,
   not another control-flow branch.
+- **A frontend is told what a turn did, not left to work it out.** `take` names a session from
+  its first line and reports the name with the prompt, so the page announces it and the terminal
+  ignores it. *`Server` used to call `Agent.nameFromPrompt` itself and test "first turn" on its own
+  before the turn, so session-naming policy lived in an HTTP route and "first turn" was spelled in
+  four places.*
 - **Two frontends show the same call the same way.** The fallback for a bash header with no
   description lived only in `html.zig`, so the terminal and the page disagreed. Shared vocabulary
   belongs in `Tools.Heading`.
