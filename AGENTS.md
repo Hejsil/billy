@@ -76,6 +76,12 @@ least once. Read the rule, not the story; the story is in the review.
   snapshot in the binary is stale by the time it ships. Fetch it when a run first needs it, version
   the file, and give the user a command to fetch it again; a failed fetch leaves an empty catalog
   and a run that still works, not a start that fails.
+- **A document from a service is read into the shape billy keeps, and the cache holds only what is
+  read back from it.** A typed parse skips what billy does not use as it reads, where a
+  `std.json.Value` tree needs a helper and a `switch` per field; a field nothing reads is bytes
+  parsed on every start for no reader. *The catalog walked models.dev through `stringField`,
+  `intField`, `boolField` and `envOf`, and every model in the 632 KB cache carried `output`, `tools`
+  and `reasoning` that nothing read; typed, and with only the window kept, it is 336 KB.*
 - **An index read back from a file is checked against what it indexes.** Drop one that names
   nothing rather than clamping it onto the nearest element, which invents a reference the writer
   never made; collapse a repeat too, since a list documented as one entry per thing is not one.

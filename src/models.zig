@@ -81,16 +81,13 @@ pub const Provider = struct {
     }
 };
 
-/// One model a provider offers.
+/// One model a provider offers. Only what billy reads is kept: models.dev says
+/// much more about a model than a request or a header needs.
 pub const Model = struct {
     /// The id a request sends.
     id: []const u8,
     /// Tokens the context window holds.
     context: usize,
-    /// Tokens the model may answer with, or zero when models.dev does not say.
-    output: usize = 0,
-    tools: bool = false,
-    reasoning: bool = false,
 };
 
 /// What is known about a model: the provider it was found under, and its window.
@@ -99,10 +96,42 @@ pub const Metadata = struct {
     context_window: usize,
 };
 
-/// The shape the cache file is written and read as.
+/// The shape the cache file is written and read as. Its version guards the
+/// shape a reader cannot bend to; a field that is dropped is not one, since a
+/// reader skips what it does not know.
 const Cache = struct {
     version: u32 = format_version,
     providers: []const Provider = &.{},
+};
+
+/// The models.dev document, as far as billy reads it: what it names that billy
+/// does not use, a model's price and its release date among them, is skipped as
+/// it is parsed rather than read and dropped again.
+const Source = std.json.ArrayHashMap(SourceProvider);
+
+const SourceProvider = struct {
+    /// The SDK models.dev knows the provider through, which is how one that
+    /// speaks the chat-completions wire billy sends is told from one that does
+    /// not. A provider it does not name is one billy cannot call.
+    npm: ?[]const u8 = null,
+    api: ?[]const u8 = null,
+    /// Optional because models.dev may leave a list it has nothing for out or
+    /// write it as `null`, and neither is a reason to lose the catalog.
+    env: ?[]const []const u8 = null,
+    models: std.json.ArrayHashMap(SourceModel) = .{},
+};
+
+const SourceModel = struct {
+    /// The id a request sends, which is the key the model is listed under; the
+    /// field is read because models.dev states it, and the key is the fallback.
+    id: ?[]const u8 = null,
+    limit: ?SourceLimit = null,
+};
+
+const SourceLimit = struct {
+    /// Tokens the context window holds. A model models.dev gives no window for
+    /// is left out rather than kept with an invented one.
+    context: ?usize = null,
 };
 
 /// Reads the catalog from `dir`, into `arena`. A missing file is
@@ -128,33 +157,32 @@ pub fn ensure(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator, dir:
     return load(io, arena, dir) catch |err| switch (err) {
         error.FileNotFound => {
             std.log.info("fetching the model catalog", .{});
-            _ = refresh(io, gpa, dir) catch |fetch_err| {
-                std.log.warn("could not fetch the model catalog: {s}", .{@errorName(fetch_err)});
-                return .{};
-            };
-            return load(io, arena, dir) catch |load_err| {
-                std.log.warn("could not read the model catalog: {s}", .{@errorName(load_err)});
-                return .{};
-            };
+            return fetchThenLoad(io, arena, gpa, dir);
         },
         // A file that is half written, from another version or edited by hand is
         // fetched again rather than left to blind the run until the user runs
         // the refresh command.
         error.CorruptCatalog, error.UnsupportedCatalogVersion => {
             std.log.warn("the model catalog cannot be used ({s}); fetching it again", .{@errorName(err)});
-            _ = refresh(io, gpa, dir) catch |fetch_err| {
-                std.log.warn("could not fetch the model catalog: {s}", .{@errorName(fetch_err)});
-                return .{};
-            };
-            return load(io, arena, dir) catch |load_err| {
-                std.log.warn("could not read the model catalog: {s}", .{@errorName(load_err)});
-                return .{};
-            };
+            return fetchThenLoad(io, arena, gpa, dir);
         },
+        // Nothing about a directory billy cannot read is made better by fetching.
         else => {
             std.log.warn("could not read the model catalog: {s}", .{@errorName(err)});
             return .{};
         },
+    };
+}
+
+/// Fetches a catalog and reads it back, reporting whichever step fails.
+fn fetchThenLoad(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator, dir: std.Io.Dir) Catalog {
+    _ = refresh(io, gpa, dir) catch |err| {
+        std.log.warn("could not fetch the model catalog: {s}", .{@errorName(err)});
+        return .{};
+    };
+    return load(io, arena, dir) catch |err| {
+        std.log.warn("could not read the model catalog: {s}", .{@errorName(err)});
+        return .{};
     };
 }
 
@@ -194,73 +222,48 @@ fn writeFrom(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir, body: []const 
     defer build_state.deinit();
     const build = build_state.allocator();
 
-    const root = std.json.parseFromSliceLeaky(std.json.Value, build, body, .{
+    const source = std.json.parseFromSliceLeaky(Source, build, body, .{
+        .ignore_unknown_fields = true,
+        // The text is `body`, which outlives what is built from it, so the
+        // strings may point into it.
         .allocate = .alloc_if_needed,
     }) catch return error.CorruptCatalog;
-    const catalog = switch (root) {
-        .object => |object| object,
-        else => return error.CorruptCatalog,
-    };
 
     var providers: std.ArrayList(Provider) = .empty;
     defer providers.deinit(build);
     var model_count: usize = 0;
 
-    var it = catalog.iterator();
+    var it = source.map.iterator();
     while (it.next()) |entry| {
         const name = entry.key_ptr.*;
-        const value = entry.value_ptr.*;
+        const provider = entry.value_ptr;
         if (name.len == 0) continue;
-        const provider = switch (value) {
-            .object => |object| object,
-            else => continue,
-        };
-        const npm = stringField(provider, "npm") orelse continue;
-        if (!openAiCompatible(npm)) continue;
-        // Some providers -- OpenAI and xAI among them -- leave the address to
-        // their SDK, so models.dev has none. They are kept with no address: a
-        // key can be stored for them, and the configuration can name where they
-        // are reached.
-        const base_url = stringField(provider, "api");
-        const models_value = provider.get("models") orelse continue;
-        const models_object = switch (models_value) {
-            .object => |object| object,
-            else => continue,
-        };
+        if (!openAiCompatible(provider.npm orelse continue)) continue;
 
+        // A model without a window is left out, and a provider left with no
+        // models is no endpoint: neither is a row.
         var models: std.ArrayList(Model) = .empty;
-        var models_it = models_object.iterator();
+        var models_it = provider.models.map.iterator();
         while (models_it.next()) |model_entry| {
-            const model = switch (model_entry.value_ptr.*) {
-                .object => |object| object,
-                else => continue,
-            };
-            const id = stringField(model, "id") orelse model_entry.key_ptr.*;
-            if (id.len == 0) continue;
-            const limit = model.get("limit") orelse continue;
-            const limit_object = switch (limit) {
-                .object => |object| object,
-                else => continue,
-            };
-            const context = intField(limit_object, "context") orelse continue;
-            if (context == 0) continue;
-            try models.append(build, .{
-                .id = id,
-                .context = context,
-                .output = intField(limit_object, "output") orelse 0,
-                .tools = boolField(model, "tool_call"),
-                .reasoning = boolField(model, "reasoning"),
-            });
+            const model = model_entry.value_ptr;
+            const id = model.id orelse model_entry.key_ptr.*;
+            const limit = model.limit orelse continue;
+            const context = limit.context orelse continue;
+            if (id.len == 0 or context == 0) continue;
+            try models.append(build, .{ .id = id, .context = context });
         }
         if (models.items.len == 0) continue;
         std.mem.sort(Model, models.items, {}, byModelId);
         model_count += models.items.len;
 
-        const env = try envOf(build, provider);
+        // Some providers -- OpenAI and xAI among them -- leave the address to
+        // their SDK, so models.dev has none. They are kept with no address: a
+        // key can be stored for them, and the configuration can name where they
+        // are reached.
         try providers.append(build, .{
             .name = name,
-            .base_url = base_url,
-            .env = env,
+            .base_url = provider.api,
+            .env = provider.env orelse &.{},
             .models = models.items,
         });
     }
@@ -291,49 +294,6 @@ fn openAiCompatible(npm: []const u8) bool {
     return std.mem.eql(u8, npm, "@ai-sdk/openai-compatible") or
         std.mem.eql(u8, npm, "@ai-sdk/openai") or
         std.mem.eql(u8, npm, "@ai-sdk/xai");
-}
-
-fn stringField(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {
-    const value = object.get(name) orelse return null;
-    return switch (value) {
-        .string => |text| text,
-        else => null,
-    };
-}
-
-fn intField(object: std.json.ObjectMap, name: []const u8) ?usize {
-    const value = object.get(name) orelse return null;
-    return switch (value) {
-        .integer => |number| if (number > 0) @intCast(number) else null,
-        else => null,
-    };
-}
-
-fn boolField(object: std.json.ObjectMap, name: []const u8) bool {
-    const value = object.get(name) orelse return false;
-    return switch (value) {
-        .bool => |flag| flag,
-        else => false,
-    };
-}
-
-fn envOf(arena: std.mem.Allocator, provider: std.json.ObjectMap) ![]const []const u8 {
-    const value = provider.get("env") orelse return &.{};
-    const list = switch (value) {
-        .array => |array| array,
-        else => return &.{},
-    };
-    const names = try arena.alloc([]const u8, list.items.len);
-    var count: usize = 0;
-    for (list.items) |item| {
-        const name = switch (item) {
-            .string => |text| text,
-            else => continue,
-        };
-        names[count] = name;
-        count += 1;
-    }
-    return names[0..count];
 }
 
 fn byName(_: void, a: Provider, b: Provider) bool {
@@ -398,13 +358,13 @@ pub const Choice = struct {
 /// windows they expect. Only a test may use it.
 pub const test_catalog = Catalog{ .providers = &.{
     .{ .name = "deepseek", .base_url = "https://api.deepseek.com", .env = &.{"DEEPSEEK_API_KEY"}, .models = &.{
-        .{ .id = "deepseek-flash", .context = 1_000_000, .tools = true },
-        .{ .id = "deepseek-v4-pro", .context = 1_000_000, .tools = true },
-        .{ .id = "deepseek-v4-flash", .context = 1_000_000, .tools = true },
+        .{ .id = "deepseek-flash", .context = 1_000_000 },
+        .{ .id = "deepseek-v4-pro", .context = 1_000_000 },
+        .{ .id = "deepseek-v4-flash", .context = 1_000_000 },
     } },
     .{ .name = "opencode-go", .base_url = "https://opencode.ai/zen/go/v1", .env = &.{"OPENCODE_API_KEY"}, .models = &.{
-        .{ .id = "kimi-k2.7-code", .context = 262_144, .tools = true },
-        .{ .id = "deepseek-flash", .context = 1_000_000, .tools = true },
+        .{ .id = "kimi-k2.7-code", .context = 262_144 },
+        .{ .id = "deepseek-flash", .context = 1_000_000 },
     } },
 } };
 
@@ -470,8 +430,10 @@ test "the cache is filtered to OpenAI-compatible providers, and reads back" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // A small models.dev-shaped document: one provider billy can call, one it
-    // cannot, and one OpenAI-compatible provider whose model has no window.
+    // A small models.dev-shaped document: the providers billy can call, one it
+    // cannot, one whose models have no window, and one models.dev gives no
+    // address for. The fields billy does not keep are here as models.dev writes
+    // them, since they are what the parse has to skip.
     const body =
         \\{
         \\  "deepseek": {
@@ -485,8 +447,12 @@ test "the cache is filtered to OpenAI-compatible providers, and reads back" {
         \\  },
         \\  "xai": {
         \\    "id": "xai", "name": "xAI", "api": "https://api.x.ai/v1",
-        \\    "npm": "@ai-sdk/xai",
+        \\    "npm": "@ai-sdk/xai", "env": null,
         \\    "models": {"grok": {"id": "grok", "limit": {"context": 131072}}}
+        \\  },
+        \\  "openai": {
+        \\    "id": "openai", "name": "OpenAI", "npm": "@ai-sdk/openai",
+        \\    "models": {"gpt": {"id": "gpt", "limit": {"context": 128000}}}
         \\  },
         \\  "anthropic": {
         \\    "id": "anthropic", "name": "Anthropic", "api": "https://api.anthropic.com",
@@ -497,8 +463,8 @@ test "the cache is filtered to OpenAI-compatible providers, and reads back" {
     ;
 
     const counts = try writeFrom(std.testing.io, gpa, tmp.dir, body);
-    try std.testing.expectEqual(@as(usize, 2), counts.providers);
-    try std.testing.expectEqual(@as(usize, 2), counts.models);
+    try std.testing.expectEqual(@as(usize, 3), counts.providers);
+    try std.testing.expectEqual(@as(usize, 3), counts.models);
 
     const catalog = try load(std.testing.io, arena, tmp.dir);
     // Anthropic is not an OpenAI-compatible provider, so it was left out.
@@ -507,14 +473,19 @@ test "the cache is filtered to OpenAI-compatible providers, and reads back" {
     const deepseek = catalog.find("deepseek").?;
     try std.testing.expectEqualStrings("DEEPSEEK_API_KEY", deepseek.env[0]);
     try std.testing.expectEqual(@as(usize, 1), deepseek.models.len);
-    try std.testing.expect(deepseek.models[0].tools);
-    try std.testing.expect(deepseek.models[0].reasoning);
-    try std.testing.expectEqual(@as(usize, 393216), deepseek.models[0].output);
+    try std.testing.expectEqualStrings("deepseek-flash", deepseek.models[0].id);
     try std.testing.expectEqual(@as(usize, 1_048_576), deepseek.models[0].context);
 
-    // A provider whose address is not known is left out as well; xAI is kept.
+    // xAI is kept, and a list of variables it did not give is an empty one, not
+    // a refusal.
     const xai = catalog.find("xai").?;
     try std.testing.expectEqual(@as(usize, 131_072), xai.models[0].context);
+    try std.testing.expectEqual(@as(usize, 0), xai.env.len);
+
+    // A provider models.dev gives no address for is kept without one, so a key
+    // can be stored for it and the configuration can say where it is reached.
+    const openai = catalog.find("openai").?;
+    try std.testing.expect(openai.base_url == null);
 }
 
 test "a missing cache is a miss, and a damaged one is refused" {
