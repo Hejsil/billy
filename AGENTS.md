@@ -77,7 +77,8 @@ least once. Read the rule, not the story; the story is in the review.
 - **A struct that owns memory is passed by pointer.** `Config` owns an `ArenaAllocator`; passing it
   by value is a shallow copy of the owner, and the first `deinit` on a copy is a double free.
 - **A slice out of the string pool dies at the next `intern`.** Copy before you leave the function,
-  or take an index and resolve it where you use it. This rule is load-bearing in three places
+  take an index and resolve it where you use it, or read it again after the write. This rule is
+  load-bearing in three places
   (`Endpoint.targetFor`, `Session.repairTail`, `Server.serveTurn`) and all three had to be fixed
   once.
 - **`deinit` once, in the owner.** Between an `errdefer` in a loop and an `errdefer` outside it,

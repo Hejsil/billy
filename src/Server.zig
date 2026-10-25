@@ -819,8 +819,9 @@ fn askSession(r: *Request, registry: *Registry, http_client: *std.http.Client, i
 ///
 /// A session created by this request has no id on the page yet, so with
 /// `announce` its id is sent as the first event, before anything else. The id
-/// is read from the session here rather than handed in, since preparing the
-/// session interns its prompt and moves the pool a slice of it would name.
+/// is resolved when it is announced, after the session is prepared, rather than
+/// held from before: preparing interns the prompt and tools, and a slice of the
+/// pool read earlier would name bytes it no longer holds.
 fn serveTurn(
     r: *Request,
     http_client: *std.http.Client,
@@ -867,6 +868,9 @@ fn serveTurn(
         return;
     }
 
+    // Resolved here, after preparing the session: the id is a slice of the pool,
+    // which preparing has just grown. Reading it again is cheaper and safer than
+    // copying it before, and it is the same id either way.
     if (announce) try stream.send("session", SessionEvent{ .id = session.id() });
 
     // A session asked for the first time is named at once, from what was asked,
