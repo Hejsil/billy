@@ -93,6 +93,12 @@ least once. Read the rule, not the story; the story is in the review.
 - **A value the layer below can resolve itself is not carried down.** `Target.provider` was copied
   out of the catalog for a window lookup that asks the catalog by the choice instead, so the field
   was read by no one and its doc said it was what the gauge measured against.
+- **A lookup over stored things asks each only for the field that decides it.** `Session.latest`
+  walks the listing in the order the question means (newest written first), asks each session file
+  only for the directory it recorded by stepping over the conversation a token at a time, and stops
+  at the first answer. *Loading every conversation to find the one started in this directory would
+  cost the whole store to answer a question about one field of it; the title is read the same way,
+  from the front of the file.*
 - **An index read back from a file is checked against what it indexes.** Drop one that names
   nothing rather than clamping it onto the nearest element, which invents a reference the writer
   never made; collapse a repeat too, since a list documented as one entry per thing is not one.

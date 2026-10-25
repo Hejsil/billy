@@ -1019,12 +1019,57 @@ pub fn list(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator) ![]Named {
     return listIn(iter_dir, io, gpa);
 }
 
+/// The id of the session in `dir` that was last written to from `start_cwd`, or
+/// null when no session was started there. The id is `gpa`'s, and the caller
+/// frees it.
+///
+/// The listing's order is the answer's order: the newest session that recorded
+/// `start_cwd` is the one a run in that directory would continue. Each is asked
+/// only for the directory it recorded, so one started elsewhere costs its bytes
+/// rather than a conversation loaded to be thrown away.
+///
+/// A file that records no directory -- one written before it was kept -- cannot
+/// say it belongs there, so it is never the answer; it is still resumable by its
+/// id, in the directory billy is run from.
+pub fn latest(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, start_cwd: []const u8) !?[]const u8 {
+    const listed = try list(io, dir, gpa);
+    defer freeList(listed, gpa);
+
+    for (listed) |listed_session| {
+        var name_buf: [max_id_len + extension.len]u8 = undefined;
+        const file_name = fileName(listed_session.id, &name_buf) orelse continue;
+        var file = dir.openFile(io, file_name, .{}) catch continue;
+        defer file.close(io);
+
+        const stored = cwdFrom(io, gpa, file) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            // A file that cannot be read through is not the session to continue
+            // here, and is still one to resume by its id.
+            else => continue,
+        };
+        defer if (stored) |text| gpa.free(text);
+        if (stored) |text| {
+            if (std.mem.eql(u8, text, start_cwd)) return try gpa.dupe(u8, listed_session.id);
+        }
+    }
+    return null;
+}
+
 /// One session as a listing shows it: the id that names it, and its title, which
 /// is "" for a session that has not been named.
 pub const Named = struct {
     id: []const u8,
     title: []const u8,
 };
+
+/// Frees what a listing returned: the ids it copied out, and the list itself.
+fn freeList(names: []Named, gpa: std.mem.Allocator) void {
+    for (names) |made| {
+        gpa.free(made.id);
+        gpa.free(made.title);
+    }
+    gpa.free(names);
+}
 
 /// The ids of the sessions in `dir`, which must be a handle this listing has to
 /// itself. See `list`, which opens one.
@@ -1086,6 +1131,45 @@ fn listIn(dir: std.Io.Dir, io: std.Io, gpa: std.mem.Allocator) ![]Named {
 /// ordinary title, so the quote that closes one is found in the first read; a
 /// longer title grows the buffer rather than being refused.
 const title_read_buffer_len = 1024;
+
+/// The working directory stored in the session file `file`, or null when it
+/// records none, which a file written before the field did.
+///
+/// The directory is the last field written, so the file is read to its end; what
+/// is stepped over on the way is the conversation, one token at a time, so a
+/// session costs its bytes rather than a conversation built for a question about
+/// one field of it.
+fn cwdFrom(io: std.Io, gpa: std.mem.Allocator, file: std.Io.File) !?[]const u8 {
+    var reader_buf: [std.heap.page_size_min]u8 = undefined;
+    var reader = file.reader(io, &reader_buf);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var j_reader = std.json.Reader.init(gpa, &reader.interface);
+    defer j_reader.deinit();
+
+    if (try j_reader.next() != .object_begin) return null;
+    while (true) {
+        const key = try j_reader.nextAlloc(arena, .alloc_if_needed);
+        const field = switch (key) {
+            .object_end => return null,
+            .string => |text| text,
+            .allocated_string => |text| text,
+            else => return null,
+        };
+        if (std.mem.eql(u8, field, "cwd")) {
+            return switch (try j_reader.nextAlloc(gpa, .alloc_always)) {
+                // `alloc_always` puts the text in memory of the caller's, which
+                // the reader's buffer cannot move under it.
+                .allocated_string => |text| text,
+                else => null,
+            };
+        }
+        try j_reader.skipValue();
+    }
+}
 
 /// The title stored in the session file `file`, or "" when it has none.
 ///
@@ -1390,15 +1474,6 @@ test "ids made one after another differ" {
     try std.testing.expect(!std.mem.eql(u8, &first, &second));
 }
 
-/// Frees what `list` returned: the ids it copied out, and the list itself.
-fn freeList(names: []Named, gpa: std.mem.Allocator) void {
-    for (names) |made| {
-        gpa.free(made.id);
-        gpa.free(made.title);
-    }
-    gpa.free(names);
-}
-
 /// Writes an empty session file named for `id`, last written `written_ms`
 /// milliseconds after the epoch, so a listing can be checked for the order it
 /// puts the files in. The file's content does not matter to a listing.
@@ -1459,6 +1534,38 @@ test "the sessions in a directory are listed by when they were written" {
     try std.testing.expectEqualStrings("dev", ids[0].id);
     try std.testing.expectEqualStrings(newest_id, ids[1].id);
     try std.testing.expectEqualStrings(oldest, ids[2].id);
+}
+
+test "the latest session for a directory is the one last written there" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // Sessions from two directories, with the conversation of one written out in
+    // full: the directory is the last field of a session, so finding it means
+    // stepping over everything before it.
+    const here =
+        \\{"version":3,"messages":[{"role":"user","content":"hello \"there\""}],"cwd":"/work"}
+    ;
+    const elsewhere =
+        \\{"version":3,"messages":[],"cwd":"/other"}
+    ;
+    try writeFileAt(&tmp, gpa, "first", here, 1_000);
+    try writeFileAt(&tmp, gpa, "other", elsewhere, 2_000);
+    try writeFileAt(&tmp, gpa, "second", here, 3_000);
+
+    // The one written to last here, not the one written to last at all.
+    const found = (try latest(std.testing.io, tmp.dir, gpa, "/work")).?;
+    defer gpa.free(found);
+    try std.testing.expectEqualStrings("second", found);
+
+    // A directory no session was started in has none to continue, and neither
+    // does a file from before the directory was recorded.
+    try std.testing.expect(try latest(std.testing.io, tmp.dir, gpa, "/nowhere") == null);
+    try writeFileAt(&tmp, gpa, "old", "{\"version\":1}", 4_000);
+    const unchanged = (try latest(std.testing.io, tmp.dir, gpa, "/work")).?;
+    defer gpa.free(unchanged);
+    try std.testing.expectEqualStrings("second", unchanged);
 }
 
 test "the ordering keeps each id with the time it was written at" {

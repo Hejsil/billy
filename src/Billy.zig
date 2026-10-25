@@ -190,8 +190,21 @@ pub fn configSet(billy: *Billy, out: Terminal.Writer, path: []const u8, value: [
     try out.print("set {s} to {s}\n", .{ path, value });
 }
 
-/// Runs one session in the terminal, resuming `resume_id` or starting a new one.
-pub fn run(billy: *Billy, out: Terminal.Writer, resume_id: ?[]const u8) !void {
+/// Which session a run continues, when it continues one.
+pub const Resume = union(enum) {
+    /// The session with this id, wherever it was started.
+    id: []const u8,
+    /// The session written to most recently in the directory billy runs in,
+    /// which is what `--resume` asks for when it names none.
+    latest,
+};
+
+/// Runs one session in the terminal, resuming what `resuming` asks for or
+/// starting a new one when it asks for nothing.
+pub fn run(billy: *Billy, out: Terminal.Writer, resuming: ?Resume) !void {
+    // Resolved before the catalog is fetched, so a resume with nothing to
+    // continue says so without reading it.
+    const resume_id = try billy.resumeId(resuming);
     billy.ensureCatalog();
     // A resumed session keeps the directory it was saved with, so a session
     // continues where it was started rather than wherever it is picked up.
@@ -254,6 +267,27 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resume_id: ?[]const u8) !void {
         );
     }
     try Agent.run(billy.io, billy.gpa, out, options, &session);
+}
+
+/// The id of the session `resuming` continues, or null when it asks for a new
+/// one. A resume that names no id of its own asks for the session this directory
+/// was last asked in, and is reported when there is none: starting a new one
+/// would leave the run somewhere the user did not ask to be.
+fn resumeId(billy: *Billy, resuming: ?Resume) !?[]const u8 {
+    const asked = resuming orelse return null;
+    switch (asked) {
+        .id => |id| return id,
+        .latest => {},
+    }
+
+    const found = Session.latest(billy.io, billy.dirs.sessions, billy.arena, billy.cwd) catch |err| {
+        std.log.err("cannot list the sessions: {s}", .{@errorName(err)});
+        return report.Reported;
+    };
+    return found orelse {
+        std.log.err("no session to resume in '{s}'", .{billy.cwd});
+        return report.Reported;
+    };
 }
 
 /// Reads the model catalog from the cache, fetching it first when there is none.

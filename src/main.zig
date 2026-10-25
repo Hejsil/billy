@@ -58,8 +58,9 @@ const billy_commands =
 
 /// The options billy itself takes.
 const run_options =
-    \\  -r, --resume <session>  continue the session with this id
-    \\  -h, --help              print this message
+    \\  -r, --resume [<session>]  continue the session named, or with none named
+    \\                            the one written to most recently in this directory
+    \\  -h, --help                print this message
 ;
 
 /// The options the `models` subcommand takes.
@@ -107,8 +108,10 @@ fn isHelp(arg: []const u8) bool {
 }
 
 const Options = struct {
-    /// Session to continue; a new one is started when this is null.
-    resume_id: ?[]const u8 = null,
+    /// The session to continue, or `--resume` with none named, which is the one
+    /// written to most recently in the working directory. A new session is
+    /// started when this is null.
+    resuming: ?Billy.Resume = null,
     /// Whether the user asked for usage instead of a run.
     help: bool = false,
 
@@ -206,7 +209,7 @@ fn run(init: std.process.Init) !u8 {
     defer billy.deinit();
 
     switch (options.command) {
-        .none => try billy.run(out, options.resume_id),
+        .none => try billy.run(out, options.resuming),
         .serve => |serve| try billy.serve(serve.host, serve.port),
         .config => |config| try billy.configSet(out, config.path.?, config.value.?),
         .login => |login| try billy.login(out, login.service),
@@ -289,8 +292,13 @@ fn parseArgs(args: *spaghet.Args) ParseError!Options {
     while (args.next()) {
         if (args.flag(&.{ "-h", "--help" }))
             options.help = true;
-        if (args.option(&.{ "-r", "--resume" })) |id|
-            options.resume_id = id;
+        if (args.option(&.{ "-r", "--resume" })) |id| {
+            // A value that names nothing is a resume with none to name, which is
+            // the one written to most recently.
+            options.resuming = if (id.len == 0) Billy.Resume{ .latest = {} } else .{ .id = id };
+        }
+        if (args.flag(&.{ "-r", "--resume" }))
+            options.resuming = .{ .latest = {} };
         if (args.positional()) |command|
             options.command = try parseCommand(args, command);
     }
@@ -397,16 +405,19 @@ test "parseArgs" {
     const cases = [_]struct { argv: []const []const u8, expected: Options }{
         .{ .argv = &.{}, .expected = .{} },
         .{ .argv = &.{"--help"}, .expected = .{ .help = true } },
-        .{ .argv = &.{ "--resume", "20250131-120000" }, .expected = .{ .resume_id = "20250131-120000" } },
-        .{ .argv = &.{ "-r", "dev" }, .expected = .{ .resume_id = "dev" } },
-        .{ .argv = &.{"--resume=dev"}, .expected = .{ .resume_id = "dev" } },
-        .{ .argv = &.{ "--help", "--resume=both" }, .expected = .{ .help = true, .resume_id = "both" } },
+        .{ .argv = &.{ "--resume", "20250131-120000" }, .expected = .{ .resuming = .{ .id = "20250131-120000" } } },
+        .{ .argv = &.{ "-r", "dev" }, .expected = .{ .resuming = .{ .id = "dev" } } },
+        .{ .argv = &.{"--resume=dev"}, .expected = .{ .resuming = .{ .id = "dev" } } },
+        .{ .argv = &.{ "--help", "--resume=both" }, .expected = .{ .help = true, .resuming = .{ .id = "both" } } },
+        // A resume with no session to name asks for the one this directory was
+        // last asked in, however it is written.
+        .{ .argv = &.{"--resume"}, .expected = .{ .resuming = .{ .latest = {} } } },
+        .{ .argv = &.{"-r"}, .expected = .{ .resuming = .{ .latest = {} } } },
+        .{ .argv = &.{"--resume="}, .expected = .{ .resuming = .{ .latest = {} } } },
     };
     for (cases) |case| try expectOptions(case.expected, try parseArgsSlice(case.argv));
 
-    // A resume without a value, an option the run does not take, and a stray
-    // argument are refused.
-    try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{"--resume"}));
+    // An option the run does not take, and a stray argument, are refused.
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{"--nope"}));
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{"extra"}));
 }
@@ -532,10 +543,13 @@ test "parseArgs reads the sessions subcommand on its own" {
 /// The slices in `Options` are compared by content rather than by pointer.
 fn expectOptions(expected: Options, actual: Options) !void {
     try std.testing.expectEqual(expected.help, actual.help);
-    if (expected.resume_id) |id| {
-        try std.testing.expectEqualStrings(id, actual.resume_id.?);
+    if (expected.resuming) |want| {
+        switch (want) {
+            .id => |id| try std.testing.expectEqualStrings(id, actual.resuming.?.id),
+            .latest => try std.testing.expect(actual.resuming.? == .latest),
+        }
     } else {
-        try std.testing.expect(actual.resume_id == null);
+        try std.testing.expect(actual.resuming == null);
     }
 
     switch (expected.command) {
