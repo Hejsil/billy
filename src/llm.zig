@@ -605,9 +605,10 @@ pub const Stream = struct {
         // The request asks for one choice, so only the first is read.
         if (chunk.choices.len == 0) return null;
 
-        const piece = chunk.choices[0].delta;
-        const calls = try arena.alloc(ToolCallDelta, piece.tool_calls.len);
-        for (piece.tool_calls, 0..) |fragment, index| {
+        const piece = chunk.choices[0].delta orelse return null;
+        const fragments = piece.tool_calls orelse &.{};
+        const calls = try arena.alloc(ToolCallDelta, fragments.len);
+        for (fragments, 0..) |fragment, index| {
             calls[index] = .{
                 .index = fragment.index,
                 .id = fragment.id,
@@ -634,17 +635,19 @@ fn set(list: *std.ArrayList(u8), gpa: std.mem.Allocator, text: []const u8) !void
 
 /// One chunk of a streamed reply, as the API sends it. Unknown fields are
 /// ignored, and a field a chunk leaves out keeps the default, since a chunk only
-/// carries what changed.
+/// carries what changed. A field a provider writes as an explicit `null` has to
+/// be optional for the same reason a missing field does: a null read as a slice
+/// is `UnexpectedToken`, which throws away a delta that was perfectly readable.
 const Chunk = struct {
     choices: []const Choice = &.{},
     usage: ?Usage = null,
     @"error": ?ApiError = null,
 
-    const Choice = struct { delta: Piece = .{} };
+    const Choice = struct { delta: ?Piece = null };
     const Piece = struct {
         content: ?[]const u8 = null,
         reasoning_content: ?[]const u8 = null,
-        tool_calls: []const Call = &.{},
+        tool_calls: ?[]const Call = null,
     };
     /// A piece of a tool call, in the shape the API nests it.
     const Call = struct {
@@ -897,6 +900,47 @@ test "a streamed reply is read a delta at a time" {
     try std.testing.expectEqualStrings("a thought", message.reasoning_content.?);
     try std.testing.expect(message.tool_calls == null);
     try std.testing.expectEqual(5, stream.usage().total_tokens);
+}
+
+test "a delta that spells its fields as null is read, not dropped" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // A provider may write a field it has nothing for as an explicit null
+    // rather than leaving it out, and it may do so in every field of the chunk
+    // at once. The text and the thinking beside those nulls are the reply, so a
+    // chunk that reads as unparseable loses a piece of it.
+    const messages = [_]Message{.{ .role = .user, .content = "hi" }};
+    var mock = try Mock.start("/chat/completions", 1, Mock.eventStream(
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1," ++
+            "\"model\":\"m\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null," ++
+            "\"delta\":{\"role\":null,\"content\":\"hel\",\"reasoning_content\":\" from REVIEW\"," ++
+            "\"tool_calls\":null}}],\"usage\":null}\n\n" ++
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\",\"reasoning_content\":null," ++
+            "\"tool_calls\":null}}]}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":null,\"finish_reason\":\"stop\"}]}\n\n" ++
+            "data: [DONE]\n\n",
+    ));
+    defer mock.deinit();
+    try mock.serve();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+    var client = clientAgainst(gpa, io, &http_client, mock.url, 1);
+
+    var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
+    defer stream.deinit();
+    var deltas: usize = 0;
+    while (try stream.next()) |_| deltas += 1;
+
+    try mock.await();
+
+    // The finish reason is not a delta, so the two that carry text are the
+    // whole reply: both were read, and the second one's nulls cost nothing.
+    try std.testing.expectEqual(2, deltas);
+    const message = try stream.message();
+    try std.testing.expectEqualStrings("hello", message.content.?);
+    try std.testing.expectEqualStrings(" from REVIEW", message.reasoning_content.?);
 }
 
 test "a streamed reply that arrived compressed is read" {

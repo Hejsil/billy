@@ -20,6 +20,12 @@ least once. Read the rule, not the story; the story is in the review.
 - **An invariant stated in a module doc needs a test.** "Every string from outside passes through
   `escape`" was the first paragraph of `html.zig` and was false. A test that renders a hostile tool
   name would have kept it true.
+- **A JSON field of theirs that may be null is optional in the shape it is read into.** A provider
+  spells a field it has nothing for either by leaving it out or by writing `null`, and a `null` read
+  as a slice or a struct is `UnexpectedToken`, not the empty value the default would have given.
+  *One DeepSeek chunk wrote `"tool_calls":null`, so `llm.Chunk` refused the whole delta and the
+  answer's text and thinking beside it were dropped with a warning; a `delta:null` frame did the
+  same.*
 
 ## Failing
 
