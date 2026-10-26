@@ -82,9 +82,10 @@ pub const Query = enum { count, format_json };
 
 /// One web search a provider answers.
 pub const SearchSpec = struct {
-    /// Appended to an address the configuration named, since a self-hosted
-    /// service lives under a known path on its instance. An address from the
-    /// table, or a test's, is used whole.
+    /// Appended to an address this table does not give: SearXNG's, whose
+    /// instance the configuration names and which answers under a known path on
+    /// it. A provider whose address the table gives is reached at that address
+    /// whole, whoever named it.
     configured_path: []const u8 = "",
     request: union(enum) {
         get: Query,
