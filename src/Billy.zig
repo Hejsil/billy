@@ -365,11 +365,16 @@ pub fn serve(billy: *Billy, host: []const u8, port: u16) !void {
     const arena = server_state.allocator();
 
     // The configured choice is resolved once here only to report a provider or a
-    // key that is missing: each turn resolves its own target when it begins.
+    // key that is missing: each turn resolves its own target when it begins, and
+    // a turn that cannot begin says so as a notice. A server is different: one
+    // that cannot send a request at all has nothing to serve, and says so before
+    // it listens rather than on the first thing asked of it.
     _ = Endpoint.configured(&billy.config, &billy.credentials, &billy.catalog, arena) catch |err| switch (err) {
-        // Both are reported where they are found, and each names what to do
-        // about it; anything else is one nobody has explained.
-        error.UnknownProvider, error.MissingApiKey => return report.Reported,
+        error.UnknownProvider, error.MissingApiKey => {
+            var notice: [256]u8 = undefined;
+            std.log.err("{s}", .{Endpoint.unreachableModel(&notice, err, billy.config.stored.model)});
+            return report.Reported;
+        },
         else => |other| return other,
     };
 

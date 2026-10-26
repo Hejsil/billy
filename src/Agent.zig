@@ -583,6 +583,11 @@ pub const Waiting = union(enum) {
     /// The line was a command, already run; what it had to say went out through
     /// the emitter.
     ran,
+    /// The line is an ordinary prompt, but the model the session goes to cannot
+    /// be resolved: what is wrong with it went out through the emitter, and
+    /// nothing was asked. The session is untouched, so the same line can be
+    /// asked once the user has done what the notice says.
+    unresolved,
 
     /// The prompt a line came to, and what taking it did to the session.
     pub const Prompt = struct {
@@ -610,7 +615,7 @@ pub fn take(agent: *Agent, emitter: *Emitter, session: *Session, line: []const u
             .compact => {
                 // Compaction is a request of its own, at the model the session
                 // records now, so it needs the client the rest of the turn does.
-                var client = try agent.clientFor(session);
+                var client = (try agent.resolvedClient(emitter, session)) orelse return .unresolved;
                 if (agent.compact(emitter, session, &client, .now) != .done)
                     try emitter.show(.{ .notice = "nothing to compact" });
             },
@@ -621,7 +626,7 @@ pub fn take(agent: *Agent, emitter: *Emitter, session: *Session, line: []const u
 
     // The client is made before the prompt is added, so what this turn is sent
     // with and what the session records are the same model.
-    var client = try agent.clientFor(session);
+    var client = (try agent.resolvedClient(emitter, session)) orelse return .unresolved;
 
     // Before the prompt is added, so the prompt is not compacted into the summary
     // it triggers.
@@ -643,6 +648,26 @@ pub fn take(agent: *Agent, emitter: *Emitter, session: *Session, line: []const u
             // every string the pool held before.
             .title = if (named) session.title() else null,
         },
+    };
+}
+
+/// The client a turn is sent with, or null when the model the session goes to
+/// cannot be resolved -- no key for its provider, or no address for it.
+///
+/// Either is the user's to fix, and both are shown through `emitter` as the
+/// notice they can act on: a turn that cannot begin is not a failure of the run,
+/// and the session is unchanged, so the next line can be the one that fixes it
+/// (`/model`, and `billy login` outside). Anything else a target can fail with --
+/// memory, mostly -- is returned, since a run cannot be carried on without it.
+fn resolvedClient(agent: *Agent, emitter: *Emitter, session: *Session) !?llm.Client {
+    return agent.clientFor(session) catch |err| switch (err) {
+        error.MissingApiKey, error.UnknownProvider => {
+            var notice: [256]u8 = undefined;
+            const choice = session.modelChoice(agent.config.stored.model);
+            try emitter.show(.{ .notice = Endpoint.unreachableModel(&notice, err, choice) });
+            return null;
+        },
+        else => |other| return other,
     };
 }
 
@@ -732,7 +757,9 @@ pub fn ask(agent: *Agent, emitter: *Emitter, session: *Session, text: []const u8
     // The client this turn is sent with is made here, from the model the session
     // records now, so the model it goes to is recorded before the prompt is
     // appended: the message and the provider it went to are written together.
-    var client = try agent.clientFor(session);
+    // A caller that came through `take` has resolved one already; one that did
+    // not is told what is wrong with the model the same way, and asks nothing.
+    var client = (try agent.resolvedClient(emitter, session)) orelse return;
 
     // The system prompt is kept apart from the conversation, so the first turn is
     // the session's first message.
@@ -838,13 +865,15 @@ pub fn run(
         // What the line came to is the agent's to decide: a command is run and
         // reported through the emitter, and anything else is what is asked.
         const waiting = try agent.take(emitter, session, line);
-        if (waiting == .ran) {
-            try writer.flush();
-            continue;
-        }
         const text = switch (waiting) {
             .prompt => |asked| asked.text,
-            .ran => continue,
+            // A command was run, or the model could not be resolved and the
+            // notice says why: either way nothing is asked, and the run carries
+            // on, so the next line can be the one that fixes it.
+            .ran, .unresolved => {
+                try writer.flush();
+                continue;
+            },
         };
         // The line editor has erased the prompt it was typed behind, so the
         // prompt is written out now as the block a replay shows: the `> ` belongs
@@ -1778,6 +1807,61 @@ const TestSetup = struct {
 /// borrows it.
 fn testTerminal(writer: Terminal.Writer) Terminal {
     return .{ .writer = writer, .io = std.testing.io, .scratch = std.testing.allocator };
+}
+
+test "a model that cannot be resolved is a notice, and asks nothing" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
+    // A provider the configuration names with nothing stored for it, beside the
+    // two the setup already points at a closed port.
+    setup.config.stored.providers = .{ .entries = try setup.arena.allocator().dupe(
+        Config.Providers.Entry,
+        &.{.{ .name = "nokey", .base_url = "http://127.0.0.1:1" }},
+    ) };
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+
+    var agent = try testAgent(io, gpa, setup, null);
+    defer agent.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var terminal = testTerminal(.{ .out = &out.writer });
+    defer terminal.deinit();
+    const emitter = terminal.emitter();
+
+    // A provider the configuration names, with no key stored for it.
+    try session.setModel("nokey/m");
+    try std.testing.expect((try agent.take(emitter, &session, "hi")) == .unresolved);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "the model nokey/m cannot be reached") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "billy login nokey") != null);
+    // Nothing was asked and nothing was written: the line can be asked again
+    // once the key is stored, which is what makes this a notice and not the end
+    // of the run.
+    try std.testing.expectEqual(@as(usize, 0), session.messages.items.len);
+    try std.testing.expect(session.systemPrompt() == null);
+
+    // A provider neither the configuration nor the catalog names says where an
+    // address comes from instead.
+    out.clearRetainingCapacity();
+    try session.setModel("who-knows/m");
+    try std.testing.expect((try agent.take(emitter, &session, "hi")) == .unresolved);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "the model who-knows/m cannot be reached") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "billy models --refresh") != null);
+
+    // And the way out of that state still answers: `/model` is read before any
+    // client is made, so it works on the session that cannot be asked.
+    out.clearRetainingCapacity();
+    try std.testing.expect((try agent.take(emitter, &session, "/model other/m")) == .ran);
+    try std.testing.expectEqualStrings("other/m", session.model().?);
+    try std.testing.expectEqual(@as(usize, 0), session.messages.items.len);
 }
 
 /// The id the header tests run under. A real one is a ULID, but the header only

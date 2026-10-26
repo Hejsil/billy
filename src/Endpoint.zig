@@ -36,6 +36,13 @@ pub fn configured(
 
 /// Where `choice`, a provider and model as `<provider>/<model>`, is sent.
 ///
+/// Fails with `error.MissingApiKey` when no key is stored for the provider, and
+/// with `error.UnknownProvider` when neither the configuration nor the catalog
+/// names its address. Both are the user's to fix and neither is logged here:
+/// `unreachableModel` writes the sentence they are shown, and where it is shown
+/// is the frontend's business -- a notice a terminal can go on from, or the
+/// failure of a run that cannot start.
+///
 /// The strings the target names are allocated from `arena`, which the caller
 /// owns: a choice is usually a slice of a session's string pool, and a pointer
 /// into that pool survives no write to it, so nothing here may keep one.
@@ -50,13 +57,14 @@ pub fn targetFor(
     const provider = halves.provider();
     // A session's own provider decides where it goes: a base URL the
     // configuration names, or the catalog's own when it knows the provider.
-    const base_url = try resolveBaseUrl(config.stored.providers, catalog, choice);
+    const base_url = baseUrlOf(config.stored.providers, catalog, choice) orelse
+        return error.UnknownProvider;
 
     return .{
         .url = try completionsUrl(arena, base_url),
         // The key is stored under the provider the choice names, which is the
         // catalog's own spelling of it.
-        .api_key = credentials.get(provider) orelse return missingKey(provider),
+        .api_key = credentials.get(provider) orelse return error.MissingApiKey,
         // The model is copied out rather than sliced from `choice`: the choice a
         // session passes is a slice of its own string pool, and a pointer into
         // that pool survives no write to it, so the next intern would leave the
@@ -95,8 +103,8 @@ fn completionsUrl(arena: std.mem.Allocator, base_url: []const u8) ![]u8 {
 }
 
 /// Where the choice is sent: the base URL the configuration gives the provider,
-/// which may be one of its own or one of billy's the file overrides. Null when
-/// the configuration names neither, which the caller reports.
+/// which may be one of its own or one the catalog knows. Null when neither
+/// names it, which leaves the choice pointing nowhere.
 fn baseUrlOf(providers: Config.Providers, catalog: *const models.Catalog, choice: []const u8) ?[]const u8 {
     const name = (models.Choice{ .text = choice }).provider();
     if (providers.get(name)) |base_url| return base_url;
@@ -104,35 +112,29 @@ fn baseUrlOf(providers: Config.Providers, catalog: *const models.Catalog, choice
     return provider.base_url;
 }
 
-/// The base URL a request is sent to, reporting a provider neither the
-/// configuration nor the catalog names before failing: the name came from a file
-/// the user wrote, so they are the one who can add it.
-fn resolveBaseUrl(providers: Config.Providers, catalog: *const models.Catalog, choice: []const u8) error{UnknownProvider}![]const u8 {
-    if (baseUrlOf(providers, catalog, choice)) |base_url| return base_url;
-
-    const name = (models.Choice{ .text = choice }).provider();
-    if (catalog.find(name)) |provider| {
-        if (provider.base_url == null) {
-            std.log.err(
-                "the model catalog does not name an address for '{s}'; add it under `providers` in the configuration",
-                .{name},
-            );
-            return error.UnknownProvider;
-        }
-    }
-    std.log.err(
-        "'{s}' names no provider the configuration or the model catalog defines; run `billy models --refresh`",
-        .{choice},
-    );
-    return error.UnknownProvider;
-}
-
-/// Reports that no key is stored for the provider a request is sent to, naming
-/// the login that stores one. Fails the request rather than sending it without a
-/// key, which the provider would only refuse with less to go on.
-fn missingKey(name: []const u8) error{MissingApiKey} {
-    std.log.err("no key stored for '{s}'; run `billy login {s}` to store one", .{ name, name });
-    return error.MissingApiKey;
+/// What is wrong with the model `choice` names, in one sentence, and what the
+/// user can do about it: written into `buffer`, which the caller owns, so
+/// nothing here allocates or keeps it.
+///
+/// The sentence is returned rather than logged because where it belongs depends
+/// on why a target was resolved: a turn that cannot begin shows it as a notice
+/// the next line can answer, and a run that cannot start at all reports it as
+/// its failure. `err` is what `targetFor` failed with.
+pub fn unreachableModel(buffer: []u8, err: anyerror, choice: []const u8) []const u8 {
+    const provider = (models.Choice{ .text = choice }).provider();
+    return switch (err) {
+        error.MissingApiKey => std.fmt.bufPrint(
+            buffer,
+            "the model {s} cannot be reached: no key is stored for '{s}' — run `billy login {s}` to store one",
+            .{ choice, provider, provider },
+        ) catch "the model cannot be reached: no key is stored for the provider it names",
+        else => std.fmt.bufPrint(
+            buffer,
+            "the model {s} cannot be reached: name its address under `providers` in the configuration," ++
+                " or run `billy models --refresh`",
+            .{choice},
+        ) catch "the model cannot be reached: no address is known for the provider it names",
+    };
 }
 
 test "a target carries the address, the key and the model of the choice it names" {
@@ -279,4 +281,29 @@ test "the configured choice is the target the configuration points at" {
     const target = try configured(&config, &credentials, &models.test_catalog, arena);
     try std.testing.expectEqualStrings("https://api.deepseek.com/chat/completions", target.url);
     try std.testing.expectEqualStrings("deepseek-flash", target.model);
+}
+
+test "what is wrong with a model is said with what to do about it" {
+    var buffer: [256]u8 = undefined;
+
+    // No key stored: the login that stores one is the thing to name, and the
+    // provider is named as the credential file names it.
+    try std.testing.expectEqualStrings(
+        "the model deepseek/deepseek-flash cannot be reached: no key is stored for 'deepseek'" ++
+            " — run `billy login deepseek` to store one",
+        unreachableModel(&buffer, error.MissingApiKey, "deepseek/deepseek-flash"),
+    );
+
+    // Neither the configuration nor the catalog names its address, so the two
+    // places an address can come from are what it says.
+    try std.testing.expectEqualStrings(
+        "the model who-knows/m cannot be reached: name its address under `providers`" ++
+            " in the configuration, or run `billy models --refresh`",
+        unreachableModel(&buffer, error.UnknownProvider, "who-knows/m"),
+    );
+
+    // A buffer too small for the sentence loses it rather than the message:
+    // what is shown still says the model cannot be reached.
+    var small: [8]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, unreachableModel(&small, error.MissingApiKey, "a/b"), "the model cannot be reached"));
 }

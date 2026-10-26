@@ -845,8 +845,13 @@ fn serveTurn(
     // on a page with a session that has nothing to fold must leave the page with
     // no new session to show. Anything that is not a command is a turn, and the
     // page is told the session's id first so it can add it to the list.
+    //
+    // A line the agent cannot get as far as asking -- the model it goes to has no
+    // key, or no address -- is the same: the notice saying so has already gone
+    // out through the emitter, and there is no session to announce, since
+    // nothing was written with it.
     const waiting = try agent.take(emitter, session, text);
-    if (waiting == .ran) {
+    if (waiting == .ran or waiting == .unresolved) {
         try r.server.sendHeader(gpa, session, &stream);
         try stream.done();
         return;
