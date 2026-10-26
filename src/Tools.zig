@@ -69,7 +69,7 @@ pub const Settings = struct {
 /// A set of tools, from the four things the run owns and the settings it runs
 /// with. The four are the run's, not the frontend's: every tool works in `dir`
 /// and sends through `http`.
-pub fn init(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, http: *std.http.Client, settings: Settings) !Tools {
+pub fn init(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, http: *std.http.Client, settings: Settings) Tools {
     return .{ .io = io, .dir = dir, .gpa = gpa, .http = http, .settings = settings };
 }
 
@@ -635,7 +635,7 @@ test "a bash command that outlives the timeout is killed and reported" {
 
     // A one-second limit kills a command that would otherwise run far longer,
     // and the model is told so rather than left waiting for it to finish.
-    var tool_set = try Tools.init(io, std.Io.Dir.cwd(), gpa, &http_client, .{ .bash_timeout_s = 1 });
+    var tool_set = Tools.init(io, std.Io.Dir.cwd(), gpa, &http_client, .{ .bash_timeout_s = 1 });
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"sleep 30\"}",
@@ -812,7 +812,7 @@ test "the tools work in the directory they are given, wherever billy runs" {
     defer log.deinit();
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var tool_set = try Tools.init(io, work, gpa, &http_client, .{ .bash_timeout_s = 120 });
+    var tool_set = Tools.init(io, work, gpa, &http_client, .{ .bash_timeout_s = 120 });
 
     // A file written by the tool lands in that directory. The result is not
     // what this is about, so it is discarded.
@@ -849,7 +849,7 @@ test "a file a tool replaces keeps the permissions it had" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var tool_set = try Tools.init(io, tmp.dir, gpa, &http_client, .{ .bash_timeout_s = 120 });
+    var tool_set = Tools.init(io, tmp.dir, gpa, &http_client, .{ .bash_timeout_s = 120 });
 
     // A file of the user's with a mode of its own, which is what a script is.
     // Replacing the file to write it is what keeps a kill from truncating it,
@@ -975,7 +975,7 @@ test "a result longer than the cap is cut and says what it lost" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var tool_set = try Tools.init(io, tmp.dir, gpa, &http_client, .{ .bash_timeout_s = 120 });
+    var tool_set = Tools.init(io, tmp.dir, gpa, &http_client, .{ .bash_timeout_s = 120 });
 
     var result: std.Io.Writer.Allocating = .init(gpa);
     defer result.deinit();
