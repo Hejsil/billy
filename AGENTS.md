@@ -58,9 +58,24 @@ least once. Read the rule, not the story; the story is in the review.
   `failureNotice` says "nothing was sent" only when the turn's emitter count did not move, and says
   the turn stopped partway when it had. *It said the first on every failure, including one that
   happened after half the reply had streamed.*
+- **Believing which layer catches a failure is not the same as having run it.** An error left out of
+  the `Reported` sweep because "the agent catches it and shows a notice" is reported twice, with a
+  trace, the first time the path to it is not the one you pictured. *`Endpoint` logged and returned
+  `MissingApiKey`; `ask` catches that and shows a notice — but `take` resolves a client before `ask`
+  is reached, so the first prompt of a run with no key stored printed the message, the error's name
+  and a stack trace, and ended the run. Ten lines of test would have walked it.*
+- **A failure a turn can meet does not end the run.** Anything `take` or `ask` can fail with belongs
+  in a notice, so the next line can be typed — `/model`, `/login` — and only a failure no turn can
+  fix belongs in the run's return. The notice carries what the failing layer knows: which provider,
+  and what to do about it.
 - **A silent `catch` is a decision: write it down.** `catch return`, `catch continue` and
   `catch {}` are fine where a comment says why the failure is not worth reporting (`Health.read`,
   `dirHas`, the terminal's restore). They are not fine by default.
+
+- **A request the user did not ask for is the one that most needs a deadline.** The run's own
+  requests happen where the user is watching a spinner; a catalog fetch happens before anything is
+  printed, on a path nobody chose, and a connection that is accepted and then stalls hangs the run
+  with no output at all.
 
 ## Writing files
 
@@ -83,7 +98,11 @@ least once. Read the rule, not the story; the story is in the review.
 - **A catalog is fetched into the cache, not compiled in.** It changes without a release, so a
   snapshot in the binary is stale by the time it ships. Fetch it when a run first needs it, version
   the file, and give the user a command to fetch it again; a failed fetch leaves an empty catalog
-  and a run that still works, not a start that fails.
+  and a run that still works, not a start that fails. **And what the default configuration names has
+  to resolve without the fetch**: a catalog that adds windows and other providers is a gain; one that
+  gates the providers billy ships is a run that cannot send a request offline. *With the shipped
+  provider table removed, a laptop with no network could not reach `deepseek/deepseek-flash` at all
+  — and the error told the user to run the one command that needed the network.*
 - **A document from a service is read into the shape billy keeps, and the cache holds only what is
   read back from it.** A typed parse skips what billy does not use as it reads, where a
   `std.json.Value` tree needs a helper and a `switch` per field; a field nothing reads is bytes
@@ -92,13 +111,18 @@ least once. Read the rule, not the story; the story is in the review.
   and `reasoning` that nothing read; typed, and with only the window kept, it is 336 KB.*
 - **A value the layer below can resolve itself is not carried down.** `Target.provider` was copied
   out of the catalog for a window lookup that asks the catalog by the choice instead, so the field
-  was read by no one and its doc said it was what the gauge measured against.
+  was read by no one and its doc said it was what the gauge measured against. The same mistake runs
+  the other way: a field added in case a frontend wants it, that only a test reads, is a promise to
+  keep it fed — grep for the reader before adding it.
 - **A lookup over stored things asks each only for the field that decides it.** `Session.latest`
   walks the listing in the order the question means (newest written first), asks each session file
   only for the directory it recorded by stepping over the conversation a token at a time, and stops
   at the first answer. *Loading every conversation to find the one started in this directory would
   cost the whole store to answer a question about one field of it; the title is read the same way,
-  from the front of the file.*
+  from the front of the file.* **Stepping over is not free, though: it reads the bytes.** A field a
+  lookup asks for belongs in the first few fields, where a reader can stop, not last, where answering
+  costs every conversation in the store. *`cwd` was written last, so `--resume` with nothing named
+  read 14 MB of sessions to answer "was this one started here?"*
 - **An index read back from a file is checked against what it indexes.** Drop one that names
   nothing rather than clamping it onto the nearest element, which invents a reference the writer
   never made; collapse a repeat too, since a list documented as one entry per thing is not one.
@@ -194,6 +218,9 @@ least once. Read the rule, not the story; the story is in the review.
 
 ## Style
 
+- A signature that returns an error it cannot produce makes every caller write a `try` that cannot
+  fail, and widens the error set of everything above it. `Tools.init` returns `!Tools` and cannot
+  fail; drop the `!`.
 - `writeAll` for a constant, `print` when there is something to format.
 - `if (!x)` not `if (x == false)`.
 - A log message carries no newline of its own; the log format adds one.
