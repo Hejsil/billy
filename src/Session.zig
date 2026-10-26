@@ -710,6 +710,14 @@ pub fn write(session: *const Session, writer: *std.Io.Writer) !void {
         try json.write(stored_title);
     }
 
+    // The directory the session was started in is written here, with the title,
+    // because it is the other field something asks a session file for without
+    // reading it: `latest` walks the files looking for the one started in this
+    // directory, and a field at the end costs every conversation in the store to
+    // answer a question about one of them.
+    try json.objectField("cwd");
+    try json.write(session.cwd());
+
     if (session.systemPrompt()) |prompt| {
         try json.objectField("system_prompt");
         try json.write(prompt);
@@ -738,9 +746,6 @@ pub fn write(session: *const Session, writer: *std.Io.Writer) !void {
 
     try json.objectField("context_tokens");
     try json.write(session.context_tokens);
-
-    try json.objectField("cwd");
-    try json.write(session.cwd());
 
     try json.endObject();
 }
@@ -1025,8 +1030,9 @@ pub fn list(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator) ![]Named {
 ///
 /// The listing's order is the answer's order: the newest session that recorded
 /// `start_cwd` is the one a run in that directory would continue. Each is asked
-/// only for the directory it recorded, so one started elsewhere costs its bytes
-/// rather than a conversation loaded to be thrown away.
+/// only for the directory it recorded, which `write` puts near the front; a file
+/// written before it moved holds it last and is stepped over, so even that one
+/// costs its bytes rather than a conversation loaded to be thrown away.
 ///
 /// A file that records no directory -- one written before it was kept -- cannot
 /// say it belongs there, so it is never the answer; it is still resumable by its
@@ -1135,10 +1141,10 @@ const title_read_buffer_len = 1024;
 /// The working directory stored in the session file `file`, or null when it
 /// records none, which a file written before the field did.
 ///
-/// The directory is the last field written, so the file is read to its end; what
-/// is stepped over on the way is the conversation, one token at a time, so a
-/// session costs its bytes rather than a conversation built for a question about
-/// one field of it.
+/// `write` puts the directory third, so this reads a dozen bytes and stops. A
+/// file written before it moved holds it last: that one is read to its end, with
+/// the conversation stepped over a token at a time, so it costs its bytes rather
+/// than a conversation built for a question about one field of it.
 fn cwdFrom(io: std.Io, gpa: std.mem.Allocator, file: std.Io.File) !?[]const u8 {
     var reader_buf: [std.heap.page_size_min]u8 = undefined;
     var reader = file.reader(io, &reader_buf);
@@ -1536,14 +1542,35 @@ test "the sessions in a directory are listed by when they were written" {
     try std.testing.expectEqualStrings(oldest, ids[2].id);
 }
 
+test "the directory a session was started in is written at the front" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try newTestSession(&tmp);
+    defer session.deinit();
+    try session.setTitle("a name");
+    try session.append(.{ .role = .user, .content = "hi" });
+
+    const text = try tmp.dir.readFileAlloc(std.testing.io, session.name(), std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(text);
+
+    // Two things read a session file without reading the conversation: the
+    // listing asks for the title, and `latest` for the directory it was started
+    // in. Both are written before anything a conversation can grow into, so
+    // neither has to step over one. The `latest` test above holds the other half:
+    // a file from an older billy keeps the directory last, and is still read.
+    try std.testing.expect(std.mem.startsWith(u8, text, "{\"version\":3,\"title\":\"a name\",\"cwd\":\"/work\","));
+}
+
 test "the latest session for a directory is the one last written there" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     // Sessions from two directories, with the conversation of one written out in
-    // full: the directory is the last field of a session, so finding it means
-    // stepping over everything before it.
+    // full. These are files from before the directory moved to the front of one,
+    // which is the shape a session saved by an older billy has: finding the
+    // directory there means stepping over everything before it.
     const here =
         \\{"version":3,"messages":[{"role":"user","content":"hello \"there\""}],"cwd":"/work"}
     ;
