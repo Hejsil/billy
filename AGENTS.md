@@ -68,6 +68,15 @@ least once. Read the rule, not the story; the story is in the review.
   in a notice, so the next line can be typed — `/model`, `/login` — and only a failure no turn can
   fix belongs in the run's return. The notice carries what the failing layer knows: which provider,
   and what to do about it.
+- **Work that can run long needs a way to be given up on.** The thing that owns the keyboard owns
+  that way: `LineEditor` puts the terminal into raw mode to read a line and restores it before it
+  returns, so for the whole of a turn the terminal is cooked, `ISIG` is on, and Ctrl-C kills the
+  process rather than the turn. A request with no deadline, a 120-second `bash` and a stalled stream
+  are all reachable, and the only exit was `kill`.
+- **Killing what you started is not killing what it started.** `std.process.run`'s timeout kills one
+  pid, and 0.17's `SpawnOptions` has no process-group option, so a killed `make -j8` leaves its
+  compilers running while the tool reports that the command was killed. Say what was killed, or put
+  the command in a group of its own.
 - **A silent `catch` is a decision: write it down.** `catch return`, `catch continue` and
   `catch {}` are fine where a comment says why the failure is not worth reporting (`Health.read`,
   `dirHas`, the terminal's restore). They are not fine by default.
@@ -92,6 +101,12 @@ least once. Read the rule, not the story; the story is in the review.
   take the bit off a script, nor open a file the user keeps to themselves — it replaces a symbolic
   link rather than writing through it, and it is the *directory* that has to be writable rather than
   the file. The first is done for you; the other two are what replacing costs.
+- **A store written whole is written once per unit of work, not once per record.** `Session.append`
+  rewrites the entire file — twice, with `createFileAtomic`'s temporary — and a turn appends the
+  prompt, the reply and one result per tool call, so the cost is quadratic in a session's messages:
+  the largest session here (3 MB, 1,933 messages) had 2.9 GB written through it. `repairTail` already
+  completes a turn a kill left half-written, so saving per turn loses nothing a per-message save was
+  protecting.
 - **A file a human may open is indented and versioned; a file only billy reads is compact and
   versioned.** When a version is bumped, the load path migrates the old shape; do not let a reader
   guess.
@@ -211,6 +226,13 @@ least once. Read the rule, not the story; the story is in the review.
 
 ## Checking by hand
 
+- **When a guarantee is borrowed from the standard library, read it and quote it.** A third review
+  spent its time checking what the code assumes rather than what it says: `std.http.Client` states
+  "connections are opened in a thread-safe manner, but individual requests are not", which is exactly
+  the shape the server uses it in; `child.kill` kills one pid, which is why a timeout's report is
+  half true. Both were assumptions until the doc was opened.
+- **Run the suite in the other modes once in a while.** `-Doptimize=ReleaseSafe` and `ReleaseFast`
+  catch reliance on a check only Debug makes, and cost a rebuild.
 - **Point billy's directories somewhere disposable before running it.** `XDG_DATA_HOME`,
   `XDG_CONFIG_HOME` and `XDG_CACHE_HOME` are what it reads and writes, and the real ones are the
   user's: a `billy config` run to see a message changed a setting in their actual configuration.
