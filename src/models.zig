@@ -37,12 +37,12 @@ pub const Catalog = struct {
         if (provider) |name| {
             if (catalog.find(name)) |known| {
                 const entry = known.model(model) orelse return null;
-                return .{ .provider = known.name, .context_window = entry.context };
+                return .{ .context_window = entry.context };
             }
         }
         for (catalog.providers) |*known| {
             const entry = known.model(model) orelse continue;
-            return .{ .provider = known.name, .context_window = entry.context };
+            return .{ .context_window = entry.context };
         }
         return null;
     }
@@ -84,9 +84,10 @@ pub const Model = struct {
     context: usize,
 };
 
-/// What is known about a model: the provider it was found under, and its window.
+/// What is known about a model: the window its provider gives it, which is what
+/// the gauge shows and what compaction is measured against. Where it was found is
+/// not kept: the choice the caller asked about already names it.
 pub const Metadata = struct {
-    provider: []const u8,
     context_window: usize,
 };
 
@@ -352,12 +353,11 @@ test "the catalog finds a provider by the name models.dev lists it under" {
 
 test "metadata is looked up at the provider, then among all providers" {
     const flash = test_catalog.metadata("deepseek", "deepseek-flash").?;
-    try std.testing.expectEqualStrings("deepseek", flash.provider);
     try std.testing.expectEqual(1_000_000, flash.context_window);
 
-    // The same model under another provider uses that provider's window.
+    // A model is asked for at the provider named, and answers with that
+    // provider's window: the same id is 262k at one provider and not at another.
     const elsewhere = test_catalog.metadata("opencode-go", "kimi-k2.7-code").?;
-    try std.testing.expectEqualStrings("opencode-go", elsewhere.provider);
     try std.testing.expectEqual(262_144, elsewhere.context_window);
 
     // Without a provider, the model is found among all of them.

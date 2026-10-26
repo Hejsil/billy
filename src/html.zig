@@ -1506,10 +1506,7 @@ test "the header carries the model, the directory and the gauge" {
         .cwd = "/home/user/repo/billy",
         .home = "/home/user",
         .context_tokens = 16_000,
-        .model_info = .{
-            .provider = "deepseek",
-            .context_window = 128_000,
-        },
+        .model_info = .{ .context_window = 128_000 },
     }, &out.writer);
 
     // The same numbers the terminal header shows, each in a part of its own.

@@ -187,11 +187,13 @@ test "a model as a header shows it carries the choice and the window of its mode
     try std.testing.expectEqualStrings("opencode-go/kimi-k2.7-code", known.choice);
     try std.testing.expectEqual(@as(usize, 262_144), known.info.?.context_window);
 
-    // A bare model id is looked for among every provider the catalog holds, since the
-    // name of a provider is not always known: that is what a proxy names.
-    const bare = modelOf("deepseek-flash", &models.test_catalog);
-    try std.testing.expectEqualStrings("deepseek-flash", bare.choice);
-    try std.testing.expectEqual("deepseek", bare.info.?.provider);
+    // A bare model id is looked for among every provider the catalog holds, since
+    // the name of a provider is not always known: that is what a proxy names. The
+    // model is one only a single provider lists, so finding its window at all is
+    // finding it there.
+    const bare = modelOf("kimi-k2.7-code", &models.test_catalog);
+    try std.testing.expectEqualStrings("kimi-k2.7-code", bare.choice);
+    try std.testing.expectEqual(@as(usize, 262_144), bare.info.?.context_window);
 
     // A model billy has no numbers for has no window, so a header shows no gauge.
     try std.testing.expect(modelOf("test/m", &models.test_catalog).info == null);

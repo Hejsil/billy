@@ -1965,7 +1965,7 @@ test "a header is built from a session" {
     defer out.deinit();
     const model: Endpoint.Model = .{
         .choice = "deepseek/deepseek-flash",
-        .info = .{ .provider = "deepseek", .context_window = 128_000 },
+        .info = .{ .context_window = 128_000 },
     };
     try out.writer.print("{f}", .{SessionHeader.of(&session, model, null)});
 

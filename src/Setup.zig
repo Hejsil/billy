@@ -333,7 +333,6 @@ test "a header names the model the session goes to, not the one billy is pointed
     const recorded = sessionModel(&opened.config, &models.test_catalog, &session);
     try std.testing.expectEqualStrings("opencode-go/kimi-k2.7-code", recorded.choice);
     try std.testing.expectEqual(@as(usize, 262_144), recorded.info.?.context_window);
-    try std.testing.expectEqual("opencode-go", recorded.info.?.provider);
 
     // A session that recorded none is sent where the configuration points, so
     // that is what its header names.
