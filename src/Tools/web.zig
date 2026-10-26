@@ -76,9 +76,11 @@ pub const Descriptor = struct {
 /// Where a provider's key goes, which is the one thing its services differ on.
 pub const Auth = enum { none, bearer, x_api_key, x_subscription_token };
 
-/// What a GET carries after the query: Brave takes a result count; SearXNG wants
-/// `format=json` and takes no count.
-pub const Query = enum { count, format_json };
+/// What a search's GET carries after the query it was given: Brave takes a result
+/// count; SearXNG wants `format=json` and takes no count. It is the tail of the
+/// query string, appended to the `q=` the search wrote, so it is not a query of
+/// its own.
+pub const QueryTail = enum { count, format_json };
 
 /// One web search a provider answers.
 pub const SearchSpec = struct {
@@ -88,7 +90,7 @@ pub const SearchSpec = struct {
     /// whole, whoever named it.
     configured_path: []const u8 = "",
     request: union(enum) {
-        get: Query,
+        get: QueryTail,
         /// A POST, with the body this builds.
         post: *const fn (gpa: std.mem.Allocator, query: []const u8, max_results: usize) anyerror![]const u8,
     },

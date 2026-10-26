@@ -117,8 +117,8 @@ fn searchBackend(
     var target = location;
 
     const method: std.http.Method = switch (spec.request) {
-        .get => |kind| get: {
-            asked_url = switch (kind) {
+        .get => |tail| get: {
+            asked_url = switch (tail) {
                 .count => try web.queryUrl(gpa, location, query, "&count={d}", .{asked}),
                 .format_json => try web.queryUrl(gpa, location, query, "&format=json", .{}),
             };
