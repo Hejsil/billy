@@ -60,7 +60,7 @@ least once. Read the rule, not the story; the story is in the review.
   happened after half the reply had streamed.*
 - **Believing which layer catches a failure is not the same as having run it.** An error left out of
   the `Reported` sweep because "the agent catches it and shows a notice" is reported twice, with a
-  trace, the first time the path to it is not the one you pictured. *`Endpoint` logged and returned
+  trace, the first time the path to it is not the one you pictured. *`endpoint` logged and returned
   `MissingApiKey`; `ask` catches that and shows a notice — but `take` resolves a client before `ask`
   is reached, so the first prompt of a run with no key stored printed the message, the error's name
   and a stack trace, and ended the run. Ten lines of test would have walked it.*
@@ -151,7 +151,7 @@ least once. Read the rule, not the story; the story is in the review.
 - **A slice out of the string pool dies at the next `intern`.** Copy before you leave the function,
   take an index and resolve it where you use it, or read it again after the write. This rule is
   load-bearing in three places
-  (`Endpoint.targetFor`, `Session.repairTail`, `Server.serveTurn`) and all three had to be fixed
+  (`endpoint.targetFor`, `Session.repairTail`, `Server.serveTurn`) and all three had to be fixed
   once.
 - **`deinit` once, in the owner.** Between an `errdefer` in a loop and an `errdefer` outside it,
   check which one frees what: `Session.listIn` got this right, and that is the shape to copy.
@@ -254,8 +254,8 @@ least once. Read the rule, not the story; the story is in the review.
   `runTerminal(billy, ...)` that the move into `Billy` had just added.*
 - **Except where a method cannot exist.** A helper taking an optional has no method call through it
   (`Health.isSetAside(?*Health, ...)`), and a free function in a module is not a decl of the type its
-  first argument has -- `Endpoint.targetFor(config, ...)` cannot be `config.targetFor(...)`, because
-  `targetFor` lives in `Endpoint`. Those are called by naming the module, which is what tells them
+  first argument has -- `endpoint.targetFor(config, ...)` cannot be `config.targetFor(...)`, because
+  `targetFor` lives in `endpoint`. Those are called by naming the module, which is what tells them
   apart from a method.
 - A signature that returns an error it cannot produce makes every caller write a `try` that cannot
   fail, and widens the error set of everything above it. `Tools.init` returns `!Tools` and cannot

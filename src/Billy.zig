@@ -17,8 +17,8 @@ const Agent = @import("Agent.zig");
 const Config = @import("Config.zig");
 const Credentials = @import("Credentials.zig");
 const Dirs = @import("Dirs.zig");
-const Endpoint = @import("Endpoint.zig");
-const Setup = @import("Setup.zig");
+const endpoint = @import("endpoint.zig");
+const setup = @import("setup.zig");
 const Health = @import("Health.zig");
 const report = @import("report.zig");
 const Session = @import("Session.zig");
@@ -253,9 +253,9 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resuming: ?Resume) !void {
         .credentials = &billy.credentials,
         .catalog = &billy.catalog,
         .behaviour = Agent.Behaviour.fromConfig(&billy.config),
-        .tools = Setup.toolSettings(
+        .tools = setup.toolSettings(
             &billy.config,
-            try Setup.Backends.build(arena, &billy.config, &billy.credentials),
+            try setup.Backends.build(arena, &billy.config, &billy.credentials),
             &billy.health,
         ),
         .home = billy.environ.get("HOME"),
@@ -333,7 +333,7 @@ fn runTerminal(
         // to now, so a model changed since the last turn reads right at once.
         try header.writer.print("{f}", .{Agent.SessionHeader.of(
             session,
-            Setup.sessionModel(&billy.config, &billy.catalog, session),
+            setup.sessionModel(&billy.config, &billy.catalog, session),
             options.home,
         )});
         const line = (try editor.readLine(header.written(), input_prompt)) orelse break;
@@ -467,10 +467,10 @@ pub fn serve(billy: *Billy, host: []const u8, port: u16) !void {
     // a turn that cannot begin says so as a notice. A server is different: one
     // that cannot send a request at all has nothing to serve, and says so before
     // it listens rather than on the first thing asked of it.
-    _ = Endpoint.configured(&billy.config, &billy.credentials, &billy.catalog, arena) catch |err| switch (err) {
+    _ = endpoint.configured(&billy.config, &billy.credentials, &billy.catalog, arena) catch |err| switch (err) {
         error.UnknownProvider, error.MissingApiKey => {
             var notice: [256]u8 = undefined;
-            std.log.err("{s}", .{Endpoint.unreachableModel(&notice, err, billy.config.stored.model)});
+            std.log.err("{s}", .{endpoint.unreachableModel(&notice, err, billy.config.stored.model)});
             return report.Reported;
         },
         else => |other| return other,
@@ -487,7 +487,7 @@ pub fn serve(billy: *Billy, host: []const u8, port: u16) !void {
         .health = &billy.health,
         .cwd = billy.cwd,
         .environ = billy.environ,
-        .backends = try Setup.Backends.build(arena, &billy.config, &billy.credentials),
+        .backends = try setup.Backends.build(arena, &billy.config, &billy.credentials),
     };
     return server.serve(host, port);
 }

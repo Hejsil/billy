@@ -131,6 +131,7 @@ pub fn build(b: *std.Build) void {
         var builder = zlinter.builder(b, .{});
         builder.addRule(.{ .builtin = .no_deprecated }, .{ .severity = .@"error" });
         builder.addRule(.{ .builtin = .no_unused }, .{ .container_declaration = .@"error" });
+        builder.addRule(.{ .builtin = .file_naming }, .{});
         builder.addPaths(.{
             .include_dirs = &.{b.path("src")},
             .include_files = &.{b.path("build.zig")},

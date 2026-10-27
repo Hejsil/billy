@@ -3,7 +3,7 @@
 //! and the model a header names.
 //!
 //! Where a request is actually sent -- the provider and model resolved into a URL
-//! and a key -- is `Endpoint`, which the agent resolves for itself before every
+//! and a key -- is `endpoint`, which the agent resolves for itself before every
 //! turn. What is here is the rest of what a frontend hands a run before it starts.
 //!
 //! Nothing is held here: every function takes the two it needs and returns a
@@ -12,7 +12,7 @@
 const std = @import("std");
 const Config = @import("Config.zig");
 const Credentials = @import("Credentials.zig");
-const Endpoint = @import("Endpoint.zig");
+const endpoint = @import("endpoint.zig");
 const models = @import("models.zig");
 const Health = @import("Health.zig");
 const report = @import("report.zig");
@@ -55,9 +55,9 @@ pub const Backends = struct {
 /// it: the choice it recorded, or the configured one for a session that recorded
 /// none. A session keeps the choice it recorded, so the header names where it
 /// goes rather than where billy is pointed. The terminal's header is
-/// built from the same `Endpoint.modelOf`, so a page and a terminal agree.
-pub fn sessionModel(config: *const Config, catalog: *const models.Catalog, session: *const Session) Endpoint.Model {
-    return Endpoint.modelOf(session.modelChoice(config.stored.model), catalog);
+/// built from the same `endpoint.modelOf`, so a page and a terminal agree.
+pub fn sessionModel(config: *const Config, catalog: *const models.Catalog, session: *const Session) endpoint.Model {
+    return endpoint.modelOf(session.modelChoice(config.stored.model), catalog);
 }
 
 /// How a run's tools are built: how their blocks are laid out, the limits they
@@ -366,7 +366,7 @@ test "a target names bytes of its own, not a slice of the session's pool" {
     // that is what it is sent to.
     const choice = session.modelChoice(opened.config.stored.model);
     try std.testing.expectEqualStrings("opencode-go/glm-5.3-flash", choice);
-    const target = try Endpoint.targetFor(&opened.config, &credentials, &models.test_catalog, arena, choice);
+    const target = try endpoint.targetFor(&opened.config, &credentials, &models.test_catalog, arena, choice);
     // The model the session recorded is interned in its string pool, and a
     // pointer into that pool survives no write to it. Writing more strings, as
     // a turn does when it stores a message, must not leave the target naming

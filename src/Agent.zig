@@ -5,7 +5,7 @@
 const std = @import("std");
 const Config = @import("Config.zig");
 const Credentials = @import("Credentials.zig");
-const Endpoint = @import("Endpoint.zig");
+const endpoint = @import("endpoint.zig");
 const llm = @import("llm.zig");
 const models = @import("models.zig");
 const Tools = @import("Tools.zig");
@@ -73,7 +73,7 @@ const Command = union(enum) {
 /// Where a request is sent, and how it is asked. Resolved from the session's own
 /// model just before each turn, so a session moved to another model is sent
 /// there, and asked that provider's way, from the next turn on.
-const Target = Endpoint.Target;
+const Target = endpoint.Target;
 
 /// What a run is given, in one value: what each turn's target is resolved from,
 /// how its agent behaves on it, what its tools run with, and the home directory
@@ -374,7 +374,7 @@ pub const SessionHeader = struct {
     /// The header for `session`: what it holds -- its id, directory and size --
     /// with the model it goes to and the window of that model, and the `home` a
     /// path is shortened against, which the session keeps none of.
-    pub fn of(session: *const Session, model: Endpoint.Model, home: ?[]const u8) SessionHeader {
+    pub fn of(session: *const Session, model: endpoint.Model, home: ?[]const u8) SessionHeader {
         return .{
             .id = session.id(),
             .model = model.choice,
@@ -553,7 +553,7 @@ fn targetFor(agent: *Agent, session: *Session) !Target {
     _ = agent.target_state.reset(.retain_capacity);
     const choice = session.modelChoice(agent.config.stored.model);
     if (session.model() == null) try session.setModel(choice);
-    return Endpoint.targetFor(agent.config, agent.credentials, agent.catalog, agent.target_state.allocator(), choice);
+    return endpoint.targetFor(agent.config, agent.credentials, agent.catalog, agent.target_state.allocator(), choice);
 }
 
 /// The client one turn is sent with, built from where the session's model points
@@ -573,8 +573,8 @@ fn clientFor(agent: *Agent, session: *Session) !llm.Client {
 
 /// The model `session` goes to, as a header shows it: the choice it recorded, or
 /// the configured one for a session that recorded none.
-fn sessionModel(agent: *const Agent, session: *const Session) Endpoint.Model {
-    return Endpoint.modelOf(session.modelChoice(agent.config.stored.model), agent.catalog);
+fn sessionModel(agent: *const Agent, session: *const Session) endpoint.Model {
+    return endpoint.modelOf(session.modelChoice(agent.config.stored.model), agent.catalog);
 }
 
 /// What a line typed into a session came to.
@@ -666,7 +666,7 @@ fn resolvedClient(agent: *Agent, emitter: *Emitter, session: *Session) !?llm.Cli
         error.MissingApiKey, error.UnknownProvider => {
             var notice: [256]u8 = undefined;
             const choice = session.modelChoice(agent.config.stored.model);
-            try emitter.show(.{ .notice = Endpoint.unreachableModel(&notice, err, choice) });
+            try emitter.show(.{ .notice = endpoint.unreachableModel(&notice, err, choice) });
             return null;
         },
         else => |other| return other,
@@ -1943,7 +1943,7 @@ test "a header is built from a session" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    const model: Endpoint.Model = .{
+    const model: endpoint.Model = .{
         .choice = "deepseek/deepseek-flash",
         .info = .{ .context_window = 128_000 },
     };

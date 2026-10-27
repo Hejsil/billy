@@ -19,7 +19,7 @@ const std = @import("std");
 const Agent = @import("Agent.zig");
 const Config = @import("Config.zig");
 const Credentials = @import("Credentials.zig");
-const Setup = @import("Setup.zig");
+const setup = @import("setup.zig");
 const Health = @import("Health.zig");
 const models = @import("models.zig");
 const html = @import("html.zig");
@@ -94,7 +94,7 @@ cwd: []const u8,
 environ: *const std.process.Environ.Map,
 /// The backends its web tools ask, resolved before anything was served so a key
 /// that is missing is reported then rather than on the first thing asked.
-backends: Setup.Backends,
+backends: setup.Backends,
 
 /// What a turn is given, resolved the same way a terminal run's is and laid out
 /// plainly rather than decorated for a terminal.
@@ -104,7 +104,7 @@ fn options(server: *const Server) Agent.Options {
         .credentials = &server.credentials,
         .catalog = server.catalog,
         .behaviour = Agent.Behaviour.fromConfig(server.config),
-        .tools = Setup.toolSettings(server.config, server.backends, server.health),
+        .tools = setup.toolSettings(server.config, server.backends, server.health),
         .home = server.environ.get("HOME"),
         // The user's own instructions live beside the configuration, and join
         // every session's prompt. The server owns the directory and outlives
@@ -884,7 +884,7 @@ fn serveTurn(
 
 /// Writes the header line the page shows above `session`'s conversation.
 fn writeHeader(server: *const Server, session: *const Session, out: *std.Io.Writer) !void {
-    const shown = Setup.sessionModel(server.config, server.catalog, session);
+    const shown = setup.sessionModel(server.config, server.catalog, session);
     try html.header(.{
         .id = session.id(),
         .model = shown.choice,
