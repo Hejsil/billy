@@ -129,6 +129,11 @@ const Codepoint = struct { cp: u21, len: usize };
 fn decode(text: []const u8) Codepoint {
     if (text.len == 0) return .{ .cp = 0, .len = 0 };
     const len = @min(std.unicode.utf8ByteSequenceLength(text[0]) catch 1, text.len);
+    // Decoding the codepoint a sequence of known width spells has no replacement
+    // yet: ziglang/zig#23096 leaves `utf8Decode` alone because it "needs a new
+    // API first", and std still calls it itself. The suppression is what finds
+    // these two places again when that API lands.
+    // zlinter-disable-next-line no_deprecated - std has no replacement yet
     const cp = std.unicode.utf8Decode(text[0..len]) catch return .{ .cp = text[0], .len = 1 };
     return .{ .cp = cp, .len = len };
 }
@@ -140,6 +145,7 @@ fn decodeBack(text: []const u8, end: usize) Codepoint {
     var start = end - 1;
     while (start > 0 and end - start < 4 and isContinuation(text[start])) start -= 1;
     const len = end - start;
+    // zlinter-disable-next-line no_deprecated - std has no replacement yet
     const cp = std.unicode.utf8Decode(text[start..end]) catch text[start];
     return .{ .cp = cp, .len = len };
 }

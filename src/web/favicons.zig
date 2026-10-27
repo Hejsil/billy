@@ -25,8 +25,8 @@ pub fn write(result: []const u8, out: *std.Io.Writer) !void {
 
 /// The host name of `url`, without the scheme, port or path.
 fn hostOf(url: []const u8) ?[]const u8 {
-    const after_scheme = if (std.mem.indexOf(u8, url, "://")) |i| url[i + 3 ..] else url;
-    const end = std.mem.indexOfAny(u8, after_scheme, "/:") orelse after_scheme.len;
+    const after_scheme = if (std.mem.find(u8, url, "://")) |i| url[i + 3 ..] else url;
+    const end = std.mem.findAny(u8, after_scheme, "/:") orelse after_scheme.len;
     const host = after_scheme[0..end];
     if (host.len == 0) return null;
     return host;
@@ -58,7 +58,7 @@ fn originOf(url: []const u8, buffer: []u8) ?[]const u8 {
     const uri = std.Uri.parse(url) catch return null;
     if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https"))
         return null;
-    return std.fmt.bufPrint(buffer, "{f}", .{uri.fmt(.{
+    return std.mem.print(buffer, "{f}", .{uri.fmt(.{
         .scheme = true,
         .authority = true,
     })}) catch null;
@@ -81,11 +81,11 @@ test "a result with an http address is given a bubble, and one without is not" {
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, written, "<a class=\"fav\""));
     // The host is the tooltip and the first letter sits behind the image, so a
     // site with no favicon still reads as a bubble.
-    try std.testing.expect(std.mem.indexOf(u8, written, "title=\"ziglang.org\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "<span class=\"letter\">d</span>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "/tmp/notes.html") == null);
+    try std.testing.expect(std.mem.find(u8, written, "title=\"ziglang.org\"") != null);
+    try std.testing.expect(std.mem.find(u8, written, "<span class=\"letter\">d</span>") != null);
+    try std.testing.expect(std.mem.find(u8, written, "/tmp/notes.html") == null);
     // The favicon comes from the result's origin, with the path left behind.
-    try std.testing.expect(std.mem.indexOf(u8, written, "https://docs.example.org/favicon.ico") != null);
+    try std.testing.expect(std.mem.find(u8, written, "https://docs.example.org/favicon.ico") != null);
 }
 
 test "text that is not a list of results is given no bubbles" {

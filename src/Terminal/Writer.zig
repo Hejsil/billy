@@ -166,6 +166,7 @@ fn writeText(writer: Writer, bytes: []const u8) !void {
             continue;
         };
         if (at + len > bytes.len) break;
+        // zlinter-disable-next-line no_deprecated - std has no replacement yet
         const codepoint = std.unicode.utf8Decode(bytes[at..][0..len]) catch {
             at += 1;
             continue;

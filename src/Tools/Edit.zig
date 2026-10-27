@@ -114,7 +114,7 @@ fn find(gpa: std.mem.Allocator, haystack: []const u8, needle: []const u8) !Found
         return .{ .rule = .exact, .spans = spans };
 
     var from: usize = 0;
-    while (std.mem.indexOfPos(u8, haystack, from, needle)) |at| {
+    while (std.mem.findPos(u8, haystack, from, needle)) |at| {
         try spans.append(gpa, .{ .start = at, .end = at + needle.len });
         from = at + needle.len;
     }
@@ -199,7 +199,7 @@ fn splitLines(gpa: std.mem.Allocator, text: []const u8) ![]Line {
 
     var at: usize = 0;
     while (at < text.len) {
-        const newline = std.mem.indexOfScalarPos(u8, text, at, '\n');
+        const newline = std.mem.findScalarPos(u8, text, at, '\n');
         const end = if (newline) |i| i + 1 else text.len;
         var content_end = if (newline) |i| i else text.len;
         // A carriage return before the newline is the line ending, not the line.
@@ -258,7 +258,7 @@ fn indentOf(line: []const u8) []const u8 {
 
 /// The first line of `text`, up to its line ending.
 fn firstLine(text: []const u8) []const u8 {
-    return text[0 .. std.mem.indexOfScalar(u8, text, '\n') orelse text.len];
+    return text[0 .. std.mem.findScalar(u8, text, '\n') orelse text.len];
 }
 
 /// What replacing `needle` produced: the new contents and how many places changed,

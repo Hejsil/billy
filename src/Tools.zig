@@ -381,7 +381,7 @@ pub const Heading = struct {
 /// a description. A header is one line, so only the first is taken; what the
 /// string holds in full is shown under the header, or in the call's body.
 pub fn headerLine(text: []const u8) []const u8 {
-    const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    const end = std.mem.findScalar(u8, text, '\n') orelse text.len;
     return std.mem.trim(u8, text[0..end], " \t\r");
 }
 
@@ -422,7 +422,7 @@ pub const BashOutput = struct {
 /// behind a `stderr:` line of its own. Null when the result does not open with a
 /// status, which is how a result stored before one was written reads.
 pub fn bashOutput(result: []const u8) ?BashOutput {
-    const newline = std.mem.indexOfScalar(u8, result, '\n') orelse return null;
+    const newline = std.mem.findScalar(u8, result, '\n') orelse return null;
     const status = result[0..newline];
     if (!std.mem.startsWith(u8, status, exit_prefix)) return null;
     const code = status[exit_prefix.len..];
@@ -439,7 +439,7 @@ pub fn bashOutput(result: []const u8) ?BashOutput {
     if (std.mem.startsWith(u8, body, marker)) {
         return .{ .exit = exit, .stdout = "", .stderr = body[marker.len..] };
     }
-    if (std.mem.indexOf(u8, body, "\n" ++ marker)) |at| {
+    if (std.mem.find(u8, body, "\n" ++ marker)) |at| {
         return .{
             .exit = exit,
             .stdout = body[0..at],
@@ -747,7 +747,7 @@ test "a fetch that fails reaches the reader as a failure" {
     defer shown.deinit();
     const writer: Terminal.Writer = .{ .style = .ansi, .out = &shown.writer };
     try Terminal.tool.printResult(call, result.written(), writer);
-    try std.testing.expect(std.mem.indexOf(u8, shown.written(), "output") != null);
+    try std.testing.expect(std.mem.find(u8, shown.written(), "output") != null);
 }
 
 test "the definitions cover every tool the loop dispatches" {
@@ -833,7 +833,7 @@ test "the tools work in the directory they are given, wherever billy runs" {
         .name = "bash",
         .arguments = "{\"command\":\"pwd\"}",
     } }, &result.writer);
-    try std.testing.expect(std.mem.indexOf(u8, result.written(), "/project\n") != null);
+    try std.testing.expect(std.mem.find(u8, result.written(), "/project\n") != null);
 }
 
 test "a file a tool replaces keeps the permissions it had" {
@@ -988,7 +988,7 @@ test "a result longer than the cap is cut and says what it lost" {
     // what the tool wrote past the cap.
     const written = result.written();
     const marker = "\n… ";
-    const cut = std.mem.indexOf(u8, written, marker) orelse return error.NoTruncation;
+    const cut = std.mem.find(u8, written, marker) orelse return error.NoTruncation;
     // What the reader kept is exactly the cap, and what the note counts is
     // everything past it. The reader numbers each line, so what it wrote is not
     // the file's length: four columns for the number (1000 is the largest), a

@@ -61,7 +61,7 @@ pub fn generate(io: std.Io, buf: *[length]u8) void {
 pub fn isId(text: []const u8) bool {
     if (text.len != length) return false;
     for (text) |byte| {
-        if (std.mem.indexOfScalar(u8, alphabet, byte) == null) return false;
+        if (std.mem.findScalar(u8, alphabet, byte) == null) return false;
     }
     return true;
 }
@@ -93,7 +93,7 @@ test "an id is 26 characters of Crockford base32" {
     try std.testing.expectEqual('7', buf[0]);
     // None of the letters Crockford leaves out can appear.
     for (buf) |byte| {
-        try std.testing.expect(std.mem.indexOfScalar(u8, "ILOU", byte) == null);
+        try std.testing.expect(std.mem.findScalar(u8, "ILOU", byte) == null);
     }
 }
 
@@ -139,7 +139,7 @@ test "the value encoded is the value decoded" {
     try std.testing.expectEqualStrings("0000000001041061050R3GG28A", &buf);
 
     var value: u128 = 0;
-    for (buf) |byte| value = value << 5 | std.mem.indexOfScalar(u8, alphabet, byte).?;
+    for (buf) |byte| value = value << 5 | std.mem.findScalar(u8, alphabet, byte).?;
 
     var expected: u128 = 0;
     for (random) |byte| expected = (expected << 8) | byte;

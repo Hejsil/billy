@@ -97,7 +97,7 @@ pub fn modelOf(choice: []const u8, catalog: *const models.Catalog) Model {
 
 /// The full URL of the completions endpoint under `base_url`.
 fn completionsUrl(arena: std.mem.Allocator, base_url: []const u8) ![]u8 {
-    return std.fmt.allocPrint(arena, "{s}/chat/completions", .{
+    return arena.print("{s}/chat/completions", .{
         std.mem.trimEnd(u8, base_url, "/"),
     });
 }
@@ -123,12 +123,12 @@ fn baseUrlOf(providers: Config.Providers, catalog: *const models.Catalog, choice
 pub fn unreachableModel(buffer: []u8, err: anyerror, choice: []const u8) []const u8 {
     const provider = (models.Choice{ .text = choice }).provider();
     return switch (err) {
-        error.MissingApiKey => std.fmt.bufPrint(
+        error.MissingApiKey => std.mem.print(
             buffer,
             "the model {s} cannot be reached: no key is stored for '{s}' — run `billy login {s}` to store one",
             .{ choice, provider, provider },
         ) catch "the model cannot be reached: no key is stored for the provider it names",
-        else => std.fmt.bufPrint(
+        else => std.mem.print(
             buffer,
             "the model {s} cannot be reached: name its address under `providers` in the configuration," ++
                 " or run `billy models --refresh`",

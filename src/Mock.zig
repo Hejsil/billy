@@ -80,7 +80,7 @@ pub fn start(
         .requests = requests,
         .answer = answer,
         .listener = listener,
-        .url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}{s}", .{
+        .url = try gpa.print("http://127.0.0.1:{d}{s}", .{
             listener.socket.address.getPort(),
             path,
         }),

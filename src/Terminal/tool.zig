@@ -146,7 +146,7 @@ fn printBash(result: []const u8, writer: Writer) !void {
 fn printExit(exit: Tools.Exit, writer: Writer) !void {
     const mark = if (exit.ok) Tools.exit_marks.ok else Tools.exit_marks.failed;
     var buffer: [64]u8 = undefined;
-    const line = std.fmt.bufPrint(&buffer, "{s} exit {s}", .{ mark, exit.code }) catch exit.code;
+    const line = std.mem.print(&buffer, "{s} exit {s}", .{ mark, exit.code }) catch exit.code;
     const hue: Writer.Color = if (exit.ok) .green else .red;
     try writer.print("{s}{s}{s}\n", .{ writer.boldColor(hue), line, writer.reset() });
 }
@@ -353,7 +353,7 @@ test "a bash block shows only the streams the command filled" {
     for (cases) |case| {
         log.clearRetainingCapacity();
         result.clearRetainingCapacity();
-        const arguments = try std.fmt.allocPrint(arena, "{{\"command\":{f}}}", .{
+        const arguments = try arena.print("{{\"command\":{f}}}", .{
             std.json.fmt(case.command, .{}),
         });
         const parsed = try Tools.runCall(

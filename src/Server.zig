@@ -370,7 +370,7 @@ const Request = struct {
 fn route(r: *Request, registry: *Registry, http_client: *std.http.Client) !void {
     // The path is the target up to a query, which none of these routes take.
     const target = r.request.head.target;
-    const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
+    const path = target[0 .. std.mem.findScalar(u8, target, '?') orelse target.len];
 
     if (std.mem.eql(u8, path, "/")) switch (r.request.head.method) {
         .GET => {
@@ -659,8 +659,8 @@ test "a parsed prompt is copied, so the body it came from can be freed" {
 
 test "the page the browser is given is the one that was written" {
     // The embedded page is served whole, and nothing is built to serve it.
-    try std.testing.expect(std.mem.indexOf(u8, page, "<!doctype html>") == 0);
-    try std.testing.expect(std.mem.indexOf(u8, page, "/api/sessions") != null);
+    try std.testing.expect(std.mem.find(u8, page, "<!doctype html>") == 0);
+    try std.testing.expect(std.mem.find(u8, page, "/api/sessions") != null);
 }
 
 test "an event leaves the stream as it is written, without filling a buffer" {
@@ -691,7 +691,7 @@ test "an event leaves the stream as it is written, without filling a buffer" {
     // until enough events filled the buffer, which is what made a page see them
     // in batches rather than as they happened.
     try stream.write("block", "{\"html\":\"<p>hi</p>\"}");
-    try std.testing.expect(std.mem.indexOf(u8, sink.written(), "event: block") != null);
+    try std.testing.expect(std.mem.find(u8, sink.written(), "event: block") != null);
 
     // A second event reaches the sink too, each as a chunk of its own.
     try stream.write("done", "{}");
@@ -1100,7 +1100,7 @@ const TestServer = struct {
 
 /// The path a session's route is asked for, owned by the caller.
 fn sessionPath(id: []const u8, suffix: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(std.testing.allocator, "/api/sessions/{s}{s}", .{ id, suffix });
+    return std.testing.allocator.print("/api/sessions/{s}{s}", .{ id, suffix });
 }
 
 /// One request through the real `route`, answered into `out`.
@@ -1131,10 +1131,10 @@ const Exchange = struct {
         errdefer exchange.written.deinit();
 
         const request_text = if (body) |payload|
-            try std.fmt.allocPrint(gpa, "{s} {s} HTTP/1.1\r\nhost: billy\r\ncontent-type: application/json\r\n" ++
+            try gpa.print("{s} {s} HTTP/1.1\r\nhost: billy\r\ncontent-type: application/json\r\n" ++
                 "content-length: {d}\r\n\r\n{s}", .{ @tagName(method), path, payload.len, payload })
         else
-            try std.fmt.allocPrint(gpa, "{s} {s} HTTP/1.1\r\nhost: billy\r\n\r\n", .{ @tagName(method), path });
+            try gpa.print("{s} {s} HTTP/1.1\r\nhost: billy\r\n\r\n", .{ @tagName(method), path });
         defer gpa.free(request_text);
 
         var in_buffer: [4096]u8 = undefined;
@@ -1165,12 +1165,12 @@ const Exchange = struct {
     /// when the answer is the one `route` writes for a request it does not know.
     fn statusLine(exchange: *Exchange) []const u8 {
         const text = exchange.written.written();
-        const end = std.mem.indexOf(u8, text, "\r\n") orelse text.len;
+        const end = std.mem.find(u8, text, "\r\n") orelse text.len;
         return text[0..end];
     }
 
     fn contains(exchange: *Exchange, needle: []const u8) bool {
-        return std.mem.indexOf(u8, exchange.written.written(), needle) != null;
+        return std.mem.find(u8, exchange.written.written(), needle) != null;
     }
 };
 

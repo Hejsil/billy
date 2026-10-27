@@ -44,7 +44,7 @@ const Command = union(enum) {
 
         const line = std.mem.trim(u8, text, spaces);
         const typed = std.mem.cutPrefix(u8, line, "/") orelse return null;
-        const split = std.mem.indexOfAny(u8, typed, spaces) orelse typed.len;
+        const split = std.mem.findAny(u8, typed, spaces) orelse typed.len;
         const name = typed[0..split];
         const argument = std.mem.trim(u8, typed[split..], spaces);
 
@@ -390,7 +390,7 @@ pub const SessionHeader = struct {
     /// the caller holds the buffer, which it already has for the line editor.
     pub fn format(self: SessionHeader, out: *std.Io.Writer) std.Io.Writer.Error!void {
         try out.print("billy · {s} · {s} · ", .{ self.id, self.model });
-        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
         try out.writeAll(displayPath(&path_buffer, self.cwd, self.home));
         if (self.context_window) |window| {
             try out.writeAll(" · ");
@@ -446,7 +446,7 @@ pub fn displayPath(buffer: []u8, cwd: []const u8, home: ?[]const u8) []const u8 
         if (dir.len > 0 and std.mem.startsWith(u8, cwd, dir)) {
             const rest = cwd[dir.len..];
             if (rest.len == 0) return "~";
-            if (rest[0] == '/') return std.fmt.bufPrint(buffer, "~{s}", .{rest}) catch cwd;
+            if (rest[0] == '/') return std.mem.print(buffer, "~{s}", .{rest}) catch cwd;
         }
     }
     return cwd;
@@ -684,7 +684,7 @@ fn selectModel(agent: *Agent, emitter: *Emitter, session: *Session, choice: ?[]c
     var notice: [256]u8 = undefined;
     const asked = choice orelse {
         const current = session.modelChoice(agent.config.stored.model);
-        return emitter.show(.{ .notice = std.fmt.bufPrint(
+        return emitter.show(.{ .notice = std.mem.print(
             &notice,
             "the model is {s}; use /model <provider>/<model> to change it",
             .{current},
@@ -706,7 +706,7 @@ fn selectModel(agent: *Agent, emitter: *Emitter, session: *Session, choice: ?[]c
     if (session.messages.items.len > 0) session.save() catch |err|
         std.log.warn("could not write the session: {s}", .{@errorName(err)});
 
-    return emitter.show(.{ .notice = std.fmt.bufPrint(&notice, "the model is now {s}", .{asked}) catch
+    return emitter.show(.{ .notice = std.mem.print(&notice, "the model is now {s}", .{asked}) catch
         "the model is set" });
 }
 
@@ -864,7 +864,7 @@ pub fn ask(agent: *Agent, emitter: *Emitter, session: *Session, text: []const u8
 /// cannot fail without losing the word the user needs.
 fn failureNotice(buffer: []u8, err: anyerror, shown: bool) []const u8 {
     const outcome = if (shown) "the turn stopped partway" else "nothing was sent";
-    return std.fmt.bufPrint(buffer, "the request failed: {s} — {s}, try again", .{ @errorName(err), outcome }) catch
+    return std.mem.print(buffer, "the request failed: {s} — {s}, try again", .{ @errorName(err), outcome }) catch
         (if (shown)
             "the request failed, and the turn stopped partway — try again"
         else
@@ -1127,14 +1127,14 @@ fn turn(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client
     // as a model that used every turn it had; the last thing it did was say
     // nothing, so it is why the turn ended.
     if (retries == 0) {
-        const silent = std.fmt.bufPrint(
+        const silent = std.mem.print(
             &buffer,
             "stopped after {d} replies in a row that said nothing",
             .{max_retries},
         ) catch "stopped with nothing to show";
         return emitter.show(.{ .notice = silent });
     }
-    const stopped = std.fmt.bufPrint(
+    const stopped = std.mem.print(
         &buffer,
         "stopped after {d} turns without a final answer",
         .{agent.behaviour.max_turns},
@@ -1462,13 +1462,13 @@ test "printTranscript shows only the last blocks and counts the rest" {
     // A count larger than the conversation leaves nothing out, so nothing is
     // counted and the whole session shows.
     try printTranscript(io, gpa, writer, &session, 10);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "earlier blocks") == null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "earlier blocks") == null);
     try std.testing.expect(std.mem.startsWith(u8, out.written(), "» prompt\none\n\n"));
     out.clearRetainingCapacity();
 
     // Zero shows the whole session too.
     try printTranscript(io, gpa, writer, &session, 0);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "earlier blocks") == null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "earlier blocks") == null);
     try std.testing.expect(std.mem.startsWith(u8, out.written(), "» prompt\none\n\n"));
 }
 
@@ -1621,11 +1621,11 @@ test "a compaction is headed by its own mark, and hides what it stands for" {
 
     // The line carries the compaction mark: the glyph in its colour and the name
     // in bold, the way every other block header is written.
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b[33m⊟\x1b[0m \x1b[1mcompacted\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "\x1b[33m⊟\x1b[0m \x1b[1mcompacted\x1b[0m") != null);
     // Neither the prompt that asked for the compaction nor the summary it
     // produced is shown: the one line stands in for both.
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "ASKEDFORTHEcompaction") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "THESUMMARYTEXT") == null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "ASKEDFORTHEcompaction") == null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "THESUMMARYTEXT") == null);
 }
 
 test "printTranscript gives each call the result that names it" {
@@ -1738,7 +1738,7 @@ const TestSetup = struct {
         const config = try arena.create(Config);
         config.* = Config.init(gpa);
         errdefer config.deinit();
-        config.stored.model = try std.fmt.allocPrint(arena, "test/{s}", .{model});
+        config.stored.model = try arena.print("test/{s}", .{model});
         // A closed port, so a request that went somewhere a test did not mean it
         // to fails rather than waiting for an answer that never comes.
         const entries = try arena.dupe(Config.Providers.Entry, &.{
@@ -1820,8 +1820,8 @@ test "a model that cannot be resolved is a notice, and asks nothing" {
     // A provider the configuration names, with no key stored for it.
     try session.setModel("nokey/m");
     try std.testing.expect((try agent.take(emitter, &session, "hi")) == .unresolved);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "the model nokey/m cannot be reached") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "billy login nokey") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "the model nokey/m cannot be reached") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "billy login nokey") != null);
     // Nothing was asked and nothing was written: the line can be asked again
     // once the key is stored, which is what makes this a notice and not the end
     // of the run.
@@ -1833,8 +1833,8 @@ test "a model that cannot be resolved is a notice, and asks nothing" {
     out.clearRetainingCapacity();
     try session.setModel("who-knows/m");
     try std.testing.expect((try agent.take(emitter, &session, "hi")) == .unresolved);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "the model who-knows/m cannot be reached") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "billy models --refresh") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "the model who-knows/m cannot be reached") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "billy models --refresh") != null);
 
     // And the way out of that state still answers: `/model` is read before any
     // client is made, so it works on the session that cannot be asked.
@@ -2176,11 +2176,7 @@ test "the prompt is billy's own, the user's instructions, then the project's" {
     {
         const text = try leadPrompt(io, gpa, project.dir, config.dir);
         defer gpa.free(text);
-        const expected = try std.fmt.allocPrint(
-            gpa,
-            "{s}\n\nThe user's instructions follow, read from AGENTS.md.\n\nUSER RULES",
-            .{base_prompt},
-        );
+        const expected = try gpa.print("{s}\n\nThe user's instructions follow, read from AGENTS.md.\n\nUSER RULES", .{base_prompt});
         defer gpa.free(expected);
         try std.testing.expectEqualStrings(expected, text);
     }
@@ -2191,9 +2187,9 @@ test "the prompt is billy's own, the user's instructions, then the project's" {
     {
         const text = try leadPrompt(io, gpa, project.dir, config.dir);
         defer gpa.free(text);
-        const user = std.mem.indexOf(u8, text, "USER RULES") orelse return error.TestUnexpectedResult;
-        const local = std.mem.indexOf(u8, text, "PROJECT RULES") orelse return error.TestUnexpectedResult;
-        try std.testing.expect(std.mem.indexOf(u8, text, base_prompt) != null);
+        const user = std.mem.find(u8, text, "USER RULES") orelse return error.TestUnexpectedResult;
+        const local = std.mem.find(u8, text, "PROJECT RULES") orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.find(u8, text, base_prompt) != null);
         try std.testing.expect(user < local);
     }
 
@@ -2202,8 +2198,8 @@ test "the prompt is billy's own, the user's instructions, then the project's" {
     {
         const text = try leadPrompt(io, gpa, project.dir, null);
         defer gpa.free(text);
-        try std.testing.expect(std.mem.indexOf(u8, text, "PROJECT RULES") != null);
-        try std.testing.expect(std.mem.indexOf(u8, text, "USER RULES") == null);
+        try std.testing.expect(std.mem.find(u8, text, "PROJECT RULES") != null);
+        try std.testing.expect(std.mem.find(u8, text, "USER RULES") == null);
     }
 }
 
@@ -2315,11 +2311,11 @@ test "maybeCompact compacts the conversation once it has filled the window" {
     // The request carried the whole conversation, tool call and result included,
     // with the compacting prompt after it.
     const body = mock.bodies.items[0];
-    try std.testing.expect(std.mem.indexOf(u8, body, "OLDPROMPT") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "call_x") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "OLDTOOLOUTPUT") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "OLDANSWER") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "free room in the context") != null);
+    try std.testing.expect(std.mem.find(u8, body, "OLDPROMPT") != null);
+    try std.testing.expect(std.mem.find(u8, body, "call_x") != null);
+    try std.testing.expect(std.mem.find(u8, body, "OLDTOOLOUTPUT") != null);
+    try std.testing.expect(std.mem.find(u8, body, "OLDANSWER") != null);
+    try std.testing.expect(std.mem.find(u8, body, "free room in the context") != null);
 
     // The prompt and the summary are added to the end of the session, which keeps
     // every message it had. The summary is a user message.
@@ -2430,7 +2426,7 @@ test "a compaction asked for now compacts the conversation in whatever its size"
 
     // The summary is compacted in, and the pair reads as one line.
     try std.testing.expectEqual(4, session.messages.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "compacted") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "compacted") != null);
 
     // Asking again does nothing: the summary is the last message, so there is
     // nothing new to compact in, and a request would only re-summarize it.
@@ -2550,17 +2546,17 @@ test "refreshLead replaces the prompt, the project instructions and the tools" {
     // The prompt is the current one: billy's own text with the project's
     // instructions after it, and none of the old prompt left.
     const prompt_text = session.systemPrompt().?;
-    try std.testing.expect(std.mem.indexOf(u8, prompt_text, base_prompt) != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt_text, "PROJECT RULES") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt_text, "OLD PROMPT") == null);
+    try std.testing.expect(std.mem.find(u8, prompt_text, base_prompt) != null);
+    try std.testing.expect(std.mem.find(u8, prompt_text, "PROJECT RULES") != null);
+    try std.testing.expect(std.mem.find(u8, prompt_text, "OLD PROMPT") == null);
 
     // The tools are the current set, replacing the one the session started with.
     var tools: std.Io.Writer.Allocating = .init(gpa);
     defer tools.deinit();
     try std.json.Stringify.value(session.toolSet(), .{}, &tools.writer);
-    try std.testing.expect(std.mem.indexOf(u8, tools.written(), "\"name\":\"read\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools.written(), "\"name\":\"bash\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools.written(), "\"name\":\"old\"") == null);
+    try std.testing.expect(std.mem.find(u8, tools.written(), "\"name\":\"read\"") != null);
+    try std.testing.expect(std.mem.find(u8, tools.written(), "\"name\":\"bash\"") != null);
+    try std.testing.expect(std.mem.find(u8, tools.written(), "\"name\":\"old\"") == null);
 
     // The refreshed session is written out, so a resume carries the current lead.
     var resumed = try Session.open(io, tmp.dir, gpa, session.id(), "/work");
@@ -2596,8 +2592,8 @@ test "prepare gives a fresh session the user's instructions from the configurati
 
     // The prompt the session runs with carries the user's instructions, so the
     // configuration directory is read for every session and not only a project.
-    try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, base_prompt) != null);
-    try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, "USER RULES") != null);
+    try std.testing.expect(std.mem.find(u8, session.systemPrompt().?, base_prompt) != null);
+    try std.testing.expect(std.mem.find(u8, session.systemPrompt().?, "USER RULES") != null);
 }
 
 test "a first prompt gives the session its prompt and tools, and is asked as typed" {
@@ -2683,19 +2679,19 @@ test "the model command says where the session is sent, and moves it there" {
     // what the command on its own reports.
     const asked = try agent.take(terminal.emitter(), &session, "/model");
     try std.testing.expect(asked == .ran);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "the model is test/m") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "the model is test/m") != null);
     try std.testing.expect(session.model() == null);
 
     // Naming another model records it, which is where the next turn is sent.
     const moved = try agent.take(terminal.emitter(), &session, "/model other/other-model");
     try std.testing.expect(moved == .ran);
     try std.testing.expectEqualStrings("other/other-model", session.model().?);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "the model is now other/other-model") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "the model is now other/other-model") != null);
 
     // A name that is not a choice says so, and leaves the session where it was.
     const refused = try agent.take(terminal.emitter(), &session, "/model other-model");
     try std.testing.expect(refused == .ran);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "a model is named as <provider>/<model>") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "a model is named as <provider>/<model>") != null);
     try std.testing.expectEqualStrings("other/other-model", session.model().?);
 }
 
@@ -2874,7 +2870,7 @@ test "the model command can move a session off a model that cannot be reached" {
 
     const asked = try agent.take(terminal.emitter(), &session, "/model");
     try std.testing.expect(asked == .ran);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "the model is who-knows/m") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "the model is who-knows/m") != null);
 
     const moved = try agent.take(terminal.emitter(), &session, "/model test/m");
     try std.testing.expect(moved == .ran);
@@ -3023,7 +3019,7 @@ test "a turn shows the tool it runs and then the answer" {
     // conversation, the next is answered with text.
     const answering = struct {
         fn answer(_: usize, body: []const u8) Mock.Answer {
-            if (std.mem.indexOf(u8, body, "\"tool\"") != null) {
+            if (std.mem.find(u8, body, "\"tool\"") != null) {
                 return .{
                     .body = "data: {\"choices\":[{\"delta\":{\"content\":\"all \"}}]}\n\n" ++
                         "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n" ++
@@ -3066,7 +3062,7 @@ test "a turn shows the tool it runs and then the answer" {
     // next request, with the assistant message it belongs to. A provider in
     // thinking mode refuses the conversation without it.
     try std.testing.expectEqual(@as(usize, 2), mock.bodies.items.len);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         mock.bodies.items[1],
         "\"reasoning_content\":\"I should run the command.\"",
@@ -3286,7 +3282,7 @@ test "a reply with nothing is not kept, and the turn is asked again" {
     // The second request is the first one again, byte for byte: the empty reply
     // was not put into the conversation, so asking again asks the same question.
     try std.testing.expectEqualStrings(mock.bodies.items[0], mock.bodies.items[1]);
-    try std.testing.expect(std.mem.indexOf(u8, mock.bodies.items[1], "\"assistant\"") == null);
+    try std.testing.expect(std.mem.find(u8, mock.bodies.items[1], "\"assistant\"") == null);
 
     // The session holds the prompt and the answer, with no empty message between
     // them, so every request after this one carries a conversation a provider
@@ -3357,7 +3353,7 @@ test "a provider that keeps saying nothing ends the turn" {
         try std.testing.expectEqualStrings("thinking it over", fragment.text);
     var expected: [96]u8 = undefined;
     try std.testing.expectEqualStrings(
-        try std.fmt.bufPrint(&expected, "stopped after {d} replies in a row that said nothing", .{max_retries}),
+        try std.mem.print(&expected, "stopped after {d} replies in a row that said nothing", .{max_retries}),
         recorder.seen.items[0].notice,
     );
 
@@ -3521,7 +3517,7 @@ test "the first turn names the session, and the naming is not part of it" {
     // the one whose body carries the titling prompt -- with a title.
     const answering = struct {
         fn answer(_: usize, body: []const u8) Mock.Answer {
-            if (std.mem.indexOf(u8, body, "short title") != null) {
+            if (std.mem.find(u8, body, "short title") != null) {
                 return .{
                     .body = "data: {\"choices\":[{\"delta\":{\"content\":\"Fix the flaky test\"}}]," ++
                         "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}\n\n" ++
@@ -3573,7 +3569,7 @@ test "the first turn names the session, and the naming is not part of it" {
     try std.testing.expectEqualStrings("assistant", session.messages.items[1].role.name());
     for (session.messages.items) |message| {
         const text = session.contentOf(message) orelse "";
-        try std.testing.expect(std.mem.indexOf(u8, text, "short title") == null);
+        try std.testing.expect(std.mem.find(u8, text, "short title") == null);
     }
 }
 
@@ -3707,5 +3703,5 @@ test "a session is sent where the choice it recorded points, not the configurati
     try std.testing.expectEqual(@as(usize, 1), chosen.served);
     // The model it was sent is the one the session recorded, not the configured
     // one, which names a model of the provider nothing is listening on.
-    try std.testing.expect(std.mem.indexOf(u8, chosen.bodies.items[0], "\"model\":\"kimi-k2.7-code\"") != null);
+    try std.testing.expect(std.mem.find(u8, chosen.bodies.items[0], "\"model\":\"kimi-k2.7-code\"") != null);
 }

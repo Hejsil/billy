@@ -132,7 +132,7 @@ pub fn login(billy: *Billy, out: Terminal.Writer, service: ?[]const u8) !void {
     }
 
     const purpose = Credentials.purposeOf(name) orelse name;
-    const prompt = try std.fmt.allocPrint(billy.arena, "Enter {s}: ", .{purpose});
+    const prompt = try billy.arena.print("Enter {s}: ", .{purpose});
     const key = (try billy.readSecret(out, prompt)) orelse {
         std.log.err("no key read", .{});
         return report.Reported;

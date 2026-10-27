@@ -189,7 +189,7 @@ comptime {
 /// owned by `gpa`, so the caller frees it whatever else it does.
 pub fn address(gpa: std.mem.Allocator, base: []const u8, path: []const u8) ![]const u8 {
     if (path.len == 0) return gpa.dupe(u8, base);
-    return std.fmt.allocPrint(gpa, "{s}{s}", .{ std.mem.trimEnd(u8, base, "/"), path });
+    return gpa.print("{s}{s}", .{ std.mem.trimEnd(u8, base, "/"), path });
 }
 
 /// Sends one request to `descriptor`, with its key in the header the provider
@@ -213,7 +213,7 @@ pub fn providerRequest(
     switch (descriptor.auth) {
         .none => {},
         .bearer => {
-            token = try std.fmt.allocPrint(gpa, "Bearer {s}", .{api_key});
+            token = try gpa.print("Bearer {s}", .{api_key});
             headers[count] = .{ .name = "authorization", .value = token.? };
             count += 1;
         },

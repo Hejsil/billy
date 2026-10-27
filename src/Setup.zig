@@ -379,7 +379,7 @@ test "a target names bytes of its own, not a slice of the session's pool" {
     try std.testing.expectEqualStrings("glm-5.3-flash", target.model);
     for (0..40) |i| {
         var buffer: [64]u8 = undefined;
-        const filler = try std.fmt.bufPrint(&buffer, "filler {d} padding padding padding padding", .{i});
+        const filler = try std.mem.print(&buffer, "filler {d} padding padding padding padding", .{i});
         try session.append(.{ .role = .user, .content = filler });
     }
     try std.testing.expectEqualStrings("glm-5.3-flash", target.model);

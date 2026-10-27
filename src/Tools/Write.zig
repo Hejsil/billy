@@ -7,7 +7,7 @@ path: []const u8,
 content: []const u8,
 
 pub fn run(write: Write, io: std.Io, dir: std.Io.Dir, out: *std.Io.Writer) !void {
-    if (std.fs.path.dirname(write.path)) |parent| {
+    if (std.Io.Dir.path.dirname(write.path)) |parent| {
         dir.createDirPath(io, parent) catch |err|
             return Tools.fail(out, "cannot create {s}: {s}", .{ parent, @errorName(err) });
     }

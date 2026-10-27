@@ -18,16 +18,16 @@ pub fn dir(
     fallback: []const []const u8,
 ) ![]const u8 {
     if (environ.get(variable)) |xdg| {
-        if (xdg.len > 0 and std.fs.path.isAbsolute(xdg)) {
-            return std.fs.path.join(gpa, &.{ xdg, app_dir });
+        if (xdg.len > 0 and std.Io.Dir.path.isAbsolute(xdg)) {
+            return std.Io.Dir.path.join(gpa, &.{ xdg, app_dir });
         }
     }
 
     const home = environ.get("HOME") orelse return error.HomeNotSet;
-    const fallback_join = std.fs.path.fmtJoin(fallback);
-    return std.fmt.allocPrint(gpa, "{s}{c}{f}{c}{s}", .{
-        home,          std.fs.path.sep,
-        fallback_join, std.fs.path.sep,
+    const fallback_join = std.Io.Dir.path.fmtJoin(fallback);
+    return gpa.print("{s}{c}{f}{c}{s}", .{
+        home,          std.Io.Dir.path.sep,
+        fallback_join, std.Io.Dir.path.sep,
         app_dir,
     });
 }
@@ -98,10 +98,10 @@ test "openDir creates the directory and its parents" {
 
     // A path billy owns nothing of, under the temporary directory the test
     // makes its own name in.
-    var requested: [std.fs.max_path_bytes]u8 = undefined;
+    var requested: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var suffix: [8]u8 = undefined;
     io.random(&suffix);
-    const path = try std.fmt.bufPrint(&requested, "/tmp/billy-open-dir-{s}/a/b", .{
+    const path = try std.mem.print(&requested, "/tmp/billy-open-dir-{s}/a/b", .{
         std.fmt.bytesToHex(suffix, .lower),
     });
     defer std.Io.Dir.cwd().deleteTree(io, path) catch {};
@@ -112,7 +112,7 @@ test "openDir creates the directory and its parents" {
     // The directory is there, with its parents, which is what a caller is going
     // to use it for.
     try opened.writeFile(io, .{ .sub_path = "marker", .data = "x" });
-    const joined = try std.fs.path.join(gpa, &.{ path, "marker" });
+    const joined = try std.Io.Dir.path.join(gpa, &.{ path, "marker" });
     defer gpa.free(joined);
     const written = try std.Io.Dir.cwd().readFileAlloc(io, joined, gpa, .unlimited);
     defer gpa.free(written);

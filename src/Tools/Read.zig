@@ -152,5 +152,5 @@ test "a file that cannot be read is the call's failure, not the run's" {
     // either reading it as the contents of a file.
     try (Read{ .path = "missing.txt" }).run(gpa, io, tmp.dir, &out.writer);
     try std.testing.expect(std.mem.startsWith(u8, out.written(), "error: cannot read missing.txt: "));
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "FileNotFound") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "FileNotFound") != null);
 }

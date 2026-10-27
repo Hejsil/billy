@@ -377,7 +377,7 @@ fn setPath(
 const Segment = struct { head: []const u8, rest: []const u8 };
 
 fn nextSegment(path: []const u8) Segment {
-    if (std.mem.indexOfScalar(u8, path, '.')) |dot| {
+    if (std.mem.findScalar(u8, path, '.')) |dot| {
         return .{ .head = path[0..dot], .rest = path[dot + 1 ..] };
     }
     return .{ .head = path, .rest = "" };

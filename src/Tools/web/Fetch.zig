@@ -435,11 +435,7 @@ test "a url that asked to be waited is a failed call, and says how long for" {
     try run(.{ .url = mock.url, .raw = true }, gpa, &http_client, .{ .backends = &.{} }, null, &out.writer);
     try mock.await();
 
-    const expected = try std.fmt.allocPrint(
-        gpa,
-        "error: {s} asked to be waited 2000ms before it is read again",
-        .{mock.url},
-    );
+    const expected = try gpa.print("error: {s} asked to be waited 2000ms before it is read again", .{mock.url});
     defer gpa.free(expected);
     try std.testing.expectEqualStrings(expected, out.written());
 }

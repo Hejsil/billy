@@ -52,7 +52,7 @@ const Stored = struct {
 /// and with no NUL in it, which is what ends a name in the pool.
 fn usable(name: []const u8) bool {
     return std.unicode.utf8ValidateSlice(name) and
-        std.mem.indexOfScalar(u8, name, 0) == null;
+        std.mem.findScalar(u8, name, 0) == null;
 }
 
 /// Where a name is in `strings`, as the map's key. A key of its own rather than
@@ -101,7 +101,7 @@ strings: std.ArrayList(u8) = .empty,
 /// The waits, by the offset of their name in `strings`, in the order they were
 /// recorded: the file is written in that order, so nothing has to be sorted or
 /// copied to write it.
-entries: std.ArrayHashMapUnmanaged(Name, Wait, Names, true) = .empty,
+entries: std.array_hash_map.Custom(Name, Wait, Names, true) = .empty,
 
 /// Reads the waits left by an earlier run.
 pub fn load(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir) !Health {
@@ -301,7 +301,7 @@ pub fn retryAfterMs(head: []const u8) ?u64 {
     var lines = std.mem.splitSequence(u8, head, "\r\n");
     _ = lines.next(); // the status line
     while (lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         if (!std.ascii.eqlIgnoreCase(line[0..colon], "retry-after")) continue;
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
         const seconds = std.fmt.parseInt(u64, value, 10) catch return null;
@@ -528,8 +528,8 @@ test "the file holds the waits in the order they were recorded" {
 
     var buffer: [1 << 12]u8 = undefined;
     const written = try t.tmp.dir.readFile(std.testing.io, file_name, &buffer);
-    try std.testing.expect(std.mem.indexOf(u8, written, "\"tavily\"").? <
-        std.mem.indexOf(u8, written, "\"brave\"").?);
+    try std.testing.expect(std.mem.find(u8, written, "\"tavily\"").? <
+        std.mem.find(u8, written, "\"brave\"").?);
 
     // Reading it back keeps that order, so a file billy did not write last is
     // not reshuffled by the next write.
@@ -540,10 +540,10 @@ test "the file holds the waits in the order they were recorded" {
     var after: [1 << 12]u8 = undefined;
     const rewritten = try t.tmp.dir.readFile(std.testing.io, file_name, &after);
 
-    try std.testing.expect(std.mem.indexOf(u8, rewritten, "\"tavily\"").? <
-        std.mem.indexOf(u8, rewritten, "\"brave\"").?);
-    try std.testing.expect(std.mem.indexOf(u8, rewritten, "\"brave\"").? <
-        std.mem.indexOf(u8, rewritten, "\"exa\"").?);
+    try std.testing.expect(std.mem.find(u8, rewritten, "\"tavily\"").? <
+        std.mem.find(u8, rewritten, "\"brave\"").?);
+    try std.testing.expect(std.mem.find(u8, rewritten, "\"brave\"").? <
+        std.mem.find(u8, rewritten, "\"exa\"").?);
 }
 
 test "writing the waits allocates nothing" {

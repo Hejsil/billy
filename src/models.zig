@@ -282,14 +282,14 @@ pub const Choice = struct {
 
     /// The provider half, before the first `/`.
     pub fn provider(choice: Choice) []const u8 {
-        const slash = std.mem.indexOfScalar(u8, choice.text, '/') orelse return "";
+        const slash = std.mem.findScalar(u8, choice.text, '/') orelse return "";
         return choice.text[0..slash];
     }
 
     /// The model half, after the first `/`. A model id may itself contain one,
     /// so only the first is the split.
     pub fn model(choice: Choice) []const u8 {
-        const slash = std.mem.indexOfScalar(u8, choice.text, '/') orelse return choice.text;
+        const slash = std.mem.findScalar(u8, choice.text, '/') orelse return choice.text;
         return choice.text[slash + 1 ..];
     }
 

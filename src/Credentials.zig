@@ -51,7 +51,7 @@ pub fn purposeOf(name: []const u8) ?[]const u8 {
     return null;
 }
 
-keys: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
+keys: std.array_hash_map.String([]const u8) = .empty,
 
 /// The key stored for `name`, or null when none is.
 pub fn get(credentials: *const Credentials, name: []const u8) ?[]const u8 {
@@ -472,19 +472,19 @@ test "the listing shows a stored name billy does not know" {
     defer sink.deinit();
     try credentials.list(&sink.writer, &.{}, &models.test_catalog);
 
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         sink.written(),
         "a-very-long-provider-name  a service billy does not know  stored",
     ) != null);
     // The columns widened to fit the long name and the label, so the known rows
     // are padded to match rather than running short.
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         sink.written(),
         "a-very-long-provider-name  a service billy does not know  stored",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         sink.written(),
         "deepseek                   DeepSeek API key               not set",
@@ -506,8 +506,8 @@ test "the listing names a catalog provider whose key is stored" {
     defer sink.deinit();
     try credentials.list(&sink.writer, &.{}, &models.test_catalog);
 
-    try std.testing.expect(std.mem.indexOf(u8, sink.written(), "a provider in the model catalog") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sink.written(), "a service billy does not know") == null);
+    try std.testing.expect(std.mem.find(u8, sink.written(), "a provider in the model catalog") != null);
+    try std.testing.expect(std.mem.find(u8, sink.written(), "a service billy does not know") == null);
 }
 
 test "a key is stored only for a name something will ask for" {
@@ -541,7 +541,7 @@ test "the listing names the providers the configuration defines" {
     // A provider the configuration names is one a key can be stored for, so the
     // listing shows it: `billy login` with no service is where a user looks to
     // find out what to type.
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         sink.written(),
         "mock         a provider the configuration names  not set",
@@ -549,7 +549,7 @@ test "the listing names the providers the configuration defines" {
     // One billy already knows is listed as the service it is, not as something
     // the configuration happened to name.
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, sink.written(), "deepseek"));
-    try std.testing.expect(std.mem.indexOf(u8, sink.written(), "a provider the configuration names") != null);
+    try std.testing.expect(std.mem.find(u8, sink.written(), "a provider the configuration names") != null);
 }
 
 test "the listing shows a key under a name nothing names any more" {
@@ -567,8 +567,8 @@ test "the listing shows a key under a name nothing names any more" {
     defer sink.deinit();
     try credentials.list(&sink.writer, &.{"mock"}, &models.test_catalog);
 
-    try std.testing.expect(std.mem.indexOf(u8, sink.written(), "gone") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sink.written(), "a service billy does not know") != null);
+    try std.testing.expect(std.mem.find(u8, sink.written(), "gone") != null);
+    try std.testing.expect(std.mem.find(u8, sink.written(), "a service billy does not know") != null);
 }
 
 test "load refuses a damaged or future credentials file" {

@@ -74,7 +74,7 @@ fn sessionsPath(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map)
     const data = try dataPath(gpa, environ);
     defer gpa.free(data);
 
-    return std.fs.path.join(gpa, &.{ data, "sessions" });
+    return std.Io.Dir.path.join(gpa, &.{ data, "sessions" });
 }
 
 test "each directory is the right one under each base" {

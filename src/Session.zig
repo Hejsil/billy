@@ -305,7 +305,7 @@ fn named(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: ?[]const
     session.interned.id = try session.pool.intern(gpa, id_text);
 
     var name_buf: [max_id_len + extension.len]u8 = undefined;
-    const file_name = try std.fmt.bufPrint(&name_buf, "{s}{s}", .{ id_text, extension });
+    const file_name = try std.mem.print(&name_buf, "{s}{s}", .{ id_text, extension });
     session.interned.name = try session.pool.intern(gpa, file_name);
 
     // The session owns its directory rather than pointing into the caller's
@@ -448,7 +448,7 @@ pub fn isCompaction(session: *const Session, index: usize) bool {
     if (index >= session.messages.items.len) return false;
     // The list holds one index per compaction, so a scan of it is short.
     const target: u32 = @intCast(index);
-    return std.mem.indexOfScalar(u32, session.compactions.items, target) != null;
+    return std.mem.findScalar(u32, session.compactions.items, target) != null;
 }
 
 /// The system prompt sent at the front of every request, or null when the
@@ -1256,7 +1256,7 @@ const Ordering = struct {
 /// when it could not name a session.
 fn fileName(session_id: []const u8, buffer: []u8) ?[]const u8 {
     if (!usableName(session_id)) return null;
-    return std.fmt.bufPrint(buffer, "{s}{s}", .{ session_id, extension }) catch null;
+    return std.mem.print(buffer, "{s}{s}", .{ session_id, extension }) catch null;
 }
 
 /// Deletes the session `id` from `dir`, so it is gone for good: billy keeps no
@@ -1503,7 +1503,7 @@ fn writeFileAt(
     data: []const u8,
     written_ms: i64,
 ) !void {
-    const file_name = try std.fmt.allocPrint(gpa, "{s}{s}", .{ session_id, extension });
+    const file_name = try gpa.print("{s}{s}", .{ session_id, extension });
     defer gpa.free(file_name);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = data });
     try tmp.dir.setTimestamps(std.testing.io, file_name, .{
@@ -2059,8 +2059,8 @@ test "a message a session read back with bytes that are not UTF-8 is repaired" {
     try session.save();
     const text = try tmp.dir.readFileAlloc(std.testing.io, "bytes.json", gpa, .unlimited);
     defer gpa.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "[97,255,98]") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "\"content\":\"a\u{FFFD}b\"") != null);
+    try std.testing.expect(std.mem.find(u8, text, "[97,255,98]") == null);
+    try std.testing.expect(std.mem.find(u8, text, "\"content\":\"a\u{FFFD}b\"") != null);
 }
 
 test "a stored message reads back as its parts" {
@@ -2537,7 +2537,7 @@ test "a session with no recorded model is read as the configured one" {
     defer std.testing.allocator.free(file);
     // A session that recorded no model writes no model field, which is what
     // reads back as the configured choice.
-    try std.testing.expect(std.mem.indexOf(u8, file, "\"model\"") == null);
+    try std.testing.expect(std.mem.find(u8, file, "\"model\"") == null);
 }
 
 test "a session file written with an empty model reads as the configured one" {

@@ -446,7 +446,7 @@ fn redraw(
     var row: usize = 0;
     var start: usize = 0;
     while (true) {
-        const newline = std.mem.indexOfScalarPos(u8, line, start, '\n');
+        const newline = std.mem.findScalarPos(u8, line, start, '\n');
         const end = newline orelse line.len;
         var pos = start;
         while (true) {
@@ -768,7 +768,7 @@ fn reflowed(line: []const u8, prompt_width: usize, old_content: usize, width: us
     var cursor_row: usize = 0;
     var start: usize = 0;
     while (true) {
-        const newline = std.mem.indexOfScalarPos(u8, line, start, '\n');
+        const newline = std.mem.findScalarPos(u8, line, start, '\n');
         const end = newline orelse line.len;
         var pos = start;
         while (true) {
@@ -847,7 +847,7 @@ fn rowAt(line: []const u8, content_width: usize, cursor: usize) Row {
     var index: usize = 0;
     var start: usize = 0;
     while (true) {
-        const newline = std.mem.indexOfScalarPos(u8, line, start, '\n');
+        const newline = std.mem.findScalarPos(u8, line, start, '\n');
         const end = newline orelse line.len;
         if (cursor <= end) {
             const text = line[start..end];
@@ -872,7 +872,7 @@ fn rowRange(line: []const u8, content_width: usize, index: usize) struct { start
     var row: usize = 0;
     var start: usize = 0;
     while (true) {
-        const newline = std.mem.indexOfScalarPos(u8, line, start, '\n');
+        const newline = std.mem.findScalarPos(u8, line, start, '\n');
         const end = newline orelse line.len;
         const rows = rowsFor(columns(line[start..end]), content_width);
         if (index < row + rows) {
@@ -895,7 +895,7 @@ fn rowCount(line: []const u8, content_width: usize) usize {
     var rows: usize = 0;
     var start: usize = 0;
     while (true) {
-        const newline = std.mem.indexOfScalarPos(u8, line, start, '\n');
+        const newline = std.mem.findScalarPos(u8, line, start, '\n');
         const end = newline orelse line.len;
         rows += rowsFor(columns(line[start..end]), content_width);
         if (newline == null) return rows;

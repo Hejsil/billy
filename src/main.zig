@@ -645,27 +645,27 @@ test "every help message reads the same way" {
         // The parts come in one order: how it is invoked, what it is, the
         // subcommands it has, and the options it takes. A command with no
         // subcommands leaves that part out entirely.
-        const usage_at = std.mem.indexOf(u8, text, "usage: ").?;
-        const description_at = std.mem.indexOf(u8, text, message.description).?;
-        const options_at = std.mem.indexOf(u8, text, "Options:").?;
+        const usage_at = std.mem.find(u8, text, "usage: ").?;
+        const description_at = std.mem.find(u8, text, message.description).?;
+        const options_at = std.mem.find(u8, text, "Options:").?;
         try std.testing.expect(usage_at < description_at);
         try std.testing.expect(description_at < options_at);
         if (message.commands) |commands| {
-            const commands_at = std.mem.indexOf(u8, text, "Commands:").?;
+            const commands_at = std.mem.find(u8, text, "Commands:").?;
             try std.testing.expect(description_at < commands_at);
             try std.testing.expect(commands_at < options_at);
             // Each part is set off from the one before it by a blank line.
-            try std.testing.expect(std.mem.indexOf(u8, text, "\n\nCommands:\n") != null);
-            try std.testing.expect(std.mem.indexOf(u8, text, "\n\nOptions:\n") != null);
-            try std.testing.expect(std.mem.indexOf(u8, text, commands) != null);
+            try std.testing.expect(std.mem.find(u8, text, "\n\nCommands:\n") != null);
+            try std.testing.expect(std.mem.find(u8, text, "\n\nOptions:\n") != null);
+            try std.testing.expect(std.mem.find(u8, text, commands) != null);
         } else {
-            try std.testing.expect(std.mem.indexOf(u8, text, "Commands:") == null);
-            try std.testing.expect(std.mem.indexOf(u8, text, "\n\nOptions:\n") != null);
+            try std.testing.expect(std.mem.find(u8, text, "Commands:") == null);
+            try std.testing.expect(std.mem.find(u8, text, "\n\nOptions:\n") != null);
         }
 
         // The invocation and the options are the ones the command has, and the
         // options are the last part, with the message ending right after them.
-        try std.testing.expect(std.mem.indexOf(u8, text, message.invocation) != null);
+        try std.testing.expect(std.mem.find(u8, text, message.invocation) != null);
         try std.testing.expectEqualStrings(
             message.options,
             std.mem.trimEnd(u8, text[options_at + "Options:\n".len ..], "\n"),

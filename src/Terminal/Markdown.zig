@@ -261,7 +261,7 @@ fn writeIndent(self: *Markdown) bool {
 fn put(self: *Markdown, text: []const u8) bool {
     var rest: []const u8 = text;
     while (rest.len > 0) {
-        const cut = std.mem.indexOfScalar(u8, rest, '\n');
+        const cut = std.mem.findScalar(u8, rest, '\n');
         const line = if (cut) |i| rest[0..i] else rest;
         if (line.len > 0) {
             if (!self.flush()) return false;
@@ -453,7 +453,7 @@ fn openItem(self: *Markdown, detail: *const md.c.MD_BLOCK_LI_DETAIL) bool {
     const frame = &self.list[self.indentDepth() - 1];
     var buffer: [24]u8 = undefined;
     const marker: []const u8 = if (frame.ordered) blk: {
-        const written = std.fmt.bufPrint(&buffer, "{d}. ", .{frame.next}) catch return self.fail();
+        const written = std.mem.print(&buffer, "{d}. ", .{frame.next}) catch return self.fail();
 
         frame.next += 1;
         break :blk written;
@@ -837,7 +837,7 @@ test "a list nested past the indent cap is still shown" {
 
     // The last line is as far in as the cap lets it go.
     const written = out.written();
-    const last = written[std.mem.lastIndexOfScalar(u8, written, '\n').? + 1 ..];
+    const last = written[std.mem.findScalarLast(u8, written, '\n').? + 1 ..];
     const indent: [2 * (max_list_depth - 1)]u8 = @splat(' ');
     try std.testing.expectEqualStrings(&indent ++ "- item", last);
 }

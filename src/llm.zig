@@ -151,7 +151,7 @@ pub const Client = struct {
         messages: anytype,
         tools: anytype,
     ) !*Stream {
-        const authorization = try std.fmt.allocPrint(client.gpa, "Bearer {s}", .{client.api_key});
+        const authorization = try client.gpa.print("Bearer {s}", .{client.api_key});
         defer client.gpa.free(authorization);
 
         const Request_ = Request(@TypeOf(messages), @TypeOf(tools));
@@ -362,7 +362,7 @@ const Answer = union(enum) {
 /// parameters, such as `; charset=utf-8`, which are not part of it.
 fn isEventStream(content_type: ?[]const u8) bool {
     const value = content_type orelse return false;
-    const end = std.mem.indexOfScalar(u8, value, ';') orelse value.len;
+    const end = std.mem.findScalar(u8, value, ';') orelse value.len;
     return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value[0..end], " \t"), "text/event-stream");
 }
 
@@ -666,7 +666,7 @@ const FrameEnd = struct { body: usize, consumed: usize };
 
 fn frameEnd(bytes: []const u8) ?FrameEnd {
     var pos: usize = 0;
-    while (std.mem.indexOfAnyPos(u8, bytes, pos, "\n\r")) |next| {
+    while (std.mem.findAnyPos(u8, bytes, pos, "\n\r")) |next| {
         pos = next + 1;
         if (std.mem.startsWith(u8, bytes[next..], "\n\n"))
             return .{ .body = next, .consumed = next + 2 };
@@ -1011,13 +1011,9 @@ test "a frame that arrives in pieces is joined" {
     const long = try gpa.alloc(u8, 30_000);
     defer gpa.free(long);
     @memset(long, 'x');
-    const reply = try std.fmt.allocPrint(
-        gpa,
-        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{s}\"}}}}]}}\n\n" ++
-            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"the end\"}}}}]}}\n\n" ++
-            "data: [DONE]\n\n",
-        .{long},
-    );
+    const reply = try gpa.print("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{s}\"}}}}]}}\n\n" ++
+        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"the end\"}}}}]}}\n\n" ++
+        "data: [DONE]\n\n", .{long});
     defer gpa.free(reply);
 
     const streamed = struct {

@@ -702,10 +702,10 @@ test "a diff of code is escaped like any other text" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     try diffLines(lines, &out.writer);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "a &lt; b") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "a &gt; b") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "a &lt; b") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "a &gt; b") != null);
     // The tags of the diff itself are still tags.
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "<span class=\"removed\">") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "<span class=\"removed\">") != null);
 }
 
 /// Writes an element holding `text`, with the text escaped. The tag and the
@@ -1000,12 +1000,12 @@ test "a call naming a tool billy has not got is headed by its name as text" {
         .arguments = "{}",
     } });
     try block(gpa, .{ .tool_begin = unknown }, &out.writer);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         out.written(),
         "<span class=\"name\">&lt;img src=x onerror=alert(1)&gt;</span>",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "<img") == null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "<img") == null);
     out.clearRetainingCapacity();
 
     // A known tool whose arguments could not be read carries a name too, and it
@@ -1015,7 +1015,7 @@ test "a call naming a tool billy has not got is headed by its name as text" {
         .arguments = "{",
     } });
     try block(gpa, .{ .tool_end = .{ .call = malformed, .result = "error: invalid arguments for read: SyntaxError" } }, &out.writer);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         out.written(),
         "<span class=\"name\">read&quot; onclick=&quot;x</span>",
@@ -1058,17 +1058,17 @@ test "a bash call shows its exit status in the head and its streams in the body"
     // A command that succeeded reads ok, and one that printed nothing says so
     // rather than leaving the body empty.
     try block(gpa, .{ .tool_end = .{ .call = bash, .result = "exit code: 0\n(no output)\n" } }, &out.writer);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "<span class=\"exit ok\" title=\"exit code 0\">✓ 0</span>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "<pre class=\"result\">(no output)</pre>") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "<span class=\"exit ok\" title=\"exit code 0\">✓ 0</span>") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "<pre class=\"result\">(no output)</pre>") != null);
     out.clearRetainingCapacity();
 
     // A bash result billy did not write -- a session saved before the status was
     // -- is shown as it is, with an empty grey pill rather than the running one:
     // the call has finished, so nothing should claim it is still going.
     try block(gpa, .{ .tool_end = .{ .call = bash, .result = "make: nothing to be done" } }, &out.writer);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "<span class=\"exit unknown\" title=\"the exit status was not recorded\"></span>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "running") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "<pre class=\"result\">make: nothing to be done</pre>") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "<span class=\"exit unknown\" title=\"the exit status was not recorded\"></span>") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "running") == null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "<pre class=\"result\">make: nothing to be done</pre>") != null);
 }
 
 test "a running call shows a grey pill, and a finished one the status" {
@@ -1103,7 +1103,7 @@ test "a running call shows a grey pill, and a finished one the status" {
     // The half sent when the result arrives: the same row with the status in the
     // pill, so replacing the first with it turns the dots into the status.
     try block(gpa, .{ .tool_end = .{ .call = bash, .result = "exit code: 0\n" } }, &out.writer);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "<span class=\"exit ok\" title=\"exit code 0\">✓ 0</span>") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "<span class=\"exit ok\" title=\"exit code 0\">✓ 0</span>") != null);
 
     // A tool with no status has no pill: not while it runs, and not when it is
     // done.
@@ -1113,10 +1113,10 @@ test "a running call shows a grey pill, and a finished one the status" {
         .arguments = "{\"path\":\"a.zig\"}",
     } });
     try block(gpa, .{ .tool_begin = read }, &out.writer);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "class=\"exit") == null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "class=\"exit") == null);
     out.clearRetainingCapacity();
     try block(gpa, .{ .tool_end = .{ .call = read, .result = "1\tx" } }, &out.writer);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "class=\"exit") == null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "class=\"exit") == null);
 }
 
 test "a bash call shows its command, and a write shows what it wrote" {
@@ -1254,8 +1254,8 @@ test "a search with nothing to link to shows no favicons" {
     // there, empty, since a status and the sources share it.
     for ([_][]const u8{ "(no results)", "1. Odd\n   javascript:alert(1)\n" }) |result| {
         try block(gpa, .{ .tool_end = .{ .call = call, .result = result } }, &out.writer);
-        try std.testing.expect(std.mem.indexOf(u8, out.written(), "<a class=\"fav\"") == null);
-        try std.testing.expect(std.mem.indexOf(u8, out.written(), "<span class=\"produced\"></span>") != null);
+        try std.testing.expect(std.mem.find(u8, out.written(), "<a class=\"fav\"") == null);
+        try std.testing.expect(std.mem.find(u8, out.written(), "<span class=\"produced\"></span>") != null);
         out.clearRetainingCapacity();
     }
 }
@@ -1306,7 +1306,7 @@ test "the blocks of a run are each rendered as what they are" {
     out.clearRetainingCapacity();
 
     try block(gpa, .{ .answer = "**done**" }, &out.writer);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "<strong>done</strong>") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "<strong>done</strong>") != null);
     out.clearRetainingCapacity();
 
     // A compaction, a line billy writes, and the count of what a trimmed
@@ -1412,34 +1412,34 @@ test "a whole conversation is rendered, a tool call and a compaction included" {
     const page = out.written();
 
     // The prompt is a block of its own, and its text is laid out as markdown.
-    try std.testing.expect(std.mem.indexOf(u8, page, "<div class=\"block prompt\">") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page, "<p>read it</p>") != null);
+    try std.testing.expect(std.mem.find(u8, page, "<div class=\"block prompt\">") != null);
+    try std.testing.expect(std.mem.find(u8, page, "<p>read it</p>") != null);
     // The read call is headed and its result is the body, wrapped in one
     // `<details>` that a page shows collapsed until it is opened.
-    try std.testing.expect(std.mem.indexOf(u8, page, "<details class=\"tool\">") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page, "<summary class=\"tool-head\">") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page, "<span class=\"name\">read</span>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page, "<pre class=\"result\">1\tconst x = 1;</pre>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page, "</div></details>\n") != null);
+    try std.testing.expect(std.mem.find(u8, page, "<details class=\"tool\">") != null);
+    try std.testing.expect(std.mem.find(u8, page, "<summary class=\"tool-head\">") != null);
+    try std.testing.expect(std.mem.find(u8, page, "<span class=\"name\">read</span>") != null);
+    try std.testing.expect(std.mem.find(u8, page, "<pre class=\"result\">1\tconst x = 1;</pre>") != null);
+    try std.testing.expect(std.mem.find(u8, page, "</div></details>\n") != null);
     // Each call is written once, from its `tool_end`: the `tool_begin` half is
     // for a stream, so a written conversation has one element per call -- the read
     // and the edit -- not two.
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, page, "<details class=\"tool\">"));
     // The details is not opened, so a page shows it collapsed to begin with.
-    try std.testing.expect(std.mem.indexOf(u8, page, "<details class=\"tool\" open>") == null);
+    try std.testing.expect(std.mem.find(u8, page, "<details class=\"tool\" open>") == null);
     // The edit is shown as its diff, and no result of its own.
-    try std.testing.expect(std.mem.indexOf(u8, page, "<span class=\"removed\">-old</span>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page, "<span class=\"added\">+new</span>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page, "replaced 1 occurrence") == null);
+    try std.testing.expect(std.mem.find(u8, page, "<span class=\"removed\">-old</span>") != null);
+    try std.testing.expect(std.mem.find(u8, page, "<span class=\"added\">+new</span>") != null);
+    try std.testing.expect(std.mem.find(u8, page, "replaced 1 occurrence") == null);
     // The reply's markdown is laid out.
-    try std.testing.expect(std.mem.indexOf(u8, page, "<p>done <strong>now</strong></p>") != null);
+    try std.testing.expect(std.mem.find(u8, page, "<p>done <strong>now</strong></p>") != null);
     // The compaction is one line, and neither the ask nor the summary is shown
     // as a block of its own.
-    try std.testing.expect(std.mem.indexOf(u8, page, "<div class=\"compacted\">") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page, "the summary so far") == null);
-    try std.testing.expect(std.mem.indexOf(u8, page, "summarize") == null);
+    try std.testing.expect(std.mem.find(u8, page, "<div class=\"compacted\">") != null);
+    try std.testing.expect(std.mem.find(u8, page, "the summary so far") == null);
+    try std.testing.expect(std.mem.find(u8, page, "summarize") == null);
     // The system prompt is never shown.
-    try std.testing.expect(std.mem.indexOf(u8, page, "be terse") == null);
+    try std.testing.expect(std.mem.find(u8, page, "be terse") == null);
 }
 
 /// The line above a conversation: the session, the model it runs, the directory
@@ -1471,7 +1471,7 @@ pub fn header(h: Header, out: *std.Io.Writer) !void {
     try out.writeAll("<span class=\"sep\">·</span><span class=\"cwd\">");
     // The directory is shortened by the same helper the terminal header uses,
     // and escaped like every other value that reaches the page.
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     try escape(Agent.displayPath(&path_buffer, h.cwd, h.home), out);
     try out.writeAll("</span>");
 
@@ -1552,6 +1552,6 @@ test "the header carries the model, the directory and the gauge" {
         .context_tokens = 0,
         .model_info = null,
     }, &out.writer);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "x&lt;y") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "/a&lt;b") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "x&lt;y") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "/a&lt;b") != null);
 }

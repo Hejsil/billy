@@ -123,7 +123,7 @@ test "text that is not valid UTF-8 is repaired on the way into the pool" {
     // The byte became the replacement character, which is three bytes, so the
     // text is the byte it was short by two.
     try std.testing.expectEqual(broken.len + 2, repaired.len);
-    try std.testing.expect(std.mem.indexOf(u8, repaired, "\u{FFFD}") != null);
+    try std.testing.expect(std.mem.find(u8, repaired, "\u{FFFD}") != null);
 }
 
 test "a NUL in the text does not end the string early" {
