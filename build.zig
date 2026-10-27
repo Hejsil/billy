@@ -149,6 +149,7 @@ pub fn build(b: *std.Build) void {
         builder.addRule(.{ .builtin = .no_panic }, .{ .severity = .@"error" });
         builder.addRule(.{ .builtin = .no_hidden_allocations }, .{ .severity = .@"error" });
         builder.addRule(.{ .builtin = .no_literal_only_bool_expression }, .{});
+        builder.addRule(.{ .builtin = .build_zig_zon }, .{});
         builder.addRule(.{ .builtin = .no_unsafe_undefined }, .{
             .return_value = .@"error",
             .break_value = .@"error",
@@ -160,7 +161,7 @@ pub fn build(b: *std.Build) void {
         });
         builder.addPaths(.{
             .include_dirs = &.{b.path("src")},
-            .include_files = &.{b.path("build.zig")},
+            .include_files = &.{ b.path("build.zig"), b.path("build.zig.zon") },
         });
         break :step builder.build();
     });
