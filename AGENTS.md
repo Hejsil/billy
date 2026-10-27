@@ -255,5 +255,4 @@ least once. Read the rule, not the story; the story is in the review.
   fail, and widens the error set of everything above it. `Tools.init` returns `!Tools` and cannot
   fail; drop the `!`.
 - `writeAll` for a constant, `print` when there is something to format.
-- `if (!x)` not `if (x == false)`.
 - A log message carries no newline of its own; the log format adds one.

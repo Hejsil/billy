@@ -115,9 +115,24 @@ pub fn build(b: *std.Build) void {
     exe_tests.link_gc_sections = true;
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    // The lint rules are billy's own source, but nothing imports them, so the
+    // module above never reaches them: they are built and tested on their own,
+    // against the same zlinter the lint step uses.
+    const rules_module = b.createModule(.{
+        .root_source_file = b.path("src/rules/no_bool_compare.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zlinter", .module = b.dependency("zlinter", .{}).module("zlinter") },
+        },
+    });
+    const rules_tests = b.addTest(.{ .root_module = rules_module });
+    const run_rules_tests = b.addRunArtifact(rules_tests);
+
     const test_step = b.step("test", "Run the tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_rules_tests.step);
 
     const fmt = b.addFmt(.{
         .paths = &.{ b.path("src"), b.path("build.zig"), b.path("build.zig.zon") },
@@ -150,6 +165,7 @@ pub fn build(b: *std.Build) void {
         builder.addRule(.{ .builtin = .no_panic }, .{ .severity = .@"error" });
         builder.addRule(.{ .builtin = .no_hidden_allocations }, .{ .severity = .@"error" });
         builder.addRule(.{ .builtin = .no_literal_only_bool_expression }, .{});
+        builder.addCustomRule("no_bool_compare", b.path("src/rules/no_bool_compare.zig"), .{});
         builder.addRule(.{ .builtin = .build_zig_zon }, .{});
         builder.addRule(.{ .builtin = .no_unsafe_undefined }, .{
             .return_value = .@"error",
