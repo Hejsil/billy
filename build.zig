@@ -142,6 +142,13 @@ pub fn build(b: *std.Build) void {
         builder.addRule(.{ .builtin = .no_redundant_comptime }, .{ .severity = .@"error" });
         builder.addRule(.{ .builtin = .import_ordering }, .{ .severity = .@"error" });
         builder.addRule(.{ .builtin = .no_empty_block }, .{});
+        builder.addRule(.{ .builtin = .function_naming }, .{});
+        builder.addRule(.{ .builtin = .switch_case_ordering }, .{ .else_is_last = .@"error" });
+        builder.addRule(.{ .builtin = .no_comment_out_code }, .{ .severity = .@"error" });
+        builder.addRule(.{ .builtin = .no_orelse_unreachable }, .{ .severity = .@"error" });
+        builder.addRule(.{ .builtin = .no_panic }, .{ .severity = .@"error" });
+        builder.addRule(.{ .builtin = .no_hidden_allocations }, .{ .severity = .@"error" });
+        builder.addRule(.{ .builtin = .no_literal_only_bool_expression }, .{});
         builder.addRule(.{ .builtin = .no_unsafe_undefined }, .{
             .return_value = .@"error",
             .break_value = .@"error",
