@@ -35,11 +35,6 @@ least once. Read the rule, not the story; the story is in the review.
   *`web_fetch`'s `raw` path used `try direct.fetch`, so a bad url ended the whole turn, left an
   unanswered tool call in the session, and told the user the request failed. `read` wrote its error
   without the prefix, so a missing file showed up as a successful, grey result.*
-- **A hint that cannot be kept is not a failure of the work.** `Health`'s waits are advice about a
-  backend, and whoever records one is holding the answer the advice is about — a search that has
-  already found its results. A table that cannot be added to, or a file that cannot be written, is a
-  warning in the log and the call carries on: returning the error throws the answer away to report
-  the hint.
 - **Report a failure once, at the layer that can say something useful.** A layer that cannot add
   anything returns the error and says nothing; the one that can explain it prints, and returns
   `report.Reported`, which `main` counts as a failure and stays quiet about.

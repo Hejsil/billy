@@ -4,6 +4,7 @@
 //! naming them.
 
 test {
+    _ = @import("hint_is_not_a_failure.zig");
     _ = @import("method_by_receiver.zig");
     _ = @import("no_bool_compare.zig");
     _ = @import("no_log_newline.zig");

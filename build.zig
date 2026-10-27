@@ -180,6 +180,7 @@ pub fn build(b: *std.Build) void {
         builder.addCustomRule("no_log_newline", b.path("src/rules/no_log_newline.zig"), .{});
         builder.addCustomRule("report_failure_once", b.path("src/rules/report_failure_once.zig"), .{});
         builder.addCustomRule("method_by_receiver", b.path("src/rules/method_by_receiver.zig"), .{});
+        builder.addCustomRule("hint_is_not_a_failure", b.path("src/rules/hint_is_not_a_failure.zig"), .{});
         builder.addPaths(.{
             .include_dirs = &.{b.path("src")},
             .include_files = &.{ b.path("build.zig"), b.path("build.zig.zon") },
