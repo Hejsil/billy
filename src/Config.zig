@@ -212,6 +212,9 @@ pub const Providers = struct {
         const parsed = try std.json.Value.jsonParse(allocator, source, options);
         if (parsed != .object) return error.UnexpectedToken;
 
+        // The entries are taken from the arena the configuration was read
+        // through, which frees everything it read in one go.
+        // zlinter-disable-next-line require_errdefer_dealloc - the arena owns it
         var entries: std.ArrayList(Entry) = .empty;
         var it = parsed.object.iterator();
         while (it.next()) |setting| {

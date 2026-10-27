@@ -988,6 +988,7 @@ fn decodeKeys(bytes: []const u8) ![]u8 {
     ed.in_pos = 0;
     ed.in_len = bytes.len;
     var keys: std.ArrayList(u8) = .empty;
+    errdefer keys.deinit(std.testing.allocator);
     while (ed.in_pos < ed.in_len) {
         try keys.append(std.testing.allocator, switch (try ed.nextKey()) {
             .char => |c| if (c[1] == 0) c[0] else '#',

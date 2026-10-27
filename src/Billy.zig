@@ -114,6 +114,9 @@ pub fn deinit(billy: *Billy) void {
 /// refused rather than stored.
 pub fn login(billy: *Billy, out: Terminal.Writer, service: ?[]const u8) !void {
     billy.ensureCatalog();
+    // The names are collected in the run's arena, which frees them with the
+    // run, so the list needs no cleanup of its own if this stops part way.
+    // zlinter-disable-next-line require_errdefer_dealloc - the arena owns it
     var provider_names: std.ArrayList([]const u8) = .empty;
     for (billy.config.stored.providers.entries) |entry| {
         try provider_names.append(billy.arena, entry.name);
