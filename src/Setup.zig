@@ -10,7 +10,6 @@
 //! value, so either frontend can build any of it where it is needed.
 
 const std = @import("std");
-const Agent = @import("Agent.zig");
 const Config = @import("Config.zig");
 const Credentials = @import("Credentials.zig");
 const Endpoint = @import("Endpoint.zig");
@@ -18,10 +17,7 @@ const models = @import("models.zig");
 const Health = @import("Health.zig");
 const report = @import("report.zig");
 const Session = @import("Session.zig");
-const Terminal = @import("Terminal.zig");
 const Tools = @import("Tools.zig");
-
-const Setup = @This();
 
 /// The backends billy's web tools ask, in the order they are tried. A tool whose
 /// backend is null is left out of the ones the model is offered.

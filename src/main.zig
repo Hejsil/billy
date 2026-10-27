@@ -102,11 +102,6 @@ fn printHelp(
     try out.print("\nOptions:\n{s}\n", .{options});
 }
 
-/// Whether `arg` asks for a usage message.
-fn isHelp(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help");
-}
-
 const Options = struct {
     /// The session to continue, or `--resume` with none named, which is the one
     /// written to most recently in the working directory. A new session is

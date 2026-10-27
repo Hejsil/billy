@@ -23,14 +23,9 @@
 const std = @import("std");
 const llm = @import("llm.zig");
 const ulid = @import("ulid.zig");
-const Agent = @import("Agent.zig");
 const Pool = @import("Pool.zig");
 
 const Session = @This();
-
-/// Subdirectory of the data directory that holds the sessions, so the session
-/// files sit apart from the credentials billy keeps in the directory itself.
-const sessions_dir = "sessions";
 
 /// Extension of a session file.
 const extension = ".json";

@@ -13,9 +13,6 @@ const Tools = @import("Tools.zig");
 
 const Config = @This();
 
-/// Directory under the XDG config directory that holds the configuration.
-const app_dir = "billy";
-
 /// Name of the configuration file inside that directory.
 pub const file_name = "config.json";
 

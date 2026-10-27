@@ -542,14 +542,6 @@ fn hasRow(comptime name: []const u8) bool {
     return false;
 }
 
-/// The table row of the tool named `name`.
-fn tableForName(comptime name: []const u8) Tool {
-    for (table) |tool| {
-        if (std.mem.eql(u8, @tagName(tool.tag), name)) return tool;
-    }
-    @compileError("no table row for the tool '" ++ name ++ "'");
-}
-
 /// The table row of tool `tag`.
 fn tableForTag(comptime tag: std.meta.Tag(Call)) Tool {
     for (table) |tool| {

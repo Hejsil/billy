@@ -550,12 +550,6 @@ fn fill(self: *Markdown, byte: u8, count: usize) bool {
     return true;
 }
 
-/// Columns `text` takes in a table: one per character, so a cell with accents
-/// lines up. A double-width character counts as one.
-fn textWidth(text: []const u8) usize {
-    return std.unicode.utf8CountCodepoints(text) catch text.len;
-}
-
 fn columnCount(self: *Markdown) usize {
     var columns: usize = 0;
     for (self.rows.items) |row| columns = @max(columns, row.cells.items.len);
