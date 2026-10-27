@@ -143,7 +143,7 @@ pub fn save(credentials: *const Credentials, io: std.Io, dir: std.Io.Dir) !void 
         .writer = &file.interface,
         .options = .{ .whitespace = .indent_2 },
     };
-    try write(credentials, &json);
+    try credentials.write(&json);
     try file.flush();
     try atomic.replace(io);
 }
@@ -320,7 +320,7 @@ test "a stored key survives a save and a load" {
     try credentials.put(allocator, "tavily", "tvly-secret");
     try credentials.put(allocator, "deepseek", "sk-secret");
     try credentials.put(allocator, "mock", "mock-secret");
-    try save(&credentials, std.testing.io, tmp.dir);
+    try credentials.save(std.testing.io, tmp.dir);
 
     const loaded = try load(std.testing.io, tmp.dir, allocator);
     try std.testing.expectEqualStrings("tvly-secret", loaded.get("tavily").?);
@@ -342,7 +342,7 @@ test "the file holds a key per name that has one, and nothing else" {
 
     var credentials: Credentials = .{};
     try credentials.put(allocator, "tavily", "tvly-secret");
-    try save(&credentials, std.testing.io, tmp.dir);
+    try credentials.save(std.testing.io, tmp.dir);
 
     const text = try tmp.dir.readFileAlloc(std.testing.io, file_name, allocator, .unlimited);
     // The names are the object's keys; a name with no key is left out rather
@@ -381,7 +381,7 @@ test "the credentials file is written for the owner alone" {
 
     var credentials: Credentials = .{};
     try credentials.put(arena_state.allocator(), "tavily", "secret");
-    try save(&credentials, std.testing.io, tmp.dir);
+    try credentials.save(std.testing.io, tmp.dir);
 
     const stat = try tmp.dir.statFile(std.testing.io, file_name, .{});
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);

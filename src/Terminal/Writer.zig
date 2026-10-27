@@ -193,12 +193,12 @@ pub const Mark = struct {
         try writer.print("{s}{s}{s} {s}", .{
             writer.color(mark.hue), mark.glyph, writer.reset(), writer.bold(),
         });
-        try writeText(writer, name);
+        try writer.writeText(name);
         try writer.write(writer.reset());
         if (target.len > 0) {
             try writer.write(" ");
             try writer.write(writer.dim());
-            try writeText(writer, target);
+            try writer.writeText(target);
             try writer.write(writer.reset());
         }
         try writer.write("\n");

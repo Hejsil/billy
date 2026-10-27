@@ -804,7 +804,7 @@ fn compact(
 /// whose instructions the prompt has to be read from. A failure is logged and the
 /// session keeps what it had.
 fn refresh(agent: *Agent, session: *Session) void {
-    refreshLead(agent, agent.tool_set.definitions(), session) catch |err|
+    agent.refreshLead(agent.tool_set.definitions(), session) catch |err|
         std.log.warn("could not refresh the prompt and tools: {s}", .{@errorName(err)});
 }
 
@@ -841,14 +841,14 @@ pub fn ask(agent: *Agent, emitter: *Emitter, session: *Session, text: []const u8
     // the emitter, and only what the turn itself shows says whether a failure
     // stopped an answer that had started.
     const shown_before = emitter.shown;
-    turn(agent, emitter, session, &client) catch |err| {
+    agent.turn(emitter, session, &client) catch |err| {
         std.log.err("a request failed: {s}", .{@errorName(err)});
         var notice: [256]u8 = undefined;
         return emitter.show(.{ .notice = failureNotice(&notice, err, emitter.shown > shown_before) });
     };
 
     if (first_turn and agent.behaviour.title) {
-        titleSession(agent, session, &client) catch |err|
+        agent.titleSession(session, &client) catch |err|
             std.log.warn("could not title the session: {s}", .{@errorName(err)});
     }
 }
@@ -2545,7 +2545,7 @@ test "refreshLead replaces the prompt, the project instructions and the tools" {
     var agent = try testAgentIn(io, gpa, setup, work_dir, null);
     defer agent.deinit();
 
-    try refreshLead(&agent, &new_tools, &session);
+    try agent.refreshLead(&new_tools, &session);
 
     // The prompt is the current one: billy's own text with the project's
     // instructions after it, and none of the old prompt left.
@@ -3058,7 +3058,7 @@ test "a turn shows the tool it runs and then the answer" {
 
     var recorder = Recorder{ .gpa = arena_state.allocator() };
     var client = try agent.clientFor(&session);
-    try turn(&agent, recorder.emitter(), &session, &client);
+    try agent.turn(recorder.emitter(), &session, &client);
 
     try mock.await();
 
@@ -3170,7 +3170,7 @@ test "a turn that fails mid-answer has shown something" {
 
     var recorder = Recorder{ .gpa = arena_state.allocator() };
     var client = try agent.clientFor(&session);
-    try std.testing.expectError(error.ApiError, turn(&agent, recorder.emitter(), &session, &client));
+    try std.testing.expectError(error.ApiError, agent.turn(recorder.emitter(), &session, &client));
     try mock.await();
 
     // The delta reached the emitter, so the turn knows the user saw half of it.
@@ -3213,7 +3213,7 @@ test "a turn that fails before showing anything has shown nothing" {
 
     var recorder = Recorder{ .gpa = arena_state.allocator() };
     var client = try agent.clientFor(&session);
-    try std.testing.expectError(error.HttpStatus, turn(&agent, recorder.emitter(), &session, &client));
+    try std.testing.expectError(error.HttpStatus, agent.turn(recorder.emitter(), &session, &client));
     try mock.await();
 
     try std.testing.expectEqual(@as(usize, 0), recorder.interface.shown);
@@ -3271,7 +3271,7 @@ test "a reply with nothing is not kept, and the turn is asked again" {
 
     var recorder = Recorder{ .gpa = arena_state.allocator() };
     var client = try agent.clientFor(&session);
-    try turn(&agent, recorder.emitter(), &session, &client);
+    try agent.turn(recorder.emitter(), &session, &client);
 
     try mock.await();
 
@@ -3339,7 +3339,7 @@ test "a provider that keeps saying nothing ends the turn" {
 
     var recorder = Recorder{ .gpa = arena_state.allocator() };
     var client = try agent.clientFor(&session);
-    try turn(&agent, recorder.emitter(), &session, &client);
+    try agent.turn(recorder.emitter(), &session, &client);
 
     // Stopped rather than waited on, since a turn that stops asking leaves the
     // mock waiting for the requests it was started for.
@@ -3430,7 +3430,7 @@ test "a reply that says something starts the run of silence over" {
 
     var recorder = Recorder{ .gpa = arena_state.allocator() };
     var client = try agent.clientFor(&session);
-    try turn(&agent, recorder.emitter(), &session, &client);
+    try agent.turn(recorder.emitter(), &session, &client);
 
     // Stopped rather than waited on: the mock is answering the request that
     // carries the answer, and a turn that stopped before reaching it would leave
@@ -3487,7 +3487,7 @@ test "a turn that runs out of turns says so" {
 
     var recorder = Recorder{ .gpa = arena_state.allocator() };
     var client = try agent.clientFor(&session);
-    try turn(&agent, recorder.emitter(), &session, &client);
+    try agent.turn(recorder.emitter(), &session, &client);
 
     // Stopped rather than waited on, since a turn that ended before using both
     // of its turns would leave the mock waiting for a request that is not coming.

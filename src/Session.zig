@@ -368,7 +368,7 @@ pub const Conversation = struct {
             try json.endObject();
         }
         for (session.messages.items[session.sentFrom()..]) |message| {
-            try writeMessage(session, json, message);
+            try session.writeMessage(json, message);
         }
         // The extra messages come last, as the newest of the request. Each is an
         // `llm.Message`, written the way the client writes a resolved
@@ -744,7 +744,7 @@ pub fn write(session: *const Session, writer: *std.Io.Writer) !void {
     try json.objectField("messages");
     try json.beginArray();
     for (session.messages.items) |message|
-        try writeMessage(session, &json, message);
+        try session.writeMessage(&json, message);
     try json.endArray();
 
     try json.objectField("compactions");
@@ -1354,7 +1354,7 @@ fn expectResume(messages: []const llm.Message) !void {
 
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
-    try expectSessionConvo(&resumed, messages);
+    try resumed.expectSessionConvo(messages);
 }
 
 /// Checks the JSON a request carries for `session` against `expected`: the
@@ -1850,7 +1850,7 @@ test "a resume answers a tool call a killed run left open" {
     // and the call did not finish.
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
-    try expectSessionConvo(&resumed, &.{
+    try resumed.expectSessionConvo(&.{
         .{ .role = .user, .content = "hello" },
         .{ .role = .assistant, .tool_calls = &.{.{
             .id = "call_1",
@@ -1881,7 +1881,7 @@ test "a resume answers every call a kill left open, in the order made" {
     // answered in the place it was made rather than after the user message.
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
-    try expectSessionConvo(&resumed, &.{
+    try resumed.expectSessionConvo(&.{
         .{ .role = .user, .content = "go" },
         .{ .role = .assistant, .tool_calls = &.{
             .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{}" } },
@@ -1980,7 +1980,7 @@ test "a conversation writes the messages a request would have carried" {
         "\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.zig\\\"}\"}}]," ++
         "\"reasoning_content\":\"Reading the file.\"}," ++
         "{\"role\":\"tool\",\"content\":\"1\\tconst x = 1;\\n\",\"tool_call_id\":\"call_1\"}]";
-    try expectRequestJson(&session, &.{}, expected);
+    try session.expectRequestJson(&.{}, expected);
 
     // Writing the stored conversation has to give the bytes the resolved one
     // does, field for field and in the same order, or a resumed session would
@@ -2007,7 +2007,7 @@ test "an extra message is written after the conversation, and is not part of it"
     // prompt that asks for a title: the extra is written last, as the newest
     // message, and the session is left exactly as it was.
     const extra = [_]llm.Message{.{ .role = .user, .content = "give it a title" }};
-    try expectRequestJson(&session, &extra, "[{\"role\":\"system\",\"content\":\"be terse\"}," ++
+    try session.expectRequestJson(&extra, "[{\"role\":\"system\",\"content\":\"be terse\"}," ++
         "{\"role\":\"user\",\"content\":\"hello\"}," ++
         "{\"role\":\"assistant\",\"content\":\"hi\"}," ++
         "{\"role\":\"user\",\"content\":\"give it a title\"}]");
@@ -2028,7 +2028,7 @@ test "a string that is not valid UTF-8 is repaired on the way into the pool" {
 
     // The pool holds text, so a request writes the content as a string. Left as
     // bytes, Zig would write it as an array of numbers the API rejects.
-    try expectRequestJson(&session, &.{}, "[{\"role\":\"tool\",\"content\":\"a\u{FFFD}b\u{FFFD}c\",\"tool_call_id\":\"call_1\"}]");
+    try session.expectRequestJson(&.{}, "[{\"role\":\"tool\",\"content\":\"a\u{FFFD}b\u{FFFD}c\",\"tool_call_id\":\"call_1\"}]");
 
     // The repaired text is what the session keeps, so a resume reads it back
     // the same rather than the bytes that could not be sent.
@@ -2360,7 +2360,7 @@ test "the messages a request carries start at the latest compaction" {
 
     // The system prompt, then the latest summary and the prompt after it: the
     // first compaction and everything before it is left out.
-    try expectRequestJson(&session, &.{}, "[{\"role\":\"system\",\"content\":\"s\"}," ++
+    try session.expectRequestJson(&.{}, "[{\"role\":\"system\",\"content\":\"s\"}," ++
         "{\"role\":\"user\",\"content\":\"summary two\"}," ++
         "{\"role\":\"user\",\"content\":\"latest\"}]");
 }

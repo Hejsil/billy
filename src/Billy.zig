@@ -276,7 +276,7 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resuming: ?Resume) !void {
             billy.config.stored.resume_blocks,
         );
     }
-    try runTerminal(billy, out, options, &session);
+    try billy.runTerminal(out, options, &session);
 }
 
 /// Runs one session on the terminal until the input ends: each line is taken as
