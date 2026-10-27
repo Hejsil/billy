@@ -1,5 +1,6 @@
 const std = @import("std");
 const Translator = @import("translate_c").Translator;
+const zlinter = @import("zlinter");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -125,9 +126,21 @@ pub fn build(b: *std.Build) void {
     const fmt_step = b.step("fmt", "Check that every source file is formatted");
     fmt_step.dependOn(&fmt.step);
 
-    const all = b.step("all", "Build and install billy, run the tests, and check formatting");
+    const lint = b.step("lint", "Lint the source");
+    lint.dependOn(step: {
+        var builder = zlinter.builder(b, .{});
+        builder.addRule(.{ .builtin = .no_todo }, .{ .severity = .off });
+        builder.addPaths(.{
+            .include_dirs = &.{b.path("src")},
+            .include_files = &.{b.path("build.zig")},
+        });
+        break :step builder.build();
+    });
+
+    const all = b.step("all", "Build and install billy, run the tests, check formatting, and lint");
     all.dependOn(b.getInstallStep());
     all.dependOn(test_step);
     all.dependOn(fmt_step);
+    all.dependOn(lint);
     b.default_step = all;
 }
