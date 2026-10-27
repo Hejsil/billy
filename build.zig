@@ -177,6 +177,7 @@ pub fn build(b: *std.Build) void {
         });
         builder.addCustomRule("no_bool_compare", b.path("src/rules/no_bool_compare.zig"), .{});
         builder.addCustomRule("no_unformatted_print", b.path("src/rules/no_unformatted_print.zig"), .{});
+        builder.addCustomRule("no_log_newline", b.path("src/rules/no_log_newline.zig"), .{});
         builder.addPaths(.{
             .include_dirs = &.{b.path("src")},
             .include_files = &.{ b.path("build.zig"), b.path("build.zig.zon") },
