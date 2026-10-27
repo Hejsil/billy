@@ -7,6 +7,10 @@
 //! to send a request, is handed the one thing it needs rather than this. The
 //! model catalog is the exception: it is read the first time a run needs it, so
 //! a command that never asks a model does not fetch it.
+//!
+//! The terminal frontend is here in full -- the line editor, the header, the
+//! writer and the loop that reads a line and shows the answer as it is written --
+//! because all of that is the frontend's. What the agent is handed is a turn.
 
 const std = @import("std");
 const Agent = @import("Agent.zig");
@@ -191,6 +195,11 @@ pub fn configSet(billy: *Billy, out: Terminal.Writer, path: []const u8, value: [
     try out.print("set {s} to {s}\n", .{ path, value });
 }
 
+/// Written in front of the line being typed, so what is being edited reads as the
+/// input rather than as another block. The editor erases it when the line is
+/// submitted and the emitter writes the prompt's block in its place.
+const input_prompt = "> ";
+
 /// Which session a run continues, when it continues one.
 pub const Resume = union(enum) {
     /// The session with this id, in whatever directory it works.
@@ -267,7 +276,95 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resuming: ?Resume) !void {
             billy.config.stored.resume_blocks,
         );
     }
-    try Agent.run(billy.io, billy.gpa, out, options, &session);
+    try runTerminal(billy, out, options, &session);
+}
+
+/// Runs one session on the terminal until the input ends: each line is taken as
+/// the agent decides what it is, and the blocks of the answer are shown as they
+/// happen. Each turn is sent where the session's model points when it begins,
+/// which is resolved again for every one of them.
+///
+/// This is the terminal frontend, and it lives here rather than with the agent:
+/// the editor, the header and the writer are the frontend's, and the agent is
+/// handed only what a turn needs.
+fn runTerminal(
+    billy: *Billy,
+    out: Terminal.Writer,
+    options: Agent.Options,
+    session: *Session,
+) !void {
+    const io = billy.io;
+    const gpa = billy.gpa;
+    // One HTTP client for the run, shared by the model requests and the search
+    // backend, so both reuse its connections and share the certificates it scans
+    // once. Every session asked in this run borrows it.
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    var agent = try Agent.init(io, gpa, options, session.cwd(), &http_client);
+    defer agent.deinit();
+    // A resumed session keeps the prompt and tools it was saved with, so it is
+    // prepared here; a new one gets them from its first prompt, through `start`.
+    const resumed = session.messages.items.len > 0;
+    if (resumed) try agent.prepare(session);
+
+    // The editor holds the lines it returns and its history in an arena of its
+    // own, over `gpa`, so the run need not keep an allocator for them.
+    var editor = LineEditor.init(io, out.out, gpa);
+    defer editor.deinit();
+
+    // The blocks of the run are shown on the terminal, the way billy has always
+    // shown them, through the writer this frontend prints with.
+    var terminal = Terminal{ .writer = out, .io = io, .scratch = gpa };
+    defer terminal.deinit();
+    const emitter = terminal.emitter();
+
+    // The header is rebuilt for every prompt, so it reflects the context size
+    // after the turns run so far. One buffer holds it for the whole loop; each pass
+    // clears it and writes the header into it.
+    var header: std.Io.Writer.Allocating = .init(gpa);
+    defer header.deinit();
+    while (true) {
+        header.clearRetainingCapacity();
+        // The header is built each pass, so it shows the session as it stands: the
+        // model it recorded and the directory, which is read from the session
+        // since its pool has grown with the turn and moved every string taken
+        // from it before. The gauge is the window of the model the session goes
+        // to now, so a model changed since the last turn reads right at once.
+        try header.writer.print("{f}", .{Agent.SessionHeader.of(
+            session,
+            Setup.sessionModel(&billy.config, &billy.catalog, session),
+            options.home,
+        )});
+        const line = (try editor.readLine(header.written(), input_prompt)) orelse break;
+        if (line.len == 0) continue;
+        // What the line came to is the agent's to decide: a command is run and
+        // reported through the emitter, and anything else is what is asked.
+        const waiting = try agent.take(emitter, session, line);
+        const text = switch (waiting) {
+            .prompt => |asked| asked.text,
+            // A command was run, or the model could not be resolved and the
+            // notice says why: either way nothing is asked, and the run carries
+            // on, so the next line can be the one that fixes it.
+            .ran, .unresolved => {
+                try out.flush();
+                continue;
+            },
+        };
+        // The line editor has erased the prompt it was typed behind, so the
+        // prompt is written out now as the block a replay shows: the `> ` belongs
+        // to the input, not to what was said. Flushed before the request, which
+        // may take a while, so the user sees what was sent.
+        //
+        // A request that failed has been reported through the emitter by `ask`,
+        // and the session carries on: a dropped connection is not the end of the
+        // conversation. Only a failure of the emitter itself, which is this
+        // terminal going away, reaches here.
+        agent.ask(emitter, session, text) catch |err|
+            std.log.err("could not show the turn: {s}", .{@errorName(err)});
+        try out.flush();
+    }
+    try out.flush();
 }
 
 /// The id of the session `resuming` continues, or null when it asks for a new

@@ -1,5 +1,7 @@
-//! The agent loop: read a request from the user, ask the model, run the tools
-//! it asks for, and repeat until it answers with text.
+//! The agent loop: ask the model, run the tools it asks for, and repeat until it
+//! answers with text. A turn is given a session and the line it was asked with;
+//! how that line was read, and how the answer is shown, are the frontend's -- it
+//! hands this an emitter to show them through.
 const std = @import("std");
 const Config = @import("Config.zig");
 const Credentials = @import("Credentials.zig");
@@ -8,7 +10,6 @@ const llm = @import("llm.zig");
 const models = @import("models.zig");
 const Tools = @import("Tools.zig");
 const Mock = @import("Mock.zig");
-const LineEditor = @import("LineEditor.zig");
 const report = @import("report.zig");
 const Session = @import("Session.zig");
 const Terminal = @import("Terminal.zig");
@@ -347,10 +348,6 @@ fn sameDir(io: std.Io, a: std.Io.Dir, b: std.Io.Dir) bool {
     const two = b.statFile(io, ".", .{}) catch return false;
     return one.inode == two.inode;
 }
-
-/// Printed in front of every line the user types. The transcript reuses it so a
-/// replayed session looks like the run it continues.
-const prompt = "> ";
 
 /// The line shown above the input prompt: the session id, the model, the working
 /// directory, and how much of the context window the conversation fills. Its
@@ -872,90 +869,6 @@ fn failureNotice(buffer: []u8, err: anyerror, shown: bool) []const u8 {
             "the request failed, and the turn stopped partway — try again"
         else
             "the request failed — nothing was sent, try again");
-}
-
-/// Runs one session on the terminal, from `options`, until the input ends: each
-/// line is taken as the agent decides what it is, and the blocks of the answer
-/// are shown as they happen. Each turn is sent where the session's model points
-/// when it begins, which is resolved again for every one of them.
-pub fn run(
-    io: std.Io,
-    gpa: std.mem.Allocator,
-    writer: Terminal.Writer,
-    options: Options,
-    session: *Session,
-) !void {
-    // One HTTP client for the run, shared by the model requests and the search
-    // backend, so both reuse its connections and share the certificates it scans
-    // once. Every session asked in this run borrows it.
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
-    var agent = try Agent.init(io, gpa, options, session.cwd(), &http_client);
-    defer agent.deinit();
-    // A resumed session keeps the prompt and tools it was saved with, so it is
-    // prepared here; a new one gets them from its first prompt, through `start`.
-    const resumed = session.messages.items.len > 0;
-    if (resumed) try agent.prepare(session);
-
-    // The editor holds the lines it returns and its history in an arena of its
-    // own, over `gpa`, so the run need not keep an allocator for them.
-    var editor = LineEditor.init(io, writer.out, gpa);
-    defer editor.deinit();
-
-    // The blocks of the run are shown on the terminal, the way billy has always
-    // shown them, through the writer the frontend gave the run.
-    var terminal = Terminal{ .writer = writer, .io = io, .scratch = gpa };
-    defer terminal.deinit();
-    const emitter = terminal.emitter();
-
-    // The header is rebuilt for every prompt, so it reflects the context size
-    // after the turns run so far. One buffer holds it for the whole loop; each pass
-    // clears it and writes the header into it.
-    var header: std.Io.Writer.Allocating = .init(gpa);
-    defer header.deinit();
-    while (true) {
-        header.clearRetainingCapacity();
-        // The header is built each pass, so it shows the session as it stands: the
-        // model it recorded and the directory, which is read from the session
-        // since its pool has grown with the turn and moved every string taken
-        // from it before. The gauge is the
-        // window of the model the session goes to now, so a model changed since
-        // the last turn reads right at once.
-        try header.writer.print("{f}", .{SessionHeader.of(
-            session,
-            agent.sessionModel(session),
-            options.home,
-        )});
-        const line = (try editor.readLine(header.written(), prompt)) orelse break;
-        if (line.len == 0) continue;
-        // What the line came to is the agent's to decide: a command is run and
-        // reported through the emitter, and anything else is what is asked.
-        const waiting = try agent.take(emitter, session, line);
-        const text = switch (waiting) {
-            .prompt => |asked| asked.text,
-            // A command was run, or the model could not be resolved and the
-            // notice says why: either way nothing is asked, and the run carries
-            // on, so the next line can be the one that fixes it.
-            .ran, .unresolved => {
-                try writer.flush();
-                continue;
-            },
-        };
-        // The line editor has erased the prompt it was typed behind, so the
-        // prompt is written out now as the block a replay shows: the `> ` belongs
-        // to the input, not to what was said. Flushed before the request, which
-        // may take a while, so the user sees what was sent.
-        //
-        // A request that failed has been reported through the emitter by `ask`,
-        // and the session carries on: a dropped connection is not the end of the
-        // conversation. Only a failure of the emitter itself, which is this
-        // terminal going away, reaches here.
-        agent.ask(emitter, session, text) catch |err|
-            std.log.err("could not show the turn: {s}", .{@errorName(err)});
-        try writer.flush();
-    }
-    try writer.flush();
 }
 
 /// Replays a stored conversation on the terminal as the blocks it was made of,
