@@ -24,6 +24,10 @@ pub fn readBody(gpa: std.mem.Allocator, response: *std.http.Client.Response) ![]
     errdefer body.deinit();
 
     var transfer_buffer: [64]u8 = undefined;
+    // `readerDecompressing` fills this in before anything is read from it, which
+    // is what its `*Decompress` argument is for; there is no value to give it
+    // first, and `.none` wants a reader that does not exist yet.
+    // zlinter-disable-next-line no_unsafe_undefined - filled in before it is read
     var decompress: std.http.Decompress = undefined;
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
     _ = try reader.streamRemaining(&body.writer);

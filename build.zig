@@ -142,6 +142,15 @@ pub fn build(b: *std.Build) void {
         builder.addRule(.{ .builtin = .no_redundant_comptime }, .{ .severity = .@"error" });
         builder.addRule(.{ .builtin = .import_ordering }, .{ .severity = .@"error" });
         builder.addRule(.{ .builtin = .no_empty_block }, .{});
+        builder.addRule(.{ .builtin = .no_unsafe_undefined }, .{
+            .return_value = .@"error",
+            .break_value = .@"error",
+            .const_value = .@"error",
+            .optional_value = .@"error",
+            .pointer_value = .@"error",
+            .enum_or_union_value = .@"error",
+            .primitive_scalar_value = .@"error",
+        });
         builder.addPaths(.{
             .include_dirs = &.{b.path("src")},
             .include_files = &.{b.path("build.zig")},
