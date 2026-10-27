@@ -88,7 +88,7 @@ const StreamOptions = struct { include_usage: bool = true };
 /// the format the API takes. That is what lets a conversation and its tools be
 /// sent from where they are stored instead of being resolved into a second copy
 /// of themselves first; the session writes both out of its own pools.
-fn Request(comptime Messages: type, comptime Tools: type) type {
+fn Request(Messages: type, Tools: type) type {
     return struct {
         model: []const u8,
         messages: Messages,

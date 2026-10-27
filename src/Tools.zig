@@ -302,7 +302,7 @@ pub fn parseCallNamed(arena: std.mem.Allocator, name: []const u8, arguments: []c
 
 /// Parses arguments that live as long as `arena`. Unknown fields are dropped, so
 /// a call from a newer model does not fail on the fields this version ignores.
-fn fromJson(comptime T: type, arena: std.mem.Allocator, json: []const u8) !T {
+fn fromJson(T: type, arena: std.mem.Allocator, json: []const u8) !T {
     return std.json.parseFromSliceLeaky(T, arena, json, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,

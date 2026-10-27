@@ -139,6 +139,7 @@ pub fn build(b: *std.Build) void {
             .detect_else_unreachable = .@"error",
         });
         builder.addRule(.{ .builtin = .require_errdefer_dealloc }, .{ .severity = .@"error" });
+        builder.addRule(.{ .builtin = .no_redundant_comptime }, .{ .severity = .@"error" });
         builder.addPaths(.{
             .include_dirs = &.{b.path("src")},
             .include_files = &.{b.path("build.zig")},

@@ -83,7 +83,7 @@ pub fn toolSettings(config: *const Config, backends: Backends, health: ?*Health)
 /// What resolving one tool's backends came to: nothing configured, the settings,
 /// or the provider that could not be built and why. The failure carries the
 /// provider, so the caller can report it by name without an out-parameter.
-fn Resolution(comptime T: type) type {
+fn Resolution(T: type) type {
     return union(enum) {
         none,
         config: T,

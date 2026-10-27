@@ -343,7 +343,7 @@ pub fn set(config: *Config, path: []const u8, value: []const u8) !void {
 /// The field is found by name at run time, but the descent is compiled section
 /// by section, so a field no path can name is skipped rather than walked into.
 fn setPath(
-    comptime T: type,
+    T: type,
     target: *T,
     path: []const u8,
     arena: std.mem.Allocator,
@@ -387,7 +387,7 @@ fn nextSegment(path: []const u8) Segment {
 /// boolean from true or false, an enum from a variant's name, and an optional
 /// as null when it says `null` or as its child otherwise. A string is copied
 /// into `arena`, which owns it.
-fn parseValue(comptime T: type, arena: std.mem.Allocator, value: []const u8) error{ InvalidValue, OutOfMemory }!T {
+fn parseValue(T: type, arena: std.mem.Allocator, value: []const u8) error{ InvalidValue, OutOfMemory }!T {
     switch (@typeInfo(T)) {
         .optional => |optional| {
             if (std.mem.eql(u8, value, "null")) return null;
@@ -413,7 +413,7 @@ fn parseValue(comptime T: type, arena: std.mem.Allocator, value: []const u8) err
 /// Whether a path can reach `T`: a value a string can set, or a section the walk
 /// goes into. A section is walked into whatever it holds, since a field a path
 /// cannot name -- a list, say -- leaves the fields beside it reachable.
-fn isSettable(comptime T: type) bool {
+fn isSettable(T: type) bool {
     if (@typeInfo(T) == .@"struct") return true;
     return isSettableValue(T);
 }
@@ -421,7 +421,7 @@ fn isSettable(comptime T: type) bool {
 /// Whether a value of `T` can be set from one string: a string, a number, a
 /// boolean, an enum, or an optional of one of those. Anything else is not a
 /// setting a path can name, so the walk leaves it alone.
-fn isSettableValue(comptime T: type) bool {
+fn isSettableValue(T: type) bool {
     return switch (@typeInfo(T)) {
         .optional => |optional| isSettableValue(optional.child),
         .int, .bool => true,

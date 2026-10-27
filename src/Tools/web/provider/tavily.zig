@@ -46,7 +46,7 @@ pub fn renderFetch(gpa: std.mem.Allocator, reply: []const u8) ![]const u8 {
 
 /// Parses a provider reply, which is the provider's own shape: a reply that does
 /// not parse is the provider's failure, reported as the shared one.
-fn parse(comptime T: type, gpa: std.mem.Allocator, reply: []const u8) !std.json.Parsed(T) {
+fn parse(T: type, gpa: std.mem.Allocator, reply: []const u8) !std.json.Parsed(T) {
     return std.json.parseFromSlice(T, gpa, reply, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,

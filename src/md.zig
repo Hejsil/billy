@@ -83,7 +83,7 @@ pub fn appendCodepoint(value: *std.ArrayList(u8), gpa: std.mem.Allocator, codepo
 /// The same description is used by the batch entry point for a whole document
 /// and by `Stream.init` for one that arrives in pieces; only how it is driven
 /// differs.
-pub fn parser(comptime T: type) c.MD_PARSER {
+pub fn parser(T: type) c.MD_PARSER {
     return .{
         .abi_version = 0,
         .flags = flags,
@@ -101,7 +101,7 @@ pub fn parser(comptime T: type) c.MD_PARSER {
 /// zero to carry on and non-zero to stop the parse, which is how a renderer
 /// stops on a failed write; the failure itself is kept on the renderer, since a
 /// C callback has no way to return an error.
-fn enterBlock(comptime T: type) *const fn (c.MD_BLOCKTYPE, ?*anyopaque, ?*anyopaque) callconv(.c) c_int {
+fn enterBlock(T: type) *const fn (c.MD_BLOCKTYPE, ?*anyopaque, ?*anyopaque) callconv(.c) c_int {
     return struct {
         fn callback(block_type: c.MD_BLOCKTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
             const renderer: *T = @ptrCast(@alignCast(userdata.?));
@@ -110,7 +110,7 @@ fn enterBlock(comptime T: type) *const fn (c.MD_BLOCKTYPE, ?*anyopaque, ?*anyopa
     }.callback;
 }
 
-fn leaveBlock(comptime T: type) *const fn (c.MD_BLOCKTYPE, ?*anyopaque, ?*anyopaque) callconv(.c) c_int {
+fn leaveBlock(T: type) *const fn (c.MD_BLOCKTYPE, ?*anyopaque, ?*anyopaque) callconv(.c) c_int {
     return struct {
         fn callback(block_type: c.MD_BLOCKTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
             const renderer: *T = @ptrCast(@alignCast(userdata.?));
@@ -119,7 +119,7 @@ fn leaveBlock(comptime T: type) *const fn (c.MD_BLOCKTYPE, ?*anyopaque, ?*anyopa
     }.callback;
 }
 
-fn enterSpan(comptime T: type) *const fn (c.MD_SPANTYPE, ?*anyopaque, ?*anyopaque) callconv(.c) c_int {
+fn enterSpan(T: type) *const fn (c.MD_SPANTYPE, ?*anyopaque, ?*anyopaque) callconv(.c) c_int {
     return struct {
         fn callback(span_type: c.MD_SPANTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
             const renderer: *T = @ptrCast(@alignCast(userdata.?));
@@ -128,7 +128,7 @@ fn enterSpan(comptime T: type) *const fn (c.MD_SPANTYPE, ?*anyopaque, ?*anyopaqu
     }.callback;
 }
 
-fn leaveSpan(comptime T: type) *const fn (c.MD_SPANTYPE, ?*anyopaque, ?*anyopaque) callconv(.c) c_int {
+fn leaveSpan(T: type) *const fn (c.MD_SPANTYPE, ?*anyopaque, ?*anyopaque) callconv(.c) c_int {
     return struct {
         fn callback(span_type: c.MD_SPANTYPE, detail: ?*anyopaque, userdata: ?*anyopaque) callconv(.c) c_int {
             const renderer: *T = @ptrCast(@alignCast(userdata.?));
@@ -137,7 +137,7 @@ fn leaveSpan(comptime T: type) *const fn (c.MD_SPANTYPE, ?*anyopaque, ?*anyopaqu
     }.callback;
 }
 
-fn writeText(comptime T: type) *const fn (c.MD_TEXTTYPE, [*c]const c.MD_CHAR, c.MD_SIZE, ?*anyopaque) callconv(.c) c_int {
+fn writeText(T: type) *const fn (c.MD_TEXTTYPE, [*c]const c.MD_CHAR, c.MD_SIZE, ?*anyopaque) callconv(.c) c_int {
     return struct {
         fn callback(
             text_type: c.MD_TEXTTYPE,

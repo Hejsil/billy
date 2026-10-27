@@ -294,7 +294,7 @@ pub fn request(
 
 /// What `requestJson` came back with: the reply parsed as `T`, or the wait the
 /// provider asked for.
-pub fn JsonAnswer(comptime T: type) type {
+pub fn JsonAnswer(T: type) type {
     return union(enum) {
         parsed: std.json.Parsed(T),
         retry_after_ms: i64,
@@ -304,7 +304,7 @@ pub fn JsonAnswer(comptime T: type) type {
 /// As `request`, for a provider whose reply is JSON of type `T`. The parsed reply
 /// owns its strings. A reply that does not parse is `error.BadReply`.
 pub fn requestJson(
-    comptime T: type,
+    T: type,
     gpa: std.mem.Allocator,
     http_client: *std.http.Client,
     method: std.http.Method,
