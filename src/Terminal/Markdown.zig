@@ -14,6 +14,7 @@
 //! in place of colour, so the text still reads as markdown when piped to a file.
 
 const std = @import("std");
+
 const md = @import("../md.zig");
 const Writer = @import("Writer.zig");
 const Style = Writer.Style;

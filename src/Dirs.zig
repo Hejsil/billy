@@ -7,6 +7,7 @@
 //! working out where each one is.
 
 const std = @import("std");
+
 const xdg = @import("xdg.zig");
 
 const Dirs = @This();

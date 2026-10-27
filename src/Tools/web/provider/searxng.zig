@@ -3,6 +3,7 @@
 //! stay here.
 
 const std = @import("std");
+
 const SearchResult = @import("../Search/Result.zig");
 
 /// A SearXNG search reply as the numbered list the model reads. SearXNG takes no

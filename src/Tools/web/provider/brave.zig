@@ -2,6 +2,7 @@
 //! the key's header and the method are the table's in `web.zig`.
 
 const std = @import("std");
+
 const SearchResult = @import("../Search/Result.zig");
 
 /// A Brave search reply as the numbered list the model reads. The results sit

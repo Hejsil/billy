@@ -5,6 +5,7 @@
 //! without editing, which keeps the harness usable from a pipe.
 
 const std = @import("std");
+
 const settings = @import("Terminal/settings.zig");
 const terminal_width = @import("Terminal/width.zig");
 

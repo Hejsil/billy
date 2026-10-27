@@ -21,9 +21,10 @@
 //! session a kill left half written is still one that can continue.
 
 const std = @import("std");
+
 const llm = @import("llm.zig");
-const ulid = @import("ulid.zig");
 const Pool = @import("Pool.zig");
+const ulid = @import("ulid.zig");
 
 const Session = @This();
 

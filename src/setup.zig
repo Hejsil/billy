@@ -10,11 +10,12 @@
 //! value, so either frontend can build any of it where it is needed.
 
 const std = @import("std");
+
 const Config = @import("Config.zig");
 const Credentials = @import("Credentials.zig");
 const endpoint = @import("endpoint.zig");
-const models = @import("models.zig");
 const Health = @import("Health.zig");
+const models = @import("models.zig");
 const report = @import("report.zig");
 const Session = @import("Session.zig");
 const Tools = @import("Tools.zig");

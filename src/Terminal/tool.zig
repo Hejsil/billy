@@ -3,9 +3,10 @@
 //! web draws the same call as HTML, and the two share only the `Tools`
 //! vocabulary they are built from.
 const std = @import("std");
-const Tools = @import("../Tools.zig");
-const llm = @import("../llm.zig");
+
 const diff = @import("../diff.zig");
+const llm = @import("../llm.zig");
+const Tools = @import("../Tools.zig");
 const Writer = @import("Writer.zig");
 
 const max_block_lines = 5;

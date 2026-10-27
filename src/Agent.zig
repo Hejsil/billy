@@ -3,16 +3,17 @@
 //! how that line was read, and how the answer is shown, are the frontend's -- it
 //! hands this an emitter to show them through.
 const std = @import("std");
+
 const Config = @import("Config.zig");
 const Credentials = @import("Credentials.zig");
 const endpoint = @import("endpoint.zig");
 const llm = @import("llm.zig");
-const models = @import("models.zig");
-const Tools = @import("Tools.zig");
 const Mock = @import("Mock.zig");
+const models = @import("models.zig");
 const report = @import("report.zig");
 const Session = @import("Session.zig");
 const Terminal = @import("Terminal.zig");
+const Tools = @import("Tools.zig");
 
 const Agent = @This();
 

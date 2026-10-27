@@ -3,6 +3,7 @@
 //! collapsed.
 
 const std = @import("std");
+
 const html = @import("../html.zig");
 const Search = @import("../Tools/web/Search.zig");
 

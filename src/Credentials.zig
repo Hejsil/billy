@@ -8,6 +8,7 @@
 //! and a key is not.
 
 const std = @import("std");
+
 const models = @import("models.zig");
 
 const Credentials = @This();

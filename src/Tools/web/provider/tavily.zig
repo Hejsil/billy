@@ -3,6 +3,7 @@
 //! what stays here is the shape of a Tavily body and the reply it answers.
 
 const std = @import("std");
+
 const SearchResult = @import("../Search/Result.zig");
 
 /// The body a Tavily search is posted with. `basic` depth is the fast, cheaper

@@ -4,6 +4,7 @@
 //! it, and `billy models --refresh` fetches it again.
 
 const std = @import("std");
+
 const http = @import("http.zig");
 
 /// The cache file, under billy's cache directory.

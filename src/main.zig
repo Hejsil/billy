@@ -3,8 +3,8 @@ const std = @import("std");
 const Billy = @import("billy").Billy;
 const report = @import("billy").report;
 const Server = @import("billy").Server;
-const Terminal = @import("billy").Terminal;
 const spaghet = @import("spaghet");
+const Terminal = @import("billy").Terminal;
 
 /// What billy is, shown at the top of its own help.
 const billy_about = "A small fast AI agent that works in your terminal.";

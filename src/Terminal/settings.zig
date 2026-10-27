@@ -1,8 +1,8 @@
 //! Where the terminal's settings are kept, so that input can be read a line at a
 //! time rather than a keystroke at a time, and put back afterwards.
 
-const std = @import("std");
 const builtin = @import("builtin");
+const std = @import("std");
 
 /// The settings `fd` is on now.
 ///

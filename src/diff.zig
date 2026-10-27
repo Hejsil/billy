@@ -8,6 +8,7 @@
 //! was written.
 
 const std = @import("std");
+
 const Terminal = @import("Terminal.zig");
 
 /// Context lines kept on each side of the change. A model often hands over the

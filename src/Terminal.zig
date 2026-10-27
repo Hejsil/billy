@@ -2,12 +2,13 @@
 //! reply's markdown laid out by the built-in renderer, and the tools printed as
 //! they were written.
 const std = @import("std");
+
 const Agent = @import("Agent.zig");
 
 pub const tool = @import("Terminal/tool.zig");
 
-pub const Writer = @import("Terminal/Writer.zig");
 pub const Markdown = @import("Terminal/Markdown.zig");
+pub const Writer = @import("Terminal/Writer.zig");
 
 const Terminal = @This();
 

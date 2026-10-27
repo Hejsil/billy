@@ -2,10 +2,11 @@
 //! until one reads it.
 
 const std = @import("std");
+
 const Health = @import("../../Health.zig");
+const Mock = @import("../../Mock.zig");
 const Tools = @import("../../Tools.zig");
 const web = @import("../web.zig");
-const Mock = @import("../../Mock.zig");
 
 const Fetch = @This();
 

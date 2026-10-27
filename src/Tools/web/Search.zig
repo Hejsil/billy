@@ -2,9 +2,10 @@
 //! until one answers.
 
 const std = @import("std");
+
 const Health = @import("../../Health.zig");
-const Tools = @import("../../Tools.zig");
 const Mock = @import("../../Mock.zig");
+const Tools = @import("../../Tools.zig");
 const web = @import("../web.zig");
 
 pub const Result = @import("Search/Result.zig");

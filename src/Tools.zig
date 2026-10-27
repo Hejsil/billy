@@ -1,14 +1,16 @@
 //! The tools the agent can call, together with their JSON Schema descriptions.
 
 const std = @import("std");
-const llm = @import("llm.zig");
-const Health = @import("Health.zig");
-const Terminal = @import("Terminal.zig");
-const Session = @import("Session.zig");
+
 const Bash = @import("Tools/Bash.zig");
 const Edit = @import("Tools/Edit.zig");
+const Health = @import("Health.zig");
+const llm = @import("llm.zig");
 const Read = @import("Tools/Read.zig");
+const Session = @import("Session.zig");
+const Terminal = @import("Terminal.zig");
 const Write = @import("Tools/Write.zig");
+
 pub const web = @import("Tools/web.zig");
 
 const Tools = @This();

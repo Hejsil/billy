@@ -14,11 +14,12 @@
 //! it ran and what it produced.
 
 const std = @import("std");
+
 const Agent = @import("Agent.zig");
 const diff = @import("diff.zig");
+const favicons = @import("web/favicons.zig");
 const md = @import("md.zig");
 const models = @import("models.zig");
-const favicons = @import("web/favicons.zig");
 const Session = @import("Session.zig");
 const Tools = @import("Tools.zig");
 

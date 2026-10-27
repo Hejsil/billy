@@ -1,6 +1,7 @@
 //! OpenAI-compatible `/chat/completions` client with function calling.
 
 const std = @import("std");
+
 const Health = @import("Health.zig");
 const http = @import("http.zig");
 const Mock = @import("Mock.zig");

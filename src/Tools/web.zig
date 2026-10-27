@@ -1,15 +1,16 @@
 //! The web tools, and the HTTP plumbing every provider they use shares.
 
 const std = @import("std");
+
+const brave = @import("web/provider/brave.zig");
+const exa = @import("web/provider/exa.zig");
 const Health = @import("../Health.zig");
 const http = @import("../http.zig");
-const tavily = @import("web/provider/tavily.zig");
-const exa = @import("web/provider/exa.zig");
-const brave = @import("web/provider/brave.zig");
 const searxng = @import("web/provider/searxng.zig");
+const tavily = @import("web/provider/tavily.zig");
 
-pub const Search = @import("web/Search.zig");
 pub const Fetch = @import("web/Fetch.zig");
+pub const Search = @import("web/Search.zig");
 
 /// What a call to a provider came back with: its text, or the wait the provider
 /// asked for before it is asked again. The text is the response body for

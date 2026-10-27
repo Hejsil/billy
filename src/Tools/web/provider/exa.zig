@@ -2,6 +2,7 @@
 //! as JSON. The address, the key and the method are the table's in `web.zig`.
 
 const std = @import("std");
+
 const SearchResult = @import("../Search/Result.zig");
 
 /// The body an Exa search is posted with. Exa would return the whole page of each

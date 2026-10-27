@@ -13,18 +13,19 @@
 //! because all of that is the frontend's. What the agent is handed is a turn.
 
 const std = @import("std");
+
 const Agent = @import("Agent.zig");
 const Config = @import("Config.zig");
 const Credentials = @import("Credentials.zig");
 const Dirs = @import("Dirs.zig");
 const endpoint = @import("endpoint.zig");
-const setup = @import("setup.zig");
 const Health = @import("Health.zig");
-const report = @import("report.zig");
-const Session = @import("Session.zig");
-const Server = @import("Server.zig");
 const LineEditor = @import("LineEditor.zig");
 const models = @import("models.zig");
+const report = @import("report.zig");
+const Server = @import("Server.zig");
+const Session = @import("Session.zig");
+const setup = @import("setup.zig");
 const Terminal = @import("Terminal.zig");
 
 const Billy = @This();

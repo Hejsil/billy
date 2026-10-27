@@ -3,6 +3,7 @@
 //! fallback, so both are built here.
 
 const std = @import("std");
+
 const report = @import("report.zig");
 
 /// Directory under the base that holds billy's files.

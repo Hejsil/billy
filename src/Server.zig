@@ -16,15 +16,16 @@
 //! something else is asked for, and why the help says so.
 
 const std = @import("std");
+
 const Agent = @import("Agent.zig");
 const Config = @import("Config.zig");
 const Credentials = @import("Credentials.zig");
-const setup = @import("setup.zig");
 const Health = @import("Health.zig");
-const models = @import("models.zig");
 const html = @import("html.zig");
+const models = @import("models.zig");
 const report = @import("report.zig");
 const Session = @import("Session.zig");
+const setup = @import("setup.zig");
 
 const Server = @This();
 
