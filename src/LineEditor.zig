@@ -159,16 +159,20 @@ fn read(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
     if (!interactive) return ed.readLinePiped();
 
     const saved = try ed.enterRaw();
-    defer {
-        settings.set(std.posix.STDIN_FILENO, saved) catch {};
-        // Bracketed paste is a property of the terminal rather than of this
-        // process, so it is turned back off when the line is done; left on, it
-        // would wrap pastes in whatever the user runs next.
-        ed.out.writeAll("\x1b[?2004l") catch {};
-        ed.out.flush() catch {};
-        ed.pasting = false;
-        ed.paste_cr = false;
-    }
+    // The line is read raw and the terminal given back here rather than from a
+    // `defer`: the restore is the same handful of writes either way, and one
+    // place that says so runs it after the read on both of the read's paths. A
+    // terminal that will not be given back is reported over the read's own
+    // failure, since that is the state the caller is left in.
+    const line = ed.readKeys(header, prompt);
+    try ed.restore(saved);
+    return line;
+}
+
+/// Turns the paste marking on and reads a line with the terminal in raw mode,
+/// which `read` has done by the time it is called: everything it changes is put
+/// back by `restore`, once this has returned however it did.
+fn readKeys(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
     // Ask the terminal to mark where a paste begins and ends, so the bytes in
     // one can be told from what the user types.
     try ed.out.writeAll("\x1b[?2004h");
@@ -347,6 +351,28 @@ fn read(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
             dirty = false;
         }
     }
+}
+
+/// Puts the terminal back as `read` found it: the settings it saved, the paste
+/// marking off, and what is buffered on its way, so the shell that runs after
+/// billy starts on a terminal it recognises.
+fn restore(ed: *LineEditor, saved: std.posix.termios) !void {
+    // Each of the three is attempted even when one fails, since a terminal that
+    // will not take its old settings may still take the escape that turns the
+    // paste marking off; the failure returned is the first of them.
+    const settings_err = settings.set(std.posix.STDIN_FILENO, saved);
+
+    // Bracketed paste is a property of the terminal rather than of this process,
+    // so it is turned back off when the line is done; left on, it would wrap
+    // pastes in whatever the user runs next.
+    const write_err = ed.out.writeAll("\x1b[?2004l");
+    const flush_err = ed.out.flush();
+    ed.pasting = false;
+    ed.paste_cr = false;
+
+    try settings_err;
+    try write_err;
+    try flush_err;
 }
 
 fn readLinePiped(ed: *LineEditor) !?[]const u8 {

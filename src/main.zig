@@ -169,22 +169,14 @@ pub fn main(init: std.process.Init) u8 {
     return run(init) catch |err| fail(err);
 }
 
-/// Everything the command line asked for, answering with the code it exits with:
-/// zero when it did what was asked.
+/// Reads the command line and answers it through one writer, which is pushed out
+/// on the way out of here rather than from a `defer`, so what a command printed
+/// is on its way before the code the run ended with is answered.
 fn run(init: std.process.Init) !u8 {
     // Anything that lives as long as the process, including the conversation,
     // is allocated here.
     const arena = init.arena.allocator();
     const io = init.io;
-
-    var stdout_buffer: [4096]u8 = undefined;
-    var stdout_file_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
-
-    // Everything billy prints goes through one writer, which decorates its blocks
-    // only when it is a terminal it is printing to. A subcommand that prints no
-    // blocks writes the same text either way.
-    const out = Terminal.Writer.detect(&stdout_file_writer);
-    defer out.flush() catch {};
 
     const argv = try std.process.Args.toSlice(init.minimal.args, arena);
     const options = parseArgsSlice(argv[1..]) catch |err| switch (err) {
@@ -193,6 +185,43 @@ fn run(init: std.process.Init) !u8 {
             return report.Reported;
         },
     };
+
+    // The writer is made once the command line is read, so the way out above has
+    // no buffer to push out, and the buffer it does hold is pushed out below
+    // rather than from a `defer`: what a command printed is on its way before
+    // the code the run ended with is answered.
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_file_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+    // Everything billy prints goes through one writer, which decorates its blocks
+    // only when it is a terminal it is printing to. A subcommand that prints no
+    // blocks writes the same text either way.
+    const out = Terminal.Writer.detect(&stdout_file_writer);
+
+    const code = answer(init, out, options) catch |err| {
+        if (err != error.WriteFailed) return err;
+        return writeFailure(&stdout_file_writer, err);
+    };
+    stdout_file_writer.flush() catch |err| return writeFailure(&stdout_file_writer, err);
+    return code;
+}
+
+/// What a run answers when what it printed could not be written.
+///
+/// A reader that went away -- `billy list | head` -- is not a failure of the
+/// run's: the lines it asked for were written, and a shell that closed the pipe
+/// has what it wanted. Anything else is one, said once here in the words of the
+/// write that failed: the writer interface reports every failed write as
+/// `WriteFailed`, and the file writer behind it is what noticed the cause.
+fn writeFailure(stdout: *std.Io.File.Writer, err: anyerror) anyerror!u8 {
+    const cause: anyerror = if (err == error.WriteFailed) stdout.err orelse err else err;
+    if (cause == error.BrokenPipe) return 0;
+    std.log.err("cannot write to stdout: {s}", .{@errorName(cause)});
+    return report.Reported;
+}
+
+/// Everything the command line asked for, through `out`: the code the process
+/// exits with, zero when it did what was asked.
+fn answer(init: std.process.Init, out: Terminal.Writer, options: Options) !u8 {
     // A usage is answered before anything is read, so it works even when billy's
     // own files cannot be: which of them asked is the command's own business, so
     // it is printed here rather than in each arm below.

@@ -281,7 +281,10 @@ pub fn request(
         // to the model as the result of the call.
         std.log.warn("{s}: HTTP {d}", .{ what, @backingInt(response.head.status) });
         const discarded = response.reader(&.{});
-        _ = discarded.discardRemaining() catch {};
+        _ = discarded.discardRemaining() catch {
+            // The answer this response carried is being thrown away, so what is
+            // left of it is too.
+        };
         if (retry_after_ms) |ms| return .{ .retry_after_ms = @intCast(@min(ms, max_retry_after_ms)) };
         return error.RequestFailed;
     }

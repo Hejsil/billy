@@ -42,7 +42,6 @@ pub fn emitter(self: *Terminal) *Agent.Emitter {
 /// Drops a streamed answer or reasoning block that will not be finished, so a
 /// run that ends early leaves nothing held and the terminal is not left dim.
 pub fn deinit(self: *Terminal) void {
-    self.dropReasoning();
     self.dropStream();
 }
 
@@ -99,15 +98,6 @@ fn endReasoning(self: *Terminal) !void {
     try self.writer.flush();
 }
 
-/// Drops an open reasoning block without writing more of it, turning the dim
-/// off so the rest of the run is not left looking like reasoning.
-fn dropReasoning(self: *Terminal) void {
-    if (!self.reasoning) return;
-    self.reasoning = false;
-    self.writer.write(self.writer.reset()) catch {};
-    self.writer.flush() catch {};
-}
-
 /// Ends a streamed answer, if one is being written: writes its last line and
 /// closes it, then the blank line that sets the block off from what follows.
 /// Returns whether there was an answer being streamed.
@@ -158,6 +148,10 @@ fn show(e: *Agent.Emitter, block: Agent.Block) anyerror!void {
         // is how a replayed session shows it.
         .answer => |content| {
             if (try self.endStream()) return;
+            // Reasoning that no fragment of an answer followed is still open
+            // here, as it is when a model stops after thinking: the dim is
+            // turned off before the answer, or the reply is written under it.
+            try self.endReasoning();
             try printAnswer(self.scratch, self.writer, content);
         },
         // The header goes out as the call begins, so a command that runs
@@ -374,4 +368,25 @@ test "an answer with no fragments is written whole" {
 
     try terminal.emitter().show(.{ .answer = "**hi**" });
     try std.testing.expectEqualStrings("◆ answer\nhi\n\n", out.written());
+}
+
+test "an answer that arrives as a block ends the reasoning before it" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var terminal = Terminal{ .writer = .{ .style = .ansi, .out = &out.writer }, .io = undefined, .scratch = gpa };
+    defer terminal.deinit();
+    const emit = terminal.emitter();
+
+    // Reasoning that no fragment of an answer follows, which is what a model
+    // that stops after thinking sends: the answer block is not reasoning, so the
+    // dim is turned off before it is written.
+    try emit.showDelta(.{ .reasoning = "think" });
+    try emit.show(.{ .answer = "done" });
+    try std.testing.expectEqualStrings(
+        "\x1b[35m◇\x1b[0m \x1b[1mreasoning\x1b[0m\n\x1b[2mthink\x1b[0m\n\n" ++
+            "\x1b[32m◆\x1b[0m \x1b[1manswer\x1b[0m\ndone\n\n",
+        out.written(),
+    );
 }

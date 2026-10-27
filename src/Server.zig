@@ -293,7 +293,11 @@ fn handle(
             .status = .internal_server_error,
             .extra_headers = &.{ContentType.text.header()},
             .keep_alive = false,
-        }) catch {};
+        }) catch {
+            // Nothing is left to tell a connection that will not take the
+            // status: the browser sees it drop, which is what this spares it
+            // rather than replaces.
+        };
     };
 }
 
@@ -835,7 +839,6 @@ fn serveTurn(
         },
     });
     r.answered = true;
-    defer body_writer.end() catch {};
 
     var stream = Stream{ .body = &body_writer, .gpa = gpa };
     const emitter = stream.emitter();
@@ -959,8 +962,14 @@ const Stream = struct {
         try self.send("error", FailedEvent{ .message = message });
     }
 
+    /// Says the turn is over, then ends the body: the frames written are the
+    /// whole of what the page is sent, so the write side is closed here rather
+    /// than left to whatever unwinds. A turn whose stream failed before reaching
+    /// this leaves the body unended on purpose -- the page has already lost that
+    /// stream, and a page told it ended cleanly would believe it.
     fn done(self: *Stream) !void {
         try self.write("done", "{}");
+        try self.body.end();
     }
 
     /// Writes one event, and flushes it, so the page has it now.
