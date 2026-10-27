@@ -5,4 +5,5 @@
 
 test {
     _ = @import("no_bool_compare.zig");
+    _ = @import("no_unformatted_print.zig");
 }

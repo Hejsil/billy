@@ -254,5 +254,4 @@ least once. Read the rule, not the story; the story is in the review.
 - A signature that returns an error it cannot produce makes every caller write a `try` that cannot
   fail, and widens the error set of everything above it. `Tools.init` returns `!Tools` and cannot
   fail; drop the `!`.
-- `writeAll` for a constant, `print` when there is something to format.
 - A log message carries no newline of its own; the log format adds one.

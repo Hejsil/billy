@@ -165,7 +165,6 @@ pub fn build(b: *std.Build) void {
         builder.addRule(.{ .builtin = .no_panic }, .{ .severity = .@"error" });
         builder.addRule(.{ .builtin = .no_hidden_allocations }, .{ .severity = .@"error" });
         builder.addRule(.{ .builtin = .no_literal_only_bool_expression }, .{});
-        builder.addCustomRule("no_bool_compare", b.path("src/rules/no_bool_compare.zig"), .{});
         builder.addRule(.{ .builtin = .build_zig_zon }, .{});
         builder.addRule(.{ .builtin = .no_unsafe_undefined }, .{
             .return_value = .@"error",
@@ -176,6 +175,8 @@ pub fn build(b: *std.Build) void {
             .enum_or_union_value = .@"error",
             .primitive_scalar_value = .@"error",
         });
+        builder.addCustomRule("no_bool_compare", b.path("src/rules/no_bool_compare.zig"), .{});
+        builder.addCustomRule("no_unformatted_print", b.path("src/rules/no_unformatted_print.zig"), .{});
         builder.addPaths(.{
             .include_dirs = &.{b.path("src")},
             .include_files = &.{ b.path("build.zig"), b.path("build.zig.zon") },
