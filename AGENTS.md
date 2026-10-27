@@ -77,10 +77,6 @@ least once. Read the rule, not the story; the story is in the review.
   pid, and 0.17's `SpawnOptions` has no process-group option, so a killed `make -j8` leaves its
   compilers running while the tool reports that the command was killed. Say what was killed, or put
   the command in a group of its own.
-- **A silent `catch` is a decision: write it down.** `catch return`, `catch continue` and
-  `catch {}` are fine where a comment says why the failure is not worth reporting (`Health.read`,
-  `dirHas`, the terminal's restore). They are not fine by default.
-
 - **A request the user did not ask for is the one that most needs a deadline.** The run's own
   requests happen where the user is watching a spinner; a catalog fetch happens before anything is
   printed, on a path nobody chose, and a connection that is accepted and then stalls hangs the run
@@ -205,9 +201,7 @@ least once. Read the rule, not the story; the story is in the review.
   `data:` address and a link may not. Bad: six lines restating a field name.
 - **A doc block ends at the blank line before the next declaration.** A detached comment silently
   becomes the next type's documentation.
-- **Name things the way the types are named.** The file that is a struct is capitalised, so it is
-  imported as the struct (`Agent`, not `agent`), and `root.zig` exports it that way too. Alias a
-  module by its stem: `diff`, not `diffing`.
+- **Alias a module by the stem of its name.** `diff`, not `diffing`.
 
 ## Tests
 
@@ -263,4 +257,3 @@ least once. Read the rule, not the story; the story is in the review.
 - `writeAll` for a constant, `print` when there is something to format.
 - `if (!x)` not `if (x == false)`.
 - A log message carries no newline of its own; the log format adds one.
-- Brace the arms of a parser; one braceless chain is not a style.
