@@ -98,13 +98,13 @@ pub fn strike(writer: Writer) []const u8 {
 
 /// The code that opens text in `hue`.
 pub fn color(writer: Writer, hue: Color) []const u8 {
-    return writer.hueCode(hue, false);
+    return writer.hueCode(hue, .plain);
 }
 
 /// The code that opens text in `hue` and bold, for the one thing on a line that
 /// is the point of the line.
 pub fn boldColor(writer: Writer, hue: Color) []const u8 {
-    return writer.hueCode(hue, true);
+    return writer.hueCode(hue, .bold);
 }
 
 /// The code that turns every decoration back off.
@@ -139,12 +139,16 @@ fn code(writer: Writer, comptime codes: []const u8) []const u8 {
     };
 }
 
-/// The escape code that opens text in `hue`, bold when `loud`. Each colour is
-/// written out at comptime, so nothing is formatted to make one.
-fn hueCode(writer: Writer, hue: Color, comptime loud: bool) []const u8 {
+/// How a colour is opened: as the hue alone, or as the hue and bold together,
+/// which is what the one thing on a line is shown in.
+const Weight = enum { plain, bold };
+
+/// The escape code that opens text in `hue`, in `weight`. Each colour is written
+/// out at comptime, so nothing is formatted to make one.
+fn hueCode(writer: Writer, hue: Color, comptime weight: Weight) []const u8 {
     if (writer.style == .plain) return "";
     return switch (hue) {
-        inline else => |known| comptime std.fmt.comptimePrint("\x1b[" ++ (if (loud) "1;" else "") ++ "{d}m", .{@backingInt(known)}),
+        inline else => |known| comptime std.fmt.comptimePrint("\x1b[" ++ (if (weight == .bold) "1;" else "") ++ "{d}m", .{@backingInt(known)}),
     };
 }
 

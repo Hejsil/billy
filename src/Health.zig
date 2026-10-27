@@ -101,7 +101,12 @@ strings: std.ArrayList(u8) = .empty,
 /// The waits, by the offset of their name in `strings`, in the order they were
 /// recorded: the file is written in that order, so nothing has to be sorted or
 /// copied to write it.
-entries: std.array_hash_map.Custom(Name, Wait, Names, true) = .empty,
+entries: std.array_hash_map.Custom(Name, Wait, Names, store_hash) = .empty,
+
+/// Whether the map keeps each entry's hash beside it rather than hashing a name
+/// again every time the table is rehashed, which the waits are read and written
+/// through often enough to be worth the word each.
+const store_hash = true;
 
 /// Reads the waits left by an earlier run.
 pub fn load(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir) !Health {

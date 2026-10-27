@@ -220,19 +220,21 @@ pub fn list(
     }
 
     for (known) |service| {
-        try printRow(out, service.name, service.purpose, name_width, purpose_width, credentials.get(service.name) != null);
+        const state: KeyState = if (credentials.get(service.name) != null) .stored else .not_set;
+        try printRow(out, service.name, service.purpose, name_width, purpose_width, state);
     }
     for (providers) |name| {
         // One billy already knows was printed as the service it is, with what
         // its key is for rather than where it came from.
         if (purposeOf(name) != null) continue;
-        try printRow(out, name, configured_purpose, name_width, purpose_width, credentials.get(name) != null);
+        const state: KeyState = if (credentials.get(name) != null) .stored else .not_set;
+        try printRow(out, name, configured_purpose, name_width, purpose_width, state);
     }
     for (credentials.names()) |name| {
         if (purposeOf(name) != null) continue;
         if (definedIn(name, providers)) continue;
         const purpose = if (catalog.find(name) != null) catalog_purpose else dangling_purpose;
-        try printRow(out, name, purpose, name_width, purpose_width, true);
+        try printRow(out, name, purpose, name_width, purpose_width, .stored);
     }
     try out.writeAll("\n`billy login <service>` stores a key\n");
 }
@@ -245,6 +247,9 @@ fn definedIn(name: []const u8, providers: []const []const u8) bool {
     return false;
 }
 
+/// Whether a key is stored for a service, which is how the listing spells it.
+const KeyState = enum { stored, not_set };
+
 /// One line of the listing: the name, what its key is for, and where the key is.
 fn printRow(
     out: *std.Io.Writer,
@@ -252,7 +257,7 @@ fn printRow(
     purpose: []const u8,
     name_width: usize,
     purpose_width: usize,
-    stored: bool,
+    state: KeyState,
 ) !void {
     try out.print("{s}", .{name});
     try out.splatByteAll(' ', name_width - name.len);
@@ -260,7 +265,10 @@ fn printRow(
     try out.print("{s}", .{purpose});
     try out.splatByteAll(' ', purpose_width - purpose.len);
     try out.writeAll("  ");
-    try out.writeAll(if (stored) "stored" else "not set");
+    try out.writeAll(switch (state) {
+        .stored => "stored",
+        .not_set => "not set",
+    });
     try out.writeAll("\n");
 }
 

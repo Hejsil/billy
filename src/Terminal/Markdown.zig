@@ -87,9 +87,13 @@ row: std.ArrayList([]u8) = .empty,
 cell: std.ArrayList(u8) = .empty,
 aligns: std.ArrayList(md.c.MD_ALIGN) = .empty,
 
+/// Whether a list numbers its items, which is what sets its marker apart from a
+/// bullet.
+const Numbering = enum { ordered, unordered };
+
 /// One open list, so an ordered list can keep counting where it left off.
 const ListFrame = struct {
-    ordered: bool = false,
+    numbering: Numbering = .unordered,
     /// The number the next item of an ordered list is.
     next: usize = 1,
 };
@@ -284,13 +288,17 @@ fn blank(self: *Markdown) bool {
     return true;
 }
 
+/// Whether a block is a heading, which is followed by what it heads rather than
+/// by a blank line, or one of the others.
+const Head = enum { heading, body };
+
 /// Opens a block, writing the blank line owed before it. Only a top-level
 /// block takes one: inside a list or a quote the blocks run together.
-fn beginBlock(self: *Markdown, heading: bool) bool {
+fn beginBlock(self: *Markdown, head: Head) bool {
     if (self.container_depth != 0) return true;
     if (self.emitted and self.need_blank and !self.blank()) return false;
     self.emitted = true;
-    self.block_head = heading;
+    self.block_head = head == .heading;
     return true;
 }
 
@@ -307,33 +315,33 @@ pub fn enterBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyo
     switch (block_type) {
         md.c.MD_BLOCK_DOC => {},
         md.c.MD_BLOCK_QUOTE => {
-            if (!self.beginBlock(false)) return false;
+            if (!self.beginBlock(.body)) return false;
             self.quote_depth += 1;
             self.container_depth += 1;
             if (!self.raw(self.writer.dim())) return false;
         },
-        md.c.MD_BLOCK_UL => return self.openList(false, 1),
+        md.c.MD_BLOCK_UL => return self.openList(.unordered, 1),
         md.c.MD_BLOCK_OL => {
             const list: *const md.c.MD_BLOCK_OL_DETAIL = @ptrCast(@alignCast(detail.?));
-            return self.openList(true, list.start);
+            return self.openList(.ordered, list.start);
         },
         md.c.MD_BLOCK_LI => return self.openItem(@ptrCast(@alignCast(detail.?))),
         md.c.MD_BLOCK_HR => {
-            if (!self.beginBlock(false)) return false;
+            if (!self.beginBlock(.body)) return false;
             if (!self.put(&rule)) return false;
         },
         md.c.MD_BLOCK_H => {
-            if (!self.beginBlock(true)) return false;
+            if (!self.beginBlock(.heading)) return false;
             // A heading is its text in bold; the `#` is not shown.
             if (!self.raw(self.writer.bold())) return false;
         },
         md.c.MD_BLOCK_CODE => {
-            if (!self.beginBlock(false)) return false;
+            if (!self.beginBlock(.body)) return false;
             self.in_code = true;
             if (!self.raw(self.writer.dim())) return false;
         },
         md.c.MD_BLOCK_P => {
-            if (!self.beginBlock(false)) return false;
+            if (!self.beginBlock(.body)) return false;
         },
         md.c.MD_BLOCK_TABLE => return self.openTable(),
         md.c.MD_BLOCK_THEAD => self.in_head = true,
@@ -415,14 +423,14 @@ fn indentDepth(self: *const Markdown) usize {
 
 /// Opens a list: remembers whether it is ordered and where its numbering
 /// starts, so an item can write its own marker.
-fn openList(self: *Markdown, ordered: bool, start: usize) bool {
-    if (!self.beginBlock(false))
+fn openList(self: *Markdown, numbering: Numbering, start: usize) bool {
+    if (!self.beginBlock(.body))
         return false;
 
     // Past the cap a list is still closed and indented like the one at the cap,
     // and shares its numbering.
     if (self.list_depth < max_list_depth)
-        self.list[self.list_depth] = .{ .ordered = ordered, .next = start };
+        self.list[self.list_depth] = .{ .numbering = numbering, .next = start };
 
     self.list_depth += 1;
     self.container_depth += 1;
@@ -453,7 +461,7 @@ fn openItem(self: *Markdown, detail: *const md.c.MD_BLOCK_LI_DETAIL) bool {
 
     const frame = &self.list[self.indentDepth() - 1];
     var buffer: [24]u8 = undefined;
-    const marker: []const u8 = if (frame.ordered) blk: {
+    const marker: []const u8 = if (frame.numbering == .ordered) blk: {
         const written = std.mem.print(&buffer, "{d}. ", .{frame.next}) catch return self.fail();
 
         frame.next += 1;
@@ -469,7 +477,7 @@ fn openItem(self: *Markdown, detail: *const md.c.MD_BLOCK_LI_DETAIL) bool {
 }
 
 fn openTable(self: *Markdown) bool {
-    if (!self.beginBlock(false)) return false;
+    if (!self.beginBlock(.body)) return false;
     self.table = true;
     self.rows = .empty;
     self.row = .empty;

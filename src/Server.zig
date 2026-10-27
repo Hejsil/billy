@@ -778,7 +778,7 @@ fn createSession(r: *Request, registry: *Registry, http_client: *std.http.Client
     if (parsed.value.text.len == 0)
         return r.reply(.text, "the prompt is empty\n", .bad_request);
 
-    try serveTurn(r, http_client, &session, r.server.options(), parsed.value.text, true);
+    try serveTurn(r, http_client, &session, r.server.options(), parsed.value.text, .announce);
 }
 
 /// `POST /api/sessions/{id}/message`: asks the session `text`, answering with the
@@ -801,8 +801,12 @@ fn askSession(r: *Request, registry: *Registry, http_client: *std.http.Client, i
     var session = (try r.open(id)) orelse return;
     defer session.deinit();
 
-    try serveTurn(r, http_client, &session, r.server.options(), parsed.value.text, false);
+    try serveTurn(r, http_client, &session, r.server.options(), parsed.value.text, .quiet);
 }
+
+/// Whether the page is told the session's id before it is asked, which a session
+/// it has not seen needs and one it is asking again does not.
+const Announce = enum { announce, quiet };
 
 /// Answers one prompt as the run happens: the run's blocks as the events of a
 /// stream, written and flushed one at a time rather than gathered, so a page sees
@@ -820,7 +824,7 @@ fn serveTurn(
     session: *Session,
     run_options: Agent.Options,
     text: []const u8,
-    announce: bool,
+    announce: Announce,
 ) !void {
     const gpa = r.server.gpa;
     var agent = try Agent.init(r.server.io, gpa, run_options, session.cwd(), http_client);
@@ -864,7 +868,7 @@ fn serveTurn(
     // Resolved here, after preparing the session: the id is a slice of the pool,
     // which preparing has just grown. Reading it again is cheaper and safer than
     // copying it before, and it is the same id either way.
-    if (announce) try stream.send("session", SessionEvent{ .id = session.id() });
+    if (announce == .announce) try stream.send("session", SessionEvent{ .id = session.id() });
 
     // A session the agent named from this line is announced by that name, so the
     // page's list shows it before the model has answered. The model's own title,

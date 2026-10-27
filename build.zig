@@ -132,6 +132,7 @@ pub fn build(b: *std.Build) void {
         builder.addRule(.{ .builtin = .no_deprecated }, .{ .severity = .@"error" });
         builder.addRule(.{ .builtin = .no_unused }, .{ .container_declaration = .@"error" });
         builder.addRule(.{ .builtin = .file_naming }, .{});
+        builder.addRule(.{ .builtin = .no_literal_args }, .{ .detect_bool_literal = .@"error" });
         builder.addRule(.{ .builtin = .no_swallow_error }, .{
             .detect_catch_unreachable = .@"error",
             .detect_empty_catch = .@"error",

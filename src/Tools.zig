@@ -568,11 +568,11 @@ comptime {
 
 /// The specs of the table's tools, in the order the model receives them, for a
 /// run with or without a web backend.
-fn specList(comptime with_web: bool) [specsCount(with_web)]Session.Definition {
-    var list: [specsCount(with_web)]Session.Definition = undefined;
+fn specList(comptime web_tools: Web) [specsCount(web_tools)]Session.Definition {
+    var list: [specsCount(web_tools)]Session.Definition = undefined;
     var n: usize = 0;
     for (table) |tool| {
-        if (!with_web and tool.web) continue;
+        if (web_tools == .without_web and tool.web) continue;
         list[n] = .{
             .name = @tagName(tool.tag),
             .description = tool.description,
@@ -583,18 +583,22 @@ fn specList(comptime with_web: bool) [specsCount(with_web)]Session.Definition {
     return list;
 }
 
+/// Whether the table is the one a run is offered with the web tools it has a
+/// backend for, or the one without them.
+const Web = enum { with_web, without_web };
+
 /// How many tools the table holds for a run with or without a web backend.
-fn specsCount(comptime with_web: bool) usize {
+fn specsCount(comptime web_tools: Web) usize {
     var n: usize = 0;
     for (table) |tool| {
-        if (!with_web and tool.web) continue;
+        if (web_tools == .without_web and tool.web) continue;
         n += 1;
     }
     return n;
 }
 
-const specs = specList(false);
-const specs_with_web = specList(true);
+const specs = specList(.without_web);
+const specs_with_web = specList(.with_web);
 
 test "a bash result splits into its status and its streams" {
     // The status is the code and whether it means success, and the two streams
