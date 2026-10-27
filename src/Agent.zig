@@ -724,7 +724,7 @@ fn changeCwd(agent: *Agent, emitter: *Emitter, session: *Session, asked: ?[]cons
 
     const wanted = asked orelse {
         const current = session.cwd();
-        return emitter.show(.{ .notice = std.fmt.bufPrint(
+        return emitter.show(.{ .notice = std.mem.print(
             &notice,
             "the session works in {s}; use /cwd <directory> to move it",
             .{current},
@@ -755,7 +755,7 @@ fn changeCwd(agent: *Agent, emitter: *Emitter, session: *Session, asked: ?[]cons
     // first turn, from wherever it works by then.
     if (session.messages.items.len > 0) agent.refresh(session);
 
-    return emitter.show(.{ .notice = std.fmt.bufPrint(
+    return emitter.show(.{ .notice = std.mem.print(
         &notice,
         "the session works in {s}",
         .{path},
@@ -765,7 +765,7 @@ fn changeCwd(agent: *Agent, emitter: *Emitter, session: *Session, asked: ?[]cons
 /// Shows why the session could not be moved to `path` -- the text the user typed
 /// -- and leaves it working where it was.
 fn cwdNotice(emitter: *Emitter, buffer: []u8, path: []const u8, err: anyerror) !void {
-    return emitter.show(.{ .notice = std.fmt.bufPrint(
+    return emitter.show(.{ .notice = std.mem.print(
         buffer,
         "cannot work in {s}: {s}",
         .{ path, @errorName(err) },
@@ -2758,7 +2758,7 @@ test "the cwd command moves the session, its tools and its prompt" {
 
     // The session starts in the root, and its prompt is read there.
     try agent.prepare(&session);
-    try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, "ROOT RULES") != null);
+    try std.testing.expect(std.mem.find(u8, session.systemPrompt().?, "ROOT RULES") != null);
     try session.append(.{ .role = .user, .content = "hello" });
 
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -2768,18 +2768,18 @@ test "the cwd command moves the session, its tools and its prompt" {
     // On its own it says where the session works.
     const asked = try agent.take(terminal.emitter(), &session, "/cwd");
     try std.testing.expect(asked == .ran);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), root) != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), root) != null);
 
     // A relative path is read from there, and recorded as the filesystem names
     // it, so a header, a resume and `pwd` say the same.
     const moved = try agent.take(terminal.emitter(), &session, "/cwd sub");
     try std.testing.expect(moved == .ran);
     try std.testing.expectEqualStrings(sub, session.cwd());
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), sub) != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), sub) != null);
 
     // The prompt is the one of the directory the session works in now.
-    try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, "SUB RULES") != null);
-    try std.testing.expect(std.mem.indexOf(u8, session.systemPrompt().?, "ROOT RULES") == null);
+    try std.testing.expect(std.mem.find(u8, session.systemPrompt().?, "SUB RULES") != null);
+    try std.testing.expect(std.mem.find(u8, session.systemPrompt().?, "ROOT RULES") == null);
 
     // The tools moved with it: a path they are given is relative to the new
     // directory, and nothing lands in the old one.
@@ -2808,7 +2808,7 @@ test "the cwd command moves the session, its tools and its prompt" {
     const missing = try agent.take(terminal.emitter(), &session, "/cwd nowhere");
     try std.testing.expect(missing == .ran);
     try std.testing.expectEqualStrings(sub, session.cwd());
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "cannot work in nowhere") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "cannot work in nowhere") != null);
 }
 
 test "the cwd command writes no session that has not been asked anything" {
@@ -2842,7 +2842,7 @@ test "the cwd command writes no session that has not been asked anything" {
     // A session comes into being with its first message, so a move of one that
     // has none leaves no file behind.
     var name_buf: [64]u8 = undefined;
-    const name = try std.fmt.bufPrint(&name_buf, "{s}.json", .{session.id()});
+    const name = try std.mem.print(&name_buf, "{s}.json", .{session.id()});
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, name, .{}));
 }
 
