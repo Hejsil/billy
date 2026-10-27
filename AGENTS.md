@@ -41,11 +41,8 @@ least once. Read the rule, not the story; the story is in the review.
   warning in the log and the call carries on: returning the error throws the answer away to report
   the hint.
 - **Report a failure once, at the layer that can say something useful.** A layer that cannot add
-  anything returns the error and says nothing. The layer that can explain it prints, and returns
-  `report.Reported`: `main` counts that as a failure and stays quiet, so the process still exits
-  non-zero for whatever is scripted around it.
-  *Nineteen sites logged an error and then returned it, and `main` printed it again — so a typo in a
-  flag produced two error lines and a stack trace, which reads as a crash.*
+  anything returns the error and says nothing; the one that can explain it prints, and returns
+  `report.Reported`, which `main` counts as a failure and stays quiet about.
 - **A way out of a state is not gated on the state it is leaving.** A command that changes where a
   turn goes has to run before anything resolves where turns go. *`take` made the session's client
   before it read the line, so a session left on a provider that no longer resolved could not be
