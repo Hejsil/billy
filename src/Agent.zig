@@ -3121,7 +3121,9 @@ test "a failure notice says whether the answer had started" {
 
 test "an emitter counts what it shows, and not a delta it drops" {
     const silent = struct {
-        fn show(_: *Emitter, _: Block) anyerror!void {}
+        fn show(_: *Emitter, _: Block) anyerror!void {
+            // Writes nothing, which is what a frontend that only counts does.
+        }
     };
     var emitter: Emitter = .{ .vtable = &.{ .block = silent.show } };
 
