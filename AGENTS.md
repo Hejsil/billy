@@ -236,18 +236,6 @@ least once. Read the rule, not the story; the story is in the review.
 
 ## Style
 
-- **A function whose first parameter is its own type is called as a method.** `fn turn(agent: *Agent,
-  ...)` declared in `Agent`'s namespace is `agent.turn(...)`, not `turn(agent, ...)`: passing the
-  receiver by hand makes it read as a free function, and every reader has to check which it is. The
-  same goes for `refreshLead`, `Session.writeMessage`, `Writer.writeText`, `Credentials.save` and the
-  test helpers. *The three in `ask` and `refresh` were fixed first; an audit for the rest found 24
-  more, the two that stand out being eight call sites in `Agent`'s own tests and one
-  `runTerminal(billy, ...)` that the move into `Billy` had just added.*
-- **Except where a method cannot exist.** A helper taking an optional has no method call through it
-  (`Health.isSetAside(?*Health, ...)`), and a free function in a module is not a decl of the type its
-  first argument has -- `endpoint.targetFor(config, ...)` cannot be `config.targetFor(...)`, because
-  `targetFor` lives in `endpoint`. Those are called by naming the module, which is what tells them
-  apart from a method.
 - A signature that returns an error it cannot produce makes every caller write a `try` that cannot
   fail, and widens the error set of everything above it. `Tools.init` returns `!Tools` and cannot
   fail; drop the `!`.

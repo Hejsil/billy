@@ -4,6 +4,7 @@
 //! naming them.
 
 test {
+    _ = @import("method_by_receiver.zig");
     _ = @import("no_bool_compare.zig");
     _ = @import("no_log_newline.zig");
     _ = @import("no_unformatted_print.zig");
