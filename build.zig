@@ -116,10 +116,10 @@ pub fn build(b: *std.Build) void {
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     // The lint rules are billy's own source, but nothing imports them, so the
-    // module above never reaches them: they are built and tested on their own,
-    // against the same zlinter the lint step uses.
+    // module above never reaches them: they are built and tested from a root of
+    // their own, against the same zlinter the lint step uses.
     const rules_module = b.createModule(.{
-        .root_source_file = b.path("src/rules/no_bool_compare.zig"),
+        .root_source_file = b.path("src/rules/test.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
