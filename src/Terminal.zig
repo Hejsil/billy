@@ -209,13 +209,14 @@ test "a streamed answer is written as it arrives, and is not written again" {
     defer terminal.deinit();
     const emit = terminal.emitter();
 
+    // What arrives is written, without waiting for the end of a line.
     try emit.showDelta(.{ .content = "hel" });
-    try std.testing.expectEqualStrings("◆ answer\n", out.written());
+    try std.testing.expectEqualStrings("◆ answer\nhel", out.written());
 
-    // The newline lets the first line out.
     try emit.showDelta(.{ .content = "lo\n**world**\n" });
-    try std.testing.expectEqualStrings("◆ answer\nhello", out.written());
+    try std.testing.expectEqualStrings("◆ answer\nhello\nworld", out.written());
 
+    // The answer block that closes the stream writes nothing of the text again.
     try emit.show(.{ .answer = "hello\n**world**\n" });
     try std.testing.expectEqualStrings("◆ answer\nhello\nworld\n\n", out.written());
 }
@@ -234,7 +235,7 @@ test "streamed reasoning is shown before the answer" {
 
     try emit.showDelta(.{ .content = "hello\n" });
     try std.testing.expectEqualStrings(
-        "◇ reasoning\nI should check.\n\n◆ answer\n",
+        "◇ reasoning\nI should check.\n\n◆ answer\nhello",
         out.written(),
     );
 
@@ -267,7 +268,7 @@ test "reasoning is dim and the answer is not" {
     try emit.showDelta(.{ .content = "hi" });
     try std.testing.expectEqualStrings(
         "\x1b[35m◇\x1b[0m \x1b[1mreasoning\x1b[0m\n\x1b[2mthink\x1b[0m\n\n" ++
-            "\x1b[32m◆\x1b[0m \x1b[1manswer\x1b[0m\n",
+            "\x1b[32m◆\x1b[0m \x1b[1manswer\x1b[0m\nhi",
         out.written(),
     );
 }

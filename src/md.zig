@@ -1,5 +1,5 @@
-//! The md4cs binding: billy's whole contact with the C markdown parser, the callbacks its renderers
-//! are driven through, and the streaming state the terminal reads a reply with.
+//! The md4cs binding: billy's whole contact with the C markdown parser and the callbacks the page's
+//! renderer is driven through.
 
 const std = @import("std");
 
@@ -12,9 +12,8 @@ extern fn md4cs_parse_batch(
     userdata: ?*anyopaque,
 ) c_int;
 
-/// The dialect billy reads, on top of plain CommonMark: the GitHub extensions a model reaches for
-/// -- tables, strikethrough, task lists, links written as bare addresses -- and no raw HTML, so a
-/// `<` in a reply is a `<` on the page.
+/// The dialect billy reads: CommonMark and the GitHub extensions a model reaches for -- tables,
+/// strikethrough, task lists, bare addresses -- with no raw HTML, so a `<` is text on the page.
 pub const flags: c_uint = c.MD_FLAG_TABLES |
     c.MD_FLAG_STRIKETHROUGH |
     c.MD_FLAG_TASKLISTS |
@@ -120,36 +119,3 @@ fn writeText(T: type) *const fn (c.MD_TEXTTYPE, [*c]const c.MD_CHAR, c.MD_SIZE, 
         }
     }.callback;
 }
-
-pub const Stream = struct {
-    ctx: *c.MD_PARSER_CTX,
-    failed: bool = false,
-
-    pub fn init(callbacks: *const c.MD_PARSER, userdata: ?*anyopaque) !Stream {
-        var ctx: ?*c.MD_PARSER_CTX = null;
-        if (c.md_stream_init(callbacks, userdata, &ctx) != 0)
-            return error.MarkdownFailed;
-        return .{ .ctx = ctx orelse return error.MarkdownFailed };
-    }
-
-    pub fn feed(self: *Stream, text: []const u8) !void {
-        var rest = text;
-        while (rest.len > 0) {
-            const count: c_uint = @intCast(@min(rest.len, std.math.maxInt(c_uint)));
-            if (c.md_stream_feed(self.ctx, rest.ptr, count) != 0) {
-                self.failed = true;
-                return error.MarkdownFailed;
-            }
-            rest = rest[count..];
-        }
-    }
-
-    pub fn flush(self: *Stream) !void {
-        if (c.md_stream_flush(self.ctx) != 0)
-            return error.MarkdownFailed;
-    }
-
-    pub fn deinit(self: *Stream) void {
-        c.md_stream_finish(self.ctx);
-    }
-};

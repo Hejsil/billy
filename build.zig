@@ -7,8 +7,8 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const filters = b.option([]const []const u8, "filter", "Run only tests whose names contain this substring") orelse &.{};
 
-    // md4cs is the one markdown parser: mdflow's md4c, streamed for a reply as it arrives and batch
-    // for a stored block, so the two frontends cannot drift.
+    // md4cs is the page's markdown parser: mdflow's md4c, read whole for the HTML a block becomes.
+    // The terminal renders a reply as it arrives from its own reader.
     const mdflow = b.dependency("mdflow", .{
         .target = target,
         .optimize = optimize,
@@ -27,8 +27,6 @@ pub fn build(b: *std.Build) void {
     });
     md4cs_zig.addIncludePath(mdflow.path("src"));
     md4cs_zig.defineCMacro("MD4C_USE_UTF8", null);
-    md4cs_zig.defineCMacro("MD4C_STREAMING", null);
-    md4cs_zig.defineCMacro("md_parse", "md4cs_parse_stream");
 
     const mod = b.addModule("billy", .{
         .root_source_file = b.path("src/root.zig"),
@@ -43,16 +41,6 @@ pub fn build(b: *std.Build) void {
         .files = &.{ "md4cs.c", "entity.c" },
         // C99, because the library is written in it, so a compiler whose default is newer or older
         // does not decide whether it builds.
-        .flags = &.{
-            "-std=c99",
-            "-DMD4C_USE_UTF8",
-            "-DMD4C_STREAMING",
-            "-Dmd_parse=md4cs_parse_stream",
-        },
-    });
-    mod.addCSourceFiles(.{
-        .root = mdflow.path("src"),
-        .files = &.{"md4cs.c"},
         .flags = &.{
             "-std=c99",
             "-DMD4C_USE_UTF8",
