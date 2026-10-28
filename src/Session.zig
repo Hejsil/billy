@@ -338,11 +338,17 @@ pub fn resolvedMessages(session: *const Session, allocator: std.mem.Allocator) !
     return messages;
 }
 
-/// Adds a message to the conversation and writes the session out, so the next run sees it even if
-/// this one is killed.
+/// Adds a message to the conversation, and writes the session out once it is a
+/// conversation again: a request can be built from what is on disk, which is what
+/// makes the file worth having.
 pub fn append(session: *Session, message: llm.Message) !void {
     try session.appendMessage(message);
-    try session.save();
+    // A turn adds the assistant message with the calls it asks for, and then a
+    // result for each: between the two the conversation asks for what it has no
+    // answer to, which no request can be built from. Writing that state out would
+    // leave a file that is only good for `repairTail`, so the file is written
+    // where the conversation is whole instead.
+    if (session.unanswered() == null) try session.save();
 }
 
 /// Adds a compaction to the conversation: the prompt that asked for it and the summary it produced.
@@ -597,16 +603,10 @@ fn loadTools(session: *Session, stored: []const StoredTool) !void {
 }
 
 fn repairTail(session: *Session) !void {
-    const tail = session.lastCall() orelse return;
-    const calls = session.messages.items[tail].tool_calls.len;
-
-    var answered: usize = 0;
-    for (session.messages.items[tail + 1 ..]) |message| {
-        if (message.role != .tool)
-            break;
-        answered += 1;
-    }
-    if (answered >= calls) return;
+    const hole = session.unanswered() orelse return;
+    const tail = hole.tail;
+    const calls = hole.calls;
+    const answered = hole.answered;
 
     // The calls with no result are answered right after the results the file holds, in the order
     // the calls were made, so the assistant message is followed by one result per call.
@@ -629,6 +629,24 @@ fn repairTail(session: *Session) !void {
         if (index.* >= at) index.* += @intCast(missing);
     }
 }
+
+/// The calls of the last assistant message that have no result yet, and where
+/// that message is: null when every call it made has been answered, which is the
+/// one state a request can be built from.
+fn unanswered(session: *const Session) ?Hole {
+    const tail = session.lastCall() orelse return null;
+    const calls = session.messages.items[tail].tool_calls.len;
+
+    var answered: usize = 0;
+    for (session.messages.items[tail + 1 ..]) |message| {
+        if (message.role != .tool) break;
+        answered += 1;
+    }
+    if (answered >= calls) return null;
+    return .{ .tail = tail, .calls = calls, .answered = answered };
+}
+
+const Hole = struct { tail: usize, calls: usize, answered: usize };
 
 fn lastCall(session: *const Session) ?usize {
     var i = session.messages.items.len;
@@ -1049,6 +1067,39 @@ test "a new session is written out by its first message" {
     try std.testing.expectEqualStrings("hello", resumed.contentOf(resumed.messages.items[0]).?);
 }
 
+test "the file only takes a conversation a request can be built from" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try newTestSession(&tmp);
+    defer session.deinit();
+
+    try session.append(.{ .role = .user, .content = "one" });
+
+    // A call with no result is a conversation no request can be built from, so what
+    // is on disk stays at the last whole state rather than taking it.
+    try session.append(.{ .role = .assistant, .tool_calls = &.{.{
+        .id = "call_1",
+        .function = .{ .name = "read", .arguments = "{}" },
+    }} });
+    var waiting = try reopenTestSession(&tmp, session.id());
+    defer waiting.deinit();
+    try waiting.expectSessionConvo(&.{.{ .role = .user, .content = "one" }});
+
+    // The result answers it, and the three are written together.
+    try session.append(.{ .role = .tool, .tool_call_id = "call_1", .content = "the result" });
+    var answered = try reopenTestSession(&tmp, session.id());
+    defer answered.deinit();
+    try answered.expectSessionConvo(&.{
+        .{ .role = .user, .content = "one" },
+        .{ .role = .assistant, .tool_calls = &.{.{
+            .id = "call_1",
+            .function = .{ .name = "read", .arguments = "{}" },
+        }} },
+        .{ .role = .tool, .tool_call_id = "call_1", .content = "the result" },
+    });
+}
+
 test "ids made one after another differ" {
     var first: [ulid.length]u8 = undefined;
     var second: [ulid.length]u8 = undefined;
@@ -1360,6 +1411,9 @@ test "a resume answers a tool call a killed run left open" {
         .id = "call_1",
         .function = .{ .name = "bash", .arguments = "{}" },
     }} });
+    // Written whatever state the conversation is in, which is what an older billy
+    // left when a run was killed between a call and its result.
+    try session.save();
 
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
@@ -1387,6 +1441,8 @@ test "a resume answers every call a kill left open, in the order made" {
     } });
     try session.append(.{ .role = .tool, .tool_call_id = "call_1", .content = "the first result" });
     try session.append(.{ .role = .user, .content = "still there?" });
+    // As an older billy left it: one call answered, one lost, and a line typed after.
+    try session.save();
 
     // The result the file held stays with its call, and the call it lost is answered in the place
     // it was made rather than after the user message.

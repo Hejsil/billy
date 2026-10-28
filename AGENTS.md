@@ -81,12 +81,6 @@ least once. Read the rule, not the story; the story is in the review.
   take the bit off a script, nor open a file the user keeps to themselves — it replaces a symbolic
   link rather than writing through it, and it is the *directory* that has to be writable rather than
   the file. The first is done for you; the other two are what replacing costs.
-- **A store written whole is written once per unit of work, not once per record.** `Session.append`
-  rewrites the entire file — twice, with `createFileAtomic`'s temporary — and a turn appends the
-  prompt, the reply and one result per tool call, so the cost is quadratic in a session's messages:
-  the largest session here (3 MB, 1,933 messages) had 2.9 GB written through it. `repairTail` already
-  completes a turn a kill left half-written, so saving per turn loses nothing a per-message save was
-  protecting.
 - **A file a human may open is indented and versioned; a file only billy reads is compact and
   versioned.** When a version is bumped, the load path migrates the old shape; do not let a reader
   guess.
