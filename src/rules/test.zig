@@ -4,6 +4,7 @@
 //! naming them.
 
 test {
+    _ = @import("comment_budget.zig");
     _ = @import("hint_is_not_a_failure.zig");
     _ = @import("method_by_receiver.zig");
     _ = @import("no_bool_compare.zig");
