@@ -206,6 +206,3 @@ least once. Read the rule, not the story; the story is in the review.
   `XDG_CONFIG_HOME` and `XDG_CACHE_HOME` are what it reads and writes, and the real ones are the
   user's: a `billy config` run to see a message changed a setting in their actual configuration.
   Set all three at a temporary directory, and `HOME` with them.
-
-## Style
-

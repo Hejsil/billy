@@ -1,6 +1,7 @@
-//! Disallows an error union a function cannot fail with: a body with no `try`,
-//! no `catch`, no error of its own and no call to hand one back has nothing to
-//! return into the `!`, so every caller writes a `try` that cannot fail.
+//! Disallows an error union a function cannot fail with: with no `try`, no
+//! `catch` and no error of its own nothing can fill the `!`, so every caller
+//! writes a `try` that cannot fail. Forwarding is `return try other()`; the
+//! body is asked as a whole, as a token says nothing of whether a call fails.
 
 pub const Config = struct {
     /// The severity (off, warning, error).
@@ -65,20 +66,10 @@ fn unproducible(tags: []const std.zig.Token.Tag, fn_token: Ast.TokenIndex) ?Ast.
     while (j < body_end) : (j += 1) {
         switch (tags[j]) {
             .keyword_try, .keyword_catch, .keyword_error => return null,
-            .keyword_return => if (reachesOut(tags, j, body_end)) return null,
             else => {},
         }
     }
     return wanted;
-}
-
-/// Whether what `return` hands back could be a call.
-fn reachesOut(tags: []const std.zig.Token.Tag, at: Ast.TokenIndex, body_end: Ast.TokenIndex) bool {
-    var j = at + 1;
-    while (j < body_end and tags[j] != .semicolon) : (j += 1) {
-        if (tags[j] == .l_paren) return true;
-    }
-    return false;
 }
 
 fn find(tags: []const std.zig.Token.Tag, from: Ast.TokenIndex, tag: std.zig.Token.Tag) ?Ast.TokenIndex {
@@ -116,16 +107,16 @@ test "an error a function cannot produce is reported, and one it can is not" {
         \\    return a;
         \\}
         \\
-        \\pub fn nothing(a: u8) !u8 {
-        \\    return .{ .a = a };
-        \\}
-        \\
-        \\pub fn forwards() !u8 {
+        \\pub fn returnsACall() !u8 {
         \\    return other();
         \\}
         \\
-        \\pub fn fallible() !u8 {
+        \\pub fn forwards() !u8 {
         \\    return try other();
+        \\}
+        \\
+        \\pub fn catches() !u8 {
+        \\    return other() catch 0;
         \\}
         \\
         \\pub fn own() !u8 {

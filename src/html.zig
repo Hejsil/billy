@@ -1095,7 +1095,7 @@ const Page = struct {
             .tool_begin => return,
             else => {},
         }
-        return block(page.gpa, b, page.out);
+        return try block(page.gpa, b, page.out);
     }
 };
 

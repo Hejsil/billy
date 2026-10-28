@@ -227,7 +227,7 @@ pub fn parseCallNamed(arena: std.mem.Allocator, name: []const u8, arguments: []c
 }
 
 fn fromJson(T: type, arena: std.mem.Allocator, json: []const u8) !T {
-    return std.json.parseFromSliceLeaky(T, arena, json, .{
+    return try std.json.parseFromSliceLeaky(T, arena, json, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     });
@@ -535,7 +535,7 @@ test "parseCall splits known, unknown and malformed calls" {
     try std.testing.expectEqualStrings("frobnicate", unknown.unknown);
 }
 
-fn testTools(with_search: bool) !Tools {
+fn testTools(with_search: bool) Tools {
     // A web tool that actually makes a request needs a live client; the tests here only exercise
     // the ones that refuse before any request, so this is never reached.
     return Tools.init(std.testing.io, .cwd(), std.testing.allocator, undefined, .{
@@ -571,7 +571,7 @@ test "a fetch that fails reaches the reader as a failure" {
         .name = "web_fetch",
         .arguments = "{\"url\":\"\"}",
     } });
-    var tool_set = try testTools(true);
+    var tool_set = testTools(true);
     try tool_set.run(call, &result.writer);
     try std.testing.expectEqualStrings("error: no url to fetch", result.written());
 
@@ -585,7 +585,7 @@ test "a fetch that fails reaches the reader as a failure" {
 
 test "the definitions cover every tool the loop dispatches" {
     const gpa = std.testing.allocator;
-    var tool_set = try testTools(false);
+    var tool_set = testTools(false);
 
     // The names are exactly the tools the loop can dispatch, in the order the model receives them,
     // so it is never offered one that does not run.
@@ -603,7 +603,7 @@ test "the definitions cover every tool the loop dispatches" {
 }
 
 test "the web tools are offered only when a backend is configured" {
-    var plain = try testTools(false);
+    var plain = testTools(false);
     const without = plain.definitions();
     try std.testing.expectEqual(specs.len, without.len);
     for (without) |definition| {
@@ -611,7 +611,7 @@ test "the web tools are offered only when a backend is configured" {
         try std.testing.expect(!std.mem.eql(u8, definition.name, "web_fetch"));
     }
 
-    var searched = try testTools(true);
+    var searched = testTools(true);
     const with = searched.definitions();
     try std.testing.expectEqual(specs_with_web.len, with.len);
     try std.testing.expectEqualStrings("web_search", with[with.len - 2].name);

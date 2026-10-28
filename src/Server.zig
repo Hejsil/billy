@@ -223,7 +223,7 @@ const Request = struct {
     }
 
     fn noSession(r: *Request) !void {
-        return r.reply(.text, "no such session\n", .not_found);
+        return try r.reply(.text, "no such session\n", .not_found);
     }
 
     fn reply(r: *Request, content_type: ContentType, body: []const u8, status: std.http.Status) !void {
@@ -236,7 +236,7 @@ const Request = struct {
     }
 
     fn replyNotAllowed(r: *Request) !void {
-        return r.reply(.text, "method not allowed\n", .method_not_allowed);
+        return try r.reply(.text, "method not allowed\n", .method_not_allowed);
     }
 };
 
@@ -247,19 +247,19 @@ fn route(r: *Request, registry: *Registry, http_client: *std.http.Client) !void 
     if (std.mem.eql(u8, path, "/")) switch (r.request.head.method) {
         .GET => {
             r.answered = true;
-            return r.request.respond(page, .{
+            return try r.request.respond(page, .{
                 .status = .ok,
                 .extra_headers = &.{ContentType.html.header()},
                 .keep_alive = false,
             });
         },
-        else => return r.replyNotAllowed(),
+        else => return try r.replyNotAllowed(),
     };
 
     if (std.mem.eql(u8, path, "/api/sessions")) switch (r.request.head.method) {
-        .GET => return writeListing(r),
-        .POST => return createSession(r, registry, http_client),
-        else => return r.replyNotAllowed(),
+        .GET => return try writeListing(r),
+        .POST => return try createSession(r, registry, http_client),
+        else => return try r.replyNotAllowed(),
     };
 
     const sessions_prefix = "/api/sessions/";
@@ -268,19 +268,19 @@ fn route(r: *Request, registry: *Registry, http_client: *std.http.Client) !void 
         const id = path[sessions_prefix.len..id_end];
 
         if (std.mem.eql(u8, path[id_end..], "/message")) switch (r.request.head.method) {
-            .POST => return askSession(r, registry, http_client, id),
-            else => return r.replyNotAllowed(),
+            .POST => return try askSession(r, registry, http_client, id),
+            else => return try r.replyNotAllowed(),
         };
 
         if (path.len == id_end) switch (r.request.head.method) {
-            .GET => return openSession(r, id),
-            .PATCH => return renameSession(r, registry, id),
-            .DELETE => return deleteSession(r, registry, id),
-            else => return r.replyNotAllowed(),
+            .GET => return try openSession(r, id),
+            .PATCH => return try renameSession(r, registry, id),
+            .DELETE => return try deleteSession(r, registry, id),
+            else => return try r.replyNotAllowed(),
         };
     }
 
-    return r.reply(.text, "not found\n", .not_found);
+    return try r.reply(.text, "not found\n", .not_found);
 }
 
 fn deleteSession(r: *Request, registry: *Registry, id: []const u8) !void {
@@ -779,7 +779,7 @@ const TestServer = struct {
     }
 
     fn exchange(server: *TestServer, method: std.http.Method, path: []const u8, body: ?[]const u8) !Exchange {
-        return Exchange.run(&server.server, &server.registry, &server.http, method, path, body);
+        return try Exchange.run(&server.server, &server.registry, &server.http, method, path, body);
     }
 
     fn session(server: *TestServer, title: ?[]const u8) ![]const u8 {
@@ -796,7 +796,7 @@ const TestServer = struct {
 };
 
 fn sessionPath(id: []const u8, suffix: []const u8) ![]const u8 {
-    return std.testing.allocator.print("/api/sessions/{s}{s}", .{ id, suffix });
+    return try std.testing.allocator.print("/api/sessions/{s}{s}", .{ id, suffix });
 }
 
 const Exchange = struct {

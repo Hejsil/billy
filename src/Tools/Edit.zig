@@ -257,11 +257,11 @@ fn expectReplace(
 }
 
 fn expectReplaceOne(expected: []const u8, contents: []const u8, old_string: []const u8, new_string: []const u8) !void {
-    return expectReplace(expected, contents, old_string, new_string, .one);
+    return try expectReplace(expected, contents, old_string, new_string, .one);
 }
 
 fn expectReplaceAll(expected: []const u8, contents: []const u8, old_string: []const u8, new_string: []const u8) !void {
-    return expectReplace(expected, contents, old_string, new_string, .all);
+    return try expectReplace(expected, contents, old_string, new_string, .all);
 }
 
 test "an exact match is changed where it is" {

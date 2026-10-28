@@ -68,14 +68,14 @@ fn historyLine(ed: *const LineEditor, index: usize) []const u8 {
 /// header is shown on its own line while the line is being edited.
 pub fn readLine(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
     ed.quiet = false;
-    return ed.read(header, prompt);
+    return try ed.read(header, prompt);
 }
 
 /// Reads a secret behind `prompt`: what is typed is not shown, so a key is not left on the screen
 /// or in the scrollback.
 pub fn readSecret(ed: *LineEditor, prompt: []const u8) !?[]const u8 {
     ed.quiet = true;
-    return ed.read("", prompt);
+    return try ed.read("", prompt);
 }
 
 fn read(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {

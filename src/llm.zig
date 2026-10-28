@@ -213,7 +213,7 @@ pub const Client = struct {
     fn pause(client: *Client, attempt: usize, retry_after_ms: ?u64) !void {
         const wait = client.pauseFor(attempt, retry_after_ms);
         std.log.warn("retrying in {d}ms", .{wait.toMilliseconds()});
-        return client.io.sleep(wait, .awake);
+        return try client.io.sleep(wait, .awake);
     }
 
     fn pauseFor(client: *Client, attempt: usize, retry_after_ms: ?u64) std.Io.Duration {

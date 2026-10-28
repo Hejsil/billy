@@ -184,7 +184,7 @@ fn projectInstructions(io: std.Io, out: *std.Io.Writer, dir: std.Io.Dir) !bool {
 }
 
 fn globalInstructions(io: std.Io, out: *std.Io.Writer, dir: std.Io.Dir) !bool {
-    return instructionsIn(io, out, dir, &instruction_files, "The user's");
+    return try instructionsIn(io, out, dir, &instruction_files, "The user's");
 }
 
 fn holds(io: std.Io, dir: std.Io.Dir, name: []const u8) bool {
@@ -239,9 +239,9 @@ pub const SessionHeader = struct {
 };
 
 pub fn formatTokens(out: *std.Io.Writer, count: usize) !void {
-    if (count < 1000) return out.print("{d}", .{count});
-    if (count < 999_500) return formatScaled(out, count, 1000, 'k');
-    return formatScaled(out, count, 1_000_000, 'M');
+    if (count < 1000) return try out.print("{d}", .{count});
+    if (count < 999_500) return try formatScaled(out, count, 1000, 'k');
+    return try formatScaled(out, count, 1_000_000, 'M');
 }
 
 fn formatScaled(out: *std.Io.Writer, count: usize, unit: usize, suffix: u8) !void {
@@ -826,7 +826,7 @@ fn compactThreshold(agent: *const Agent, session: *const Session) usize {
 fn maybeCompact(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client) !bool {
     const threshold = agent.compactThreshold(session);
     if (threshold == 0 or session.context_tokens < threshold) return false;
-    return agent.summarize(emitter, session, client);
+    return try agent.summarize(emitter, session, client);
 }
 
 fn summarize(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client) !bool {
@@ -1113,7 +1113,7 @@ fn testAgentIn(
     http_client: ?*std.http.Client,
 ) !Agent {
     var unused: std.http.Client = undefined;
-    return Agent.init(io, gpa, setup.options(), work_dir, http_client orelse &unused);
+    return try Agent.init(io, gpa, setup.options(), work_dir, http_client orelse &unused);
 }
 
 const TestSetup = struct {
@@ -2233,7 +2233,7 @@ const Recorder = struct {
     }
 
     fn keeper(self: *Recorder, text: []const u8) ![]const u8 {
-        return self.gpa.dupe(u8, text);
+        return try self.gpa.dupe(u8, text);
     }
 
     fn selfOf(e: *Emitter) *Recorder {

@@ -148,8 +148,8 @@ comptime {
 /// The address one call goes to: the backend's own when a test names one, or the provider's, and a
 /// configured instance's path under it.
 pub fn address(gpa: std.mem.Allocator, base: []const u8, path: []const u8) ![]const u8 {
-    if (path.len == 0) return gpa.dupe(u8, base);
-    return gpa.print("{s}{s}", .{ std.mem.trimEnd(u8, base, "/"), path });
+    if (path.len == 0) return try gpa.dupe(u8, base);
+    return try gpa.print("{s}{s}", .{ std.mem.trimEnd(u8, base, "/"), path });
 }
 
 /// Sends one request to `descriptor`, with its key in the header the provider expects and JSON

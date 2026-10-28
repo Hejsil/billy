@@ -42,15 +42,15 @@ pub fn deinit(dirs: *Dirs, io: std.Io) void {
 }
 
 fn dataPath(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
-    return xdg.dir(gpa, environ, "XDG_DATA_HOME", &.{ ".local", "share" });
+    return try xdg.dir(gpa, environ, "XDG_DATA_HOME", &.{ ".local", "share" });
 }
 
 fn cachePath(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
-    return xdg.dir(gpa, environ, "XDG_CACHE_HOME", &.{".cache"});
+    return try xdg.dir(gpa, environ, "XDG_CACHE_HOME", &.{".cache"});
 }
 
 fn configPath(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
-    return xdg.dir(gpa, environ, "XDG_CONFIG_HOME", &.{".config"});
+    return try xdg.dir(gpa, environ, "XDG_CONFIG_HOME", &.{".config"});
 }
 
 fn sessionsPath(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {

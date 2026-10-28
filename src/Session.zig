@@ -155,7 +155,7 @@ pub fn open(
 }
 
 pub fn create(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: []const u8, start_cwd: []const u8) !Session {
-    return named(io, dir, gpa, named_id, start_cwd);
+    return try named(io, dir, gpa, named_id, start_cwd);
 }
 
 fn named(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: ?[]const u8, start_cwd: []const u8) !Session {
@@ -914,11 +914,11 @@ fn idInName(file_name: []const u8) ?[]const u8 {
 }
 
 fn newTestSession(tmp: *std.testing.TmpDir) !Session {
-    return Session.open(std.testing.io, tmp.dir, std.testing.allocator, null, "/work");
+    return try Session.open(std.testing.io, tmp.dir, std.testing.allocator, null, "/work");
 }
 
 fn reopenTestSession(tmp: *std.testing.TmpDir, session_id: []const u8) !Session {
-    return Session.open(std.testing.io, tmp.dir, std.testing.allocator, session_id, "/work");
+    return try Session.open(std.testing.io, tmp.dir, std.testing.allocator, session_id, "/work");
 }
 
 fn expectConvo(expected: []const llm.Message, actual: []const llm.Message) !void {
@@ -1356,7 +1356,7 @@ test "the title is read from the front of a session file, unescaped" {
 
 fn titleOf(gpa: std.mem.Allocator, front: []const u8) !?[]u8 {
     var reader: std.Io.Reader = .fixed(front);
-    return titleFrom(&reader, gpa);
+    return try titleFrom(&reader, gpa);
 }
 
 fn expectTitle(gpa: std.mem.Allocator, expected: []const u8, front: []const u8) !void {

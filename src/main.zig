@@ -237,7 +237,7 @@ const ParseError = error{InvalidArgument};
 
 fn parseArgsSlice(slice: []const []const u8) ParseError!Options {
     var args = spaghet.Args.initSlice(slice);
-    return parseArgs(&args);
+    return try parseArgs(&args);
 }
 
 fn parseArgs(args: *spaghet.Args) ParseError!Options {

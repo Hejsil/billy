@@ -6,7 +6,7 @@ const SearchResult = @import("../Search/Result.zig");
 
 /// The body a Tavily search is posted with.
 pub fn searchBody(gpa: std.mem.Allocator, query: []const u8, max_results: usize) ![]const u8 {
-    return std.json.Stringify.valueAlloc(gpa, Request{
+    return try std.json.Stringify.valueAlloc(gpa, Request{
         .query = query,
         .max_results = max_results,
     }, .{ .emit_null_optional_fields = false });
@@ -21,7 +21,7 @@ pub fn renderSearch(gpa: std.mem.Allocator, reply: []const u8, _: usize) ![]cons
 
 /// The body a Tavily extraction is posted with.
 pub fn fetchBody(gpa: std.mem.Allocator, url: []const u8) ![]const u8 {
-    return std.json.Stringify.valueAlloc(gpa, ExtractRequest{
+    return try std.json.Stringify.valueAlloc(gpa, ExtractRequest{
         .urls = &.{url},
     }, .{ .emit_null_optional_fields = false });
 }

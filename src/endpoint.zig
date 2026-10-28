@@ -19,7 +19,7 @@ pub fn configured(
     catalog: *const models.Catalog,
     arena: std.mem.Allocator,
 ) !Target {
-    return targetFor(config, credentials, catalog, arena, config.stored.model);
+    return try targetFor(config, credentials, catalog, arena, config.stored.model);
 }
 
 pub fn targetFor(
@@ -58,7 +58,7 @@ pub fn modelOf(choice: []const u8, catalog: *const models.Catalog) Model {
 }
 
 fn completionsUrl(arena: std.mem.Allocator, base_url: []const u8) ![]u8 {
-    return arena.print("{s}/chat/completions", .{
+    return try arena.print("{s}/chat/completions", .{
         std.mem.trimEnd(u8, base_url, "/"),
     });
 }
