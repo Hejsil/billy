@@ -84,14 +84,6 @@ least once. Read the rule, not the story; the story is in the review.
 - **A file a human may open is indented and versioned; a file only billy reads is compact and
   versioned.** When a version is bumped, the load path migrates the old shape; do not let a reader
   guess.
-- **A catalog is fetched into the cache, not compiled in.** It changes without a release, so a
-  snapshot in the binary is stale by the time it ships. Fetch it when a run first needs it, version
-  the file, and give the user a command to fetch it again; a failed fetch leaves an empty catalog
-  and a run that still works, not a start that fails. **And what the default configuration names has
-  to resolve without the fetch**: a catalog that adds windows and other providers is a gain; one that
-  gates the providers billy ships is a run that cannot send a request offline. *With the shipped
-  provider table removed, a laptop with no network could not reach `deepseek/deepseek-flash` at all
-  — and the error told the user to run the one command that needed the network.*
 - **A document from a service is read into the shape billy keeps, and the cache holds only what is
   read back from it.** A typed parse skips what billy does not use as it reads, where a
   `std.json.Value` tree needs a helper and a `switch` per field; a field nothing reads is bytes
@@ -217,6 +209,3 @@ least once. Read the rule, not the story; the story is in the review.
 
 ## Style
 
-- A signature that returns an error it cannot produce makes every caller write a `try` that cannot
-  fail, and widens the error set of everything above it. `Tools.init` returns `!Tools` and cannot
-  fail; drop the `!`.

@@ -43,7 +43,7 @@ fn run(
             if (tags[j + 1] != .period or tags[j + 2] != .identifier) continue;
             if (!isDrain(tree.tokenSlice(j + 2))) continue;
             if (tags[j + 3] != .l_paren) continue;
-            if (try declarationOf(tree, tags, tree.tokenSlice(j), close)) |token| {
+            if (declarationOf(tree, tags, tree.tokenSlice(j), close)) |token| {
                 try problems.append(arena, .{
                     .rule_id = rule.rule_id,
                     .severity = config.severity,
@@ -69,7 +69,7 @@ fn isDrain(name: []const u8) bool {
 }
 
 /// The `Allocating` token of the declaration that names `held`.
-fn declarationOf(tree: Ast, tags: []const std.zig.Token.Tag, held: []const u8, before: Ast.TokenIndex) !?Ast.TokenIndex {
+fn declarationOf(tree: Ast, tags: []const std.zig.Token.Tag, held: []const u8, before: Ast.TokenIndex) ?Ast.TokenIndex {
     var i: Ast.TokenIndex = 0;
     while (i + 6 < before) : (i += 1) {
         if (tags[i] != .keyword_var or tags[i + 1] != .identifier) continue;

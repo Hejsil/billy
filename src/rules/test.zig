@@ -11,4 +11,5 @@ test {
     _ = @import("no_unformatted_print.zig");
     _ = @import("report_failure_once.zig");
     _ = @import("streamed_write.zig");
+    _ = @import("unfailable_error.zig");
 }

@@ -162,6 +162,7 @@ pub fn build(b: *std.Build) void {
         builder.addCustomRule("comment_budget", b.path("src/rules/comment_budget.zig"), .{});
         builder.addCustomRule("atomic_write", b.path("src/rules/atomic_write.zig"), .{});
         builder.addCustomRule("streamed_write", b.path("src/rules/streamed_write.zig"), .{});
+        builder.addCustomRule("unfailable_error", b.path("src/rules/unfailable_error.zig"), .{});
         builder.addPaths(.{
             .include_dirs = &.{b.path("src")},
             .include_files = &.{ b.path("build.zig"), b.path("build.zig.zon") },
