@@ -102,7 +102,7 @@ least once. Read the rule, not the story; the story is in the review.
   cost the whole store to answer a question about one field of it; the title is read the same way,
   from the front of the file.* **Stepping over is not free, though: it reads the bytes.** A field a
   lookup asks for belongs in the first few fields, where a reader can stop, not last, where answering
-  costs every conversation in the store. *`cwd` was written last, so `--resume` with nothing named
+  costs every conversation in the store. *`cwd` was written last, so `billy resume` with nothing named
   read 14 MB of sessions to answer "was this one started here?"*
 - **An index read back from a file is checked against what it indexes.** Drop one that names
   nothing rather than clamping it onto the nearest element, which invents a reference the writer
