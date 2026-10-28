@@ -76,10 +76,6 @@ least once. Read the rule, not the story; the story is in the review.
 
 ## Writing files
 
-- **What is written is streamed onto the file's writer, not built in memory first.** Writing
-  allocates nothing, and a large file costs no second copy. *The catalog stringified into an
-  `Allocating` buffer to copy it into its atomic file, while `Config.save` beside it already wrote
-  straight through.*
 - **Replacing a file is not the same as writing it.** The new file is a new inode, which carries the
   permissions it was created with unless the old one's are read and given back — an edit must not
   take the bit off a script, nor open a file the user keeps to themselves — it replaces a symbolic

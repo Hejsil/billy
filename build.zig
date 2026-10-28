@@ -161,6 +161,7 @@ pub fn build(b: *std.Build) void {
         builder.addCustomRule("no_flush_in_defer", b.path("src/rules/no_flush_in_defer.zig"), .{});
         builder.addCustomRule("comment_budget", b.path("src/rules/comment_budget.zig"), .{});
         builder.addCustomRule("atomic_write", b.path("src/rules/atomic_write.zig"), .{});
+        builder.addCustomRule("streamed_write", b.path("src/rules/streamed_write.zig"), .{});
         builder.addPaths(.{
             .include_dirs = &.{b.path("src")},
             .include_files = &.{ b.path("build.zig"), b.path("build.zig.zon") },
