@@ -76,10 +76,6 @@ least once. Read the rule, not the story; the story is in the review.
 
 ## Writing files
 
-- **Anything that replaces a file billy owns is written atomically** — `createFileAtomic`, write,
-  `replace` — and anything that replaces a file billy does *not* own is written that way too, only
-  more so. *`edit` and `write` truncated the user's source files in place while config, credentials,
-  sessions and health were all careful.* `Tools.writeFile` is the one to write through.
 - **What is written is streamed onto the file's writer, not built in memory first.** Writing
   allocates nothing, and a large file costs no second copy. *The catalog stringified into an
   `Allocating` buffer to copy it into its atomic file, while `Config.save` beside it already wrote
