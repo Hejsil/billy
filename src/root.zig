@@ -24,8 +24,6 @@ pub const ulid = @import("ulid.zig");
 pub const xdg = @import("xdg.zig");
 
 test {
-    // `zig build test` only collects the tests declared in the test target's
-    // root file. The declarations above are lazy, so without this the tests in
-    // the imported files are never analyzed and the suite silently runs nothing.
+    // `zig build test` only collects the tests declared in the test target's root file.
     @import("std").testing.refAllDecls(@This());
 }

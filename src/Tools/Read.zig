@@ -5,9 +5,7 @@ const Tools = @import("../Tools.zig");
 const Read = @This();
 
 path: []const u8,
-/// First line to read, 1-based.
 offset: usize = 1,
-/// Maximum number of lines.
 limit: usize = 2000,
 
 pub fn run(read: Read, gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, out: *std.Io.Writer) !void {
@@ -24,17 +22,14 @@ pub fn run(read: Read, gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, out:
     if (text.len == 0) return out.writeAll("(empty file)");
 
     const total = std.mem.count(u8, text, "\n") + 1;
-    // `offset` is 1-based, and 0 is read as the first line.
     const first = @max(read.offset, 1);
     if (first > total) {
-        // The call asked for lines the file has not got, so it failed rather
-        // than answering: what it is given says how long the file is, which is
-        // what it needs to ask again.
+        // The call asked for lines the file has not got, so it failed rather than answering: what
+        // it is given says how long the file is, which is what it needs to ask again.
         return Tools.fail(out, "offset {d} is past the end; {d} lines", .{ read.offset, total });
     }
     const last = @min(total, first - 1 +| read.limit);
 
-    // The numbers line up on the largest one printed, so the width is known first.
     const width = std.fmt.count("{d}", .{last});
     var lines = std.mem.splitScalar(u8, text, '\n');
     var number: usize = 0;
@@ -79,7 +74,6 @@ test "a read cut by the limit says how many lines are left" {
         \\… 3 more lines
         \\
     );
-    // Counted from the offset, not from the top of the file.
     try expectRead(contents, .{ .path = test_file, .offset = 2, .limit = 2 },
         \\2: b
         \\3: c
@@ -113,7 +107,6 @@ test "line numbers are padded to the width of the largest one shown" {
         \\j
         \\k
     ;
-    // The last line shown is 11, so the single digits are padded to two.
     try expectRead(contents, .{ .path = test_file, .offset = 8 },
         \\ 8: h
         \\ 9: i
@@ -121,7 +114,6 @@ test "line numbers are padded to the width of the largest one shown" {
         \\11: k
         \\
     );
-    // Stopping before 10 keeps the width at one.
     try expectRead(contents, .{ .path = test_file, .offset = 8, .limit = 2 },
         \\8: h
         \\9: i
@@ -131,9 +123,6 @@ test "line numbers are padded to the width of the largest one shown" {
 }
 
 test "an offset past the end says how long the file is" {
-    // The call asked for a line the file has not got, so it is the call that
-    // failed, not the read: the mark says so, and what follows still tells it
-    // how long the file is.
     try expectRead("a\nb\n", .{ .path = test_file, .offset = 3 }, "error: offset 3 is past the end; 2 lines");
 }
 
@@ -147,10 +136,9 @@ test "a file that cannot be read is the call's failure, not the run's" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    // Nothing is returned: a read that could not open its file is written as
-    // the call's result, beginning with the mark both readers branch on, so the
-    // terminal shows it as a failure and the page draws it as one rather than
-    // either reading it as the contents of a file.
+    // Nothing is returned: a read that could not open its file is written as the call's result,
+    // beginning with the mark both readers branch on, so the terminal shows it as a failure and the
+    // page draws it as one rather than either reading it as the contents of a file.
     try (Read{ .path = "missing.txt" }).run(gpa, io, tmp.dir, &out.writer);
     try std.testing.expect(std.mem.startsWith(u8, out.written(), "error: cannot read missing.txt: "));
     try std.testing.expect(std.mem.find(u8, out.written(), "FileNotFound") != null);

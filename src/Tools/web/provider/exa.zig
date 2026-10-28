@@ -1,13 +1,10 @@
-//! Exa's request bodies and replies: a search and a contents call, both posted
-//! as JSON. The address, the key and the method are the table's in `web.zig`.
+//! Exa's request bodies and replies: a search and a contents call, both posted as JSON.
 
 const std = @import("std");
 
 const SearchResult = @import("../Search/Result.zig");
 
-/// The body an Exa search is posted with. Exa would return the whole page of each
-/// result, so the text is asked for capped: a search is a list of snippets, and a
-/// page is what `web_fetch` is for.
+/// The body an Exa search is posted with.
 pub fn searchBody(gpa: std.mem.Allocator, query: []const u8, max_results: usize) ![]const u8 {
     return std.json.Stringify.valueAlloc(gpa, Request{
         .query = query,
@@ -30,8 +27,7 @@ pub fn fetchBody(gpa: std.mem.Allocator, url: []const u8) ![]const u8 {
     }, .{ .emit_null_optional_fields = false });
 }
 
-/// An Exa contents reply as the url's text. A url it read no text for comes back
-/// as `error.UrlUnreadable`, which is not a failure of the backend.
+/// An Exa contents reply as the url's text.
 pub fn renderFetch(gpa: std.mem.Allocator, reply: []const u8) ![]const u8 {
     const parsed = try parse(ContentsResponse, gpa, reply);
     defer parsed.deinit();
@@ -40,8 +36,6 @@ pub fn renderFetch(gpa: std.mem.Allocator, reply: []const u8) ![]const u8 {
     return gpa.dupe(u8, parsed.value.results[0].text);
 }
 
-/// Parses a provider reply, which is the provider's own shape: a reply that does
-/// not parse is the provider's failure, reported as the shared one.
 fn parse(T: type, gpa: std.mem.Allocator, reply: []const u8) !std.json.Parsed(T) {
     return std.json.parseFromSlice(T, gpa, reply, .{
         .ignore_unknown_fields = true,
@@ -52,7 +46,6 @@ fn parse(T: type, gpa: std.mem.Allocator, reply: []const u8) !std.json.Parsed(T)
     };
 }
 
-/// The body an Exa search is posted with. Its field names are camelCase.
 const Request = struct {
     query: []const u8,
     numResults: usize,
@@ -67,24 +60,20 @@ const Request = struct {
     };
 };
 
-/// The part of an Exa search response billy uses.
 const Response = struct {
     results: []const Result = &.{},
 };
 
-/// One Exa result: its snippet is the `text` field.
 const Result = struct {
     title: []const u8 = "",
     url: []const u8 = "",
     text: []const u8 = "",
 };
 
-/// The body an Exa contents call is posted with.
 const ContentsRequest = struct {
     urls: []const []const u8,
 };
 
-/// The part of an Exa contents response billy uses: the text of each url.
 const ContentsResponse = struct {
     results: []const Content = &.{},
 };

@@ -5,10 +5,6 @@ const Tools = @import("../Tools.zig");
 const Bash = @This();
 
 command: []const u8,
-/// A short, one-line description of what the command does, written by the
-/// model. It is shown in the call's header, so a collapsed call says what
-/// it is for rather than only what it ran. Null when the model gave none,
-/// which is every stored call from before the tool asked for one.
 description: ?[]const u8 = null,
 
 pub fn run(
@@ -19,18 +15,17 @@ pub fn run(
     timeout: std.Io.Duration,
     out: *std.Io.Writer,
 ) !void {
-    // Longest output captured from one command.
     const max_command_output = 1 << 20;
 
     const result = std.process.run(gpa, io, .{
         .argv = &.{ "bash", "-c", bash.command },
-        // The command runs where the session's tools do, which is the session's
-        // own directory rather than the one billy was started in.
+        // The command runs where the session's tools do, which is the session's own directory
+        // rather than the one billy was started in.
         .cwd = .{ .dir = dir },
         .stdout_limit = .limited(max_command_output),
         .stderr_limit = .limited(max_command_output),
-        // A command that outlives the configured limit is killed, so a
-        // runaway command cannot hang the agent forever.
+        // A command that outlives the configured limit is killed, so a runaway command cannot hang
+        // the agent forever.
         .timeout = .{ .duration = .{ .clock = .awake, .raw = timeout } },
     }) catch |err| switch (err) {
         error.StreamTooLong => return Tools.fail(
@@ -61,8 +56,6 @@ pub fn run(
     }
 }
 
-/// The status a command ended with, the way a shell reports it: the code it
-/// exited with, or 128 plus the number of the signal that ended it.
 pub fn exitCode(term: std.process.Child.Term) u8 {
     return switch (term) {
         .exited => |code| code,

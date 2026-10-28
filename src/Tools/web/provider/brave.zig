@@ -1,12 +1,10 @@
-//! Brave's reply: a search sent as a GET with the query in the url. The address,
-//! the key's header and the method are the table's in `web.zig`.
+//! Brave's reply: a search sent as a GET with the query in the url.
 
 const std = @import("std");
 
 const SearchResult = @import("../Search/Result.zig");
 
-/// A Brave search reply as the numbered list the model reads. The results sit
-/// under `web`, and each snippet is the `description` field.
+/// A Brave search reply as the numbered list the model reads.
 pub fn renderSearch(gpa: std.mem.Allocator, reply: []const u8, _: usize) ![]const u8 {
     const parsed = std.json.parseFromSlice(Response, gpa, reply, .{
         .ignore_unknown_fields = true,
@@ -19,8 +17,6 @@ pub fn renderSearch(gpa: std.mem.Allocator, reply: []const u8, _: usize) ![]cons
     return SearchResult.renderMapped(gpa, parsed.value.web.results, "description");
 }
 
-/// The part of a Brave search response billy uses. The results sit under `web`,
-/// which a query that matched nothing leaves out, so it defaults to none.
 const Response = struct {
     web: Web = .{},
 
@@ -29,7 +25,6 @@ const Response = struct {
     };
 };
 
-/// One Brave result: its snippet is the `description` field.
 const Result = struct {
     title: []const u8 = "",
     url: []const u8 = "",

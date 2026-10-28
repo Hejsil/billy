@@ -1,19 +1,4 @@
 //! The web frontend: billy served over HTTP instead of in a terminal.
-//!
-//! The server listens where it is asked to, this machine only unless another
-//! address is given. Every connection is handled on its own task, so a slow
-//! request does not hold up the rest, and a connection that cannot be served is
-//! closed rather than taking the server down with it.
-//!
-//! What a route answers with is rendered here but built by `html.zig` and read
-//! out of a session, so the page shows the same blocks the terminal does. Every
-//! string that comes from outside billy passes through `html.escape`, so nothing
-//! a model, a file or a request writes can become markup.
-//!
-//! Nothing is authenticated. Any process that can reach the address, and any
-//! page the browser loads, can reach these routes, and the routes can run
-//! commands as the user. That is why the address is this machine only unless
-//! something else is asked for, and why the help says so.
 
 const std = @import("std");
 
@@ -29,18 +14,10 @@ const setup = @import("setup.zig");
 
 const Server = @This();
 
-/// The port billy serves on when nothing else is asked for.
 pub const default_port = 8787;
 
-/// The address billy serves on when nothing else is asked for: this machine
-/// only. Anywhere else may be asked for, but billy has no authentication and its
-/// routes run commands as the user, so the help says what listening elsewhere
-/// means.
 pub const default_host = "127.0.0.1";
 
-/// The page the browser is given at `/`: one document, with its styles and its
-/// script in it, put together at compile time from `web/style.css`,
-/// `web/body.html` and `web/script.js`.
 const page =
     \\<!doctype html>
     \\<html lang="en">
@@ -65,40 +42,20 @@ const page =
     \\
 ;
 
-/// The most connections billy serves at once.
-///
-/// Each connection is handled on its own task, so without a bound a server
-/// listening beyond this machine could be asked for tasks until memory ran out.
-/// A browser opens only a handful of connections, so this leaves room to spare
-/// while keeping a stranger from taking the machine down.
 const max_connections = 64;
 
 io: std.Io,
 gpa: std.mem.Allocator,
-/// The session files, and the directory the user's own instructions live in,
-/// which joins every session's prompt. Both are billy's and outlive the server.
 session_dir: std.Io.Dir,
 config_dir: std.Io.Dir,
-/// The configuration every request is built from. It is borrowed from the
-/// frontend that owns it, which outlives the server: a copy would share the
-/// arena, and a `deinit` on each would free it twice.
 config: *const Config,
-/// The providers and models every request is built from: the catalog fetched
-/// into the cache at startup, borrowed from billy.
 catalog: *const models.Catalog,
-/// The keys every request is built from.
 credentials: Credentials,
 health: *Health,
-/// Where billy was started, and the environment it was started in: the home
-/// directory shown in the header, and what the model is told about itself.
 cwd: []const u8,
 environ: *const std.process.Environ.Map,
-/// The backends its web tools ask, resolved before anything was served so a key
-/// that is missing is reported then rather than on the first thing asked.
 backends: setup.Backends,
 
-/// What a turn is given, resolved the same way a terminal run's is and laid out
-/// plainly rather than decorated for a terminal.
 fn options(server: *const Server) Agent.Options {
     return .{
         .config = server.config,
@@ -107,18 +64,10 @@ fn options(server: *const Server) Agent.Options {
         .behaviour = Agent.Behaviour.fromConfig(server.config),
         .tools = setup.toolSettings(server.config, server.backends, server.health),
         .home = server.environ.get("HOME"),
-        // The user's own instructions live beside the configuration, and join
-        // every session's prompt. The server owns the directory and outlives
-        // every turn.
         .instructions = server.config_dir,
     };
 }
 
-/// Serves the frontend on the address `host` at `port`, until the process is
-/// stopped. Zero asks the system for a free port, which is what a test uses.
-///
-/// The URL is printed once the socket is bound, so what is printed is the port
-/// that was actually taken, and not the one that was asked for.
 pub fn serve(server: *const Server, host: []const u8, port: u16) !void {
     const address = listenAddress(host, port) catch |err| {
         std.log.err(
@@ -130,14 +79,9 @@ pub fn serve(server: *const Server, host: []const u8, port: u16) !void {
     var listener = try address.listen(server.io, .{ .reuse_address = true });
     defer listener.deinit(server.io);
 
-    // One HTTP client for the whole server, shared by every request of every
-    // session, so they reuse its connections and share the certificates it scans
-    // once.
     var http_client: std.http.Client = .{ .allocator = server.gpa, .io = server.io };
     defer http_client.deinit();
 
-    // What the server knows about sessions beyond their files. It outlives every
-    // connection, which is why it is here and not in the handler.
     var registry = Registry{ .io = server.io, .gpa = server.gpa };
     defer registry.deinit();
 
@@ -146,15 +90,11 @@ pub fn serve(server: *const Server, host: []const u8, port: u16) !void {
         listener.socket.address.getPort(),
     });
 
-    // One task per connection, gathered so that they are all cancelled when the
-    // loop ends, as they all share the listener's lifetime.
+    // One task per connection, gathered so that they are all cancelled when the loop ends, as they
+    // all share the listener's lifetime.
     var group: std.Io.Group = .init;
     defer group.cancel(server.io);
 
-    // At most `max_connections` are served at once. A permit is taken before a
-    // connection is accepted, so one that arrives while the server is full waits
-    // in the socket's backlog rather than being given a task of its own; the
-    // permit is given back when the connection is answered and its task ends.
     var slots: std.Io.Semaphore = .{ .permits = max_connections };
     while (true) {
         try slots.wait(server.io);
@@ -163,8 +103,8 @@ pub fn serve(server: *const Server, host: []const u8, port: u16) !void {
             return err;
         };
         group.concurrent(server.io, handle, .{ server, &registry, &http_client, stream, &slots }) catch |err| {
-            // A connection that cannot be given a task is one to let go of,
-            // rather than one to bring the server down over.
+            // A connection that cannot be given a task is one to let go of, rather than one to
+            // bring the server down over.
             slots.post(server.io);
             std.log.err("cannot serve a connection: {s}", .{@errorName(err)});
             var copy = stream;
@@ -174,37 +114,17 @@ pub fn serve(server: *const Server, host: []const u8, port: u16) !void {
     }
 }
 
-/// The address `host` and `port` name.
-///
-/// `localhost` is taken as the loopback address, which is what it means
-/// everywhere. Anything else has to be an address, since billy does not resolve
-/// names: `0.0.0.0` for every interface, or the address of one of them.
 fn listenAddress(host: []const u8, port: u16) !std.Io.net.IpAddress {
     if (std.mem.eql(u8, host, "localhost"))
         return .{ .ip4 = std.Io.net.Ip4Address.loopback(port) };
 
-    // What was asked for that is not an address comes back as one error, since
-    // what billy does not do is resolve a name; the caller says so.
     return std.Io.net.IpAddress.parse(host, port) catch error.InvalidHost;
 }
 
-/// What the server knows about sessions beyond their files: the ids a turn is
-/// running for right now, so a session can only be asked one thing at a time.
-///
-/// A session is written by its first message, so until then it exists only as
-/// the id a turn is running for: it is not in the listing, and its page is a
-/// 404. The page learns the id from the `session` event and asks for the list
-/// again once that turn has written the file.
-///
-/// Every connection runs on its own task, so this is reached from several at
-/// once and a lock guards it.
 const Registry = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
     mutex: std.Io.Mutex = .init,
-    /// The ids of sessions a turn is running for right now, each with the id
-    /// that names it owned as the key. A session can only be asked one thing at
-    /// a time, so a second ask while one runs is refused.
     busy: std.StringHashMapUnmanaged(void) = .empty,
 
     fn deinit(registry: *Registry) void {
@@ -213,20 +133,11 @@ const Registry = struct {
         registry.busy.deinit(registry.gpa);
     }
 
-    /// Takes the session `id` for a turn, and says whether it was free. A
-    /// session already taken is one a turn is running for, which is refused
-    /// rather than queued: what a second ask would mean is not clear, and the
-    /// page can say the session is busy.
-    ///
-    /// A taken session must be released with `release`, whatever happens in
-    /// between, or it stays busy until the server stops.
     fn claim(registry: *Registry, id: []const u8) !bool {
         registry.mutex.lockUncancelable(registry.io);
         defer registry.mutex.unlock(registry.io);
 
         if (registry.busy.contains(id)) return false;
-        // The key is the id itself, which the caller only has for this request,
-        // so it is copied and the copy is the one freed on release.
         const owned = try registry.gpa.dupe(u8, id);
         errdefer registry.gpa.free(owned);
         try registry.busy.put(registry.gpa, owned, {});
@@ -240,12 +151,6 @@ const Registry = struct {
     }
 };
 
-/// Answers one connection, and closes it. Nothing a request or a reply does is
-/// allowed to reach the caller: a connection that goes wrong is logged and
-/// dropped, since the server outlives it.
-///
-/// `slots` is the permit the connection was accepted under, given back when the
-/// connection is done so that the next one may be accepted.
 fn handle(
     server: *const Server,
     registry: *Registry,
@@ -255,8 +160,8 @@ fn handle(
 ) void {
     defer slots.post(server.io);
     defer {
-        // `Stream.close` overwrites its argument with undefined, which it cannot
-        // do to a parameter that was not declared mutable.
+        // `Stream.close` overwrites its argument with undefined, which it cannot do to a parameter
+        // that was not declared mutable.
         var copy = stream;
         copy.close(server.io);
     }
@@ -266,64 +171,39 @@ fn handle(
     var reader = stream.reader(server.io, &recv_buffer);
     var writer = stream.writer(server.io, &send_buffer);
 
-    // A `Server` is per-connection, not per-listener: it wraps this connection's
-    // reader and writer and holds the protocol state for them, so it is built
-    // here, once for the connection, over this connection's buffers. The shared
-    // thing is `listener`, the socket that is accepted on. A single `Server`
-    // handed to every connection would be shared mutable state over one reader,
-    // and could only ever serve one of them.
-    //
-    // One request is served and the connection closed (`keep_alive = false`
-    // everywhere), so `receiveHead` is called once; the same `Server` could
-    // serve further requests on this connection if some reply asked to keep it.
+    // A `Server` is per-connection, not per-listener: it wraps this connection's reader and writer
+    // and holds the protocol state for them, so it is built here, once for the connection, over
+    // this connection's buffers.
     var http_server: std.http.Server = .init(&reader.interface, &writer.interface);
 
     var request = http_server.receiveHead() catch return;
 
-    // The flag inside tells the failure path below whether a status is still
-    // possible: a reply that has begun has sent its head already.
     var r = Request{ .server = server, .request = &request };
     route(&r, registry, http_client) catch |err| {
-        // A failure that already said what went wrong, in the log this task
-        // writes to, is not said again here: what is left is to answer the
-        // browser with a status rather than let the connection drop.
+        // A failure that already said what went wrong, in the log this task writes to, is not said
+        // again here: what is left is to answer the browser with a status rather than let the
+        // connection drop.
         if (err != report.Reported) std.log.err("cannot answer a request: {s}", .{@errorName(err)});
-        // Nothing has been sent, so the browser can be told what happened
-        // rather than only watching the connection drop.
+        // Nothing has been sent, so the browser can be told what happened rather than only watching
+        // the connection drop.
         if (!r.answered) request.respond("billy: internal error\n", .{
             .status = .internal_server_error,
             .extra_headers = &.{ContentType.text.header()},
             .keep_alive = false,
         }) catch {
-            // Nothing is left to tell a connection that will not take the
-            // status: the browser sees it drop, which is what this spares it
-            // rather than replaces.
+            // Nothing is left to tell a connection that will not take the status: the browser sees
+            // it drop, which is what this spares it rather than replaces.
         };
     };
 }
 
-/// One request being answered: what every route needs, and the failures they all
-/// share.
-///
-/// A route answers a failure rather than returning one, so the reasons a session
-/// cannot be opened or taken are written once here instead of once per route.
-/// Keeping the reasons together is also what keeps them consistent: a route that
-/// forgot one would answer a different status for the same state.
 const Request = struct {
     server: *const Server,
     request: *std.http.Server.Request,
-    /// Whether a reply for this request has begun. A failure after that cannot be
-    /// reported with a status -- the head is already sent -- so this is what
-    /// tells the caller of `route` whether a 500 is still possible.
     answered: bool = false,
 
-    /// Opens the session `id`, or answers why it could not be and returns null,
-    /// so the caller has nothing more to do. Which status an id deserves is
-    /// decided here, once, rather than by every route that opens one.
     fn open(r: *Request, id: []const u8) !?Session {
         return Session.open(r.server.io, r.server.session_dir, r.server.gpa, id, r.server.cwd) catch |err| switch (err) {
-            // An id that could not be a session name is a bad request rather than
-            // a missing session: what was asked for could never exist.
             error.InvalidSessionId => {
                 try r.reply(.text, "bad session id\n", .bad_request);
                 return null;
@@ -336,23 +216,16 @@ const Request = struct {
         };
     }
 
-    /// Takes the session `id` for a turn, or answers that it is busy and returns
-    /// false. A taken session is released with `Registry.release`, whatever
-    /// happens in between.
     fn claim(r: *Request, registry: *Registry, id: []const u8) !bool {
         if (try registry.claim(id)) return true;
         try r.reply(.text, "the session is busy\n", .conflict);
         return false;
     }
 
-    /// Answers that the session named was not found. Written once because it is
-    /// the answer to two different misses: an id nothing was ever handed out, and
-    /// a file that is gone.
     fn noSession(r: *Request) !void {
         return r.reply(.text, "no such session\n", .not_found);
     }
 
-    /// Answers a request with `body`, and ends the connection.
     fn reply(r: *Request, content_type: ContentType, body: []const u8, status: std.http.Status) !void {
         r.answered = true;
         try r.request.respond(body, .{
@@ -367,13 +240,7 @@ const Request = struct {
     }
 };
 
-/// The routes there are. Everything else is a 404, so a request billy does not
-/// understand is answered rather than left hanging.
-///
-/// The handlers are given one of these, which carries everything a route needs
-/// and answers the failures they all share.
 fn route(r: *Request, registry: *Registry, http_client: *std.http.Client) !void {
-    // The path is the target up to a query, which none of these routes take.
     const target = r.request.head.target;
     const path = target[0 .. std.mem.findScalar(u8, target, '?') orelse target.len];
 
@@ -400,13 +267,11 @@ fn route(r: *Request, registry: *Registry, http_client: *std.http.Client) !void 
         const id_end = std.mem.findScalarPos(u8, path, sessions_prefix.len, '/') orelse path.len;
         const id = path[sessions_prefix.len..id_end];
 
-        // /api/sessions/{id}/message
         if (std.mem.eql(u8, path[id_end..], "/message")) switch (r.request.head.method) {
             .POST => return askSession(r, registry, http_client, id),
             else => return r.replyNotAllowed(),
         };
 
-        // /api/sessions/{id}
         if (path.len == id_end) switch (r.request.head.method) {
             .GET => return openSession(r, id),
             .PATCH => return renameSession(r, registry, id),
@@ -418,15 +283,9 @@ fn route(r: *Request, registry: *Registry, http_client: *std.http.Client) !void 
     return r.reply(.text, "not found\n", .not_found);
 }
 
-/// `DELETE /api/sessions/{id}`: removes a session for good. There is no trash,
-/// so this cannot be undone.
-///
-/// A session a turn is running for answers 409, since removing it under the turn
-/// would leave the run writing to a file that is gone. An id with no file is a
-/// 404, so deleting one twice says the second was nothing.
 fn deleteSession(r: *Request, registry: *Registry, id: []const u8) !void {
-    // Taken for the moment it takes to remove, so a turn cannot start against a
-    // session that is being removed. Given back whether or not it is removed.
+    // Taken for the moment it takes to remove, so a turn cannot start against a session that is
+    // being removed.
     if (!try r.claim(registry, id)) return;
     defer registry.release(id);
 
@@ -438,13 +297,8 @@ fn deleteSession(r: *Request, registry: *Registry, id: []const u8) !void {
     return r.reply(.text, "", .ok);
 }
 
-/// The body a rename sends: the session's new name.
 const Rename = struct { title: []const u8 };
 
-/// `PATCH /api/sessions/{id}`: renames a session. The name is trimmed the way
-/// `Session.setTitle` trims it, and written out at once, so the
-/// list shows it. A session a turn is running for answers 409, since renaming it
-/// would race the turn writing the same file.
 fn renameSession(r: *Request, registry: *Registry, id: []const u8) !void {
     const gpa = r.server.gpa;
 
@@ -459,8 +313,8 @@ fn renameSession(r: *Request, registry: *Registry, id: []const u8) !void {
         .allocate = .alloc_always,
     }) catch return r.reply(.text, "the title is not JSON\n", .bad_request);
     defer parsed.deinit();
-    // A title of nothing is refused rather than stored: a session with an empty
-    // name reads as one that was never named.
+    // A title of nothing is refused rather than stored: a session with an empty name reads as one
+    // that was never named.
     const title = std.mem.trim(u8, parsed.value.title, " \t\r\n");
     if (title.len == 0) return r.reply(.text, "the title is empty\n", .bad_request);
 
@@ -474,25 +328,16 @@ fn renameSession(r: *Request, registry: *Registry, id: []const u8) !void {
     return r.reply(.text, "", .ok);
 }
 
-/// One session as the listing shows it: just its id, which is what names it.
 const Listed = struct {
     id: []const u8,
-    /// The session's title, shown in the list; "" for one that has not been named
-    /// yet, which the page falls back to showing the id for.
     title: []const u8,
 };
 
-/// The body of `GET /api/sessions`: every session, in the order the page shows
-/// them.
 const Listing = struct { sessions: []const Listed };
 
-/// `GET /api/sessions`: every session on disk, newest written first.
 fn writeListing(r: *Request) !void {
     const gpa = r.server.gpa;
 
-    // What is on disk. Each id and title is its own allocation, freed once the
-    // reply is built from them. The listing opens the directory itself, so a
-    // listing here and one on another connection do not read over each other.
     const stored = try Session.list(r.server.io, r.server.session_dir, gpa);
     defer {
         for (stored) |named| {
@@ -512,28 +357,17 @@ fn writeListing(r: *Request) !void {
     return r.reply(.json, body.written(), .ok);
 }
 
-/// One session's page: the header line above a conversation, and the
-/// conversation itself, both as HTML for the page to put in whole.
 const Opened = struct {
     header: []const u8,
     blocks: []const u8,
 };
 
-/// `GET /api/sessions/{id}`: a session as the page shows it.
-///
-/// A session is written by its first message, so an id a turn has just handed
-/// out and not yet written is a 404, like any other missing id. The page learns
-/// the id from the `session` event and lists the session once that turn has
-/// written it; it does not open one that has no file yet.
 fn openSession(r: *Request, id: []const u8) !void {
     const gpa = r.server.gpa;
 
     var body: std.Io.Writer.Allocating = .init(gpa);
     defer body.deinit();
     const opened = r.server.writeSession(gpa, id, &body.writer) catch |err| switch (err) {
-        // An id that could not be a session name is a bad request, not a missing
-        // session; an id with no file is a missing session, whether nothing was
-        // ever handed out under it or its turn has not written it yet.
         error.InvalidSessionId => return r.reply(.text, "bad session id\n", .bad_request),
         else => return err,
     };
@@ -541,9 +375,6 @@ fn openSession(r: *Request, id: []const u8) !void {
     return r.reply(.json, body.written(), .ok);
 }
 
-/// Writes the JSON a session's page is built from, and says whether the session
-/// was there at all: false for an id with no file, which includes one a turn has
-/// handed out and not yet written.
 fn writeSession(
     server: *const Server,
     gpa: std.mem.Allocator,
@@ -568,7 +399,6 @@ fn writeSession(
     return true;
 }
 
-/// Writes the two halves of a session's page as the JSON object the page reads.
 fn writeOpened(out: *std.Io.Writer, header: []const u8, blocks: []const u8) !void {
     try std.json.Stringify.value(Opened{
         .header = header,
@@ -576,7 +406,6 @@ fn writeOpened(out: *std.Io.Writer, header: []const u8, blocks: []const u8) !voi
     }, .{}, out);
 }
 
-/// What a reply is, so the browser is told how to read it.
 const ContentType = enum {
     html,
     json,
@@ -601,22 +430,16 @@ test "a session is taken for a turn, and refused while one runs" {
     var registry = Registry{ .io = std.testing.io, .gpa = gpa };
     defer registry.deinit();
 
-    // Free to begin with, so the first ask takes it.
     try std.testing.expect(try registry.claim("one"));
-    // A second ask while the turn runs is refused rather than queued.
     try std.testing.expect(!try registry.claim("one"));
-    // Another session is its own, so it is free.
     try std.testing.expect(try registry.claim("two"));
 
-    // Giving one back frees only that one.
     registry.release("one");
     try std.testing.expect(try registry.claim("one"));
     try std.testing.expect(!try registry.claim("two"));
     registry.release("one");
     registry.release("two");
 
-    // The keys were copied, so the id a claim was made with need not outlive it:
-    // what is freed on release is the copy, not the caller's slice.
     var short: [4]u8 = "take".*;
     try std.testing.expect(try registry.claim(&short));
     @memset(&short, 'x');
@@ -631,14 +454,11 @@ test "a session's page is written as the JSON the page reads" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    // The two halves are HTML, so the quotes and newlines in them are escaped
-    // into the JSON rather than ending the string early.
     try writeOpened(&out.writer, "<div class=\"header\">hi</div>\n", "<p>one</p>\n");
     try std.testing.expectEqualStrings(
         "{\"header\":\"<div class=\\\"header\\\">hi</div>\\n\",\"blocks\":\"<p>one</p>\\n\"}",
         out.written(),
     );
-    // The page reads this back as the two strings it wrote.
     const parsed = try std.json.parseFromSlice(Opened, gpa, out.written(), .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("<div class=\"header\">hi</div>\n", parsed.value.header);
@@ -648,9 +468,6 @@ test "a session's page is written as the JSON the page reads" {
 test "a parsed prompt is copied, so the body it came from can be freed" {
     const gpa = std.testing.allocator;
 
-    // The body lives in a buffer that is overwritten after the parse, standing
-    // in for the request body being freed. A borrowed string would follow the
-    // overwrite and read as the overwrites; a copied one is unaffected.
     var buffer: [64]u8 = @splat(' ');
     const json = "{\"text\":\"hello\"}";
     @memcpy(buffer[0..json.len], json);
@@ -663,7 +480,6 @@ test "a parsed prompt is copied, so the body it came from can be freed" {
 }
 
 test "the page the browser is given is the one that was written" {
-    // The embedded page is served whole, and nothing is built to serve it.
     try std.testing.expect(std.mem.find(u8, page, "<!doctype html>") == 0);
     try std.testing.expect(std.mem.find(u8, page, "/api/sessions") != null);
 }
@@ -671,10 +487,6 @@ test "the page the browser is given is the one that was written" {
 test "an event leaves the stream as it is written, without filling a buffer" {
     const gpa = std.testing.allocator;
 
-    // The body writer an event is written through, over a sink that keeps what
-    // it is given. Only the protocol output is watched: an event that has been
-    // flushed has reached it, and one still sitting in the body writer's buffer
-    // has not.
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
     var body_buffer: [4096]u8 = undefined;
@@ -691,47 +503,35 @@ test "an event leaves the stream as it is written, without filling a buffer" {
     };
     var stream = Stream{ .body = &body, .gpa = gpa };
 
-    // A frame small enough to sit in the buffer whole, so it reaches the sink
-    // only because the event is flushed. Without that flush it would wait there
-    // until enough events filled the buffer, which is what made a page see them
-    // in batches rather than as they happened.
+    // A frame small enough to sit in the buffer whole, so it reaches the sink only because the
+    // event is flushed.
     try stream.write("block", "{\"html\":\"<p>hi</p>\"}");
     try std.testing.expect(std.mem.find(u8, sink.written(), "event: block") != null);
 
-    // A second event reaches the sink too, each as a chunk of its own.
     try stream.write("done", "{}");
     try std.testing.expect(std.mem.count(u8, sink.written(), "event: ") == 2);
 }
 
 test "the address to listen on is read from what was asked for" {
-    // An address is taken as itself, and the port carried through.
     const anywhere = try listenAddress("0.0.0.0", 8787);
     try std.testing.expect(anywhere.eql(&(try std.Io.net.IpAddress.parse("0.0.0.0", 8787))));
 
-    // `localhost` is the one name taken, and it names loopback.
     const here = try listenAddress("localhost", 8787);
     try std.testing.expect(here.eql(&(try std.Io.net.IpAddress.parse("127.0.0.1", 8787))));
 
-    // A v6 address, and a port of zero, which asks the system for a free one.
     const v6 = try listenAddress("::1", 0);
     try std.testing.expect(v6.eql(&(try std.Io.net.IpAddress.parse("::1", 0))));
 
-    // A name billy does not resolve is refused rather than left to fail later.
     try std.testing.expectError(error.InvalidHost, listenAddress("example.com", 8787));
     try std.testing.expectError(error.InvalidHost, listenAddress("", 8787));
 }
 
-/// The prompt a page sends: what the user typed.
 const Prompt = struct {
     text: []const u8,
 };
 
-/// Reads the prompt a POST carries, or replies with why it could not and returns
-/// null, so the caller has nothing more to do.
 fn readPrompt(r: *Request) !?std.json.Parsed(Prompt) {
     const gpa = r.server.gpa;
-    // The prompt is read first, so a request with nothing usable in it is
-    // refused before a session is taken or made.
     var body_buffer: [4096]u8 = undefined;
     const body_reader = r.request.readerExpectNone(&body_buffer);
     const body = body_reader.allocRemaining(gpa, .limited(1 << 20)) catch {
@@ -740,17 +540,12 @@ fn readPrompt(r: *Request) !?std.json.Parsed(Prompt) {
     };
     defer gpa.free(body);
 
-    // The strings are copied out of `body`, which is freed on the way out, so
-    // the value stands on its own.
     return parsePrompt(gpa, body) catch {
         try r.reply(.text, "the prompt is not JSON\n", .bad_request);
         return null;
     };
 }
 
-/// Parses the prompt out of a request body. Every string is copied out of
-/// `body`, so the value does not point into it and outlives it: a borrowed slice
-/// would dangle once the body is freed.
 fn parsePrompt(gpa: std.mem.Allocator, body: []const u8) !std.json.Parsed(Prompt) {
     return std.json.parseFromSlice(Prompt, gpa, body, .{
         .ignore_unknown_fields = true,
@@ -758,18 +553,11 @@ fn parsePrompt(gpa: std.mem.Allocator, body: []const u8) !std.json.Parsed(Prompt
     });
 }
 
-/// `POST /api/sessions`: starts a session with the page's first prompt and
-/// answers with the run as it happens.
-///
-/// A new session has no id on the page until it is asked something, so the id it
-/// is given here is the first event of the stream: that is how the page learns it
-/// and adds the session to its list.
 fn createSession(r: *Request, registry: *Registry, http_client: *std.http.Client) !void {
     const gpa = r.server.gpa;
     const parsed = (try readPrompt(r)) orelse return;
     defer parsed.deinit();
 
-    // A fresh session with a new id and no file: the first message writes it.
     var session = try Session.open(r.server.io, r.server.session_dir, gpa, null, r.server.cwd);
     defer session.deinit();
     if (!try r.claim(registry, session.id())) return;
@@ -781,43 +569,23 @@ fn createSession(r: *Request, registry: *Registry, http_client: *std.http.Client
     try serveTurn(r, http_client, &session, r.server.options(), parsed.value.text, .announce);
 }
 
-/// `POST /api/sessions/{id}/message`: asks the session `text`, answering with the
-/// run as it happens.
-///
-/// A session a turn is already running for answers 409: one thing at a time.
 fn askSession(r: *Request, registry: *Registry, http_client: *std.http.Client, id: []const u8) !void {
     const parsed = (try readPrompt(r)) orelse return;
     defer parsed.deinit();
     if (parsed.value.text.len == 0)
         return r.reply(.text, "the prompt is empty\n", .bad_request);
 
-    // Taken for the whole turn, and given back however the turn ends.
     if (!try r.claim(registry, id)) return;
     defer registry.release(id);
 
-    // The session is opened fresh for this turn and dropped at the end, so it is
-    // always what is on disk; a session changed by another billy in between is
-    // read rather than overwritten.
     var session = (try r.open(id)) orelse return;
     defer session.deinit();
 
     try serveTurn(r, http_client, &session, r.server.options(), parsed.value.text, .quiet);
 }
 
-/// Whether the page is told the session's id before it is asked, which a session
-/// it has not seen needs and one it is asking again does not.
 const Announce = enum { announce, quiet };
 
-/// Answers one prompt as the run happens: the run's blocks as the events of a
-/// stream, written and flushed one at a time rather than gathered, so a page sees
-/// each block the moment it is done and a slow tool call start long before it
-/// finishes.
-///
-/// A session created by this request has no id on the page yet, so with
-/// `announce` its id is sent as the first event, before anything else. The id
-/// is resolved when it is announced, after the session is prepared, rather than
-/// held from before: preparing interns the prompt and tools, and a slice of the
-/// pool read earlier would name bytes it no longer holds.
 fn serveTurn(
     r: *Request,
     http_client: *std.http.Client,
@@ -829,13 +597,10 @@ fn serveTurn(
     const gpa = r.server.gpa;
     var agent = try Agent.init(r.server.io, gpa, run_options, session.cwd(), http_client);
     defer agent.deinit();
-    // A resumed session keeps the prompt and tools it was saved with; a new one
-    // gets them when its first line is taken.
     try agent.prepare(session);
 
-    // The head of the reply goes out before the run starts, so the page can read
-    // the stream while the model is working. From here on a failure is part of
-    // the stream rather than something the connection can be told with a status.
+    // The head of the reply goes out before the run starts, so the page can read the stream while
+    // the model is working.
     var stream_buffer: [4096]u8 = undefined;
     var body_writer = try r.request.respondStreaming(&stream_buffer, .{
         .respond_options = .{
@@ -848,16 +613,9 @@ fn serveTurn(
     var stream = Stream{ .body = &body_writer, .gpa = gpa };
     const emitter = stream.emitter();
 
-    // The line is given to the agent before the session is announced, because a
-    // command is answered without the session being started at all: a `/compact`
-    // on a page with a session that has nothing to fold must leave the page with
-    // no new session to show. Anything that is not a command is a turn, and the
-    // page is told the session's id first so it can add it to the list.
-    //
-    // A line the agent cannot get as far as asking -- the model it goes to has no
-    // key, or no address -- is the same: the notice saying so has already gone
-    // out through the emitter, and there is no session to announce, since
-    // nothing was written with it.
+    // The line is given to the agent before the session is announced, because a command is answered
+    // without the session being started at all: a `/compact` on a page with a session that has
+    // nothing to fold must leave the page with no new session to show.
     const waiting = try agent.take(emitter, session, text);
     if (waiting == .ran or waiting == .unresolved) {
         try r.server.sendHeader(gpa, session, &stream);
@@ -865,32 +623,19 @@ fn serveTurn(
         return;
     }
 
-    // Resolved here, after preparing the session: the id is a slice of the pool,
-    // which preparing has just grown. Reading it again is cheaper and safer than
-    // copying it before, and it is the same id either way.
     if (announce == .announce) try stream.send("session", SessionEvent{ .id = session.id() });
 
-    // A session the agent named from this line is announced by that name, so the
-    // page's list shows it before the model has answered. The model's own title,
-    // if it gives one, arrives with the list the page refreshes when the turn
-    // ends.
     if (waiting.prompt.title) |title| try stream.send("title", TitleEvent{ .title = title });
 
-    // A request that failed has been reported through the emitter by `ask`,
-    // which is the same notice the terminal shows. Only a failure of the stream
-    // itself, which is this page going away, reaches here.
     agent.ask(emitter, session, text) catch |err| {
         std.log.err("could not show the turn: {s}", .{@errorName(err)});
         try stream.fail(@errorName(err));
     };
 
-    // What the run left the session at, so the page shows the new gauge and
-    // knows the turn is over.
     try r.server.sendHeader(gpa, session, &stream);
     try stream.done();
 }
 
-/// Writes the header line the page shows above `session`'s conversation.
 fn writeHeader(server: *const Server, session: *const Session, out: *std.Io.Writer) !void {
     const shown = setup.sessionModel(server.config, server.catalog, session);
     try html.header(.{
@@ -903,8 +648,6 @@ fn writeHeader(server: *const Server, session: *const Session, out: *std.Io.Writ
     }, out);
 }
 
-/// Sends the header line the page shows above a conversation: the session's state
-/// now, so the gauge is current.
 fn sendHeader(server: *const Server, gpa: std.mem.Allocator, session: *const Session, stream: *Stream) !void {
     var header: std.Io.Writer.Allocating = .init(gpa);
     defer header.deinit();
@@ -913,31 +656,17 @@ fn sendHeader(server: *const Server, gpa: std.mem.Allocator, session: *const Ses
     try stream.send("header", HtmlEvent{ .html = header.written() });
 }
 
-/// The event a block and a header are sent as: the HTML of one piece of the
-/// page, which the page puts in whole.
 const HtmlEvent = struct { html: []const u8 };
 
-/// What a failure is sent as, so the page can show why a turn stopped.
 const FailedEvent = struct { message: []const u8 };
 
-/// What a new title is sent as, once a session's first turn has named it, so the
-/// page can show it in the list without asking for the list again.
 const TitleEvent = struct { title: []const u8 };
 
-/// What a new session's id is sent as, first, so the page can add it to the list.
 const SessionEvent = struct { id: []const u8 };
 
-/// Turns the blocks of a run into the events of a stream as they happen.
-///
-/// The events are written and flushed one at a time rather than gathered, which
-/// is the whole point: a page sees each block the moment it is done, and sees a
-/// slow tool call start long before it finishes.
 const Stream = struct {
     body: *std.http.BodyWriter,
     gpa: std.mem.Allocator,
-    /// The emitter the run shows through. It holds the count of what it showed,
-    /// which the run reads to say whether a failure stopped an answer that had
-    /// started. The page has no delta handler, so only whole blocks count.
     interface: Agent.Emitter = .{ .vtable = &vtable },
 
     const vtable: Agent.Emitter.VTable = .{ .block = show };
@@ -951,9 +680,6 @@ const Stream = struct {
         var rendered: std.Io.Writer.Allocating = .init(self.gpa);
         defer rendered.deinit();
 
-        // Both halves of a tool call are whole elements on their own, so the page
-        // can replace the call it is showing with the finished one. Everything
-        // else is a single `block`.
         const event: []const u8 = switch (b) {
             .tool_begin => "tool_begin",
             .tool_end => "tool_end",
@@ -967,17 +693,11 @@ const Stream = struct {
         try self.send("error", FailedEvent{ .message = message });
     }
 
-    /// Says the turn is over, then ends the body: the frames written are the
-    /// whole of what the page is sent, so the write side is closed here rather
-    /// than left to whatever unwinds. A turn whose stream failed before reaching
-    /// this leaves the body unended on purpose -- the page has already lost that
-    /// stream, and a page told it ended cleanly would believe it.
     fn done(self: *Stream) !void {
         try self.write("done", "{}");
         try self.body.end();
     }
 
-    /// Writes one event, and flushes it, so the page has it now.
     fn send(self: *Stream, event: []const u8, payload: anytype) !void {
         var data: std.Io.Writer.Allocating = .init(self.gpa);
         defer data.deinit();
@@ -985,18 +705,6 @@ const Stream = struct {
         try self.write(event, data.written());
     }
 
-    /// Writes one event frame: its name, its data on one line, and the blank
-    /// line that ends it. The data is JSON, which never holds a newline, so a
-    /// frame is always what it should be.
-    ///
-    /// The two flushes are both needed and are in this order. The body writer
-    /// gathers what is written to it in a buffer of its own, and only pushes that
-    /// into `http_protocol_output` when it is flushed or full; `BodyWriter.flush`
-    /// flushes `http_protocol_output` and *not* that buffer. Flushing the buffer
-    /// first sends this event into the protocol output, and flushing the body
-    /// then sends it down the socket. Without the first, an event sits in the
-    /// buffer until enough of them fill it, so a page sees them in batches rather
-    /// than as they happen.
     fn write(self: *Stream, event: []const u8, data: []const u8) !void {
         try self.body.writer.print("event: {s}\ndata: {s}\n\n", .{ event, data });
         try self.body.writer.flush();
@@ -1004,33 +712,12 @@ const Stream = struct {
     }
 };
 
-/// A server over a temporary directory, for a test that drives a route.
-///
-/// The real one reads the environment, the configuration file and the
-/// credentials; a route needs none of that, only somewhere to keep sessions and
-/// a model to name. What it does not read is left empty, and nothing in the
-/// routes reaches for it.
-///
-/// Only a test may build one: it runs on `std.testing.allocator` and
-/// `std.testing.io`, so nothing outside one may reach it.
 const TestServer = struct {
-    /// The server the routes are asked through: the same fields a served
-    /// connection has, built once so a test drives what is really there.
     server: Server,
     tmp: std.testing.TmpDir,
-    /// The configuration the server points at, owned here and freed with this
-    /// test server. Allocated, so the server points at a value that does not move
-    /// with this struct.
     config: *Config,
-    /// The environment the server reads, which a route asks for `HOME`. It is
-    /// held by pointer and allocated, so the address the server was given stays
-    /// the map's when this value is moved out of `init`.
     environ: *std.process.Environ.Map,
-    /// Which search backends are set aside. Allocated for the same reason as the
-    /// environment: the server points at it, and it must not move.
     health: *Health,
-    /// What the server knows beyond the session files, and the client its routes
-    /// borrow, which outlive every request made through this.
     registry: Registry,
     http: std.http.Client,
 
@@ -1091,14 +778,10 @@ const TestServer = struct {
         server.tmp.cleanup();
     }
 
-    /// Answers `method path` with `body`, through the real `route`.
     fn exchange(server: *TestServer, method: std.http.Method, path: []const u8, body: ?[]const u8) !Exchange {
         return Exchange.run(&server.server, &server.registry, &server.http, method, path, body);
     }
 
-    /// A session holding one prompt and its reply, written to disk and named as
-    /// `title` when there is one, so a route has something to serve. Its id is
-    /// returned, owned by the caller.
     fn session(server: *TestServer, title: ?[]const u8) ![]const u8 {
         var opened = try Session.open(std.testing.io, server.server.session_dir, std.testing.allocator, null, ".");
         defer opened.deinit();
@@ -1112,26 +795,14 @@ const TestServer = struct {
     }
 };
 
-/// The path a session's route is asked for, owned by the caller.
 fn sessionPath(id: []const u8, suffix: []const u8) ![]const u8 {
     return std.testing.allocator.print("/api/sessions/{s}{s}", .{ id, suffix });
 }
 
-/// One request through the real `route`, answered into `out`.
-///
-/// The request is written as HTTP and read back by a real `std.http.Server`, so
-/// what is tested is the dispatcher and the handlers as they run, not a stand-in
-/// for them: the target, the method and the body all take the path they take in
-/// a served connection. Nothing is allocated for the answer's own buffers, so a
-/// test sees the bytes the socket would have carried.
 const Exchange = struct {
-    /// What the connection would have written: the status line, the headers and
-    /// the body.
     written: std.Io.Writer.Allocating,
-    /// Whether a reply had begun, as `handle` tracks it.
     answered: bool = false,
 
-    /// Answers `method path` with `body`, exactly as the server would.
     fn run(
         server: *const Server,
         registry: *Registry,
@@ -1156,7 +827,6 @@ const Exchange = struct {
         @memcpy(in_buffer[0..request_text.len], request_text);
         var reader = std.Io.Reader.fixed(in_buffer[0..request_text.len]);
 
-        // Room for the largest answer a route writes, which is the page itself.
         var out_buffer: [128 * 1024]u8 = undefined;
         var writer = std.Io.Writer.fixed(&out_buffer);
 
@@ -1175,8 +845,6 @@ const Exchange = struct {
         exchange.written.deinit();
     }
 
-    /// What the answer began with, such as `200 OK`, or the method and target
-    /// when the answer is the one `route` writes for a request it does not know.
     fn statusLine(exchange: *Exchange) []const u8 {
         const text = exchange.written.written();
         const end = std.mem.find(u8, text, "\r\n") orelse text.len;
@@ -1207,8 +875,6 @@ test "the page is served at the root, byte for byte" {
     defer exchange.deinit();
 
     try std.testing.expectEqualStrings("HTTP/1.1 200 OK", exchange.statusLine());
-    // The answer is the embedded page and nothing else, not something built to
-    // look like it.
     try std.testing.expect(exchange.contains(page));
 }
 
@@ -1216,14 +882,11 @@ test "the session list is read from disk, newest first" {
     var server = try TestServer.init();
     defer server.deinit();
 
-    // Nothing on disk is an empty list rather than a failure, since a fresh
-    // billy has no sessions at all.
     var empty = try server.exchange(.GET, "/api/sessions", null);
     defer empty.deinit();
     try std.testing.expectEqualStrings("HTTP/1.1 200 OK", empty.statusLine());
     try std.testing.expect(empty.contains("{\"sessions\":[]}"));
 
-    // A session written to disk is listed by its id and title.
     const id = try server.session("a named session");
     defer std.testing.allocator.free(id);
 
@@ -1246,13 +909,9 @@ test "one session is opened as the page the frontend reads" {
     var opened = try server.exchange(.GET, path, null);
     defer opened.deinit();
     try std.testing.expectEqualStrings("HTTP/1.1 200 OK", opened.statusLine());
-    // The two things the page reads: the header and the blocks.
     try std.testing.expect(opened.contains("\"header\":"));
-    // The header names the model the session is sent to, provider and all, which
-    // is the same choice the terminal header shows.
     try std.testing.expect(opened.contains("deepseek/deepseek-flash"));
     try std.testing.expect(opened.contains("\"blocks\":"));
-    // The conversation is in the blocks, as the page shows it.
     try std.testing.expect(opened.contains("hello"));
 }
 
@@ -1260,13 +919,10 @@ test "an id with no session is a 404, and one that is not an id is a 400" {
     var server = try TestServer.init();
     defer server.deinit();
 
-    // An id of the right shape with no file behind it.
     var missing = try server.exchange(.GET, "/api/sessions/01M3AAAAAAAAAAAAAAAAAAAAAA", null);
     defer missing.deinit();
     try std.testing.expectEqualStrings("HTTP/1.1 404 Not Found", missing.statusLine());
 
-    // Something that could never be an id is refused as a bad request rather
-    // than looked for, so it cannot be turned into a path.
     var malformed = try server.exchange(.GET, "/api/sessions/..%2f..%2fetc", null);
     defer malformed.deinit();
     try std.testing.expectEqualStrings("HTTP/1.1 400 Bad Request", malformed.statusLine());
@@ -1285,7 +941,6 @@ test "a session is renamed, and the name is on disk" {
     defer renamed.deinit();
     try std.testing.expectEqualStrings("HTTP/1.1 200 OK", renamed.statusLine());
 
-    // The new name is on disk, not only in the answer.
     var reread = try Session.open(std.testing.io, server.server.session_dir, std.testing.allocator, id, ".");
     defer reread.deinit();
 
@@ -1301,18 +956,16 @@ test "a rename that says nothing usable is refused" {
     const path = try sessionPath(id, "");
     defer std.testing.allocator.free(path);
 
-    // Whitespace is not a title: a session named " " would read as one that was
-    // never named, which is what the list falls back to the id for.
+    // Whitespace is not a title: a session named " " would read as one that was never named, which
+    // is what the list falls back to the id for.
     var blank = try server.exchange(.PATCH, path, "{\"title\":\"   \"}");
     defer blank.deinit();
     try std.testing.expectEqualStrings("HTTP/1.1 400 Bad Request", blank.statusLine());
 
-    // Body that is not JSON at all.
     var not_json = try server.exchange(.PATCH, path, "not json");
     defer not_json.deinit();
     try std.testing.expectEqualStrings("HTTP/1.1 400 Bad Request", not_json.statusLine());
 
-    // And the session is left unnamed rather than holding either of them.
     var reread = try Session.open(std.testing.io, server.server.session_dir, std.testing.allocator, id, ".");
     defer reread.deinit();
 
@@ -1332,7 +985,6 @@ test "a session is deleted, and deleting it again is a 404" {
     defer removed.deinit();
     try std.testing.expectEqualStrings("HTTP/1.1 200 OK", removed.statusLine());
 
-    // Gone from disk, so nothing can be opened by that id again.
     try std.testing.expectError(error.SessionNotFound, Session.open(
         std.testing.io,
         server.server.session_dir,
@@ -1341,8 +993,6 @@ test "a session is deleted, and deleting it again is a 404" {
         ".",
     ));
 
-    // A second delete finds nothing to remove, which is a 404 rather than a
-    // failure: the session is gone either way.
     var again = try server.exchange(.DELETE, path, null);
     defer again.deinit();
     try std.testing.expectEqualStrings("HTTP/1.1 404 Not Found", again.statusLine());
@@ -1357,14 +1007,10 @@ test "a prompt is refused while the session is busy, and one that asks nothing" 
     const path = try sessionPath(id, "/message");
     defer std.testing.allocator.free(path);
 
-    // An empty prompt is refused before anything is opened or taken, so a
-    // request that asks nothing cannot start a turn.
     var empty = try server.exchange(.POST, path, "{\"text\":\"\"}");
     defer empty.deinit();
     try std.testing.expectEqualStrings("HTTP/1.1 400 Bad Request", empty.statusLine());
 
-    // A session a turn is running for answers 409 rather than running a second
-    // one over the top of it. The claim stands in for the turn here.
     try std.testing.expect(try server.registry.claim(id));
     defer server.registry.release(id);
     var busy = try server.exchange(.POST, path, "{\"text\":\"do something\"}");

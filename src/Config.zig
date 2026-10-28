@@ -1,11 +1,5 @@
-//! Configuration: the settings read from a JSON file under the XDG config
-//! directory, so that a run can be tuned without rebuilding the binary.
-//!
-//! The file lives at `$XDG_CONFIG_HOME/billy/config.json`, or
-//! `$HOME/.config/billy/config.json` when that is unset. It is written with the
-//! defaults the first time it is needed, which is also how the settings that
-//! exist are discovered. Unknown fields are ignored, so a file written by a
-//! newer billy does not break an older one.
+//! Configuration: the settings read from a JSON file under the XDG config directory, so that a run
+//! can be tuned without rebuilding the binary.
 
 const std = @import("std");
 
@@ -14,122 +8,50 @@ const Tools = @import("Tools.zig");
 
 const Config = @This();
 
-/// Name of the configuration file inside that directory.
 pub const file_name = "config.json";
 
-/// What `open` found, including whether the file had to be written.
 pub const Opened = struct {
     config: Config,
-    /// Whether the file was missing and has just been written with defaults.
     created: bool,
 };
 
-/// Settings for the tools the agent can call, one group per tool.
 pub const ToolSettings = struct {
     bash: Bash = .{},
     web_search: WebSearch = .{},
     web_fetch: WebFetch = .{},
 };
 
-/// Settings for the web fetch tool.
 pub const WebFetch = struct {
-    /// The backends to read a url with, in the order they are tried: the first
-    /// that reads it is used. Empty leaves `web_fetch` out of the tools the
-    /// model is offered. The names are the variants of `web.Provider` that can
-    /// fetch. `raw` is the url itself, read directly, which is what a call asking
-    /// for the bytes as they are uses; a fresh configuration holds only that, so
-    /// fetching works without a service to extract a page.
-    ///
-    /// The key a backend needs is the credential `billy login` stored for it.
     providers: []const Tools.web.Provider = &.{.raw},
 };
 
-/// Settings for the web search tool.
 pub const WebSearch = struct {
-    /// The backends to search with, in the order they are tried: the first that
-    /// answers is used, so a backend that is down or rate-limited falls through
-    /// to the next. Empty leaves web search out of the tools the model is
-    /// offered, which is the default: a fresh configuration has no key to search
-    /// with. The names are the variants of `web.Provider` that can search, and
-    /// one billy does not know, or one that cannot search, is refused rather
-    /// than reading as "no search".
-    ///
-    /// The key a backend needs is the credential `billy login` stored for it,
-    /// and never this file, which is written to disk in the clear.
     providers: []const Tools.web.Provider = &.{},
-    /// Results asked for per query. The backend may return fewer, and billy caps
-    /// it.
     max_results: usize = 5,
-    /// Settings for the SearXNG backend, under its own name. A backend that billy
-    /// knows the address of needs none of its own.
     searxng: Searxng = .{},
 
-    /// Settings for SearXNG, which is self-hosted rather than a service billy
-    /// knows the address of.
     pub const Searxng = struct {
-        /// The instance to search with, such as `https://searx.example.org`. It
-        /// must have the JSON format turned on, which SearXNG leaves off by
-        /// default.
         url: ?[]const u8 = null,
     };
 };
 
-/// Settings for the bash tool.
 pub const Bash = struct {
-    /// Longest a command may run before it is killed, in seconds. A command that
-    /// outlives this is killed, so a runaway command cannot hang the agent
-    /// forever. Zero would kill every command as it starts, which is never what
-    /// the file is meant to say, so it is rejected rather than read as "no
-    /// limit"; set a large value for a command that legitimately runs long.
     timeout_s: usize = 120,
 };
 
-/// The configuration file as it is written to and read from disk. The settings
-/// are the configuration's own, since the file holds exactly those.
 const Stored = struct {
     version: u32 = 1,
-    /// Which provider and model a new session asks for, as `provider/model`:
-    /// `deepseek/deepseek-v4-flash`, `opencode-go/glm-5.3-flash`.
-    ///
-    /// It is one setting rather than two because the two halves are only
-    /// meaningful together: a model id alone names no endpoint, and the model
-    /// ids of two providers do not overlap enough for the provider to be
-    /// guessed from one. A session keeps the choice it recorded, so changing
-    /// this affects new sessions and not the ones in progress.
     model: []const u8 = "deepseek/deepseek-flash",
-    /// The endpoints billy talks to that the model catalog does not name, or
-    /// names differently: a proxy, a server of the user's own, or a stand-in a
-    /// test points a run at. Each is
-    /// written as a provider name with the base URL its completions path is
-    /// appended to, and named in `model` like any other provider.
-    ///
-    /// A name billy already knows may be given here too, which is how a proxy in
-    /// front of a known provider is reached.
     providers: Providers = .{},
     max_turns: usize = 100,
-    /// Blocks to replay on a resume. Zero shows the whole session.
     resume_blocks: usize = 10,
-    /// Blocks of a session the web page shows when it is opened. Zero shows the
-    /// whole session. It is its own setting rather than `resume_blocks` because
-    /// the two are read on different things: a replay fills a terminal's screen,
-    /// while the page is scrolled, so it wants far more of the conversation and
-    /// still far less than all of it.
     web_blocks: usize = 200,
-    /// How full the context window must be, as a whole percentage, before the
-    /// conversation is compacted into a summary. Zero turns compaction off.
     compact_at: usize = 80,
-    /// Whether billy asks the model for a short title for a session, after its
-    /// first turn, so the web frontend can list it by name. Off asks for none,
-    /// and a session is then listed by its id.
     title: bool = true,
     tools: ToolSettings = .{},
 
     const default = Stored{};
 
-    /// Whether the file is one billy can use: a version it knows, a turn limit
-    /// above zero, and a bash timeout above zero. Zero turns would give the model
-    /// no chance to answer at all, and a zero timeout would kill every command as
-    /// it starts, neither of which is ever what the file is meant to say.
     fn validate(stored: Stored) !void {
         if (stored.version > Stored.default.version) return error.UnsupportedConfigVersion;
         if (stored.max_turns == 0) return error.InvalidConfig;
@@ -139,10 +61,6 @@ const Stored = struct {
         try stored.validateModel();
     }
 
-    /// Whether every web provider named can do the job it is named for. The two
-    /// tools share one list of providers now, so the file has to say that a
-    /// search backend can search and a fetch backend can fetch: `raw` under
-    /// `web_search` names a service that would answer nothing.
     fn validateWeb(stored: Stored) !void {
         for (stored.tools.web_search.providers) |provider| {
             if (!provider.searches()) return error.InvalidConfig;
@@ -152,16 +70,10 @@ const Stored = struct {
         }
     }
 
-    /// Whether the model setting names both a provider and a model. Whether the
-    /// provider is one billy can reach is not known here: it is resolved against
-    /// the configuration and the model catalog when a request is made, and
-    /// refused there with the catalog's own report.
     fn validateModel(stored: Stored) !void {
         if (!stored.choice().isComplete()) return error.InvalidConfig;
     }
 
-    /// Whether every provider the file defines is one a request could be sent
-    /// to: a name to write in `model`, and a URL to send it to.
     fn validateProviders(stored: Stored) !void {
         for (stored.providers.entries) |entry| {
             if (entry.name.len == 0) return error.InvalidConfig;
@@ -169,28 +81,21 @@ const Stored = struct {
         }
     }
 
-    /// What the model setting asks for, as the pair of halves it holds.
     pub fn choice(stored: Stored) models.Choice {
         return .{ .text = stored.model };
     }
 };
 
-/// The endpoints the configuration names itself, as the object the file holds
-/// them as: a name, and the settings of the provider stored under it.
-///
-/// Written as an object keyed by name rather than a list, since the name is what
-/// `model` and `credentials.json` both refer to, and a list would spell it twice.
+/// The endpoints the configuration names itself, as the object the file holds them as: a name, and
+/// the settings of the provider stored under it.
 pub const Providers = struct {
     entries: []const Entry = &.{},
 
     pub const Entry = struct {
-        /// The name `model` writes before the `/`.
         name: []const u8,
-        /// The base URL its completions path is appended to.
         base_url: []const u8,
     };
 
-    /// The base URL of `name`, or null when the configuration does not name it.
     pub fn get(providers: Providers, name: []const u8) ?[]const u8 {
         for (providers.entries) |entry| {
             if (std.mem.eql(u8, entry.name, name)) return entry.base_url;
@@ -198,13 +103,12 @@ pub const Providers = struct {
         return null;
     }
 
-    /// Whether the configuration names it at all.
     pub fn has(providers: Providers, name: []const u8) bool {
         return providers.get(name) != null;
     }
 
-    /// The object is read as a value and walked, since the names are the user's
-    /// and no set of fields could hold them.
+    /// The object is read as a value and walked, since the names are the user's and no set of
+    /// fields could hold them.
     pub fn jsonParse(
         allocator: std.mem.Allocator,
         source: anytype,
@@ -213,8 +117,8 @@ pub const Providers = struct {
         const parsed = try std.json.Value.jsonParse(allocator, source, options);
         if (parsed != .object) return error.UnexpectedToken;
 
-        // The entries are taken from the arena the configuration was read
-        // through, which frees everything it read in one go.
+        // The entries are taken from the arena the configuration was read through, which frees
+        // everything it read in one go.
         // zlinter-disable-next-line require_errdefer_dealloc - the arena owns it
         var entries: std.ArrayList(Entry) = .empty;
         var it = parsed.object.iterator();
@@ -244,19 +148,9 @@ pub const Providers = struct {
     }
 };
 
-/// Backs every string the configuration holds, which is what the settings read
-/// out of the file are kept in. The configuration owns it, so a caller frees the
-/// whole configuration with `deinit` rather than tracking each string, and every
-/// allocation `open` makes goes through it.
-///
-/// It is why a configuration is never copied: a copy would share this arena
-/// without owning it, and a `deinit` on each would free it twice. It is passed by
-/// pointer, and only the one `init` or `open` made is deinitialised.
 arena: std.heap.ArenaAllocator,
 stored: Stored = .default,
 
-/// An empty configuration, with the arena a file read fills in. Its settings
-/// are the defaults, which is what a missing file is written with.
 pub fn init(gpa: std.mem.Allocator) Config {
     return .{ .arena = .init(gpa) };
 }
@@ -266,12 +160,7 @@ pub fn deinit(config: *Config) void {
     config.arena.deinit();
 }
 
-/// Reads the configuration from `dir`, writing `file_name` with the defaults
-/// when it is missing. `dir` must be the directory holding the file.
-///
-/// `gpa` backs the configuration's own arena, where every string it reads and
-/// every buffer it parses through is kept; the caller frees them all at once
-/// with `deinit`.
+/// Reads the configuration from `dir`, writing `file_name` with the defaults when it is missing.
 pub fn open(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator) !Opened {
     var config = Config.init(gpa);
     errdefer config.deinit();
@@ -295,13 +184,7 @@ pub fn open(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator) !Opened {
     return .{ .config = config, .created = false };
 }
 
-/// Writes the configuration to `file_name` in `dir`. The previous contents
-/// are replaced in one step, leaving them intact if writing fails part way.
-///
-/// It is written indented rather than compact, unlike a session file: it is
-/// there to be read and edited by hand, while a session is only ever read
-/// back as a whole. The JSON is streamed straight onto the file, so writing it
-/// allocates nothing.
+/// Writes the configuration to `file_name` in `dir`.
 pub fn save(config: *const Config, io: std.Io, dir: std.Io.Dir) !void {
     var atomic = try dir.createFileAtomic(io, file_name, .{ .replace = true });
     defer atomic.deinit(io);
@@ -315,24 +198,14 @@ pub fn save(config: *const Config, io: std.Io, dir: std.Io.Dir) !void {
     try atomic.replace(io);
 }
 
-/// Sets the option named by the dotted `path` -- such as `tools.bash.timeout_s` --
-/// to `value`, the text a user typed. The path names a field of the settings
-/// and, dot by dot, the sections it lives in; the value is read as that field's
-/// type, a string kept as it is and `null` clearing an optional setting. Every
-/// field whose type can be read from one string is reachable, so a scalar added
-/// to the configuration is settable without anything here changing; a list, such
-/// as the web providers, is set in the file.
-///
-/// The result is checked the way a file read is, and written into the
-/// configuration only once it passes, so a value that would make the
-/// configuration unusable, such as a zero timeout, is refused rather than
-/// stored. Strings are kept in the configuration's own arena.
+/// Sets the option named by the dotted `path` -- such as `tools.bash.timeout_s` -- to `value`, the
+/// text a user typed.
 pub fn set(config: *Config, path: []const u8, value: []const u8) !void {
     var stored = config.stored;
     try setPath(Stored, &stored, path, config.arena.allocator(), value);
 
-    // A value that would make the configuration one the next read refuses, such
-    // as a zero timeout, is a value this setting does not take.
+    // A value that would make the configuration one the next read refuses, such as a zero timeout,
+    // is a value this setting does not take.
     stored.validate() catch |err| switch (err) {
         error.InvalidConfig => return error.InvalidValue,
         else => |other| return other,
@@ -340,9 +213,6 @@ pub fn set(config: *Config, path: []const u8, value: []const u8) !void {
     config.stored = stored;
 }
 
-/// Walks `path` into `target` one field at a time and sets the leaf it names.
-/// The field is found by name at run time, but the descent is compiled section
-/// by section, so a field no path can name is skipped rather than walked into.
 fn setPath(
     T: type,
     target: *T,
@@ -355,7 +225,6 @@ fn setPath(
 
     const info = @typeInfo(T).@"struct";
     inline for (info.field_names, info.field_types) |name, Field| {
-        // The version is the file's own, not a setting a path names.
         if (comptime !std.mem.eql(u8, name, "version") and isSettable(Field)) {
             if (std.mem.eql(u8, name, segment.head)) {
                 if (segment.rest.len == 0) {
@@ -373,8 +242,6 @@ fn setPath(
     return error.UnknownOption;
 }
 
-/// The first dotted segment of `path`, and the rest that follows it. The rest is
-/// empty when the segment is the last, which is the value the path names.
 const Segment = struct { head: []const u8, rest: []const u8 };
 
 fn nextSegment(path: []const u8) Segment {
@@ -384,10 +251,6 @@ fn nextSegment(path: []const u8) Segment {
     return .{ .head = path, .rest = "" };
 }
 
-/// Reads `value` as a `T`: a string as itself, a number from its digits, a
-/// boolean from true or false, an enum from a variant's name, and an optional
-/// as null when it says `null` or as its child otherwise. A string is copied
-/// into `arena`, which owns it.
 fn parseValue(T: type, arena: std.mem.Allocator, value: []const u8) error{ InvalidValue, OutOfMemory }!T {
     switch (@typeInfo(T)) {
         .optional => |optional| {
@@ -411,17 +274,11 @@ fn parseValue(T: type, arena: std.mem.Allocator, value: []const u8) error{ Inval
     }
 }
 
-/// Whether a path can reach `T`: a value a string can set, or a section the walk
-/// goes into. A section is walked into whatever it holds, since a field a path
-/// cannot name -- a list, say -- leaves the fields beside it reachable.
 fn isSettable(T: type) bool {
     if (@typeInfo(T) == .@"struct") return true;
     return isSettableValue(T);
 }
 
-/// Whether a value of `T` can be set from one string: a string, a number, a
-/// boolean, an enum, or an optional of one of those. Anything else is not a
-/// setting a path can name, so the walk leaves it alone.
 fn isSettableValue(T: type) bool {
     return switch (@typeInfo(T)) {
         .optional => |optional| isSettableValue(optional.child),
@@ -432,9 +289,6 @@ fn isSettableValue(T: type) bool {
     };
 }
 
-/// Writes `json` as the configuration file and opens it, so a test reads as the
-/// file it wrote and the setting it read back. The caller frees what comes back
-/// with `opened.config.deinit()`.
 fn openFrom(tmp: *std.testing.TmpDir, json: []const u8) !Opened {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = json });
     return Config.open(std.testing.io, tmp.dir, std.testing.allocator);
@@ -449,7 +303,6 @@ test "open writes the defaults when the file is missing" {
     try std.testing.expect(first.created);
     try std.testing.expectEqual(Stored.default.max_turns, first.config.stored.max_turns);
 
-    // The file is now there, so a second open leaves it alone and reads it back.
     var second = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
     defer second.config.deinit();
     try std.testing.expect(!second.created);
@@ -467,7 +320,6 @@ test "open reads the max_turns and the bash timeout from the file" {
     try std.testing.expect(!opened.created);
     try std.testing.expectEqual(7, opened.config.stored.max_turns);
     try std.testing.expectEqual(30, opened.config.stored.tools.bash.timeout_s);
-    // A file without a replay count shows the default number of blocks.
     try std.testing.expectEqual(Stored.default.resume_blocks, opened.config.stored.resume_blocks);
 }
 
@@ -479,7 +331,6 @@ test "open reads the block count a resume replays from the file" {
     defer opened.config.deinit();
     try std.testing.expectEqual(3, opened.config.stored.resume_blocks);
 
-    // Zero is allowed: it shows the whole session.
     var whole = try openFrom(&tmp, "{\"resume_blocks\":0}");
     defer whole.config.deinit();
     try std.testing.expectEqual(0, whole.config.stored.resume_blocks);
@@ -493,12 +344,10 @@ test "open reads the compaction threshold from the file" {
     defer opened.config.deinit();
     try std.testing.expectEqual(50, opened.config.stored.compact_at);
 
-    // A file without it falls back to the default.
     var bare = try openFrom(&tmp, "{}");
     defer bare.config.deinit();
     try std.testing.expectEqual(Stored.default.compact_at, bare.config.stored.compact_at);
 
-    // Zero turns compaction off; it is a setting, not a mistake.
     var off = try openFrom(&tmp, "{\"compact_at\":0}");
     defer off.config.deinit();
     try std.testing.expectEqual(0, off.config.stored.compact_at);
@@ -508,9 +357,6 @@ test "a retired markdown setting in the file is ignored" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A reply and a prompt are laid out by billy's own renderer now, so the
-    // `markdown` section a file may still carry is read the way any unknown field
-    // is: left alone, without making the file unusable.
     var opened = try openFrom(&tmp, "{\"markdown\":{\"format\":\"glow -\"},\"max_turns\":7}");
     defer opened.config.deinit();
     try std.testing.expectEqual(7, opened.config.stored.max_turns);
@@ -520,8 +366,6 @@ test "open reads the bash timeout from the file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A file written before the setting existed has no tools at all, so the
-    // default timeout stands.
     var older = try openFrom(&tmp, "{\"max_turns\":7}");
     defer older.config.deinit();
     try std.testing.expectEqual(Stored.default.tools.bash.timeout_s, older.config.stored.tools.bash.timeout_s);
@@ -535,8 +379,6 @@ test "open reads a self-hosted backend's instance from the file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // SearXNG is the one backend with no address billy knows, so its instance is
-    // named under its own section. A backend billy knows leaves it unset.
     var opened = try openFrom(&tmp, "{\"tools\":{\"web_search\":{" ++
         "\"providers\":[\"searxng\"],\"searxng\":{\"url\":\"https://searx.example.org\"}}}}");
     defer opened.config.deinit();
@@ -552,26 +394,22 @@ test "open reads the web search backends and result count from the file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // The backends are kept in the order they are named, since that is the order
-    // they are tried.
     var opened = try openFrom(&tmp, "{\"tools\":{\"web_search\":{" ++
         "\"providers\":[\"tavily\",\"brave\"],\"max_results\":3}}}");
     defer opened.config.deinit();
     try std.testing.expectEqualSlices(Tools.web.Provider, &.{ .tavily, .brave }, opened.config.stored.tools.web_search.providers);
     try std.testing.expectEqual(3, opened.config.stored.tools.web_search.max_results);
 
-    // The defaults leave it off, and the count ready for a backend to be named.
     var bare = try openFrom(&tmp, "{}");
     defer bare.config.deinit();
     try std.testing.expectEqual(@as(usize, 0), bare.config.stored.tools.web_search.providers.len);
     try std.testing.expectEqual(Stored.default.tools.web_search.max_results, bare.config.stored.tools.web_search.max_results);
 
-    // A name that is not a backend makes the file unusable rather than reading
-    // as "no search", so a typo is not silently dropped.
+    // A name that is not a backend makes the file unusable rather than reading as "no search", so a
+    // typo is not silently dropped.
     try std.testing.expectError(error.CorruptConfig, openFrom(&tmp, "{\"tools\":{\"web_search\":{\"providers\":[\"google\"]}}}"));
-    // One billy knows, but that cannot do the job it is named for, is refused
-    // too: the two tools share one list of providers, so the file has to say
-    // which of them may be named for each.
+    // One billy knows, but that cannot do the job it is named for, is refused too: the two tools
+    // share one list of providers, so the file has to say which of them may be named for each.
     try std.testing.expectError(error.InvalidConfig, openFrom(&tmp, "{\"tools\":{\"web_search\":{\"providers\":[\"raw\"]}}}"));
     try std.testing.expectError(error.InvalidConfig, openFrom(&tmp, "{\"tools\":{\"web_fetch\":{\"providers\":[\"brave\"]}}}"));
 }
@@ -640,8 +478,6 @@ test "save round-trips a configured search backend" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // The backend is written by name, which is the variant's own, and read back
-    // as the variant it names.
     var config = Config.init(std.testing.allocator);
     defer config.deinit();
 
@@ -658,8 +494,6 @@ test "open rejects damaged, future and unusable configurations" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A rejected configuration frees the arena it made on the way out, so a
-    // failure leaks nothing.
     try std.testing.expectError(error.CorruptConfig, openFrom(&tmp, "{"));
 
     try std.testing.expectError(error.UnsupportedConfigVersion, openFrom(&tmp, "{\"version\":99}"));
@@ -679,8 +513,6 @@ test "the model setting names a provider and a model of it" {
     try std.testing.expectEqualStrings("opencode-go", choice.provider());
     try std.testing.expectEqualStrings("glm-5.3-flash", choice.model());
 
-    // A model id may hold a slash of its own, so only the first one splits the
-    // string; the rest is the model.
     const nested = models.Choice{ .text = "vendor/model/variant" };
     try std.testing.expectEqualStrings("vendor", nested.provider());
     try std.testing.expectEqualStrings("model/variant", nested.model());
@@ -690,14 +522,10 @@ test "a model setting with half of it missing is refused" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A model with no provider in front of it, or a provider with no model
-    // after it, names a pair with a missing half. Whether the provider exists is
-    // resolved against the catalog at the request, not here.
     try std.testing.expectError(error.InvalidConfig, openFrom(&tmp, "{\"model\":\"deepseek-flash\"}"));
     try std.testing.expectError(error.InvalidConfig, openFrom(&tmp, "{\"model\":\"deepseek/\"}"));
     try std.testing.expectError(error.InvalidConfig, openFrom(&tmp, "{\"model\":\"\"}"));
 
-    // The default the file is written with is one billy can use.
     try Stored.default.validate();
 }
 
@@ -705,8 +533,6 @@ test "the providers map names an endpoint of the user's own" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A provider billy does not ship, named by the file and used by `model`,
-    // which is how a proxy or a server of the user's own is reached.
     var opened = try openFrom(&tmp,
         \\{"model":"mock/m","providers":{"mock":{"base_url":"http://127.0.0.1:8901/v1"}}}
     );
@@ -714,7 +540,6 @@ test "the providers map names an endpoint of the user's own" {
     try std.testing.expectEqualStrings("http://127.0.0.1:8901/v1", opened.config.stored.providers.get("mock").?);
     try std.testing.expect(opened.config.stored.providers.get("other") == null);
 
-    // It survives a save and a read back, so the file is the whole truth.
     try opened.config.save(std.testing.io, tmp.dir);
     var reread = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
     defer reread.config.deinit();
@@ -726,8 +551,6 @@ test "a model naming a provider the file does not define is refused" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // The provider is resolved at the request, against the catalog or the
-    // configuration, so opening the file only checks the pair is complete.
     var opened = try openFrom(&tmp, "{\"model\":\"opencode-go/glm-5.3-flash\"}");
     defer opened.config.deinit();
 }
@@ -736,8 +559,8 @@ test "a provider entry with no name or no url is refused" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A name with no URL names nothing to send to; a URL with no name is one
-    // `model` could never write.
+    // A name with no URL names nothing to send to; a URL with no name is one `model` could never
+    // write.
     try std.testing.expectError(error.InvalidConfig, openFrom(&tmp,
         \\{"model":"mock/m","providers":{"mock":{"base_url":""}}}
     ));
@@ -783,22 +606,15 @@ test "set refuses a setting that is unknown, a section, or a bad value" {
     var config = Config.init(std.testing.allocator);
     defer config.deinit();
 
-    // A path that names no field, at the top or inside a section.
     try std.testing.expectError(error.UnknownOption, config.set("nope", "1"));
     try std.testing.expectError(error.UnknownOption, config.set("tools.nope", "1"));
-    // The version is the file's own, not a setting.
     try std.testing.expectError(error.UnknownOption, config.set("version", "2"));
-    // A section is walked into, not set from one string, and a value has nothing
-    // below it.
     try std.testing.expectError(error.NotASection, config.set("tools", "x"));
     try std.testing.expectError(error.NotASection, config.set("tools.bash.timeout_s.x", "y"));
-    // Text that is not the kind of value the setting takes.
     try std.testing.expectError(error.InvalidValue, config.set("tools.bash.timeout_s", "soon"));
-    // A list setting is edited in the file, not named by a path, so it is not a
-    // setting the command knows.
     try std.testing.expectError(error.UnknownOption, config.set("tools.web_search.providers", "tavily"));
-    // A value the file itself would refuse is refused before it is written, and
-    // the setting keeps what it had.
+    // A value the file itself would refuse is refused before it is written, and the setting keeps
+    // what it had.
     try std.testing.expectError(error.InvalidValue, config.set("tools.bash.timeout_s", "0"));
     try std.testing.expectError(error.InvalidValue, config.set("max_turns", "0"));
     try std.testing.expectEqual(Stored.default.tools.bash.timeout_s, config.stored.tools.bash.timeout_s);

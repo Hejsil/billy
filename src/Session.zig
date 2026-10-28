@@ -1,24 +1,5 @@
-//! Sessions: the conversation persisted under the XDG data directory so that a
-//! later run can pick up where the previous one stopped.
-//!
-//! Every session is one JSON file named after its id. The file is rewritten
-//! after each message, so killing the process loses at most the message being
-//! written. The system prompt and the tool definitions are kept with the
-//! session, apart from the conversation, and reused when it is resumed, so a
-//! resume resends the exact request of the run it continues and hits the prompt
-//! cache. They are refreshed when the conversation is compacted, which is the
-//! one time replacing the front of a request costs no cache that was not already
-//! being thrown away; see `Agent.refresh`.
-//!
-//! A session also carries a title, a short name for it that a frontend lists it
-//! by. It is written first in the file, so a listing reads it without reading the
-//! conversation, and it is optional, so a session saved before titles were kept
-//! simply has none (`list`).
-//!
-//! A kill that lands while a tool runs can leave the last turn of a session
-//! without the results of its tool calls, which the API rejects on the next
-//! request. A resume completes that turn before anything else reads it, so a
-//! session a kill left half written is still one that can continue.
+//! Sessions: the conversation persisted under the XDG data directory so that a later run can pick
+//! up where the previous one stopped.
 
 const std = @import("std");
 
@@ -28,23 +9,12 @@ const ulid = @import("ulid.zig");
 
 const Session = @This();
 
-/// Extension of a session file.
 const extension = ".json";
 
-/// Most a session id may be. A generated one is the 26 characters of a ULID; the
-/// room is for a name typed on the command line. The buffer holds this many bytes
-/// and is written from the front, so there is always a byte left to end the id.
 const max_id_len = 64;
 
-/// The result given a tool call a kill left open. It restores a conversation the
-/// API will take, and tells the model the call did not finish so it can try
-/// again.
 const interrupted_result = "Error: the tool call was interrupted before it produced a result.";
 
-/// A tool definition as the API takes it, which is how a session file holds
-/// one, so a file written before a session kept its own tools still reads. The
-/// arguments schema is the parsed object in the file and becomes the JSON text
-/// the session stores.
 const StoredTool = struct {
     type: []const u8 = "function",
     function: Function,
@@ -56,52 +26,15 @@ const StoredTool = struct {
     };
 };
 
-/// A session file as it is written to and read from disk.
 const Stored = struct {
-    /// Layout of a session file, bumped when its shape changes. Version 3 keeps
-    /// the system prompt in `system_prompt` rather than as the first message;
-    /// version 1 and 2 files hold it in `messages` and are migrated on load.
     version: u32 = 3,
-    /// A short name for the session, for a frontend to show in a list. Null for
-    /// a session that has not been named, which is one that has not been asked
-    /// anything yet, and one saved before titles were kept. It is written first,
-    /// right after `version`, so a listing can read it from the front of the file
-    /// without reading the conversation (`list`).
     title: ?[]const u8 = null,
-    /// The system prompt sent at the front of every request, or null for a
-    /// session that has none. It is kept apart from `messages`, which is the
-    /// conversation alone, so that the prompt and the tools can be replaced at a
-    /// compaction without rewriting the conversation the model has seen.
     system_prompt: ?[]const u8 = null,
-    /// The provider and model this session was started on, as `provider/model`,
-    /// the same one string the configuration names it by.
-    ///
-    /// A session keeps the choice it began with rather than following the
-    /// configuration, because the conversation belongs to the model that
-    /// produced it: the tool calls in it are that model's ids and the cached
-    /// prefix is its bytes, and sending either to a different model is a
-    /// different request. Changing the configuration affects new sessions only.
-    ///
-    /// Empty for a session saved before this was recorded. Those are read as the
-    /// choice billy is configured with, which is where they were being sent
-    /// anyway, and are saved with it from then on.
     model: ?[]const u8 = null,
-    /// The conversation, oldest first.
     messages: []const llm.Message = &.{},
-    /// Indices into `messages`, sorted, of the summaries a compaction produced.
-    /// A request starts at the last of them, so everything before it, which the
-    /// summary stands in for, is left out. The prompt that asked for the
-    /// compaction is the message just before its summary; it is stored so the
-    /// two read as a question and its answer, and shows in the transcript as one
-    /// line along with the summary.
     compactions: []const u32 = &.{},
-    /// The tool definitions the conversation was started with.
     tools: []const StoredTool = &.{},
-    /// Tokens in the conversation as of the last request, which is what the
-    /// context window gauge shows.
     context_tokens: usize = 0,
-    /// The directory the session works in. Empty for a session saved before it
-    /// was recorded, which is read as the directory billy runs in.
     cwd: ?[]const u8 = null,
 
     const default = Stored{};
@@ -109,24 +42,12 @@ const Stored = struct {
 
 const StringIndex = Pool.Index;
 
-/// The strings a session owns: its id and file name, the directory it started
-/// in, its system prompt, its title and the model it is sent to. Each is an
-/// index into the pool rather than a slice, so a field can be named for what it
-/// holds -- `interned.cwd` -- without colliding with the method that reads it.
-/// Reading one hands back a slice into the pool, which the next intern moves.
 const Interned = struct {
-    /// The id: the session's name among the files in its directory.
     id: StringIndex = .none,
-    /// The id with the file extension: the name of the session file.
     name: StringIndex = .none,
-    /// The directory the session works in, which is the one it was started in
-    /// until it is moved.
     cwd: StringIndex = .none,
-    /// The system prompt sent at the front of every request.
     system_prompt: StringIndex = .none,
-    /// A short name for the session, for a frontend to show in a list.
     title: StringIndex = .none,
-    /// The provider and model the session was started on.
     model: StringIndex = .none,
 };
 
@@ -141,7 +62,6 @@ const ToolCallIndex = struct {
     }
 };
 
-/// An llm.ToolCall as stored in a session.
 const ToolCall = struct {
     id: StringIndex,
     type: StringIndex,
@@ -164,7 +84,6 @@ const ToolCall = struct {
     }
 };
 
-/// An llm.Message as stored in a session.
 pub const Message = struct {
     role: llm.Role,
     content: StringIndex = .none,
@@ -172,9 +91,6 @@ pub const Message = struct {
     reasoning: StringIndex = .none,
     tool_calls: ToolCallIndex = .empty,
 
-    /// The message as the API client takes it, with every string resolved out of
-    /// the pool. `allocator` owns the tool calls, which have to be pieced back
-    /// together into a slice of their own.
     pub fn resolve(message: Message, session: *const Session, allocator: std.mem.Allocator) !llm.Message {
         const stored = message.tool_calls.resolve(session);
         var calls: ?[]const llm.ToolCall = null;
@@ -193,69 +109,38 @@ pub const Message = struct {
     }
 };
 
-/// A tool definition as a session stores it. Every string is an index into the
-/// pool, and the arguments schema is the JSON text the request carries, so
-/// nothing here is a parsed document: the set is one array that frees with the
-/// pool and no per-tool walk to free it.
 pub const StoredDefinition = struct {
     name: StringIndex,
     description: StringIndex,
-    /// The JSON Schema of the arguments, as the JSON text it is sent as.
     parameters: StringIndex,
 };
 
-/// A tool definition as it comes from outside the session: the strings to be
-/// interned, so a caller builds the set without knowing the pool.
 pub const Definition = struct {
     name: []const u8,
     description: []const u8,
-    /// The JSON Schema of the arguments, as JSON text.
     parameters: []const u8,
 };
 
 io: std.Io,
 
-/// Directory holding the session files. Owned by the caller.
 dir: std.Io.Dir,
 
-/// Owns the conversation and everything a resume read back, all freed by
-/// `deinit`.
 gpa: std.mem.Allocator,
 
-/// All string data. The pool keeps text as it comes and does not look for
-/// strings it already holds; see `Pool`.
 pool: Pool = .{},
 
-/// The strings the session owns, each an index into `pool`: its id and file
-/// name, the directory it was started in, its prompt, its title and its model.
 interned: Interned = .{},
 
 tool_calls: std.ArrayList(ToolCall) = .empty,
 
-/// The conversation, oldest first. The system prompt is not part of it: it is
-/// sent at the front of every request, from `interned.system_prompt`, and kept
-/// out of the conversation so the two can be replaced apart from each other.
 messages: std.ArrayList(Message) = .empty,
 
-/// Indices into `messages` of the summaries a compaction produced
 compactions: std.ArrayList(u32) = .empty,
 
-/// The tool definitions sent with every request. Stored in the session so a
-/// resume offers the model the same tools as the run it continues. The whole set
-/// is one array `deinit` frees; every string in it is interned in the pool.
 tools: []const StoredDefinition = &.{},
 
-/// Tokens in the conversation as of the last request.
 context_tokens: usize = 0,
 
-/// Opens the session called `resume_id`, or starts a new one when it is null.
-///
-/// `cwd` is the directory billy is running in. A new session records it; a
-/// resumed one keeps the directory it was saved with, so a session continues
-/// where it was left.
-///
-/// Fails with `error.SessionNotFound` when the session is missing, and with
-/// `error.InvalidSessionId` when `resume_id` is not a usable name.
 pub fn open(
     io: std.Io,
     dir: std.Io.Dir,
@@ -263,34 +148,20 @@ pub fn open(
     resume_id: ?[]const u8,
     start_cwd: []const u8,
 ) !Session {
-    // A resume that fails part way leaves what it had read behind, since the
-    // caller only gets the session on the way out.
     var session = try named(io, dir, gpa, resume_id, start_cwd);
     errdefer session.deinit();
     if (resume_id != null) try session.load();
     return session;
 }
 
-/// Starts a session named `id`, which is not read from disk even if a file of
-/// that name is there.
-///
-/// This is for an id handed out before the session exists: the id is what names
-/// it, and nothing is read because there is nothing to read. Nothing is written
-/// either, so the session comes into being with its first message; a run that
-/// is started and left alone leaves no file behind.
 pub fn create(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: []const u8, start_cwd: []const u8) !Session {
     return named(io, dir, gpa, named_id, start_cwd);
 }
 
-/// A session named `named_id`, or one given a fresh id when it is null, with
-/// nothing read from disk and nothing written.
 fn named(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: ?[]const u8, start_cwd: []const u8) !Session {
     var session: Session = .{ .io = io, .dir = dir, .gpa = gpa };
     errdefer session.deinit();
 
-    // The id is checked or made, then interned with the file name built from it,
-    // so both live in the pool and every read and write goes through one place.
-    // A generated id is a ULID; a resume takes one from the command line.
     var id_buf: [max_id_len]u8 = @splat(0);
     const id_text = if (named_id) |given|
         try setCheckedId(&id_buf, given)
@@ -304,8 +175,8 @@ fn named(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: ?[]const
     const file_name = try std.mem.print(&name_buf, "{s}{s}", .{ id_text, extension });
     session.interned.name = try session.pool.intern(gpa, file_name);
 
-    // The session owns its directory rather than pointing into the caller's
-    // memory, which it may outlive.
+    // The session owns its directory rather than pointing into the caller's memory, which it may
+    // outlive.
     session.interned.cwd = try session.pool.intern(gpa, start_cwd);
     return session;
 }
@@ -318,12 +189,10 @@ pub fn deinit(session: *Session) void {
     session.gpa.free(session.tools);
 }
 
-/// Names the session; also its file name without the extension.
 pub fn id(session: *const Session) []const u8 {
     return session.pool.get(session.interned.id) orelse "";
 }
 
-/// Name of the session file inside `dir`.
 pub fn name(session: *const Session) []const u8 {
     return session.pool.get(session.interned.name) orelse "";
 }
@@ -332,29 +201,15 @@ pub fn cwd(session: *const Session) []const u8 {
     return session.pool.get(session.interned.cwd) orelse "";
 }
 
-/// The conversation as a completion request carries it: the `messages` array of
-/// a request body, written straight out of the pool.
-///
-/// A request takes one of these rather than a resolved copy, so sending what a
-/// session holds allocates nothing: the strings are read where they were stored.
-/// It carries the system prompt and then only what follows the latest summary,
-/// so the messages a compaction stands in for are not sent. The field order and
-/// the fields left out are `llm.Message`'s, so the body is the same either way.
+/// The conversation as a completion request carries it: the `messages` array of a request body,
+/// written straight out of the pool.
 pub const Conversation = struct {
     session: *const Session,
-    /// Messages written after the conversation, for a request that carries one
-    /// turn more than the session holds: the prompt that asks for a summary, or
-    /// for a title. They are read straight out of the caller's own memory, so
-    /// adding one message to a request costs no more than sending the
-    /// conversation itself; a copy of the conversation is never built. They are
-    /// not part of the session and are not kept anywhere.
     extra: []const llm.Message = &.{},
 
     pub fn jsonStringify(self: Conversation, json: anytype) !void {
         const session = self.session;
         try json.beginArray();
-        // The system prompt leads every request, and is the one message that is
-        // not part of the conversation.
         if (session.systemPrompt()) |prompt| {
             try json.beginObject();
             try json.objectField("role");
@@ -366,28 +221,14 @@ pub const Conversation = struct {
         for (session.messages.items[session.sentFrom()..]) |message| {
             try session.writeMessage(json, message);
         }
-        // The extra messages come last, as the newest of the request. Each is an
-        // `llm.Message`, written the way the client writes a resolved
-        // conversation, so the bytes are the ones the resolved path would write
-        // -- which is what keeps a request carrying an extra message
-        // cache-compatible with one that does not.
         for (self.extra) |message| try json.write(message);
         try json.endArray();
     }
 };
 
-/// Writes one message as the `messages` array of a request holds it, with every
-/// string read out of the pool.
-///
-/// The field order is `llm.Message`'s, so a request built from the session is
-/// the bytes the resolved conversation would send. The session file uses the
-/// same function, so the stored form and the sent form cannot drift, and a
-/// message never carries both a call and its own id, so the single order serves
-/// both.
 fn writeMessage(session: *const Session, json: anytype, message: Message) !void {
     try json.beginObject();
     try json.objectField("role");
-    // The name the API knows the role by, so a file reads as it always did.
     try json.write(message.role.name());
 
     if (session.pool.get(message.content)) |content| {
@@ -416,72 +257,46 @@ fn writeMessage(session: *const Session, json: anytype, message: Message) !void 
     try json.endObject();
 }
 
-/// The conversation as a request carries it, for passing to a client without
-/// resolving it first. `extra` is written after the conversation, for a request
-/// that asks the model one thing more than the session holds; see
-/// `Conversation.extra`. The returned value borrows the session and `extra`.
+/// The conversation as a request carries it, for passing to a client without resolving it first.
 pub fn conversation(session: *const Session, extra: []const llm.Message) Conversation {
     return .{ .session = session, .extra = extra };
 }
 
-/// The first message a compaction leaves out of a request: the summary the last
-/// compaction produced, or zero for a conversation that has never been
-/// compacted. The list is sorted, so the last index is the latest compaction.
-///
-/// The session keeps the messages a request skips, so a transcript still shows
-/// the whole history and a resume reads all of it back; only what is sent to the
-/// model is cut down.
+/// The first message a compaction leaves out of a request: the summary the last compaction
+/// produced, or zero for a conversation that has never been compacted.
 pub fn sentFrom(session: *const Session) usize {
     if (session.compactions.items.len == 0) return 0;
     return session.compactions.items[session.compactions.items.len - 1];
 }
 
-/// Whether the message at `index` is a summary a compaction produced. A request
-/// starts at the latest such message, and a transcript shows it as the single
-/// line that stands in for the compaction. False for an index past the
-/// conversation, so a caller can ask about the message after the last one.
 pub fn isCompaction(session: *const Session, index: usize) bool {
     if (index >= session.messages.items.len) return false;
-    // The list holds one index per compaction, so a scan of it is short.
     const target: u32 = @intCast(index);
     return std.mem.findScalar(u32, session.compactions.items, target) != null;
 }
 
-/// The system prompt sent at the front of every request, or null when the
-/// session has none. That is the case for a session saved before the prompt was
-/// kept apart from the conversation and for one opened but not yet prepared.
 pub fn systemPrompt(session: *const Session) ?[]const u8 {
     return session.pool.get(session.interned.system_prompt);
 }
 
-/// The session's title, a short name for it, or null when it has none.
 pub fn title(session: *const Session) ?[]const u8 {
     return session.pool.get(session.interned.title);
 }
 
-/// Names the session, replacing any title it had. The whitespace around it is
-/// trimmed and the title has no length limit. It is held in the pool and
-/// reaches the file with the next save.
 pub fn setTitle(session: *Session, text: []const u8) !void {
     session.interned.title = try session.pool.intern(session.gpa, std.mem.trim(u8, text, " \t\r\n"));
 }
 
-/// A tool call as the transcript reads it: the id that names the result which
-/// answers it, and the tool plus the arguments to run the call back through the
-/// parser. Every one is a window into the pool, so reading a call allocates
-/// nothing.
 pub const Call = struct {
     id: []const u8,
     name: []const u8,
     arguments: []const u8,
 };
 
-/// The content of a message, or null when it has none.
 pub fn contentOf(session: *const Session, message: Message) ?[]const u8 {
     return session.pool.get(message.content);
 }
 
-/// One tool call of a message, by position within it.
 pub fn callAt(session: *const Session, message: Message, index: usize) Call {
     const call = message.tool_calls.resolve(session)[index];
     return .{
@@ -491,15 +306,6 @@ pub fn callAt(session: *const Session, message: Message, index: usize) Call {
     };
 }
 
-/// The content of the tool message that answers `id`, looking from message
-/// `from` onwards, which is where the result of a call sits: the message just
-/// after the one that asked for it. Empty when the session does not hold it, so
-/// a file written without one still replays.
-///
-/// Only the run of tool messages that starts at `from` is searched: some
-/// providers reuse call ids from one turn to the next, so a later turn's result
-/// must not answer this call. Every string compared is a window into the pool,
-/// so finding a result costs nothing to allocate.
 pub fn toolResult(session: *const Session, from: usize, call: []const u8) []const u8 {
     const messages = session.messages.items;
     if (from >= messages.len)
@@ -515,15 +321,8 @@ pub fn toolResult(session: *const Session, from: usize, call: []const u8) []cons
     return "";
 }
 
-/// The conversation as plain API messages, every string resolved out of the
-/// pool: the system prompt, when there is one, and then the whole conversation.
-/// `allocator` owns the result, since resolving a message has to piece its tool
-/// calls back together into a slice of its own.
-///
-/// Nothing that shows or sends a conversation needs this: a request is built
-/// from `conversation`, and the transcript reads the session a message at a
-/// time. It is for a caller that wants the conversation as messages, which is
-/// what comparing two of them takes.
+/// The conversation as plain API messages, every string resolved out of the pool: the system
+/// prompt, when there is one, and then the whole conversation.
 pub fn resolvedMessages(session: *const Session, allocator: std.mem.Allocator) ![]const llm.Message {
     const lead: usize = if (session.systemPrompt() != null) 1 else 0;
     const messages = try allocator.alloc(llm.Message, lead + session.messages.items.len);
@@ -539,24 +338,14 @@ pub fn resolvedMessages(session: *const Session, allocator: std.mem.Allocator) !
     return messages;
 }
 
-/// Adds a message to the conversation and writes the session out, so the
-/// next run sees it even if this one is killed.
-///
-/// This is what brings a new session into being: opening one only reserves its
-/// id, and the id, the system prompt, the tools and the conversation all reach
-/// the file together with the first message added.
+/// Adds a message to the conversation and writes the session out, so the next run sees it even if
+/// this one is killed.
 pub fn append(session: *Session, message: llm.Message) !void {
     try session.appendMessage(message);
     try session.save();
 }
 
-/// Adds a compaction to the conversation: the prompt that asked for it and the
-/// summary it produced. The summary's index is recorded in `compactions`, so a
-/// request from then on starts at it while the session keeps every message it
-/// always had. The prompt is kept so the transcript can show the pair as one
-/// line; the summary is a user message, so the model reads it as context handed
-/// to it rather than as something it said. Both are written out together, so the
-/// file is never left holding half of a compaction.
+/// Adds a compaction to the conversation: the prompt that asked for it and the summary it produced.
 pub fn appendCompaction(session: *Session, prompt: []const u8, summary: []const u8) !void {
     try session.appendMessage(.{ .role = .user, .content = prompt });
     const summary_index: u32 = @intCast(session.messages.items.len);
@@ -565,8 +354,6 @@ pub fn appendCompaction(session: *Session, prompt: []const u8, summary: []const 
     try session.save();
 }
 
-/// Appends one message to the conversation without writing the session out.
-/// The parts are interned into the pool.
 fn appendMessage(session: *Session, message: llm.Message) !void {
     const tool_calls = message.tool_calls orelse &.{};
     const interned_tool_calls = ToolCallIndex{
@@ -594,65 +381,36 @@ fn appendMessage(session: *Session, message: llm.Message) !void {
     });
 }
 
-/// Records `system_prompt` as what every request opens with, replacing any prompt
-/// the session already had.
-///
-/// This is what a compaction uses to refresh the front of a request; `prepare`
-/// uses `ensureSystemPrompt` so that a resumed session keeps the prompt it was
-/// saved with and hits its prompt cache. The prompt is held in the pool and
-/// reaches the file with the next save, like the tools.
+/// Records `system_prompt` as what every request opens with, replacing any prompt the session
+/// already had.
 pub fn setSystemPrompt(session: *Session, system_prompt: []const u8) !void {
     session.interned.system_prompt = try session.pool.intern(session.gpa, system_prompt);
 }
 
-/// Records the provider and model the session is sent to.
-///
-/// Where a session goes is resolved from this before every turn, so setting it is
-/// what moves a session to another provider: the next turn is sent there, and
-/// every turn after it, until it is changed again.
 pub fn setModel(session: *Session, choice: []const u8) !void {
     session.interned.model = try session.pool.intern(session.gpa, choice);
 }
 
-/// Records the directory the session works in, which is where its tools run and
-/// where the project's instructions are read from.
-///
-/// It reaches the file with the next save, like the model and the prompt.
 pub fn setCwd(session: *Session, directory: []const u8) !void {
     session.interned.cwd = try session.pool.intern(session.gpa, directory);
 }
 
-/// The provider and model the session is sent to, or null for one saved before
-/// either was recorded.
 pub fn model(session: *const Session) ?[]const u8 {
     return session.pool.get(session.interned.model);
 }
 
-/// The choice to send the session to: its own model, or `fallback` for a session
-/// saved before one was recorded -- the choice billy is configured with, which
-/// is where it was being sent anyway.
+/// The choice to send the session to: its own model, or `fallback` for a session saved before one
+/// was recorded -- the choice billy is configured with, which is where it was being sent anyway.
 pub fn modelChoice(session: *const Session, fallback: []const u8) []const u8 {
     return session.model() orelse fallback;
 }
 
-/// Records `system_prompt` unless the session already has one. A resumed session
-/// carries the prompt it was saved with, which is kept so the request it sends
-/// matches the earlier run byte for byte; a new session gets the current one.
 pub fn ensureSystemPrompt(session: *Session, system_prompt: []const u8) !void {
     if (session.systemPrompt() != null) return;
     try session.setSystemPrompt(system_prompt);
 }
 
-/// Records the tool definitions to send with every request, replacing any the
-/// session already had.
-///
-/// Like the prompt, this is what a compaction uses to refresh the tools, and
-/// what a new session is given; `ensureTools` is the guarded form a resume uses.
 pub fn setTools(session: *Session, definitions: []const Definition) !void {
-    // The strings are interned into the pool, so the set costs one array and
-    // frees with the pool. Nothing is copied per string and there is no parsed
-    // document to keep alive: the arguments schema is stored as the JSON text it
-    // is sent as.
     const tools = try session.gpa.alloc(StoredDefinition, definitions.len);
     errdefer session.gpa.free(tools);
     for (definitions, tools) |definition, *tool| {
@@ -666,21 +424,13 @@ pub fn setTools(session: *Session, definitions: []const Definition) !void {
     session.tools = tools;
 }
 
-/// Records the tool definitions unless the session already has some. A resumed
-/// session carries the tools it was saved with, which are kept so the request
-/// matches the earlier run and hits the prompt cache; a new session, or one saved
-/// before the tools were stored, gets the current definitions instead.
-///
-/// Like the system prompt, the set is held in memory and written out with the
-/// session's first message.
 pub fn ensureTools(session: *Session, definitions: []const Definition) !void {
     if (session.tools.len != 0) return;
     try session.setTools(definitions);
 }
 
-/// Remembers how full the context window is: the size of the conversation the
-/// last request was sent. It reaches the file with the next save, which follows
-/// every message.
+/// Remembers how full the context window is: the size of the conversation the last request was
+/// sent.
 pub fn recordUsage(session: *Session, usage: llm.Usage) void {
     session.context_tokens = usage.total_tokens;
 }
@@ -715,11 +465,10 @@ pub fn write(session: *const Session, writer: *std.Io.Writer) !void {
         try json.write(stored_title);
     }
 
-    // The directory the session was started in is written here, with the title,
-    // because it is the other field something asks a session file for without
-    // reading it: `latest` walks the files looking for the one started in this
-    // directory, and a field at the end costs every conversation in the store to
-    // answer a question about one of them.
+    // The directory the session was started in is written here, with the title, because it is the
+    // other field something asks a session file for without reading it: `latest` walks the files
+    // looking for the one started in this directory, and a field at the end costs every
+    // conversation in the store to answer a question about one of them.
     try json.objectField("cwd");
     try json.write(session.cwd());
 
@@ -728,10 +477,6 @@ pub fn write(session: *const Session, writer: *std.Io.Writer) !void {
         try json.write(prompt);
     }
 
-    // Written only when the session has one: a session that records no model is
-    // sent to the configured choice, and a file without the field is what says
-    // it recorded none. A session resumed from an older file takes the
-    // configured choice and is saved with it from here on.
     if (session.model()) |recorded| {
         try json.objectField("model");
         try json.write(recorded);
@@ -755,7 +500,6 @@ pub fn write(session: *const Session, writer: *std.Io.Writer) !void {
     try json.endObject();
 }
 
-/// Reads an existing session's file into `session`.
 fn load(session: *Session) !void {
     var arena_allocator = std.heap.ArenaAllocator.init(session.gpa);
     defer arena_allocator.deinit();
@@ -788,8 +532,8 @@ fn load(session: *Session) !void {
         try session.setTitle(stored_title);
 
     if (stored.model) |stored_model| {
-        // An empty field is a file written without one rather than a session
-        // sent to no model, so it is left unset and read as the fallback.
+        // An empty field is a file written without one rather than a session sent to no model, so
+        // it is left unset and read as the fallback.
         if (stored_model.len > 0) try session.setModel(stored_model);
     }
     session.context_tokens = stored.context_tokens;
@@ -802,11 +546,6 @@ fn loadPromptAndMessages(
     system_prompt: ?[]const u8,
     messages: []const llm.Message,
 ) !usize {
-    // The system prompt is its own field in a version 3 file. An older file
-    // instead holds it as the first message, sometimes as a leading run of them;
-    // that run is lifted out into the prompt and left out of the conversation, so
-    // a request built from the session opens the way it did before. The first of
-    // the run is the prompt, which is the one billy ever wrote.
     var lead: usize = 0;
     if (system_prompt) |prompt| {
         try session.setSystemPrompt(prompt);
@@ -822,30 +561,19 @@ fn loadPromptAndMessages(
     return lead;
 }
 
-/// Reads the compaction indices back against the conversation just loaded, so
-/// the sorted list a request and a transcript read is sound even if the file was
-/// written by hand: one past the end is dropped rather than trusted, a repeat is
-/// folded into the one compaction it names, and the list is sorted. A migrated
-/// file's indices name the messages as they were stored, so each is shifted by
-/// the `lead` lifted out of the front of them.
 fn loadCompactions(session: *Session, stored: []const u32, lead: usize) !void {
-    // A summary stands at a message, so with none there is nothing to point at.
     if (session.messages.items.len == 0) return;
 
     const last: u32 = @intCast(session.messages.items.len - 1);
     try session.compactions.ensureTotalCapacity(session.gpa, stored.len);
     for (stored) |stored_index| {
         const index = std.math.sub(u32, stored_index, @intCast(lead)) catch 0;
-        // An index past the end names no message to stand in for. Moving it
-        // onto the last message instead would make it read as a summary of a
-        // conversation it never compacted.
+        // An index past the end names no message to stand in for.
         if (index > last) continue;
         session.compactions.appendAssumeCapacity(index);
     }
     std.mem.sort(u32, session.compactions.items, {}, std.sort.asc(u32));
 
-    // `compact` appends a message before recording its index, so a repeat can
-    // only come from a file written by hand; it names the one compaction.
     var kept: usize = 0;
     for (session.compactions.items) |index| {
         if (kept > 0 and session.compactions.items[kept - 1] == index) continue;
@@ -855,8 +583,6 @@ fn loadCompactions(session: *Session, stored: []const u32, lead: usize) !void {
     session.compactions.shrinkRetainingCapacity(kept);
 }
 
-/// Interns the stored tool definitions, so the set is one array and the
-/// arguments schema becomes the JSON text the request sends it as.
 fn loadTools(session: *Session, stored: []const StoredTool) !void {
     const tools = try session.gpa.alloc(StoredDefinition, stored.len);
     errdefer session.gpa.free(tools);
@@ -870,22 +596,10 @@ fn loadTools(session: *Session, stored: []const StoredTool) !void {
     session.tools = tools;
 }
 
-/// Completes the last turn of a conversation a kill left half written.
-///
-/// A run killed while a tool ran can stop after the assistant message that asked
-/// for the calls was written and before the results were, so the last turn of a
-/// resumed session can hold calls with no message answering them, which the API
-/// rejects: every turn before it finished and is left alone, and only the calls
-/// the kill left open are answered here, each by a message saying the call was
-/// interrupted so the model can carry on.
 fn repairTail(session: *Session) !void {
-    // The last message that asks for tools is where a kill leaves off. A
-    // conversation with none, or whose last such message is answered in full, is
-    // one the earlier run finished.
     const tail = session.lastCall() orelse return;
     const calls = session.messages.items[tail].tool_calls.len;
 
-    // The results that follow the message, which is where they were written.
     var answered: usize = 0;
     for (session.messages.items[tail + 1 ..]) |message| {
         if (message.role != .tool)
@@ -894,14 +608,8 @@ fn repairTail(session: *Session) !void {
     }
     if (answered >= calls) return;
 
-    // The calls with no result are answered right after the results the file
-    // holds, in the order the calls were made, so the assistant message is
-    // followed by one result per call.
-    //
-    // The id that names each result is the one the call already carries, taken
-    // as its index into the pool rather than as the text it names: interning
-    // the other strings grows the pool, which would leave a copy of that text
-    // dangling, while an index survives the pool moving.
+    // The calls with no result are answered right after the results the file holds, in the order
+    // the calls were made, so the assistant message is followed by one result per call.
     const at = tail + 1 + answered;
     const missing = calls - answered;
     var k: usize = answered;
@@ -915,17 +623,13 @@ fn repairTail(session: *Session) !void {
         try session.messages.insert(session.gpa, at + (k - answered), result);
     }
 
-    // A compaction records where its summary sits by index, and the answers push
-    // every message from `at` on along, so a summary at or past `at` moves with
-    // them. Only a file written by hand holds a summary behind an unfinished
-    // turn; it is moved so that such a file still reads soundly.
+    // A compaction records where its summary sits by index, and the answers push every message from
+    // `at` on along, so a summary at or past `at` moves with them.
     for (session.compactions.items) |*index| {
         if (index.* >= at) index.* += @intCast(missing);
     }
 }
 
-/// The index of the last message that asks for tools, or null when the
-/// conversation asks for none.
 fn lastCall(session: *const Session) ?usize {
     var i = session.messages.items.len;
     while (i > 0) {
@@ -937,9 +641,6 @@ fn lastCall(session: *const Session) ?usize {
     return null;
 }
 
-/// The arguments schema of a tool as JSON text: already text when a file holds
-/// it so, and written back out when an older file holds the parsed object, which
-/// is what the request is sent.
 fn internParameters(session: *Session, value: std.json.Value) !StringIndex {
     switch (value) {
         .string => |text| return session.pool.intern(session.gpa, text),
@@ -951,10 +652,8 @@ fn internParameters(session: *Session, value: std.json.Value) !StringIndex {
     }
 }
 
-/// The tools as JSON: the definitions written out, each with its arguments
-/// schema as the JSON text it is held as. A request writes the tools it sends
-/// through this, and the session file stores them the same way, so the two are
-/// written by one piece of code.
+/// The tools as JSON: the definitions written out, each with its arguments schema as the JSON text
+/// it is held as.
 pub const ToolSet = struct {
     session: *const Session,
 
@@ -963,7 +662,6 @@ pub const ToolSet = struct {
         try json.beginArray();
         for (session.tools) |tool| {
             try json.beginObject();
-            // The API takes the kind of every tool billy offers as "function".
             try json.objectField("type");
             try json.write("function");
             try json.objectField("function");
@@ -973,7 +671,6 @@ pub const ToolSet = struct {
             try json.objectField("description");
             try json.write(session.pool.get(tool.description) orelse "");
             try json.objectField("parameters");
-            // The schema is written as the JSON it is, not as a quoted string.
             try json.print("{s}", .{session.pool.get(tool.parameters) orelse "{}"});
             try json.endObject();
             try json.endObject();
@@ -982,25 +679,17 @@ pub const ToolSet = struct {
     }
 };
 
-/// The tools as a request carries them. The returned value borrows the session.
 pub fn toolSet(session: *const Session) ToolSet {
     return .{ .session = session };
 }
 
-/// Copies an id given on the command line into `buf`, rejecting anything that
-/// could name another file or directory or that does not fit. Returns the id as
-/// a slice of `buf`; the buffer is zero-filled, so the copy ends in NUL.
 fn setCheckedId(buf: []u8, given: []const u8) ![]const u8 {
-    // One byte is kept for the NUL that ends the id in the buffer.
     if (given.len + 1 > buf.len) return error.InvalidSessionId;
     if (!usableName(given)) return error.InvalidSessionId;
     @memcpy(buf[0..given.len], given);
     return buf[0..given.len];
 }
 
-/// Whether `text` could be the id of a session. An id is the characters a file
-/// name shares with one, and is neither empty nor all dots, which are the names
-/// that walk the directory rather than name a file in it.
 fn usableName(text: []const u8) bool {
     if (text.len == 0) return false;
     for (text) |byte| switch (byte) {
@@ -1010,18 +699,8 @@ fn usableName(text: []const u8) bool {
     return !std.mem.allEqual(u8, text, '.');
 }
 
-/// The ids of the sessions in the directory `dir`, the one most recently written
-/// to first, each with its title. Only files that could be a session are listed.
-/// The ids and titles are `gpa`'s, and the caller frees each and then the list.
-///
-/// The order is the time each file was last written, asked of the filesystem
-/// rather than read out of the id: an id carries the time it was *made*, and one
-/// made before ids became ULIDs does not sort against them.
-///
-/// The directory is opened here, one handle per listing. A read holds its place
-/// in the handle it was opened on, so two listings sharing one would read over
-/// each other; the server asks from several connections at once, and this is what
-/// makes each of those impossible to get wrong.
+/// The ids of the sessions in the directory `dir`, the one most recently written to first, each
+/// with its title.
 pub fn list(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator) ![]Named {
     var iter_dir = try dir.openDir(io, ".", .{ .iterate = true });
     defer iter_dir.close(io);
@@ -1029,19 +708,8 @@ pub fn list(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator) ![]Named {
     return listIn(iter_dir, io, gpa);
 }
 
-/// The id of the session in `dir` that was last written to from `start_cwd`, or
-/// null when no session was started there. The id is `gpa`'s, and the caller
-/// frees it.
-///
-/// The listing's order is the answer's order: the newest session that recorded
-/// `start_cwd` is the one a run in that directory would continue. Each is asked
-/// only for the directory it recorded, which `write` puts near the front; a file
-/// written before it moved holds it last and is stepped over, so even that one
-/// costs its bytes rather than a conversation loaded to be thrown away.
-///
-/// A file that records no directory -- one written before it was kept -- cannot
-/// say it belongs there, so it is never the answer; it is still resumable by its
-/// id, in the directory billy is run from.
+/// The id of the session in `dir` that was last written to from `start_cwd`, or null when no
+/// session was started there.
 pub fn latest(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, start_cwd: []const u8) !?[]const u8 {
     const listed = try list(io, dir, gpa);
     defer freeList(listed, gpa);
@@ -1054,8 +722,8 @@ pub fn latest(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, start_cwd: []
 
         const stored = cwdFrom(io, gpa, file) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            // A file that cannot be read through is not the session to continue
-            // here, and is still one to resume by its id.
+            // A file that cannot be read through is not the session to continue here, and is still
+            // one to resume by its id.
             else => continue,
         };
         defer if (stored) |text| gpa.free(text);
@@ -1066,14 +734,13 @@ pub fn latest(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, start_cwd: []
     return null;
 }
 
-/// One session as a listing shows it: the id that names it, and its title, which
-/// is "" for a session that has not been named.
+/// One session as a listing shows it: the id that names it, and its title, which is "" for a
+/// session that has not been named.
 pub const Named = struct {
     id: []const u8,
     title: []const u8,
 };
 
-/// Frees what a listing returned: the ids it copied out, and the list itself.
 fn freeList(names: []Named, gpa: std.mem.Allocator) void {
     for (names) |made| {
         gpa.free(made.id);
@@ -1082,11 +749,7 @@ fn freeList(names: []Named, gpa: std.mem.Allocator) void {
     gpa.free(names);
 }
 
-/// The ids of the sessions in `dir`, which must be a handle this listing has to
-/// itself. See `list`, which opens one.
 fn listIn(dir: std.Io.Dir, io: std.Io, gpa: std.mem.Allocator) ![]Named {
-    // The names and the times they were written are two lists kept in step: the
-    // times are only there to order the names by, so sorting has to move both.
     var names: std.ArrayList(Named) = .empty;
     errdefer {
         for (names.items) |made| {
@@ -1100,30 +763,19 @@ fn listIn(dir: std.Io.Dir, io: std.Io, gpa: std.mem.Allocator) ![]Named {
 
     var entries = dir.iterate();
     while (try entries.next(io)) |entry| {
-        // A session is a regular file, so a directory or a symlink in the way is
-        // not one to read.
         if (entry.kind != .file) continue;
         const stem = idInName(entry.name) orelse continue;
 
-        // One handle gives both the time the file was written and its title. A
-        // file that cannot be opened or asked about is left out rather than
-        // failing the listing.
         var file = dir.openFile(io, entry.name, .{}) catch continue;
         defer file.close(io);
         const stat = file.stat(io) catch continue;
 
-        // The title is read from the front of the file, which keeps a listing
-        // cheap however large the conversations are. A file that is not a session
-        // is left out before anything is allocated for it, so `continue` leaks
-        // nothing and the two lists stay the same length.
         const stored_title = readTitle(io, gpa, file) catch |err| switch (err) {
             error.SyntaxError => continue,
             else => return err,
         };
         errdefer gpa.free(stored_title);
 
-        // The name is a window into the iterator, which the next entry moves on,
-        // so the id is copied out before it can go.
         const owned_id = try gpa.dupe(u8, stem);
         errdefer gpa.free(owned_id);
 
@@ -1138,18 +790,8 @@ fn listIn(dir: std.Io.Dir, io: std.Io, gpa: std.mem.Allocator) ![]Named {
     return names.toOwnedSlice(gpa);
 }
 
-/// The first buffer a session file's title is read into. It is big enough for an
-/// ordinary title, so the quote that closes one is found in the first read; a
-/// longer title grows the buffer rather than being refused.
 const title_read_buffer_len = 1024;
 
-/// The working directory stored in the session file `file`, or null when it
-/// records none, which a file written before the field did.
-///
-/// `write` puts the directory third, so this reads a dozen bytes and stops. A
-/// file written before it moved holds it last: that one is read to its end, with
-/// the conversation stepped over a token at a time, so it costs its bytes rather
-/// than a conversation built for a question about one field of it.
 fn cwdFrom(io: std.Io, gpa: std.mem.Allocator, file: std.Io.File) !?[]const u8 {
     var reader_buf: [std.heap.page_size_min]u8 = undefined;
     var reader = file.reader(io, &reader_buf);
@@ -1172,8 +814,8 @@ fn cwdFrom(io: std.Io, gpa: std.mem.Allocator, file: std.Io.File) !?[]const u8 {
         };
         if (std.mem.eql(u8, field, "cwd")) {
             return switch (try j_reader.nextAlloc(gpa, .alloc_always)) {
-                // `alloc_always` puts the text in memory of the caller's, which
-                // the reader's buffer cannot move under it.
+                // `alloc_always` puts the text in memory of the caller's, which the reader's buffer
+                // cannot move under it.
                 .allocated_string => |text| text,
                 else => null,
             };
@@ -1182,23 +824,12 @@ fn cwdFrom(io: std.Io, gpa: std.mem.Allocator, file: std.Io.File) !?[]const u8 {
     }
 }
 
-/// The title stored in the session file `file`, or "" when it has none.
-///
-/// Only the front of the file is read, and only as far as the title: the fields
-/// it opens with are stepped over a token at a time, so a listing reads a few
-/// dozen bytes rather than the whole conversation, however large the file is.
 fn readTitle(io: std.Io, gpa: std.mem.Allocator, file: std.Io.File) ![]const u8 {
     var reader_buf: [std.heap.page_size_min]u8 = undefined;
     var reader = file.reader(io, &reader_buf);
     return (try titleFrom(&reader.interface, gpa)) orelse "";
 }
 
-/// Reads the title out of the front of a session file, or null when it has none.
-///
-/// It leans on the order `save` writes: the title is the second field, right
-/// after the version. So only those two are looked at, and a file that does not
-/// name the session -- one saved before titles, or hand-written -- is recognized
-/// and left alone after a few bytes rather than scanned to its end.
 fn titleFrom(reader: *std.Io.Reader, gpa: std.mem.Allocator) !?[]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1227,17 +858,11 @@ fn titleFrom(reader: *std.Io.Reader, gpa: std.mem.Allocator) !?[]u8 {
     return try gpa.dupe(u8, title_value.allocated_string);
 }
 
-/// Orders sessions by when their files were written, newest first, carrying the
-/// times along with them. The two lists are one list of pairs that the sorting
-/// cannot see, so a swap has to move both.
 const Ordering = struct {
     names: []Named,
     written: []i64,
 
     pub fn lessThan(self: Ordering, a: usize, b: usize) bool {
-        // Newest first, and two written in the same millisecond by their ids,
-        // which is the order they were made in, so the order is total and a
-        // listing does not shuffle between calls.
         if (self.written[a] != self.written[b]) return self.written[a] > self.written[b];
         return std.mem.order(u8, self.names[a].id, self.names[b].id) == .gt;
     }
@@ -1248,16 +873,12 @@ const Ordering = struct {
     }
 };
 
-/// The name of the session file for `session_id`, written into `buffer`, or null
-/// when it could not name a session.
 fn fileName(session_id: []const u8, buffer: []u8) ?[]const u8 {
     if (!usableName(session_id)) return null;
     return std.mem.print(buffer, "{s}{s}", .{ session_id, extension }) catch null;
 }
 
-/// Deletes the session `id` from `dir`, so it is gone for good: billy keeps no
-/// trash. A session that has no file is `error.SessionNotFound`, and an id that
-/// could not name one is `error.InvalidSessionId`.
+/// Deletes the session `id` from `dir`, so it is gone for good: billy keeps no trash.
 pub fn delete(io: std.Io, dir: std.Io.Dir, session_id: []const u8) !void {
     var buffer: [max_id_len + extension.len]u8 = undefined;
     const file = fileName(session_id, &buffer) orelse return error.InvalidSessionId;
@@ -1267,8 +888,6 @@ pub fn delete(io: std.Io, dir: std.Io.Dir, session_id: []const u8) !void {
     };
 }
 
-/// The id in `file_name`, which is the name with the extension taken off, or null
-/// when the name is not that of a session file.
 fn idInName(file_name: []const u8) ?[]const u8 {
     if (!std.mem.endsWith(u8, file_name, extension)) return null;
     const stem = file_name[0 .. file_name.len - extension.len];
@@ -1276,26 +895,14 @@ fn idInName(file_name: []const u8) ?[]const u8 {
     return stem;
 }
 
-/// A session opened fresh in `tmp`, for a test to build a conversation in. The
-/// caller owns it and frees it with `deinit`.
 fn newTestSession(tmp: *std.testing.TmpDir) !Session {
     return Session.open(std.testing.io, tmp.dir, std.testing.allocator, null, "/work");
 }
 
-/// The session `id` read back from `tmp`, which is what reopening it does. The
-/// caller owns it and frees it with `deinit`.
 fn reopenTestSession(tmp: *std.testing.TmpDir, session_id: []const u8) !Session {
     return Session.open(std.testing.io, tmp.dir, std.testing.allocator, session_id, "/work");
 }
 
-/// Checks two conversations hold the same messages, field for field: the role,
-/// the content, the model's thinking, the call a result answers, and every tool
-/// call. The text is compared by content, since two sessions number their
-/// strings differently; a role is the enum itself, so it is compared as one.
-///
-/// A field that is null and one that is empty are compared as the same, since a
-/// store that leaves a value out and one that writes nothing for it are both no
-/// text. A test that has to tell the two apart cannot use this helper.
 fn expectConvo(expected: []const llm.Message, actual: []const llm.Message) !void {
     try std.testing.expectEqual(expected.len, actual.len);
     for (expected, actual) |want, got| {
@@ -1316,8 +923,6 @@ fn expectConvo(expected: []const llm.Message, actual: []const llm.Message) !void
     }
 }
 
-/// Frees the messages `resolvedMessages` returns: it allocates the slice and each
-/// message's tool calls, so both are given back, one message at a time.
 fn freeResolved(gpa: std.mem.Allocator, messages: []const llm.Message) void {
     for (messages) |message| {
         if (message.tool_calls) |calls| gpa.free(calls);
@@ -1325,9 +930,6 @@ fn freeResolved(gpa: std.mem.Allocator, messages: []const llm.Message) void {
     gpa.free(messages);
 }
 
-/// Checks the conversation `session` resolves to against `expected`, freeing what
-/// resolving it allocates. This is what a test uses instead of comparing two
-/// sessions' own indices, which number their strings differently.
 fn expectSessionConvo(session: *const Session, expected: []const llm.Message) !void {
     const gpa = std.testing.allocator;
     const resolved = try session.resolvedMessages(gpa);
@@ -1335,11 +937,6 @@ fn expectSessionConvo(session: *const Session, expected: []const llm.Message) !v
     try expectConvo(expected, resolved);
 }
 
-/// Writes `messages` as a session's conversation, resumes the session, and
-/// checks the conversation comes back exactly as it went in: the save/load
-/// round trip, for a conversation of any shape. The session is opened with the
-/// testing allocator, not an arena, so a resume that does not free what it read
-/// is reported rather than hidden.
 fn expectResume(messages: []const llm.Message) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1353,8 +950,6 @@ fn expectResume(messages: []const llm.Message) !void {
     try resumed.expectSessionConvo(messages);
 }
 
-/// Checks the JSON a request carries for `session` against `expected`: the
-/// `messages` array of a request body, with `extra` written after it or none.
 fn expectRequestJson(session: *const Session, extra: []const llm.Message, expected: []const u8) !void {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -1371,8 +966,6 @@ test "a new session is given a ULID, and nothing is written yet" {
     defer session.deinit();
 
     try std.testing.expect(ulid.isId(session.id()));
-    // Opening a new session records an id and nothing else, so the first write
-    // is the first message. Nothing is named after the id until then.
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, session.name(), .{}));
 }
 
@@ -1381,21 +974,17 @@ test "a session can be started for an id that has no file yet" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // An id handed out before the session exists: the id is what names it, and
-    // nothing is read, since there is nothing to read.
     var session = try Session.create(std.testing.io, tmp.dir, gpa, "made-by-hand", "/work");
     defer session.deinit();
     try std.testing.expectEqualStrings("made-by-hand", session.id());
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, session.name(), .{}));
 
-    // The first message is what writes it, exactly as for a generated id.
     try session.append(.{ .role = .user, .content = "hello" });
     var resumed = try reopenTestSession(&tmp, "made-by-hand");
     defer resumed.deinit();
     try std.testing.expectEqual(@as(usize, 1), resumed.messages.items.len);
     try std.testing.expectEqualStrings("hello", resumed.contentOf(resumed.messages.items[0]).?);
 
-    // An id that could not name a session is refused rather than written.
     try std.testing.expectError(
         error.InvalidSessionId,
         Session.create(std.testing.io, tmp.dir, gpa, "../escape", "/work"),
@@ -1407,7 +996,6 @@ test "a session is deleted for good, and only that session" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Two sessions, so the delete can be seen to remove one and leave the other.
     var kept = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer kept.deinit();
     try kept.append(.{ .role = .user, .content = "keep me" });
@@ -1422,16 +1010,13 @@ test "a session is deleted for good, and only that session" {
 
     try Session.delete(std.testing.io, tmp.dir, gone_id);
 
-    // The one deleted is gone, and cannot be deleted again.
     try std.testing.expectError(error.SessionNotFound, reopenTestSession(&tmp, gone_id));
     try std.testing.expectError(error.SessionNotFound, Session.delete(std.testing.io, tmp.dir, gone_id));
 
-    // The other is untouched.
     var still = try reopenTestSession(&tmp, kept_id);
     defer still.deinit();
     try std.testing.expectEqualStrings("keep me", still.contentOf(still.messages.items[0]).?);
 
-    // An id that could not name a session is refused rather than looked for.
     try std.testing.expectError(error.InvalidSessionId, Session.delete(std.testing.io, tmp.dir, "../escape"));
 }
 
@@ -1448,22 +1033,15 @@ test "a new session is written out by its first message" {
     var session = try newTestSession(&tmp);
     defer session.deinit();
 
-    // Setting a session up -- its prompt and its tools -- is held in memory, so
-    // a run that is started and left alone leaves nothing behind. This is what
-    // keeps an untouched `billy` from littering the sessions directory.
     try session.setSystemPrompt("be terse");
     try session.ensureTools(&tools);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, session.name(), .{}));
 
-    // The first message is what brings the session into being, and everything
-    // set up before it lands in the file with it.
     try session.append(.{ .role = .user, .content = "hello" });
 
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
     try std.testing.expectEqual(1, resumed.tools.len);
-    // The prompt is its own field, apart from the conversation, which is the
-    // message alone.
     try std.testing.expect(resumed.systemPrompt() != null);
     try std.testing.expectEqualStrings("be terse", resumed.systemPrompt().?);
     try std.testing.expectEqual(1, resumed.messages.items.len);
@@ -1477,17 +1055,11 @@ test "ids made one after another differ" {
     ulid.generate(std.testing.io, &first);
     ulid.generate(std.testing.io, &second);
 
-    // Two sessions made one after the other never share an id. The clock alone
-    // cannot promise that, which is what the random bits are for; that the
-    // timestamp makes them sort is `ulid.zig`'s to prove.
     try std.testing.expect(ulid.isId(&first));
     try std.testing.expect(ulid.isId(&second));
     try std.testing.expect(!std.mem.eql(u8, &first, &second));
 }
 
-/// Writes an empty session file named for `id`, last written `written_ms`
-/// milliseconds after the epoch, so a listing can be checked for the order it
-/// puts the files in. The file's content does not matter to a listing.
 fn writeSessionAt(tmp: *std.testing.TmpDir, gpa: std.mem.Allocator, session_id: []const u8, written_ms: i64) !void {
     try writeFileAt(tmp, gpa, session_id, "{}", written_ms);
 }
@@ -1512,13 +1084,9 @@ fn writeFileAt(
 test "the sessions in a directory are listed by when they were written" {
     const gpa = std.testing.allocator;
 
-    // Opened for iteration, since that is what listing a directory does.
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    // An older id and a newer one, and a name that is not a ULID at all. The
-    // order below is none of these: it is the time each file was written, which
-    // is what makes the listing newest-first whatever the ids are.
     var older_buf: [max_id_len]u8 = undefined;
     ulid.encode(older_buf[0..ulid.length], 1_700_000_000_000, @splat(0));
     var newer_buf: [max_id_len]u8 = undefined;
@@ -1533,8 +1101,6 @@ test "the sessions in a directory are listed by when they were written" {
     };
     for (files) |file| try writeSessionAt(&tmp, gpa, file.id, file.written_ms);
 
-    // Files that are not sessions are passed over: another extension, a name that
-    // could not be an id, and a directory.
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "notes.txt", .data = "x" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad name" ++ extension, .data = "x" });
     try tmp.dir.createDirPath(std.testing.io, "a-directory" ++ extension);
@@ -1559,11 +1125,6 @@ test "the directory a session was started in is written at the front" {
     const text = try tmp.dir.readFileAlloc(std.testing.io, session.name(), std.testing.allocator, .unlimited);
     defer std.testing.allocator.free(text);
 
-    // Two things read a session file without reading the conversation: the
-    // listing asks for the title, and `latest` for the directory it was started
-    // in. Both are written before anything a conversation can grow into, so
-    // neither has to step over one. The `latest` test above holds the other half:
-    // a file from an older billy keeps the directory last, and is still read.
     try std.testing.expect(std.mem.startsWith(u8, text, "{\"version\":3,\"title\":\"a name\",\"cwd\":\"/work\","));
 }
 
@@ -1572,10 +1133,6 @@ test "the latest session for a directory is the one last written there" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    // Sessions from two directories, with the conversation of one written out in
-    // full. These are files from before the directory moved to the front of one,
-    // which is the shape a session saved by an older billy has: finding the
-    // directory there means stepping over everything before it.
     const here =
         \\{"version":3,"messages":[{"role":"user","content":"hello \"there\""}],"cwd":"/work"}
     ;
@@ -1586,13 +1143,10 @@ test "the latest session for a directory is the one last written there" {
     try writeFileAt(&tmp, gpa, "other", elsewhere, 2_000);
     try writeFileAt(&tmp, gpa, "second", here, 3_000);
 
-    // The one written to last here, not the one written to last at all.
     const found = (try latest(std.testing.io, tmp.dir, gpa, "/work")).?;
     defer gpa.free(found);
     try std.testing.expectEqualStrings("second", found);
 
-    // A directory no session was started in has none to continue, and neither
-    // does a file from before the directory was recorded.
     try std.testing.expect(try latest(std.testing.io, tmp.dir, gpa, "/nowhere") == null);
     try writeFileAt(&tmp, gpa, "old", "{\"version\":1}", 4_000);
     const unchanged = (try latest(std.testing.io, tmp.dir, gpa, "/work")).?;
@@ -1605,10 +1159,9 @@ test "the ordering keeps each id with the time it was written at" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    // Six sessions whose id order and write order run opposite ways, so the sort
-    // has to move the times along with the ids rather than reorder one list on
-    // its own: the id that was made first is the one written last, and so is the
-    // one that comes first in the listing.
+    // Six sessions whose id order and write order run opposite ways, so the sort has to move the
+    // times along with the ids rather than reorder one list on its own: the id that was made first
+    // is the one written last, and so is the one that comes first in the listing.
     const count = 6;
     var buffers: [count][max_id_len]u8 = undefined;
     for (0..count) |i| {
@@ -1620,8 +1173,6 @@ test "the ordering keeps each id with the time it was written at" {
     const ids = try listIn(tmp.dir, std.testing.io, std.testing.allocator);
     defer freeList(ids, std.testing.allocator);
 
-    // The write times descend as the ids ascend, so the listing is the ids in
-    // the order they were made in, each still with the time it was written at.
     try std.testing.expectEqual(@as(usize, count), ids.len);
     for (ids, 0..) |listed, position| {
         try std.testing.expectEqualStrings(buffers[position][0..ulid.length], listed.id);
@@ -1638,8 +1189,6 @@ test "sessions written at the same moment are ordered by their ids" {
     var newer_buf: [max_id_len]u8 = undefined;
     ulid.encode(newer_buf[0..ulid.length], 1_700_000_001_000, @splat(0));
 
-    // The same write time on both, so the newer id comes first and the order does
-    // not depend on how the directory happened to be read.
     for ([_][]const u8{ older_buf[0..ulid.length], newer_buf[0..ulid.length] }) |made| {
         try writeSessionAt(&tmp, gpa, made, 1_000);
     }
@@ -1656,10 +1205,8 @@ test "a file that is not a session is left out without disturbing the order" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    // The unreadable file is written between the others, so wherever the
-    // directory yields it, some session follows it. What it leaves behind, were
-    // it counted, would shift the times of the ones after it, and the testing
-    // allocator reports anything it allocated and did not free.
+    // The unreadable file is written between the others, so wherever the directory yields it, some
+    // session follows it.
     try writeSessionAt(&tmp, gpa, "a", 1_000);
     try writeSessionAt(&tmp, gpa, "b", 2_000);
     try writeFileAt(&tmp, gpa, "broken", "not json at all", 3_000);
@@ -1687,9 +1234,6 @@ test "a listing carries each session's title" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    // One session named with a long title, one with a short title, and one that
-    // has not been named. The long one is longer than the first read buffer, so
-    // it is read back only because the reader grows.
     const long_title: [title_read_buffer_len + 1]u8 = @splat('y');
     try std.testing.expect(long_title.len > title_read_buffer_len);
     var long = try newTestSession(&tmp);
@@ -1710,8 +1254,6 @@ test "a listing carries each session's title" {
     defer freeList(listed, gpa);
     try std.testing.expectEqual(@as(usize, 3), listed.len);
 
-    // Each entry carries the title the file holds, or "" for the session that
-    // has none.
     for (listed) |entry| {
         if (std.mem.eql(u8, entry.id, long.id())) {
             try std.testing.expectEqualStrings(&long_title, entry.title);
@@ -1730,12 +1272,9 @@ test "a title is trimmed when it is set, and kept whole however long" {
     var session = try newTestSession(&tmp);
     defer session.deinit();
 
-    // The whitespace a paste brings is not part of the title.
     try session.setTitle("  Fix the parser\n");
     try std.testing.expectEqualStrings("Fix the parser", session.title().?);
 
-    // A title of any length is kept whole.
-    // The euro sign is three bytes in UTF-8, so this is not one byte repeated.
     const many_euros = comptime blk: {
         var out: [3 * 500]u8 = undefined;
         for (0..500) |i| @memcpy(out[i * 3 ..][0..3], "\u{20AC}");
@@ -1748,39 +1287,27 @@ test "a title is trimmed when it is set, and kept whole however long" {
 test "the title is read from the front of a session file, unescaped" {
     const gpa = std.testing.allocator;
 
-    // The title sits right after the version, and the reader stops there rather
-    // than reading the rest of the file.
+    // The title sits right after the version, and the reader stops there rather than reading the
+    // rest of the file.
     try expectTitle(gpa, "Fix it", "{\"version\":3,\"title\":\"Fix it\",\"system_prompt\":\"x\"}");
-    // The escapes the writer produces are undone.
     try expectTitle(gpa, "a \"quoted\" \\ title", "{\"version\":3,\"title\":\"a \\\"quoted\\\" \\\\ title\"}");
-    // A title that ends in an escaped backslash, which the quote after it does
-    // not close.
     try expectTitle(gpa, "ends with a backslash \\", "{\"version\":3,\"title\":\"ends with a backslash \\\\\",\"messages\":[]}");
-    // A title that is a single escaped quote.
     try expectTitle(gpa, "\"", "{\"version\":3,\"title\":\"\\\"\"}");
-    // An empty title is read as empty, not as "no title".
     try expectTitle(gpa, "", "{\"version\":3,\"title\":\"\",\"messages\":[]}");
 
-    // A session with no title -- one saved before titles, or hand-written -- is
-    // recognized by the field after the version and left alone.
     try std.testing.expect((try titleOf(gpa, "{\"version\":3,\"system_prompt\":\"be terse\",\"messages\":[]}")) == null);
     try std.testing.expect((try titleOf(gpa, "{\"version\":3,\"messages\":[]}")) == null);
-    // Something that is not a session at all.
     try std.testing.expectError(error.SyntaxError, titleOf(gpa, "not json at all"));
 
-    // A title of any length is read, however long: there is no limit.
     const long_title: [4096]u8 = @splat('y');
     try expectTitle(gpa, &long_title, "{\"version\":3,\"title\":\"" ++ &long_title ++ "\"}");
 }
 
-/// Reads the title out of `front`, which stands in for the start of a session
-/// file. The reader is fixed over `front`, so the whole of it is available.
 fn titleOf(gpa: std.mem.Allocator, front: []const u8) !?[]u8 {
     var reader: std.Io.Reader = .fixed(front);
     return titleFrom(&reader, gpa);
 }
 
-/// Checks what `titleFrom` reads, freeing what it allocates.
 fn expectTitle(gpa: std.mem.Allocator, expected: []const u8, front: []const u8) !void {
     const got = (try titleOf(gpa, front)).?;
     defer gpa.free(got);
@@ -1790,7 +1317,6 @@ fn expectTitle(gpa: std.mem.Allocator, expected: []const u8, front: []const u8) 
 test "setCheckedId rejects names that could escape the session directory" {
     var buf: [max_id_len]u8 = undefined;
 
-    // A name typed on the command line, and an id this module would make.
     try std.testing.expectEqualStrings("dev", try setCheckedId(&buf, "dev"));
     try std.testing.expectEqualStrings("20250131-120000", try setCheckedId(&buf, "20250131-120000"));
     try std.testing.expectEqualStrings(
@@ -1803,18 +1329,14 @@ test "setCheckedId rejects names that could escape the session directory" {
     try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, "../x"));
     try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, "a/b"));
     try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, "a b"));
-    // A name that does not fit, with room for its NUL, is refused rather than
-    // cut short: the longest that fits is one byte less than the buffer.
+    // A name that does not fit, with room for its NUL, is refused rather than cut short: the
+    // longest that fits is one byte less than the buffer.
     try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, &@as([max_id_len + 1]u8, @splat('x'))));
     try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, &@as([max_id_len]u8, @splat('x'))));
     _ = try setCheckedId(&buf, &@as([max_id_len - 1]u8, @splat('x')));
 }
 
 test "a session survives a save and resume" {
-    // A message of every shape: a prompt, an assistant message that thinks and
-    // asks for a tool, the result that answers it, and the answer that ends the
-    // turn. The thinking has to come back with the message, since a provider in
-    // thinking mode asks for it on every request that carries tools.
     try expectResume(&.{
         .{ .role = .user, .content = "hello" },
         .{ .role = .assistant, .reasoning_content = "I should read the file.", .tool_calls = &.{.{
@@ -1833,17 +1355,12 @@ test "a resume answers a tool call a killed run left open" {
     var session = try newTestSession(&tmp);
     defer session.deinit();
 
-    // The assistant asked for a tool, and the run was killed before its result
-    // was written, so the session ends on the call with no message answering it.
     try session.append(.{ .role = .user, .content = "hello" });
     try session.append(.{ .role = .assistant, .tool_calls = &.{.{
         .id = "call_1",
         .function = .{ .name = "bash", .arguments = "{}" },
     }} });
 
-    // The call now has an answer, so the request the session builds is one the
-    // API takes: the assistant message is followed by the result of its call,
-    // and the call did not finish.
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
     try resumed.expectSessionConvo(&.{
@@ -1869,12 +1386,10 @@ test "a resume answers every call a kill left open, in the order made" {
         .{ .id = "call_2", .function = .{ .name = "read", .arguments = "{}" } },
     } });
     try session.append(.{ .role = .tool, .tool_call_id = "call_1", .content = "the first result" });
-    // Killed before the second result, and the user typed on afterwards, so the
-    // message that follows the run is not a result at all.
     try session.append(.{ .role = .user, .content = "still there?" });
 
-    // The result the file held stays with its call, and the call it lost is
-    // answered in the place it was made rather than after the user message.
+    // The result the file held stays with its call, and the call it lost is answered in the place
+    // it was made rather than after the user message.
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
     try resumed.expectSessionConvo(&.{
@@ -1896,8 +1411,6 @@ test "a resume leaves a finished conversation alone" {
     var session = try newTestSession(&tmp);
     defer session.deinit();
 
-    // A run that finished leaves every call answered and its compaction in
-    // place, which is what the repair must not disturb.
     try session.setSystemPrompt("be terse");
     try session.append(.{ .role = .user, .content = "go" });
     try session.append(.{ .role = .assistant, .tool_calls = &.{
@@ -1924,9 +1437,6 @@ test "a repair moves a compaction that sits behind the turn it completes" {
     var session = try newTestSession(&tmp);
     defer session.deinit();
 
-    // A file that holds a compaction right behind a call with no result, as one
-    // written by hand can: the answer the repair inserts lands in front of both
-    // the prompt and the summary.
     try session.append(.{ .role = .user, .content = "go" });
     try session.append(.{ .role = .assistant, .tool_calls = &.{.{
         .id = "call_1",
@@ -1937,9 +1447,9 @@ test "a repair moves a compaction that sits behind the turn it completes" {
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
 
-    // user, the assistant message, its answer, then the prompt and the summary:
-    // the summary the file recorded at index 3 moves to 4 with the message it
-    // names, so a request still starts at the summary rather than at the prompt.
+    // user, the assistant message, its answer, then the prompt and the summary: the summary the
+    // file recorded at index 3 moves to 4 with the message it names, so a request still starts at
+    // the summary rather than at the prompt.
     try std.testing.expectEqual(@as(usize, 5), resumed.messages.items.len);
     try std.testing.expectEqual(@as(usize, 4), resumed.sentFrom());
     try std.testing.expect(resumed.isCompaction(resumed.sentFrom()));
@@ -1954,10 +1464,6 @@ test "a conversation writes the messages a request would have carried" {
     var session = try newTestSession(&tmp);
     defer session.deinit();
 
-    // A message of every shape: an optional left out, one filled in, a call
-    // alongside the result that answers it, and the thinking that has to go
-    // back with the assistant message. The system prompt is its own field,
-    // which the request opens with.
     try session.setSystemPrompt("be terse");
     try session.append(.{ .role = .user, .content = "hello" });
     try session.append(.{
@@ -1978,9 +1484,9 @@ test "a conversation writes the messages a request would have carried" {
         "{\"role\":\"tool\",\"content\":\"1\\tconst x = 1;\\n\",\"tool_call_id\":\"call_1\"}]";
     try session.expectRequestJson(&.{}, expected);
 
-    // Writing the stored conversation has to give the bytes the resolved one
-    // does, field for field and in the same order, or a resumed session would
-    // send a request that misses its prompt cache.
+    // Writing the stored conversation has to give the bytes the resolved one does, field for field
+    // and in the same order, or a resumed session would send a request that misses its prompt
+    // cache.
     const resolved = try session.resolvedMessages(gpa);
     defer freeResolved(gpa, resolved);
     const via_messages = try std.json.Stringify.valueAlloc(gpa, resolved, .{ .emit_null_optional_fields = false });
@@ -1999,9 +1505,6 @@ test "an extra message is written after the conversation, and is not part of it"
     try session.append(.{ .role = .assistant, .content = "hi" });
     const before = session.messages.items.len;
 
-    // A request that carries one message more than the session holds, such as the
-    // prompt that asks for a title: the extra is written last, as the newest
-    // message, and the session is left exactly as it was.
     const extra = [_]llm.Message{.{ .role = .user, .content = "give it a title" }};
     try session.expectRequestJson(&extra, "[{\"role\":\"system\",\"content\":\"be terse\"}," ++
         "{\"role\":\"user\",\"content\":\"hello\"}," ++
@@ -2017,17 +1520,12 @@ test "a string that is not valid UTF-8 is repaired on the way into the pool" {
     var session = try newTestSession(&tmp);
     defer session.deinit();
 
-    // A command's output and a file read back are arbitrary bytes, so a result
-    // holds a stray continuation byte and a cut-off sequence, neither of which
-    // is UTF-8.
     try session.append(.{ .role = .tool, .tool_call_id = "call_1", .content = "a\x80b\xffc" });
 
-    // The pool holds text, so a request writes the content as a string. Left as
-    // bytes, Zig would write it as an array of numbers the API rejects.
     try session.expectRequestJson(&.{}, "[{\"role\":\"tool\",\"content\":\"a\u{FFFD}b\u{FFFD}c\",\"tool_call_id\":\"call_1\"}]");
 
-    // The repaired text is what the session keeps, so a resume reads it back
-    // the same rather than the bytes that could not be sent.
+    // The repaired text is what the session keeps, so a resume reads it back the same rather than
+    // the bytes that could not be sent.
     try std.testing.expectEqualStrings("a\u{FFFD}b\u{FFFD}c", session.contentOf(session.messages.items[0]).?);
 }
 
@@ -2036,9 +1534,6 @@ test "a message a session read back with bytes that are not UTF-8 is repaired" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A session file written before a result was repaired holds the content as
-    // the array of numbers Zig writes for bytes that are not UTF-8, which is
-    // how the bytes "a\xffb" were stored.
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "bytes.json",
         .data = "{\"version\":2,\"messages\":[{\"role\":\"tool\"," ++
@@ -2050,8 +1545,8 @@ test "a message a session read back with bytes that are not UTF-8 is repaired" {
 
     try std.testing.expectEqualStrings("a\u{FFFD}b", session.contentOf(session.messages.items[0]).?);
 
-    // Saving it back writes the content as a string, so the bytes are gone for
-    // good and the file is one a later resume reads as text.
+    // Saving it back writes the content as a string, so the bytes are gone for good and the file is
+    // one a later resume reads as text.
     try session.save();
     const text = try tmp.dir.readFileAlloc(std.testing.io, "bytes.json", gpa, .unlimited);
     defer gpa.free(text);
@@ -2072,13 +1567,11 @@ test "a stored message reads back as its parts" {
         .{ .id = "call_2", .function = .{ .name = "bash", .arguments = "{}" } },
     } });
 
-    // What the transcript reads a message through, without building a message.
     const user = session.messages.items[0];
     try std.testing.expectEqualStrings("user", user.role.name());
     try std.testing.expectEqualStrings("hello", session.contentOf(user).?);
     try std.testing.expectEqual(0, user.tool_calls.len);
 
-    // A message with no content reports none, rather than an empty string.
     const assistant = session.messages.items[1];
     try std.testing.expectEqualStrings("assistant", assistant.role.name());
     try std.testing.expect(session.contentOf(assistant) == null);
@@ -2109,14 +1602,9 @@ test "a tool result is found only from where the search starts" {
     try session.append(.{ .role = .tool, .tool_call_id = "call_1", .content = "the result" });
     try session.append(.{ .role = .tool, .tool_call_id = "old", .content = "an earlier result" });
 
-    // The replay searches from the message after the call, which is where its
-    // result sits.
     try std.testing.expectEqualStrings("the result", session.toolResult(1, "call_1"));
-    // A result behind the point the search starts from is not the answer to
-    // anything ahead of it.
     try std.testing.expectEqualStrings("", session.toolResult(2, "call_1"));
     try std.testing.expectEqualStrings("an earlier result", session.toolResult(2, "old"));
-    // A result the session does not hold, and a search past the end of it.
     try std.testing.expectEqualStrings("", session.toolResult(1, "nothing"));
     try std.testing.expectEqualStrings("", session.toolResult(99, "call_1"));
 }
@@ -2128,8 +1616,6 @@ test "a result is not taken from a later turn that reuses the call id" {
     var session = try newTestSession(&tmp);
     defer session.deinit();
 
-    // Some providers number calls from the start every turn. The first call got
-    // no result, so what answers `call_0` further on belongs to the second.
     try session.append(.{ .role = .assistant, .tool_calls = &.{.{
         .id = "call_0",
         .function = .{ .name = "read", .arguments = "{}" },
@@ -2162,10 +1648,6 @@ test "every string is kept as it was written, and reads back as its own" {
         },
     });
 
-    // The pool opens with the strings the session owns -- its id and file name,
-    // and the directory it was started in -- then every string as it came, in
-    // the order it was added, with a role among them: a role is the enum, so no
-    // copy of "user" or "assistant" is kept.
     var expected: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer expected.deinit();
     try expected.writer.print("{s}\x00{s}\x00/work\x00", .{ session.id(), session.name() });
@@ -2174,8 +1656,6 @@ test "every string is kept as it was written, and reads back as its own" {
             "call_1\x00function\x00read\x00[]\x00",
     );
     try std.testing.expectEqualStrings(expected.written(), session.pool.strings.items);
-    // Two equal contents are two entries in the pool, and each message reads
-    // back the text that was written for it.
     try std.testing.expectEqualStrings("hello", session.contentOf(session.messages.items[0]).?);
     try std.testing.expectEqualStrings("hello", session.contentOf(session.messages.items[1]).?);
     const calls = session.messages.items[2].tool_calls.resolve(&session);
@@ -2187,8 +1667,6 @@ test "a version 2 file's system prompt is lifted into its own field" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A file from before the prompt was kept apart from the conversation holds it
-    // as the first message.
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "one.json",
         .data = "{\"version\":2,\"messages\":[" ++
@@ -2199,14 +1677,11 @@ test "a version 2 file's system prompt is lifted into its own field" {
     var resumed = try reopenTestSession(&tmp, "one");
     defer resumed.deinit();
 
-    // The prompt comes back as its own field and is no longer a message, so the
-    // conversation is the user message alone.
     try std.testing.expectEqualStrings("old prompt", resumed.systemPrompt().?);
     try std.testing.expectEqual(1, resumed.messages.items.len);
     try std.testing.expectEqualStrings("user", resumed.messages.items[0].role.name());
     try std.testing.expectEqualStrings("hi", resumed.contentOf(resumed.messages.items[0]).?);
 
-    // A resume keeps it rather than taking a newer one.
     try resumed.ensureSystemPrompt("new prompt");
     try std.testing.expectEqualStrings("old prompt", resumed.systemPrompt().?);
 }
@@ -2221,12 +1696,8 @@ test "a compaction is appended and a request starts at its summary" {
     try session.setSystemPrompt("be terse");
     try session.append(.{ .role = .user, .content = "one" });
     try session.append(.{ .role = .assistant, .content = "first answer" });
-    // Nothing compacted yet, so a request carries the whole conversation.
     try std.testing.expectEqual(0, session.sentFrom());
 
-    // A compaction adds the prompt and the summary to the end, keeping every
-    // message it stands in for. The summary is a user message, so the model
-    // reads it as context given to it.
     try session.appendCompaction("summarize this", "what happened so far");
     try std.testing.expectEqual(4, session.messages.items.len);
     try std.testing.expectEqualStrings("user", session.messages.items[2].role.name());
@@ -2234,17 +1705,12 @@ test "a compaction is appended and a request starts at its summary" {
     try std.testing.expectEqualStrings("user", session.messages.items[3].role.name());
     try std.testing.expectEqualStrings("what happened so far", session.contentOf(session.messages.items[3]).?);
 
-    // A request now starts at the summary, skipping everything the summary stands
-    // in for. The prompt is not a message, so it is not part of the count.
     try std.testing.expectEqual(3, session.sentFrom());
     try std.testing.expect(session.isCompaction(3));
-    // The prompt that asked for the compaction is not itself a summary.
     try std.testing.expect(!session.isCompaction(2));
     try std.testing.expect(!session.isCompaction(1));
-    // An index past the conversation is never a compaction.
     try std.testing.expect(!session.isCompaction(99));
 
-    // The messages after the compaction are sent in full.
     try session.append(.{ .role = .user, .content = "next" });
     try std.testing.expectEqual(3, session.sentFrom());
 }
@@ -2263,7 +1729,6 @@ test "a compaction survives a save and resume" {
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
 
-    // Everything comes back, and the request still starts at the summary.
     try std.testing.expectEqualStrings("be terse", resumed.systemPrompt().?);
     try std.testing.expectEqual(4, resumed.messages.items.len);
     try std.testing.expectEqual(2, resumed.sentFrom());
@@ -2275,9 +1740,6 @@ test "the compaction list is sorted, deduplicated and dropped where it names not
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A file written by hand, with the indices out of order, a repeat, one past
-    // the end of the conversation, and one naming the prompt a version 2 file
-    // held as the first message.
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "odd.json",
         .data = "{\"version\":2,\"messages\":[" ++
@@ -2292,12 +1754,11 @@ test "the compaction list is sorted, deduplicated and dropped where it names not
     defer session.deinit();
 
     try std.testing.expectEqualStrings("s", session.systemPrompt().?);
-    // 99 is past the end and dropped, not moved onto the last message, where it
-    // would have read as a summary of "two"; the two 2s name one compaction.
+    // 99 is past the end and dropped, not moved onto the last message, where it would have read as
+    // a summary of "two"; the two 2s name one compaction.
     try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, session.compactions.items);
     try std.testing.expectEqual(1, session.sentFrom());
     try std.testing.expect(session.isCompaction(1));
-    // The last message is not a summary, so a request carries the whole tail.
     try std.testing.expect(!session.isCompaction(2));
 }
 
@@ -2305,8 +1766,6 @@ test "compactions in a file with no messages are dropped" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Hand-written: a summary is named, but there is no conversation for it to
-    // stand in.
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "empty.json",
         .data = "{\"version\":3,\"messages\":[],\"compactions\":[0,5]}",
@@ -2336,7 +1795,6 @@ test "a session that fails part way through reading its tools frees what it took
             "\"messages\":[]}",
     });
 
-    // Fails each allocation in turn, and checks that nothing is left behind.
     try std.testing.checkAllAllocationFailures(std.testing.allocator, openOnce, .{tmp.dir});
 }
 
@@ -2348,14 +1806,11 @@ test "the messages a request carries start at the latest compaction" {
     defer session.deinit();
     try session.setSystemPrompt("s");
     try session.append(.{ .role = .user, .content = "old" });
-    // Two compactions: a request starts at the later summary, not the earlier.
     try session.appendCompaction("p1", "summary one");
     try session.append(.{ .role = .user, .content = "middle" });
     try session.appendCompaction("p2", "summary two");
     try session.append(.{ .role = .user, .content = "latest" });
 
-    // The system prompt, then the latest summary and the prompt after it: the
-    // first compaction and everything before it is left out.
     try session.expectRequestJson(&.{}, "[{\"role\":\"system\",\"content\":\"s\"}," ++
         "{\"role\":\"user\",\"content\":\"summary two\"}," ++
         "{\"role\":\"user\",\"content\":\"latest\"}]");
@@ -2368,20 +1823,16 @@ test "the system prompt is kept apart from the conversation and is not replaced"
     var session = try newTestSession(&tmp);
     defer session.deinit();
 
-    // Setting the prompt does not put a message in the conversation: it is its own
-    // field, sent at the front of every request.
     try session.setSystemPrompt("current prompt");
     try std.testing.expect(session.systemPrompt() != null);
     try std.testing.expectEqualStrings("current prompt", session.systemPrompt().?);
     try std.testing.expectEqual(0, session.messages.items.len);
 
-    // A session that already has one keeps it, which is what a resume relies on.
     try session.append(.{ .role = .user, .content = "hi" });
     try session.ensureSystemPrompt("a different prompt");
     try std.testing.expectEqualStrings("current prompt", session.systemPrompt().?);
     try std.testing.expectEqual(1, session.messages.items.len);
 
-    // Setting it outright replaces it, which is what a compaction does.
     try session.setSystemPrompt("a different prompt");
     try std.testing.expectEqualStrings("a different prompt", session.systemPrompt().?);
 }
@@ -2406,8 +1857,6 @@ test "the tools are written out with the schema as the JSON it is" {
     var json: std.json.Stringify = .{ .writer = &out.writer };
     try json.write(session.toolSet());
 
-    // The schema is the JSON it is, not the quoted string it is stored as, and
-    // the tool carries the kind the API wants.
     try std.testing.expectEqualStrings(
         "[{\"type\":\"function\",\"function\":{" ++
             "\"name\":\"read\",\"description\":\"Read a file.\"," ++
@@ -2432,22 +1881,18 @@ test "ensureTools stores the tools and only sets them once" {
     try std.testing.expectEqual(1, session.tools.len);
     try std.testing.expectEqualStrings("read", session.pool.get(session.tools[0].name).?);
 
-    // The tools are held in memory until the session's first message, which is
-    // what writes the session out.
     try std.testing.expectError(
         error.FileNotFound,
         tmp.dir.statFile(std.testing.io, session.name(), .{}),
     );
     try session.append(.{ .role = .user, .content = "hi" });
 
-    // The stored tools survive a save and resume.
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
     try std.testing.expectEqual(1, resumed.tools.len);
     try std.testing.expectEqualStrings("read", resumed.pool.get(resumed.tools[0].name).?);
     try std.testing.expectEqualStrings("Read a file.", resumed.pool.get(resumed.tools[0].description).?);
 
-    // A session that already has tools keeps them, rather than taking a new set.
     const replaced = [_]Definition{.{
         .name = "bash",
         .description = "Run a command.",
@@ -2464,7 +1909,6 @@ test "a session saved without tools loads with none" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Sessions saved before the tools were stored have no tools field.
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "legacy.json",
         .data = "{\"version\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
@@ -2484,7 +1928,6 @@ test "the context size survives a save and resume" {
 
     session.recordUsage(.{ .prompt_tokens = 100, .completion_tokens = 10, .total_tokens = 110 });
     try session.append(.{ .role = .user, .content = "hi" });
-    // A second request replaces the size rather than adding to it.
     session.recordUsage(.{ .prompt_tokens = 200, .completion_tokens = 20, .total_tokens = 220 });
     try session.append(.{ .role = .assistant, .content = "hello" });
 
@@ -2500,7 +1943,6 @@ test "the provider and model a session was started on are saved and resumed" {
 
     var session = try newTestSession(&tmp);
     defer session.deinit();
-    // A fresh session records nothing, so a caller has to say where it is sent.
     try std.testing.expect(session.model() == null);
     try session.setModel("opencode-go/glm-5.3-flash");
     try session.append(.{ .role = .user, .content = "hello" });
@@ -2509,9 +1951,9 @@ test "the provider and model a session was started on are saved and resumed" {
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
 
-    // The resumed session keeps the provider and model it was started on rather
-    // than following whatever the configuration now says, since the conversation
-    // belongs to the model that produced it.
+    // The resumed session keeps the provider and model it was started on rather than following
+    // whatever the configuration now says, since the conversation belongs to the model that
+    // produced it.
     try std.testing.expect(resumed.model() != null);
     try std.testing.expectEqualStrings("opencode-go/glm-5.3-flash", resumed.modelChoice("deepseek/deepseek-flash"));
 }
@@ -2520,19 +1962,13 @@ test "a session with no recorded model is read as the configured one" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A file written before this was recorded has no model field, and one with
-    // it empty is the same: both were being sent wherever billy was pointed, so
-    // that is what they are read as.
     var session = try newTestSession(&tmp);
     defer session.deinit();
     try std.testing.expectEqualStrings("deepseek/deepseek-flash", session.modelChoice("deepseek/deepseek-flash"));
 
-    // The file only exists once the session has something to save.
     try session.append(.{ .role = .user, .content = "hi" });
     const file = try tmp.dir.readFileAlloc(std.testing.io, session.name(), std.testing.allocator, .unlimited);
     defer std.testing.allocator.free(file);
-    // A session that recorded no model writes no model field, which is what
-    // reads back as the configured choice.
     try std.testing.expect(std.mem.find(u8, file, "\"model\"") == null);
 }
 
@@ -2540,9 +1976,6 @@ test "a session file written with an empty model reads as the configured one" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // What an older billy wrote: the field is there, with nothing in it, since
-    // those files record no choice. It reads as unset rather than as a session
-    // named by the empty string.
     const session_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = session_id ++ ".json",
@@ -2607,13 +2040,11 @@ test "the working directory is stored and restored on resume" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A session started in one directory.
     var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/home/user/project");
     defer session.deinit();
     try std.testing.expectEqualStrings("/home/user/project", session.cwd());
     try session.append(.{ .role = .user, .content = "hello" });
 
-    // Resumed from somewhere else, it keeps the directory it was started in.
     var resumed = try Session.open(std.testing.io, tmp.dir, gpa, session.id(), "/somewhere/else");
     defer resumed.deinit();
     try std.testing.expectEqualStrings("/home/user/project", resumed.cwd());
@@ -2624,7 +2055,6 @@ test "a session saved before the directory was recorded uses the run's own" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A file written before the field existed, with no `cwd`.
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "old" ++ extension,
         .data = "{\"version\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
@@ -2640,10 +2070,9 @@ test "a resumed session frees everything it read back" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A file big enough that holding its bytes for the run would show: writing
-    // and resuming it here runs under the testing gpa, which reports any
-    // allocation left behind, so this passing means the file it read and the
-    // parse of it were both freed by `deinit`.
+    // A file big enough that holding its bytes for the run would show: writing and resuming it here
+    // runs under the testing gpa, which reports any allocation left behind, so this passing means
+    // the file it read and the parse of it were both freed by `deinit`.
     var big: std.ArrayList(u8) = .empty;
     defer big.deinit(gpa);
     try big.appendSlice(gpa, "{\"version\":1,\"cwd\":\"/work\",\"messages\":[");
@@ -2664,8 +2093,6 @@ test "the id and file name read back from their fixed buffers" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A session with a short name typed on the command line, shorter than a
-    // generated id, so the NUL that ends it is what sets its length.
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "dev" ++ extension,
         .data = "{\"version\":1,\"messages\":[]}",
@@ -2675,12 +2102,10 @@ test "the id and file name read back from their fixed buffers" {
     try std.testing.expectEqualStrings("dev", resumed.id());
     try std.testing.expectEqualStrings("dev" ++ extension, resumed.name());
 
-    // A new session gets a generated ULID of its own.
     var fresh = try newTestSession(&tmp);
     defer fresh.deinit();
     try std.testing.expectEqual(ulid.length, fresh.id().len);
     try std.testing.expect(ulid.isId(fresh.id()));
-    // The file name is that id with the extension.
     try std.testing.expect(std.mem.endsWith(u8, fresh.name(), extension));
     try std.testing.expectEqualStrings(
         fresh.id(),

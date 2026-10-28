@@ -1,13 +1,6 @@
-//! Disallows calling a function by its first argument when that argument is its
-//! own receiver. A function declared in this file whose first parameter is the
-//! file's own type is a method: `turn(agent, ...)` reads as a free function and
-//! makes every reader check which it is, where `agent.turn(...)` says so.
-//!
-//! The check is per file, since a rule reads one document at a time: a call from
-//! another file, `Session.writeMessage(session, ...)`, is not seen here.
+//! Disallows calling a function by its first argument when that argument is its own receiver.
 
 pub const Config = struct {
-    /// The severity (off, warning, error).
     severity: zlinter.rules.LintProblemSeverity = .@"error",
 };
 
@@ -28,35 +21,28 @@ fn run(
     const arena = session.runtime.sessionArena();
     const tree = doc.tree(session);
     const tags = tree.tokens.items(.tag);
-    // A file that names no type of its own holds functions, not methods.
     const self_name = selfTypeName(tree, tags) orelse return null;
 
-    // The problems are taken from the session's own arena, which frees them
-    // once this rule has had its say, so the list needs no cleanup of its own.
+    // The problems are taken from the session's own arena, which frees them once this rule has had
+    // its say, so the list needs no cleanup of its own.
     // zlinter-disable-next-line require_errdefer_dealloc - the session's arena owns it
     var problems: std.ArrayList(zlinter.results.LintProblem) = .empty;
 
-    // Every call of a method by its name alone, and every call of it through the
-    // type's name, `Counter.bump(counter, ...)`: both pass the receiver by hand.
     var i: Ast.TokenIndex = 1;
     while (i + 2 < tags.len) : (i += 1) {
         if (tags[i] != .identifier) continue;
         if (tags[i + 1] != .l_paren) continue;
         if (tags[i - 1] == .keyword_fn) continue;
-        // A receiver has to be a value. `run(.{ .url = ... }, ...)` has a struct
-        // literal where the receiver would go, and a literal has no call through
-        // it, so there is nothing here to write the other way round.
+        // A receiver has to be a value.
         switch (tags[i + 2]) {
             .identifier, .ampersand => {},
             else => continue,
         }
         if (tags[i - 1] != .period) {
-            // A bare call, which is the method passed by its first argument.
             if (!isMethod(tree, tags, tree.tokenSlice(i), self_name)) continue;
             try report(arena, &problems, rule, config, tree, i, tree.tokenSlice(i));
             continue;
         }
-        // `Self.name(...)`: the type named as the namespace of its own method.
         if (!isMethod(tree, tags, tree.tokenSlice(i), self_name)) continue;
         if (i < 2 or tags[i - 2] != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(i - 2), self_name)) continue;
@@ -87,7 +73,6 @@ fn report(
     });
 }
 
-/// The name the file gives its own type, from `const Name = @This();`.
 fn selfTypeName(tree: Ast, tags: []const std.zig.Token.Tag) ?[]const u8 {
     var i: Ast.TokenIndex = 0;
     while (i + 5 < tags.len) : (i += 1) {
@@ -100,8 +85,6 @@ fn selfTypeName(tree: Ast, tags: []const std.zig.Token.Tag) ?[]const u8 {
     return null;
 }
 
-/// Whether the file declares `name` as a function whose first parameter is
-/// `self_name`, bare or behind a pointer, `const` or an optional.
 fn isMethod(tree: Ast, tags: []const std.zig.Token.Tag, name: []const u8, self_name: []const u8) bool {
     var i: Ast.TokenIndex = 0;
     while (i + 3 < tags.len) : (i += 1) {
@@ -113,8 +96,6 @@ fn isMethod(tree: Ast, tags: []const std.zig.Token.Tag, name: []const u8, self_n
     return false;
 }
 
-/// Whether the parameter list starting at `open` takes `self_name` first, with
-/// only `*` and `const` in front of it.
 fn firstParameterIs(tree: Ast, tags: []const std.zig.Token.Tag, open: Ast.TokenIndex, self_name: []const u8) bool {
     var i = open;
     while (i < tags.len and (tags[i] == .keyword_comptime or tags[i] == .keyword_noalias)) i += 1;
@@ -125,8 +106,6 @@ fn firstParameterIs(tree: Ast, tags: []const std.zig.Token.Tag, open: Ast.TokenI
     var found = false;
     while (i < tags.len) : (i += 1) {
         switch (tags[i]) {
-            // An optional has no call through it, so `?*Self` is a parameter the
-            // caller passes by name: there is no `opt.?.method(...)` to write.
             .question_mark => return false,
             .asterisk, .keyword_const => continue,
             .identifier => {
@@ -134,8 +113,6 @@ fn firstParameterIs(tree: Ast, tags: []const std.zig.Token.Tag, open: Ast.TokenI
                 found = std.mem.eql(u8, tree.tokenSlice(i), self_name);
             },
             .comma, .r_paren => break,
-            // A type written some other way -- `anytype`, a slice, a function --
-            // is not this file's own type.
             else => return false,
         }
     }

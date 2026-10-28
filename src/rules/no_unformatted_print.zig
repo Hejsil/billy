@@ -1,10 +1,6 @@
-//! Disallows `print` of a string with nothing to format. `writeAll` says the
-//! same thing with one fewer argument, and a reader who sees `print` looks for
-//! what it is formatting: a constant is not a format, and an empty argument list
-//! is the tell.
+//! Disallows `print` of a string with nothing to format.
 
 pub const Config = struct {
-    /// The severity (off, warning, error).
     severity: zlinter.rules.LintProblemSeverity = .@"error",
 };
 
@@ -25,14 +21,11 @@ fn run(
     const arena = session.runtime.sessionArena();
     const tree = doc.tree(session);
     const tags = tree.tokens.items(.tag);
-    // The problems are taken from the session's own arena, which frees them
-    // once this rule has had its say, so the list needs no cleanup of its own.
+    // The problems are taken from the session's own arena, which frees them once this rule has had
+    // its say, so the list needs no cleanup of its own.
     // zlinter-disable-next-line require_errdefer_dealloc - the session's arena owns it
     var problems: std.ArrayList(zlinter.results.LintProblem) = .empty;
 
-    // `.print("text", .{})`, read as tokens: a method call, a string literal, a
-    // comma and an empty argument list. A declaration of `print` has no period
-    // before it, and a format that says anything has a brace in it.
     var i: Ast.TokenIndex = 2;
     while (i + 5 < tags.len) : (i += 1) {
         if (tags[i] != .identifier or tags[i - 1] != .period) continue;

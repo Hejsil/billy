@@ -1,17 +1,4 @@
 //! Rendering markdown for the terminal.
-//!
-//! A reply and a prompt are written in markdown, and a terminal has no browser to
-//! lay it out. The same parser the page uses reads it (`md.zig`), and this module
-//! writes the text a terminal shows: headings bold, lists bulleted, code set
-//! apart, a link clickable where the terminal takes escape codes. Only the
-//! display changes -- what a session stores and the model is sent keep the
-//! markdown as it was written.
-//!
-//! Nothing here measures the terminal. A line is written as it is and left for
-//! the terminal to wrap, which is how the terminal's own scrollback already
-//! works: billy prints a block once and never redraws it, so a width it read at
-//! one moment would be wrong the next. Structure the terminal cannot show is kept
-//! in place of colour, so the text still reads as markdown when piped to a file.
 
 const std = @import("std");
 
@@ -22,97 +9,52 @@ const terminal_width = @import("width.zig");
 
 const Markdown = @This();
 
-/// Deepest a list nests before its indent stops growing, so a malformed document
-/// cannot walk `list` off its end.
 const max_list_depth = 16;
-/// Columns a fenced or indented code block is set in, so it reads apart from the
-/// text around it.
 const code_indent = "    ";
-/// The line a horizontal rule is drawn with.
 const rule: [40]u8 = @splat('-');
-/// Most columns a table is read for, so a broken one cannot walk an array off its
-/// end.
 const max_columns = 32;
 
 gpa: std.mem.Allocator,
-/// Where the laid-out text goes, and the style it is decorated in. The renderer
-/// writes its own text through it and lays the codes of a style in between, which
-/// it asks the writer for rather than writing itself.
 writer: Writer,
-/// The first failure, kept here because a callback returns a number, not an
-/// error.
 err: ?anyerror = null,
 
-/// Newlines seen but not yet written. They are held back so a style or colour
-/// code that ends a block is written before the newline that closes it, and
-/// so the last block leaves no trailing newline for the caller's own to add
-/// to. Writing them is what `flush` does, just before the next text.
 pending_newlines: usize = 0,
-/// Whether the next text goes at the start of a line, where the indent is
-/// written. True at the very beginning, so the first block is indented too.
 at_line_start: bool = true,
 
 quote_depth: usize = 0,
 list_depth: usize = 0,
 list: [max_list_depth]ListFrame = undefined,
-/// Blocks inside a list or a quote, where the blank line between top-level
-/// blocks does not belong.
 container_depth: usize = 0,
-/// Whether anything has been written, so the first block opens without a
-/// blank line in front of it.
 emitted: bool = false,
-/// Whether a blank line is owed before the next top-level block.
 need_blank: bool = false,
-/// Whether the block being written is a heading, which is followed directly
-/// by what it heads rather than by a blank line.
 block_head: bool = false,
 in_code: bool = false,
 in_head: bool = false,
 
-/// How deep inside an image label this is: the label is the alt text, and it
-/// is gathered rather than written where it stands.
 image_depth: usize = 0,
 image_label: std.ArrayList(u8) = .empty,
-/// The address of the image being read, from its open to its close.
 image_url: []const u8 = "",
-/// The address of the link being written, from its open to its close: the parser
-/// reports it once, but a hyperlink is opened and closed around the text.
 link_url: []const u8 = "",
 
-/// Whether a table is being read. Its cells are buffered until all of it is
-/// in, so the columns can be aligned.
 table: bool = false,
 rows: std.ArrayList(Row) = .empty,
 row: std.ArrayList([]u8) = .empty,
 cell: std.ArrayList(u8) = .empty,
 aligns: std.ArrayList(md.c.MD_ALIGN) = .empty,
 
-/// Whether a list numbers its items, which is what sets its marker apart from a
-/// bullet.
 const Numbering = enum { ordered, unordered };
 
-/// One open list, so an ordered list can keep counting where it left off.
 const ListFrame = struct {
     numbering: Numbering = .unordered,
-    /// The number the next item of an ordered list is.
     next: usize = 1,
 };
 
-/// A row of a table while it is buffered, waiting for the column widths to be
-/// known: a table cannot be aligned until all of it has been read.
 const Row = struct {
     header: bool = false,
     cells: std.ArrayList([]u8) = .empty,
 };
 
-/// Writes `text`, read as markdown, as the terminal shows it. The writer's style
-/// decides whether bold, colour and links are written as escape codes or left
-/// out, which is what makes a pipe to a file read as plain structured text.
-///
-/// All the text is here at once, so it goes through the parser's batch mode:
-/// a replayed reply, a prompt and the page's HTML are read the way CommonMark
-/// reads the whole document. A live reply is read by `Stream` instead, which is
-/// the same parser built in its streaming mode.
+/// Writes `text`, read as markdown, as the terminal shows it.
 pub fn write(gpa: std.mem.Allocator, text: []const u8, writer: Writer) !void {
     var render = Markdown{ .gpa = gpa, .writer = writer };
     defer render.deinit();
@@ -120,35 +62,19 @@ pub fn write(gpa: std.mem.Allocator, text: []const u8, writer: Writer) !void {
     var callbacks = md.parser(Markdown);
     try md.parse(text, &callbacks, &render);
 
-    // A callback cannot return an error, so a failed write is kept on the
-    // renderer and reported here, once the parser has stopped.
+    // A callback cannot return an error, so a failed write is kept on the renderer and reported
+    // here, once the parser has stopped.
     if (render.err) |err| return err;
 }
 
-/// A renderer and the streaming parser driving it, kept together so the parser's
-/// `userdata` pointer stays valid for as long as the document does.
-///
-/// A reply arrives a fragment at a time and is written as it does. The parser
-/// holds a line back until it is complete, and the last line of a paragraph
-/// until the paragraph ends, since markdown cannot always be read before then.
-/// A reply therefore shows at line and paragraph boundaries rather than word by
-/// word, and a one-line reply appears when it is complete. The renderer owns no
-/// width and does not redraw, so what is written stays in the terminal's
-/// scrollback.
-///
-/// This is the parser's streaming mode, so it carries its documented limits: a
-/// loose list's first item may be written tight, and a reference link is only a
-/// link once its definition has arrived. A whole reply is replayed through the
-/// batch parser (`write`), which resolves both the way CommonMark says.
+/// A renderer and the streaming parser driving it, kept together so the parser's `userdata` pointer
+/// stays valid for as long as the document does.
 pub const Stream = struct {
     gpa: std.mem.Allocator,
-    /// Owned here rather than held by value, because the parser keeps a pointer
-    /// to it and a value could be moved.
     renderer: *Markdown,
     stream: md.Stream,
 
-    /// Starts a document. The block header and the blank line after the answer
-    /// are the caller's; this writes only the markdown itself.
+    /// Starts a document.
     pub fn open(gpa: std.mem.Allocator, writer: Writer) !Stream {
         const renderer = try gpa.create(Markdown);
         errdefer gpa.destroy(renderer);
@@ -163,17 +89,14 @@ pub const Stream = struct {
         };
     }
 
-    /// Writes more of the reply. A failed write is reported as the renderer's
-    /// own failure, which is the one the parser stopped on.
+    /// Writes more of the reply.
     pub fn feed(self: *Stream, text: []const u8) !void {
         self.stream.feed(text) catch |err| return self.renderer.err orelse err;
     }
 
-    /// Ends the document, writing the last line and closing the blocks still
-    /// open, and frees what was held for it. The stream is unusable afterwards.
+    /// Ends the document, writing the last line and closing the blocks still open, and frees what
+    /// was held for it.
     pub fn close(self: *Stream) !void {
-        // A document whose parse already stopped is not asked to flush the
-        // rest: the callback that stopped it may have left it part-written.
         var failure = self.renderer.err;
         if (!self.stream.failed and failure == null) {
             self.stream.flush() catch |err| {
@@ -199,8 +122,6 @@ fn deinit(self: *Markdown) void {
     self.freeTable();
 }
 
-/// Writes `bytes` on as they are, keeping the failure if there is one and
-/// returning whether the write worked, so a callback can stop the parse.
 fn raw(self: *Markdown, bytes: []const u8) bool {
     if (self.err != null) return false;
     self.writer.out.writeAll(bytes) catch |err| {
@@ -210,9 +131,6 @@ fn raw(self: *Markdown, bytes: []const u8) bool {
     return true;
 }
 
-/// Writes the newlines held back, so the next text starts on a line of its
-/// own. A style code written after a block ends is written before this, so it
-/// closes on the block's last line rather than below it.
 fn flush(self: *Markdown) bool {
     var i: usize = 0;
     while (i < self.pending_newlines) : (i += 1)
@@ -224,24 +142,15 @@ fn flush(self: *Markdown) bool {
     return true;
 }
 
-/// Ends the line: the newline is held until the next text, so nothing is
-/// written after the very last one.
 fn newline(self: *Markdown) void {
     self.pending_newlines += 1;
     self.at_line_start = true;
 }
 
-/// Ends the line the block being written is on, when it left one open. A
-/// block whose text already ended with a newline -- a code block, most of
-/// them -- is owed none, which is what keeps a single blank line between
-/// blocks rather than two.
 fn endLine(self: *Markdown) void {
     if (!self.at_line_start) self.newline();
 }
 
-/// Writes the prefix of a line: a bar for each quote it is inside, two spaces
-/// for each list, and the code indent inside a code block. Only at the start
-/// of a line, so a block writes its own indent once.
 fn writeIndent(self: *Markdown) bool {
     if (!self.at_line_start)
         return true;
@@ -261,8 +170,6 @@ fn writeIndent(self: *Markdown) bool {
     return true;
 }
 
-/// Writes `text` a line at a time, flushing the held newlines and writing the
-/// indent before each line's first character.
 fn put(self: *Markdown, text: []const u8) bool {
     var rest: []const u8 = text;
     while (rest.len > 0) {
@@ -281,19 +188,13 @@ fn put(self: *Markdown, text: []const u8) bool {
     return true;
 }
 
-/// Writes the blank line owed between top-level blocks, on top of the newline
-/// that ended the block before it.
 fn blank(self: *Markdown) bool {
     self.newline();
     return true;
 }
 
-/// Whether a block is a heading, which is followed by what it heads rather than
-/// by a blank line, or one of the others.
 const Head = enum { heading, body };
 
-/// Opens a block, writing the blank line owed before it. Only a top-level
-/// block takes one: inside a list or a quote the blocks run together.
 fn beginBlock(self: *Markdown, head: Head) bool {
     if (self.container_depth != 0) return true;
     if (self.emitted and self.need_blank and !self.blank()) return false;
@@ -302,14 +203,10 @@ fn beginBlock(self: *Markdown, head: Head) bool {
     return true;
 }
 
-/// Closes a block. A heading is owed no blank line, so what it heads follows
-/// it directly.
 fn endBlock(self: *Markdown) void {
     if (self.container_depth != 0) return;
     self.need_blank = !self.block_head;
 }
-
-// ---- blocks ----
 
 pub fn enterBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
     switch (block_type) {
@@ -332,7 +229,6 @@ pub fn enterBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyo
         },
         md.c.MD_BLOCK_H => {
             if (!self.beginBlock(.heading)) return false;
-            // A heading is its text in bold; the `#` is not shown.
             if (!self.raw(self.writer.bold())) return false;
         },
         md.c.MD_BLOCK_CODE => {
@@ -354,8 +250,8 @@ pub fn enterBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyo
                 self.aligns.append(self.gpa, cell.@"align") catch return self.fail();
             }
         },
-        // Raw HTML never reaches here (`md.flags` turns it off), and a block
-        // of an extension billy does not read is ignored.
+        // Raw HTML never reaches here (`md.flags` turns it off), and a block of an extension billy
+        // does not read is ignored.
         else => {},
     }
     return true;
@@ -394,9 +290,6 @@ pub fn leaveBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyo
             self.endBlock();
         },
         md.c.MD_BLOCK_P => {
-            // A paragraph keeps its own lines; the block ends with one more,
-            // which the held newlines turn into the blank line before what
-            // follows.
             self.endLine();
             self.endBlock();
         },
@@ -416,19 +309,14 @@ pub fn leaveBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyo
     return true;
 }
 
-/// How many lists deep the indent goes, which stops growing at `max_list_depth`.
 fn indentDepth(self: *const Markdown) usize {
     return @min(self.list_depth, max_list_depth);
 }
 
-/// Opens a list: remembers whether it is ordered and where its numbering
-/// starts, so an item can write its own marker.
 fn openList(self: *Markdown, numbering: Numbering, start: usize) bool {
     if (!self.beginBlock(.body))
         return false;
 
-    // Past the cap a list is still closed and indented like the one at the cap,
-    // and shares its numbering.
     if (self.list_depth < max_list_depth)
         self.list[self.list_depth] = .{ .numbering = numbering, .next = start };
 
@@ -437,16 +325,11 @@ fn openList(self: *Markdown, numbering: Numbering, start: usize) bool {
     return true;
 }
 
-/// Opens a list item: writes its marker and lets what follows write on the
-/// same line, indented to where the item's text begins.
 fn openItem(self: *Markdown, detail: *const md.c.MD_BLOCK_LI_DETAIL) bool {
-    // Start on a line of the item's own, ending the one before it if it left
-    // one open: a tight item has no paragraph to write the closing newline.
     self.endLine();
     if (!self.flush())
         return false;
 
-    // The item's own marker is one level in from the list's indent.
     self.at_line_start = true;
 
     var i: usize = 0;
@@ -486,8 +369,6 @@ fn openTable(self: *Markdown) bool {
     return true;
 }
 
-/// Writes the buffered table, aligned, and frees what was held for it. The
-/// header is underlined with a rule, so it reads as a header without a border.
 fn closeTable(self: *Markdown) bool {
     defer self.freeTable();
     self.table = false;
@@ -523,7 +404,6 @@ fn closeTable(self: *Markdown) bool {
     return true;
 }
 
-/// Writes the line under a table's header: dashes the width of each column.
 fn writeRule(self: *Markdown, widths: []const usize, columns: usize) bool {
     if (!self.flush()) return false;
     self.at_line_start = true;
@@ -549,7 +429,6 @@ fn writeCell(self: *Markdown, text: []const u8, width: usize, alignment: md.c.MD
     return self.fill(' ', after - before);
 }
 
-/// Writes `byte` `count` times.
 fn fill(self: *Markdown, byte: u8, count: usize) bool {
     if (self.err != null) return false;
     self.writer.out.splatByteAll(byte, count) catch |err| {
@@ -585,8 +464,6 @@ fn freeTable(self: *Markdown) void {
     self.aligns = .empty;
 }
 
-// ---- spans ----
-
 pub fn enterSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) bool {
     if (span_type == md.c.MD_SPAN_IMG) {
         const img: *const md.c.MD_SPAN_IMG_DETAIL = @ptrCast(@alignCast(detail.?));
@@ -594,8 +471,8 @@ pub fn enterSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaq
         self.image_depth += 1;
         return true;
     }
-    // Inside a table cell only the text is kept: a code of colour would make
-    // the column widths wrong.
+    // Inside a table cell only the text is kept: a code of colour would make the column widths
+    // wrong.
     if (self.table) return true;
     return switch (span_type) {
         md.c.MD_SPAN_EM => self.raw(self.writer.italic()),
@@ -603,7 +480,6 @@ pub fn enterSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaq
         md.c.MD_SPAN_CODE => self.raw(self.writer.dim()),
         md.c.MD_SPAN_DEL => self.raw(self.writer.strike()),
         md.c.MD_SPAN_A => self.openA(@ptrCast(@alignCast(detail.?))),
-        // An image is its alt text, written when the label has been read.
         else => true,
     };
 }
@@ -619,9 +495,6 @@ pub fn leaveSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaq
     };
 }
 
-/// Opens a link: a terminal that takes escape codes shows it as a hyperlink
-/// over its own text, with the address kept for the close. In plain text the
-/// address is written after the text instead (see `closeA`).
 fn openA(self: *Markdown, detail: *const md.c.MD_SPAN_A_DETAIL) bool {
     self.link_url = attribute(detail.href);
     if (self.writer.linkOpen().len == 0) return true;
@@ -633,8 +506,6 @@ fn closeA(self: *Markdown) bool {
     if (self.writer.linkOpen().len > 0) {
         if (!self.raw(self.writer.linkOpen()) or !self.raw(self.writer.linkClose())) return false;
     } else if (self.link_url.len > 0) {
-        // With no escape codes the address has to be visible, or the link is
-        // lost; it follows the text the way a printed markdown note would.
         if (!self.put(" (")) return false;
         if (!self.put(self.link_url)) return false;
         if (!self.put(")")) return false;
@@ -643,15 +514,10 @@ fn closeA(self: *Markdown) bool {
     return true;
 }
 
-/// Writes an image as its alt text, taken from the label just read, or its
-/// address when there is none. In a terminal that takes escape codes the text
-/// opens the image's address.
 fn closeImg(self: *Markdown) bool {
     self.image_depth -= 1;
     if (self.image_depth > 0) return true;
 
-    // The label was gathered as text; an image with no label is shown by its
-    // address, so something is written either way.
     const label = self.image_label.items;
     const has_label = std.mem.trim(u8, label, " \t\r\n").len > 0;
     const shown: []const u8 = if (has_label) label else self.image_url;
@@ -667,10 +533,7 @@ fn closeImg(self: *Markdown) bool {
     return true;
 }
 
-// ---- text ----
-
 pub fn writeText(self: *Markdown, text_type: md.c.MD_TEXTTYPE, text: []const u8) bool {
-    // Inside an image label every run is the alt text, gathered for the close.
     if (self.image_depth > 0) {
         self.image_label.appendSlice(self.gpa, text) catch return self.fail();
         return true;
@@ -678,18 +541,15 @@ pub fn writeText(self: *Markdown, text_type: md.c.MD_TEXTTYPE, text: []const u8)
     return switch (text_type) {
         // A NULL is replaced the way CommonMark says, rather than written.
         md.c.MD_TEXT_NULLCHAR => self.emit("\u{FFFD}"),
-        // A break of any kind is a newline: nothing here is re-wrapped, so
-        // the text is shown where it was written and left to the terminal.
         md.c.MD_TEXT_BR, md.c.MD_TEXT_SOFTBR => self.emit("\n"),
         md.c.MD_TEXT_ENTITY => self.writeEntity(text),
-        // A code block's text is written as it is: the newline that ends its
-        // last line is held like any other, so the colour code that closes
-        // the block lands on that line rather than below it.
+        // A code block's text is written as it is: the newline that ends its last line is held like
+        // any other, so the colour code that closes the block lands on that line rather than below
+        // it.
         else => self.emit(text),
     };
 }
 
-/// Writes a decoded entity, so `&amp;` reads back as `&`.
 fn writeEntity(self: *Markdown, text: []const u8) bool {
     var value: std.ArrayList(u8) = .empty;
     defer value.deinit(self.gpa);
@@ -697,8 +557,6 @@ fn writeEntity(self: *Markdown, text: []const u8) bool {
     return self.emit(value.items);
 }
 
-/// Hands `bytes` to the table cell being read, or writes them where they
-/// stand.
 fn emit(self: *Markdown, bytes: []const u8) bool {
     if (self.table) {
         self.cell.appendSlice(self.gpa, bytes) catch return self.fail();
@@ -707,21 +565,16 @@ fn emit(self: *Markdown, bytes: []const u8) bool {
     return self.put(bytes);
 }
 
-/// Stops the parse by returning a failure; the error itself is already on
-/// `err`.
 fn fail(self: *Markdown) bool {
     if (self.err == null) self.err = error.OutOfMemory;
     return false;
 }
 
-/// The bytes of a parser attribute, which is empty when it has no text.
 fn attribute(value: md.c.MD_ATTRIBUTE) []const u8 {
     if (value.text == null or value.size == 0) return "";
     return value.text[0..value.size];
 }
 
-/// Renders `text` and compares it to `expected`, so a test reads as the text a
-/// terminal shows rather than as the buffer around it.
 fn expectRendered(expected: []const u8, text: []const u8, style: Style) !void {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
@@ -740,19 +593,15 @@ fn expectAnsi(expected: []const u8, text: []const u8) !void {
 
 test "a paragraph is written as it stands" {
     try expectPlain("hello world", "hello world");
-    // Its own line breaks are kept, not re-wrapped.
     try expectPlain("one\ntwo", "one\ntwo");
 }
 
 test "inline markdown is set in the style of the terminal" {
-    // Plain text keeps the text and drops the style, so a pipe to a file reads.
     try expectPlain("bold and italic and code", "**bold** and *italic* and `code`");
-    // A terminal that takes escape codes shows each as it is meant.
     try expectAnsi(
         "\x1b[1mbold\x1b[0m and \x1b[3mitalic\x1b[0m and \x1b[2mcode\x1b[0m",
         "**bold** and *italic* and `code`",
     );
-    // Strike-through, which the model reaches for.
     try expectAnsi("\x1b[9mgone\x1b[0m", "~~gone~~");
 }
 
@@ -768,7 +617,6 @@ test "a list is bulleted and indented, a nested list further" {
 
 test "an ordered list keeps its numbers" {
     try expectPlain("1. one\n2. two", "1. one\n2. two");
-    // A list that starts at another number keeps it.
     try expectPlain("3. three\n4. four", "3. three\n4. four");
 }
 
@@ -794,9 +642,7 @@ test "a horizontal rule is a line of dashes" {
 }
 
 test "a link is clickable where the terminal takes escape codes, else its address is shown" {
-    // Plain text has no escape codes, so the address has to be written out.
     try expectPlain("the spec (https://example.com)", "[the spec](https://example.com)");
-    // A terminal that takes escape codes gets a hyperlink over the text alone.
     try expectAnsi(
         "\x1b]8;;https://example.com\x1b\\the spec\x1b]8;;\x1b\\",
         "[the spec](https://example.com)",
@@ -805,7 +651,6 @@ test "a link is clickable where the terminal takes escape codes, else its addres
 
 test "an image is shown as its alt text" {
     try expectPlain("a cat", "![a cat](cat.png)");
-    // With no alt text the address stands in, so something is shown.
     try expectPlain("cat.png", "![](cat.png)");
 }
 
@@ -817,7 +662,6 @@ test "a table is aligned in columns" {
 }
 
 test "a table is aligned by characters, not bytes" {
-    // "é" is two bytes but one column, so the cell is padded for one.
     try expectPlain(
         "name  n\n----  --\n\u{e9}     1\nabc   22",
         "| name | n |\n| --- | --- |\n| \u{e9} | 1 |\n| abc | 22 |",
@@ -838,7 +682,6 @@ test "a list nested past the indent cap is still shown" {
     const writer: Writer = .{ .out = &out.writer };
     try write(gpa, text.items, writer);
 
-    // The last line is as far in as the cap lets it go.
     const written = out.written();
     const last = written[std.mem.findScalarLast(u8, written, '\n').? + 1 ..];
     const indent: [2 * (max_list_depth - 1)]u8 = @splat(' ');
@@ -847,7 +690,6 @@ test "a list nested past the indent cap is still shown" {
 
 test "a block is set off from the one before it" {
     try expectPlain("one\n\ntwo", "one\n\ntwo");
-    // A heading is followed directly by what it heads, with no blank line.
     try expectPlain("Title\nthe body", "# Title\nthe body");
 }
 
@@ -869,8 +711,6 @@ test "a reply read in pieces is laid out like one read whole" {
     defer whole.deinit();
     try write(gpa, text, .{ .out = &whole.writer });
 
-    // The pieces cut through words, lines and multibyte characters, which is
-    // what a streamed reply does.
     var streamed: std.Io.Writer.Allocating = .init(gpa);
     defer streamed.deinit();
     var stream = try Stream.open(gpa, .{ .out = &streamed.writer });

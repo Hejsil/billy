@@ -1,11 +1,6 @@
-//! Disallows logging a failure and then returning it. The layer that explains a
-//! failure says it once: `main` prints whatever comes back from it, so an error
-//! that was already written to the log is written a second time, and a stack
-//! trace with it. What such a layer returns is `report.Reported`, which `main`
-//! counts as a failure and stays quiet about.
+//! Disallows logging a failure and then returning it.
 
 pub const Config = struct {
-    /// The severity (off, warning, error).
     severity: zlinter.rules.LintProblemSeverity = .@"error",
 };
 
@@ -26,13 +21,11 @@ fn run(
     const arena = session.runtime.sessionArena();
     const tree = doc.tree(session);
     const tags = tree.tokens.items(.tag);
-    // The problems are taken from the session's own arena, which frees them
-    // once this rule has had its say, so the list needs no cleanup of its own.
+    // The problems are taken from the session's own arena, which frees them once this rule has had
+    // its say, so the list needs no cleanup of its own.
     // zlinter-disable-next-line require_errdefer_dealloc - the session's arena owns it
     var problems: std.ArrayList(zlinter.results.LintProblem) = .empty;
 
-    // `std.log.err("...", ...); return <error>;` -- the log, the whole call of
-    // it, then the statement that hands the same failure on.
     var i: Ast.TokenIndex = 0;
     while (i + 4 < tags.len) : (i += 1) {
         if (tags[i] != .identifier) continue;
@@ -63,7 +56,6 @@ fn run(
         null;
 }
 
-/// The token of the `)` that closes the `(` at `open`.
 fn matchingParen(tree: Ast, open: Ast.TokenIndex) ?Ast.TokenIndex {
     const tags = tree.tokens.items(.tag);
     var depth: usize = 0;
@@ -81,11 +73,6 @@ fn matchingParen(tree: Ast, open: Ast.TokenIndex) ?Ast.TokenIndex {
     return null;
 }
 
-/// The failure a `return` starting at `start` hands back, if it hands back one
-/// that was just logged: an error literal such as `error.Unreadable`, or the
-/// error a `catch` captured. A `return` of a value that is not a failure -- a
-/// `false`, a `null`, a call -- is not this rule's business.
-/// Where a failure is written in the source: the first and last token of it.
 const Span = struct { first: Ast.TokenIndex, last: Ast.TokenIndex };
 
 fn returnedFailure(tree: Ast, tags: []const std.zig.Token.Tag, start: Ast.TokenIndex) ?Span {
@@ -97,8 +84,8 @@ fn returnedFailure(tree: Ast, tags: []const std.zig.Token.Tag, start: Ast.TokenI
     }
     if (tags[start] != .identifier) return null;
     if (start + 1 >= tags.len or tags[start + 1] != .semicolon) return null;
-    // An identifier that names a value rather than a failure is not reported
-    // here: `false` and `null` are answers, not errors handed on.
+    // An identifier that names a value rather than a failure is not reported here: `false` and
+    // `null` are answers, not errors handed on.
     const name = tree.tokenSlice(start);
     if (std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false")) return null;
     if (std.mem.eql(u8, name, "null") or std.mem.eql(u8, name, "undefined")) return null;

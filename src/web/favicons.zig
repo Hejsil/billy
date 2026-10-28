@@ -1,20 +1,13 @@
-//! The favicons of a web search: one small round bubble per result, which a page
-//! shows in the summary of the call so the sources are visible while the call is
-//! collapsed.
+//! The favicons of a web search: one small round bubble per result, which a page shows in the
+//! summary of the call so the sources are visible while the call is collapsed.
 
 const std = @import("std");
 
 const html = @import("../html.zig");
 const Search = @import("../Tools/web/Search.zig");
 
-/// Writes the favicons of a web search: one small round bubble per result,
-/// holding the source's own favicon and opening its url. They sit in the
-/// summary, so a page shows which sources were found without expanding the call.
-///
-/// A bubble is written only for a result with an `http(s)` address, since the
-/// favicon is fetched from its host and the bubble opens it. A result billy
-/// cannot link to is left to the body, and nothing is written at all for text
-/// that is not a list of results, such as a search that matched nothing.
+/// Writes the favicons of a web search: one small round bubble per result, holding the source's own
+/// favicon and opening its url.
 pub fn write(result: []const u8, out: *std.Io.Writer) !void {
     var origin_buffer: [256]u8 = undefined;
     var found = Search.Result.parse(result);
@@ -24,7 +17,6 @@ pub fn write(result: []const u8, out: *std.Io.Writer) !void {
     }
 }
 
-/// The host name of `url`, without the scheme, port or path.
 fn hostOf(url: []const u8) ?[]const u8 {
     const after_scheme = if (std.mem.find(u8, url, "://")) |i| url[i + 3 ..] else url;
     const end = std.mem.findAny(u8, after_scheme, "/:") orelse after_scheme.len;
@@ -33,10 +25,6 @@ fn hostOf(url: []const u8) ?[]const u8 {
     return host;
 }
 
-/// Writes one favicon bubble: the source's favicon, filling the round bubble and
-/// cropping to it, with the source's first letter behind it so a site that has no
-/// favicon still reads as a small bubble rather than a broken image. The host is
-/// the bubble's tooltip, and the whole bubble opens the result.
 fn bubble(found: Search.Result, origin: []const u8, out: *std.Io.Writer) !void {
     const host = hostOf(found.url) orelse return;
     try out.writeAll("<a class=\"fav\" href=\"");
@@ -51,10 +39,6 @@ fn bubble(found: Search.Result, origin: []const u8, out: *std.Io.Writer) !void {
     try out.writeAll("/favicon.ico\" alt=\"\" onerror=\"this.remove()\"></a>");
 }
 
-/// The origin of `url` -- its scheme and host, without the path -- written into
-/// `buffer`, or null when it is not an `http(s)` address with a host. A result's
-/// favicon is fetched from its origin, so a bubble only makes sense for a result
-/// whose origin is one billy will fetch from.
 fn originOf(url: []const u8, buffer: []u8) ?[]const u8 {
     const uri = std.Uri.parse(url) catch return null;
     if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https"))
@@ -68,8 +52,8 @@ fn originOf(url: []const u8, buffer: []u8) ?[]const u8 {
 test "a result with an http address is given a bubble, and one without is not" {
     const gpa = std.testing.allocator;
 
-    // The text a search wrote: two results billy can link to, and one it cannot,
-    // since a bubble's favicon is fetched from the host it opens.
+    // The text a search wrote: two results billy can link to, and one it cannot, since a bubble's
+    // favicon is fetched from the host it opens.
     const text =
         "1. Zig\n   https://ziglang.org\n   A language.\n\n" ++
         "2. Local\n   /tmp/notes.html\n   Not a page.\n\n" ++
@@ -80,12 +64,11 @@ test "a result with an http address is given a bubble, and one without is not" {
 
     const written = out.written();
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, written, "<a class=\"fav\""));
-    // The host is the tooltip and the first letter sits behind the image, so a
-    // site with no favicon still reads as a bubble.
+    // The host is the tooltip and the first letter sits behind the image, so a site with no favicon
+    // still reads as a bubble.
     try std.testing.expect(std.mem.find(u8, written, "title=\"ziglang.org\"") != null);
     try std.testing.expect(std.mem.find(u8, written, "<span class=\"letter\">d</span>") != null);
     try std.testing.expect(std.mem.find(u8, written, "/tmp/notes.html") == null);
-    // The favicon comes from the result's origin, with the path left behind.
     try std.testing.expect(std.mem.find(u8, written, "https://docs.example.org/favicon.ico") != null);
 }
 

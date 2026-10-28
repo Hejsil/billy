@@ -1,9 +1,6 @@
-//! Disallows a log message that ends in a newline. The log format ends the line
-//! itself, so a message that carries one of its own leaves a blank line under
-//! every entry, and the entries stop reading as one list.
+//! Disallows a log message that ends in a newline.
 
 pub const Config = struct {
-    /// The severity (off, warning, error).
     severity: zlinter.rules.LintProblemSeverity = .@"error",
 };
 
@@ -12,8 +9,6 @@ pub fn buildRule(options: zlinter.rules.RuleOptions) zlinter.rules.LintRule {
     return .{ .rule_id = "no_log_newline", .run = &run };
 }
 
-/// The levels `std.log` takes. `scoped` is not one of them: it takes a scope and
-/// answers a logger, whose own calls are not spelled `log.<level>`.
 const levels = [_][]const u8{ "err", "warn", "info", "debug" };
 
 fn run(
@@ -28,13 +23,11 @@ fn run(
     const arena = session.runtime.sessionArena();
     const tree = doc.tree(session);
     const tags = tree.tokens.items(.tag);
-    // The problems are taken from the session's own arena, which frees them
-    // once this rule has had its say, so the list needs no cleanup of its own.
+    // The problems are taken from the session's own arena, which frees them once this rule has had
+    // its say, so the list needs no cleanup of its own.
     // zlinter-disable-next-line require_errdefer_dealloc - the session's arena owns it
     var problems: std.ArrayList(zlinter.results.LintProblem) = .empty;
 
-    // `log.<level>("...", ...)`, read as tokens: the level is one of the four,
-    // and what follows it is the format string.
     var i: Ast.TokenIndex = 0;
     while (i + 4 < tags.len) : (i += 1) {
         if (tags[i] != .identifier) continue;
@@ -66,8 +59,6 @@ fn isLevel(name: []const u8) bool {
     return false;
 }
 
-/// Whether a string literal token ends with a newline, written as an escape in a
-/// quoted literal or as the line break that ends a multi-line one.
 fn endsWithNewline(literal: []const u8) bool {
     if (std.mem.endsWith(u8, literal, "\n")) return true;
     return std.mem.endsWith(u8, literal, "\\n\"");

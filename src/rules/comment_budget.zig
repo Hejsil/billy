@@ -1,17 +1,11 @@
-//! Caps how much of a file may be comment: a few lines to begin with, plus one
-//! more for every `code_per_line` lines of code. A comment costs a reader time
-//! and goes stale silently, so it has to be worth one of the few a file gets.
+//! Caps how much of a file may be comment: a few lines to begin with, plus one more for every
+//! `code_per_line` lines of code.
 
 pub const Config = struct {
-    /// The severity (off, warning, error).
     severity: zlinter.rules.LintProblemSeverity = .@"error",
 
-    /// Comment lines every file may spend, whatever it holds. A file of one line
-    /// has nothing that takes more than a few to explain, and one that is
-    /// complicated has the code to show for it, which is what buys the rest.
     allowance: u32 = 5,
 
-    /// One more comment line is allowed for every this many lines of code.
     code_per_line: u32 = 20,
 };
 
@@ -29,8 +23,8 @@ fn run(
     const config = options.getConfig(Config);
     if (config.severity == .off) return null;
 
-    // The lines are counted from the source rather than from the tokens: a
-    // multi-line string covers lines no token starts on, and those are code.
+    // The lines are counted from the source rather than from the tokens: a multi-line string covers
+    // lines no token starts on, and those are code.
     const source = doc.tree(session).source;
     var comment_lines: u32 = 0;
     var code_lines: u32 = 0;
@@ -49,7 +43,6 @@ fn run(
         comment_lines += 1;
         if (first == null) {
             const start = offset + (line.len - std.mem.trimStart(u8, line, " \t").len);
-            // `end` is the last byte of the span, as a token's end is.
             first = .{ .start = start, .end = start + text.len - 1 };
         }
     }

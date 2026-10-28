@@ -1,21 +1,10 @@
-//! A line diff of an edit: what the model asked to remove and what it asked to
-//! put in its place. It is the intent, not what the file actually became, so it
-//! is computed from the two strings of the call alone and a replayed session
-//! shows the same diff as the run it continues.
-//!
-//! The rendering is a `-`/`+` block with a few lines of context. The layout is
-//! presentation only: the file, the session and the model keep the text as it
-//! was written.
+//! A line diff of an edit: what the model asked to remove and what it asked to put in its place.
 
 const std = @import("std");
 
 const Terminal = @import("Terminal.zig");
 
-/// Context lines kept on each side of the change. A model often hands over the
-/// whole block it matched; only the lines nearest the change are worth showing.
 const context_lines = 3;
-/// Most removed, or added, lines shown before the rest is counted instead, so a
-/// whole file passed as one edit cannot flood the display.
 const max_hunk_lines = 20;
 
 /// How a line relates to the change, which is also the mark it is printed with.
@@ -23,11 +12,9 @@ pub const Kind = enum {
     context,
     removed,
     added,
-    /// Stands in for lines left out, holding the count in `hidden`.
     elided,
 
-    /// The single character a line of this kind opens with, as a unified diff
-    /// does. A line left out carries no mark of its own.
+    /// The single character a line of this kind opens with, as a unified diff does.
     pub fn mark(kind: Kind) u8 {
         return switch (kind) {
             .context => ' ',
@@ -38,27 +25,21 @@ pub const Kind = enum {
     }
 };
 
-/// One line of the diff. `text` points into the old or new string, so only the
-/// list of lines is allocated.
+/// One line of the diff.
 pub const Line = struct {
     kind: Kind,
     text: []const u8 = "",
-    /// For an `elided` line, how many lines it stands in for.
     hidden: usize = 0,
 };
 
-/// The diff of `old` into `new`, line by line. Common leading and trailing lines
-/// are context, trimmed to the few nearest the change; what is left of each
-/// string is the change itself, capped so a large edit stays readable. An empty
-/// result means the two are the same, so there is nothing to show.
+/// The diff of `old` into `new`, line by line.
 pub fn lines(gpa: std.mem.Allocator, old: []const u8, new: []const u8) ![]Line {
     const old_lines = try splitLines(gpa, old);
     defer gpa.free(old_lines);
     const new_lines = try splitLines(gpa, new);
     defer gpa.free(new_lines);
 
-    // The lines both sides open with, and the lines both sides close with. They
-    // cannot overlap: each is bounded by the other.
+    // The lines both sides open with, and the lines both sides close with.
     var prefix: usize = 0;
     while (prefix < old_lines.len and prefix < new_lines.len and
         std.mem.eql(u8, old_lines[prefix], new_lines[prefix])) : (prefix += 1)
@@ -70,14 +51,11 @@ pub fn lines(gpa: std.mem.Allocator, old: []const u8, new: []const u8) ![]Line {
 
     const removed = old_lines[prefix .. old_lines.len - suffix];
     const added = new_lines[prefix .. new_lines.len - suffix];
-    // Nothing changed: there is no diff to show.
     if (removed.len == 0 and added.len == 0) return gpa.alloc(Line, 0);
 
     var out: std.ArrayList(Line) = .empty;
     errdefer out.deinit(gpa);
 
-    // Only the context nearest the change is kept, so a wide match does not push
-    // the change off the screen.
     const kept_prefix = @min(prefix, context_lines);
     for (old_lines[prefix - kept_prefix .. prefix]) |line| {
         try out.append(gpa, .{ .kind = .context, .text = line });
@@ -91,8 +69,6 @@ pub fn lines(gpa: std.mem.Allocator, old: []const u8, new: []const u8) ![]Line {
     return out.toOwnedSlice(gpa);
 }
 
-/// Adds a whole side of the change, up to `max_hunk_lines` of it, counting the
-/// rest on an elided line.
 fn appendHunk(gpa: std.mem.Allocator, out: *std.ArrayList(Line), kind: Kind, lines_of: []const []const u8) !void {
     const shown = @min(lines_of.len, max_hunk_lines);
     for (lines_of[0..shown]) |line| try out.append(gpa, .{ .kind = kind, .text = line });
@@ -101,10 +77,8 @@ fn appendHunk(gpa: std.mem.Allocator, out: *std.ArrayList(Line), kind: Kind, lin
     }
 }
 
-/// Writes the diff the way billy shows it: a removed line red, an added line
-/// green, the context dim, and each line opened with the mark of its kind. The
-/// marks carry the meaning where the colour does not, such as a pipe or a
-/// colour-blind terminal.
+/// Writes the diff the way billy shows it: a removed line red, an added line green, the context
+/// dim, and each line opened with the mark of its kind.
 pub fn print(diff: []const Line, writer: Terminal.Writer) !void {
     for (diff) |line| {
         switch (line.kind) {
@@ -117,19 +91,13 @@ pub fn print(diff: []const Line, writer: Terminal.Writer) !void {
     }
 }
 
-/// Writes one line as its mark and its text in `hue`, so a removed line reads
-/// `-what it was` and an added line `+what it is`.
 fn markedLine(kind: Kind, text: []const u8, hue: Terminal.Writer.Color, writer: Terminal.Writer) !void {
     try writer.print("{s}{c}{s}{s}", .{ writer.color(hue), kind.mark(), text, writer.reset() });
 }
 
-/// The lines of `text`, without a trailing empty line for a terminating newline:
-/// `"a\nb\n"` is two lines, `"a\n\n"` is three, and `""` is none.
 fn splitLines(gpa: std.mem.Allocator, text: []const u8) ![]const []const u8 {
     var list: std.ArrayList([]const u8) = .empty;
     errdefer list.deinit(gpa);
-    // Each segment is appended once the next is seen, so the last one can be
-    // dropped when it is only the terminator of the line before it.
     var it = std.mem.splitScalar(u8, text, '\n');
     var previous: ?[]const u8 = null;
     while (it.next()) |line| {
@@ -160,8 +128,6 @@ test "a change in the middle keeps the lines around it" {
 
 test "the lines both sides share are context, and only the nearest are kept" {
     const gpa = std.testing.allocator;
-    // Five shared lines open the match, so only the last three are shown, and the
-    // shared line that closes it is kept.
     const diff = try lines(gpa, "1\n2\n3\n4\n5\nold\nz", "1\n2\n3\n4\n5\nnew\nz");
     defer gpa.free(diff);
 
@@ -186,7 +152,6 @@ test "an unchanged edit has no diff" {
 
 test "a large side is counted rather than shown whole" {
     const gpa = std.testing.allocator;
-    // 25 old lines replaced by one new line: only 20 are shown, the rest counted.
     var old: std.Io.Writer.Allocating = .init(gpa);
     defer old.deinit();
     for (0..25) |i| try old.writer.print("line {d}\n", .{i});

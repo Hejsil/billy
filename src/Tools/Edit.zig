@@ -42,10 +42,6 @@ const Amount = enum {
     all,
 };
 
-/// Replaces `needle` with `replacement` in `haystack`, matching exactly when it
-/// can and ignoring whitespace when it cannot. `replace == .all` changes every
-/// place the text appears. Without it, text that appears more than once is
-/// `ambiguous` rather than changed at a guess
 fn replace(
     gpa: std.mem.Allocator,
     haystack: []const u8,
@@ -61,8 +57,6 @@ fn replace(
     if (found.spans.items.len > 1 and amount == .one)
         return .{ .ambiguous = found.spans.items.len };
 
-    // An exact match is already laid out the way the haystack is, so only a loosely
-    // matched one is re-indented, to the indentation of the line it replaces.
     const reindented = if (found.rule == .exact)
         replacement
     else
@@ -88,14 +82,9 @@ fn replace(
     return .{ .applied = .{ .text = text, .count = found.spans.items.len } };
 }
 
-/// How `needle` was found
 const Matching = enum {
-    /// The text appears as it is written, byte for byte.
     exact,
-    /// The text appears once trailing whitespace and the line ending are ignored
-    /// on each line
     trailing_whitespace,
-    /// The text also appears ignoring the indentation in front of each line
     indentation,
 };
 
@@ -104,9 +93,6 @@ const Found = struct {
     spans: std.ArrayList(Span),
 };
 
-/// Finds `needle` in `haystack`, exact first and then loosely, returning the
-/// spans it covers and the rule that found them. An empty result means it was
-/// not found at all
 fn find(gpa: std.mem.Allocator, haystack: []const u8, needle: []const u8) !Found {
     var spans: std.ArrayList(Span) = .empty;
     errdefer spans.deinit(gpa);
@@ -123,8 +109,6 @@ fn find(gpa: std.mem.Allocator, haystack: []const u8, needle: []const u8) !Found
     if (spans.items.len > 0)
         return .{ .rule = .exact, .spans = spans };
 
-    // Whole lines now: the text is lined up line by line, with the whitespace a
-    // line carries left out of the comparison.
     for ([_]Matching{ .trailing_whitespace, .indentation }) |tier| {
         spans.clearRetainingCapacity();
 
@@ -140,8 +124,6 @@ fn find(gpa: std.mem.Allocator, haystack: []const u8, needle: []const u8) !Found
 
 const Span = struct { start: usize, end: usize };
 
-/// Finds `needle` in `haystack` as a run of whole lines, ignoring whitespace
-/// based on `trim`
 fn findLines(
     gpa: std.mem.Allocator,
     haystack: []const u8,
@@ -158,8 +140,6 @@ fn findLines(
     if (needle_lines.len == 0 or needle_lines.len > haystack_lines.len)
         return;
 
-    // Whether the text ends on a newline says whether the line it stops on is
-    // taken whole; without one, that line's own ending is left in the haystack.
     const ends_with_newline = needle[needle.len - 1] == '\n';
 
     var i: usize = 0;
@@ -183,17 +163,12 @@ fn findLines(
     }
 }
 
-/// One line of a haystack, by the offsets it occupies: `start` is its first byte,
-/// `content_end` the byte after its text, and `end` the byte after its line
-/// ending, which is `content_end` on a last line that has none.
 const Line = struct {
     start: usize,
     content_end: usize,
     end: usize,
 };
 
-/// Splits `text` into the lines it holds, each with its offsets. Text that ends
-/// on a newline does not gain an empty line after it.
 fn splitLines(gpa: std.mem.Allocator, text: []const u8) ![]Line {
     var lines: std.ArrayList(Line) = .empty;
     errdefer lines.deinit(gpa);
@@ -203,7 +178,6 @@ fn splitLines(gpa: std.mem.Allocator, text: []const u8) ![]Line {
         const newline = std.mem.findScalarPos(u8, text, at, '\n');
         const end = if (newline) |i| i + 1 else text.len;
         var content_end = if (newline) |i| i else text.len;
-        // A carriage return before the newline is the line ending, not the line.
         if (content_end > at and text[content_end - 1] == '\r') content_end -= 1;
         try lines.append(gpa, .{ .start = at, .content_end = content_end, .end = end });
         at = end;
@@ -217,7 +191,6 @@ const Trim = enum {
     trim,
 };
 
-/// A line as it is compared, with whitespace trimmed based on `trim`
 fn normalize(line: []const u8, trim: Trim) []const u8 {
     var text = line;
     if (trim != .trim_end) text = std.mem.trimStart(u8, text, " \t");
@@ -225,11 +198,6 @@ fn normalize(line: []const u8, trim: Trim) []const u8 {
     return text;
 }
 
-/// `text` with its lines shifted so that a block indented at `from` sits at `to`
-/// instead. This is how a loosely matched replacement keeps the indentation of
-/// the text it lands in: a line indented at least as far as `from` is moved with
-/// it, and one that is not, such as a blank line, is left where it is. The
-/// result is owned by `gpa`.
 fn reindent(gpa: std.mem.Allocator, text: []const u8, from: []const u8, to: []const u8) ![]u8 {
     if (std.mem.eql(u8, from, to))
         return gpa.dupe(u8, text);
@@ -252,29 +220,20 @@ fn reindent(gpa: std.mem.Allocator, text: []const u8, from: []const u8, to: []co
     return out.toOwnedSlice(gpa);
 }
 
-/// The whitespace in front of `line`, which is its indentation.
 fn indentOf(line: []const u8) []const u8 {
     return line[0 .. line.len - std.mem.trimStart(u8, line, " \t").len];
 }
 
-/// The first line of `text`, up to its line ending.
 fn firstLine(text: []const u8) []const u8 {
     return text[0 .. std.mem.findScalar(u8, text, '\n') orelse text.len];
 }
 
-/// What replacing `needle` produced: the new contents and how many places changed,
-/// or why no change could be made.
 const Change = union(enum) {
     applied: struct {
-        /// The haystack with the replacement applied
         text: std.ArrayList(u8),
-        /// How many places were changed.
         count: usize,
     },
-    /// The `needle` was not in the `haystack`, even ignoring whitespace.
     not_found,
-    /// The `needle` was in the `haystack` this many times, so which one to
-    /// change is unclear.
     ambiguous: usize,
 };
 
@@ -306,17 +265,14 @@ fn expectReplaceAll(expected: []const u8, contents: []const u8, old_string: []co
 }
 
 test "an exact match is changed where it is" {
-    // The line's own ending is not part of the text, so it is left in the `haystack`.
     try expectReplaceOne("let x = 42;\nlet y = 2;\n", "let x = 1;\nlet y = 2;\n", "let x = 1;", "let x = 42;");
-    // The ending is part of the text when the text carries it.
     try expectReplaceOne("qux();\n", "foo();\n", "foo();\n", "qux();\n");
-    // Text in the middle of a line, not only whole lines.
     try expectReplaceOne("a = 2; b = 3;\n", "a = 1; b = 3;\n", "a = 1;", "a = 2;");
 }
 
 test "an exact match is preferred over a loose one" {
-    // The first line matches exactly, so it is changed even though the second
-    // matches only once whitespace is ignored, which would be two candidates.
+    // The first line matches exactly, so it is changed even though the second matches only once
+    // whitespace is ignored, which would be two candidates.
     try expectReplaceOne("x = 1\n  x = 1\n", "x = 0\n  x = 1\n", "x = 0", "x = 1");
 }
 
@@ -337,7 +293,6 @@ test "text that is not in the haystack is not found" {
         .not_found => {},
         else => return error.TestExpectedNoMatch,
     }
-    // Nor when it is a different haystack than the one the lines were copied from.
     switch (try replace(gpa, "def\nabc\n", "abc\ndef\n", "q", .one)) {
         .not_found => {},
         else => return error.TestExpectedNoMatch,
@@ -345,27 +300,18 @@ test "text that is not in the haystack is not found" {
 }
 
 test "trailing whitespace and the line ending are ignored when exact fails" {
-    // Trailing spaces the model dropped from a copied line.
     try expectReplaceOne("qux();\nbar();\n", "foo();   \nbar();\n", "foo();\n", "qux();\n");
-    // A carriage return line ending where the text was written with a newline.
-    // Only the matched line is changed, so the rest keeps its own ending.
     try expectReplaceOne("qux();\nbar();\r\n", "foo();\r\nbar();\r\n", "foo();\n", "qux();\n");
-    // Trailing spaces the model added that the haystack does not have, in text
-    // written without a line ending, so the haystack keeps its own.
     try expectReplaceOne("qux();\n", "foo();\n", "foo();   ", "qux();");
 }
 
 test "indentation is ignored when the haystack is indented differently" {
-    // The text was written unindented but sits inside a block in the haystack. The
-    // replacement is indented to sit where the text did, so the block keeps its
-    // shape.
     try expectReplaceOne(
         "    if (x) {\n        z();\n    }\n",
         "    if (x) {\n        y();\n    }\n",
         "if (x) {\n    y();\n}\n",
         "if (x) {\n    z();\n}\n",
     );
-    // The same the other way: text indented more than the haystack it lands in.
     try expectReplaceOne(
         "if (x) {\n    z();\n}\n",
         "if (x) {\n    y();\n}\n",
@@ -384,8 +330,6 @@ test "a blank line in a loosely matched replacement carries no indentation" {
 }
 
 test "a replacement matched exactly is not re-indented" {
-    // The text matches byte for byte, so the replacement is left as written even
-    // though its own first line is indented differently.
     try expectReplaceOne(
         "one();\n        three();\n",
         "one();\n    two();\n",

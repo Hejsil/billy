@@ -1,12 +1,6 @@
-//! Disallows flushing a writer from a `defer`. A `defer` runs while whatever
-//! brought the scope to an end is still on its way out, so a flush that fails
-//! there has no one left to tell: the failure is either swallowed by a `catch`
-//! that can do nothing with it, or it replaces the failure that got there first.
-//! Flushing where the work ends puts the failure in a place that can answer for
-//! it. `errdefer` is the same shape with less to say, so it is checked too.
+//! Disallows flushing a writer from a `defer`.
 
 pub const Config = struct {
-    /// The severity (off, warning, error).
     severity: zlinter.rules.LintProblemSeverity = .@"error",
 };
 
@@ -27,8 +21,8 @@ fn run(
     const arena = session.runtime.sessionArena();
     const tree = doc.tree(session);
     const tags = tree.tokens.items(.tag);
-    // The problems are taken from the session's own arena, which frees them
-    // once this rule has had its say, so the list needs no cleanup of its own.
+    // The problems are taken from the session's own arena, which frees them once this rule has had
+    // its say, so the list needs no cleanup of its own.
     // zlinter-disable-next-line require_errdefer_dealloc - the session's arena owns it
     var problems: std.ArrayList(zlinter.results.LintProblem) = .empty;
 
@@ -37,7 +31,6 @@ fn run(
         if (tags[i] != .keyword_defer and tags[i] != .keyword_errdefer) continue;
         const end = bodyEnd(tags, i + 1) orelse continue;
 
-        // The first `flush(` in the body is enough: one is one too many.
         var j = i + 1;
         while (j < end) : (j += 1) {
             if (tags[j] != .identifier) continue;
@@ -62,8 +55,6 @@ fn run(
         null;
 }
 
-/// The last token of the statement `defer` governs at `start`: the `}` that
-/// closes its block, or the `;` that ends the one statement it defers.
 fn bodyEnd(tags: []const std.zig.Token.Tag, start: Ast.TokenIndex) ?Ast.TokenIndex {
     if (start >= tags.len) return null;
     var depth: usize = 0;

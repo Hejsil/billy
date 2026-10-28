@@ -1,17 +1,4 @@
 //! Rendering for the web frontend: the HTML a browser is given.
-//!
-//! Everything a model writes, a file holds or a user types reaches a page as
-//! text and nowhere else, so every one of those is escaped before it is written.
-//! A `<` in a file billy read is a `<` on the page, not the start of a tag.
-//!
-//! The markdown a reply is written in is read as CommonMark by the same parser
-//! the terminal uses (`markdown`, and `md.zig`), not by an approximation of it.
-//! Only the display changes: what a session stores and what the model is sent
-//! keep the markdown as written.
-//!
-//! A tool call is a `<details>` a page shows collapsed, so a conversation with
-//! many calls stays readable: the summary is the call's head and the body is what
-//! it ran and what it produced.
 
 const std = @import("std");
 
@@ -23,10 +10,8 @@ const models = @import("models.zig");
 const Session = @import("Session.zig");
 const Tools = @import("Tools.zig");
 
-/// Writes `text` with the characters that mean something in HTML replaced by the
-/// entities that mean the characters themselves. This is what every string
-/// coming from outside billy passes through before it reaches a page, so nothing
-/// a model or a file writes can become markup.
+/// Writes `text` with the characters that mean something in HTML replaced by the entities that mean
+/// the characters themselves.
 pub fn escape(text: []const u8, out: *std.Io.Writer) !void {
     var plain: usize = 0;
     for (text, 0..) |byte, i| {
@@ -35,8 +20,6 @@ pub fn escape(text: []const u8, out: *std.Io.Writer) !void {
             '<' => "&lt;",
             '>' => "&gt;",
             '"' => "&quot;",
-            // The hex form, which is what a CommonMark renderer writes for an
-            // apostrophe, so billy's escaping reads like any other renderer's.
             '\'' => "&#x27;",
             else => continue,
         };
@@ -48,39 +31,21 @@ pub fn escape(text: []const u8, out: *std.Io.Writer) !void {
 }
 
 /// Writes the markdown of a reply or a prompt as HTML.
-///
-/// Driving the parser's callbacks rather than handing the document to a renderer
-/// is what lets billy check a link's address before writing it: a renderer that
-/// writes a `javascript:` link as a link would let a reply run code.
 pub fn markdown(gpa: std.mem.Allocator, text: []const u8, out: *std.Io.Writer) !void {
     var render = Markdown{ .gpa = gpa, .out = out };
     var callbacks = md.parser(Markdown);
     try md.parse(text, &callbacks, &render);
-    // A callback cannot return an error, so a failed write is kept on the
-    // renderer and reported here, once the parser has stopped.
+    // A callback cannot return an error, so a failed write is kept on the renderer and reported
+    // here, once the parser has stopped.
     if (render.err) |err| return err;
 }
 
-/// Renders one document. It is the `userdata` the parser hands back to every
-/// callback, and holds the writer each piece goes to.
-///
-/// The parser's callbacks say *what* a piece of the document is, and this writes
-/// the HTML for it: the tags are the ones a CommonMark renderer writes, so the
-/// page gets the markup it expects, with a link's address checked on the way
-/// (`safeAddress`).
 const Markdown = struct {
     gpa: std.mem.Allocator,
     out: *std.Io.Writer,
-    /// The first failure of the writer. A callback returns a number, not an
-    /// error, so the failure is kept here and reported once the parse is over.
     err: ?std.Io.Writer.Error = null,
-    /// How deep inside an image label this is. The text of a label is an
-    /// attribute, so no tags are written there and a line break becomes a space.
     image_depth: usize = 0,
 
-    /// Writes `text` on, keeping the failure if there is one. Returns whether the
-    /// write worked, so a callback can stop the parse: the parser stops at the
-    /// first callback that returns non-zero.
     fn put(self: *Markdown, text: []const u8) bool {
         self.out.writeAll(text) catch |err| {
             self.err = err;
@@ -89,8 +54,6 @@ const Markdown = struct {
         return true;
     }
 
-    /// Writes a formatted run of HTML, where `put` writes text as it is. Returns
-    /// whether the write worked, so a callback can stop the parse the same way.
     fn print(self: *Markdown, comptime format: []const u8, args: anytype) bool {
         self.out.print(format, args) catch |err| {
             self.err = err;
@@ -99,7 +62,6 @@ const Markdown = struct {
         return true;
     }
 
-    /// Writes `text` escaped, so nothing in it can become markup.
     fn putEscaped(self: *Markdown, text: []const u8) bool {
         escape(text, self.out) catch |err| {
             self.err = err;
@@ -107,8 +69,6 @@ const Markdown = struct {
         };
         return true;
     }
-
-    // ---- blocks ----
 
     pub fn enterBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
         switch (block_type) {
@@ -130,9 +90,8 @@ const Markdown = struct {
             md.c.MD_BLOCK_TR => return self.put("<tr>\n"),
             md.c.MD_BLOCK_TH => return self.openCell("th", @ptrCast(@alignCast(detail.?))),
             md.c.MD_BLOCK_TD => return self.openCell("td", @ptrCast(@alignCast(detail.?))),
-            // Raw HTML never reaches here: `md.flags` turns it off, so it comes
-            // as text and is escaped. Anything else is a block of an extension
-            // billy does not read.
+            // Raw HTML never reaches here: `md.flags` turns it off, so it comes as text and is
+            // escaped.
             else => {},
         }
         return true;
@@ -163,15 +122,11 @@ const Markdown = struct {
         return true;
     }
 
-    /// A list that starts at a number other than one keeps it, so a list written
-    /// from 3 shows 3, 4, 5 rather than 1, 2, 3.
     fn openOl(self: *Markdown, detail: *const md.c.MD_BLOCK_OL_DETAIL) bool {
         if (detail.start == 1) return self.put("<ol>\n");
         return self.print("<ol start=\"{d}\">\n", .{detail.start});
     }
 
-    /// A task item is a disabled checkbox, so a `- [x]` reads as a checked box
-    /// rather than as its own text.
     fn openLi(self: *Markdown, detail: *const md.c.MD_BLOCK_LI_DETAIL) bool {
         if (detail.is_task == 0) return self.put("<li>");
         if (!self.put("<li class=\"task-list-item\">" ++
@@ -180,8 +135,6 @@ const Markdown = struct {
         return self.put(">");
     }
 
-    /// A fenced block keeps its language, which is what a highlighter would hang
-    /// off: `class="language-zig"`. An indented block has no language.
     fn openCode(self: *Markdown, detail: *const md.c.MD_BLOCK_CODE_DETAIL) bool {
         if (!self.put("<pre><code")) return false;
         if (detail.lang.text != null) {
@@ -192,7 +145,6 @@ const Markdown = struct {
         return self.put(">");
     }
 
-    /// A table cell, with the alignment the table asked for.
     fn openCell(self: *Markdown, tag: []const u8, detail: *const md.c.MD_BLOCK_TD_DETAIL) bool {
         if (!self.put("<")) return false;
         if (!self.put(tag)) return false;
@@ -204,13 +156,11 @@ const Markdown = struct {
         };
     }
 
-    // ---- spans ----
-
     pub fn enterSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) bool {
         const inside_image = self.image_depth > 0;
         if (span_type == md.c.MD_SPAN_IMG) self.image_depth += 1;
-        // Inside an image label only the text matters: it is the alt text, and a
-        // tag written there would break out of the attribute.
+        // Inside an image label only the text matters: it is the alt text, and a tag written there
+        // would break out of the attribute.
         if (inside_image) return true;
 
         switch (span_type) {
@@ -249,8 +199,6 @@ const Markdown = struct {
         return true;
     }
 
-    /// A link. Its address is checked, so one that could run code is written as a
-    /// link that goes nowhere (`safeAddress`).
     fn openA(self: *Markdown, detail: *const md.c.MD_SPAN_A_DETAIL) bool {
         if (!self.put("<a href=\"")) return false;
         if (!self.writeAttribute(&detail.href, .link)) return false;
@@ -275,51 +223,35 @@ const Markdown = struct {
         return self.put("\">");
     }
 
-    // ---- text ----
-
     pub fn writeText(self: *Markdown, text_type: md.c.MD_TEXTTYPE, text: []const u8) bool {
         switch (text_type) {
             // A NULL is replaced the way CommonMark says, rather than written.
             md.c.MD_TEXT_NULLCHAR => return self.put("\u{FFFD}"),
             md.c.MD_TEXT_BR => return self.put(if (self.image_depth == 0) "<br>\n" else " "),
             md.c.MD_TEXT_SOFTBR => return self.put(if (self.image_depth == 0) "\n" else " "),
-            // An entity is decoded to the character it stands for, then escaped
-            // like any other text, so `&amp;` reads back as `&`.
             md.c.MD_TEXT_ENTITY => {
                 var value: std.ArrayList(u8) = .empty;
                 defer value.deinit(self.gpa);
                 md.decodeEntity(self.gpa, text, &value) catch return self.fail();
                 return self.putEscaped(value.items);
             },
-            // Everything else is text: normal text, code inside a block or span,
-            // and -- with raw HTML turned off -- what would have been HTML.
+            // Everything else is text: normal text, code inside a block or span, and -- with raw
+            // HTML turned off -- what would have been HTML.
             else => return self.putEscaped(text),
         }
     }
 
-    /// Records that writing failed, having no error to carry; the write itself
-    /// put the error on the renderer.
     fn fail(self: *Markdown) bool {
         if (self.err == null) self.err = error.WriteFailed;
         return false;
     }
 
-    // ---- attribute values ----
-
-    /// What an attribute holds, which is what decides what is safe in it.
     const Attribute = enum {
-        /// Text, such as a link's title.
         text,
-        /// A link's address, checked against a scheme that could run code.
         link,
-        /// An image's address, which may be a `data:` image and so is held to
-        /// less than a link.
         image,
     };
 
-    /// Writes an attribute's value: an address that could run code becomes `#`,
-    /// and any other value is written escaped. The value is the entity-decoded
-    /// text, which is what the browser will read.
     fn writeAttribute(self: *Markdown, attribute: *const md.c.MD_ATTRIBUTE, kind: Attribute) bool {
         var value: std.ArrayList(u8) = .empty;
         defer value.deinit(self.gpa);
@@ -329,9 +261,6 @@ const Markdown = struct {
         return self.putEscaped(value.items);
     }
 
-    /// Reads an attribute into `value`, resolving the entities in it. The parser
-    /// hands an attribute over in runs, each of which is ordinary text, an entity
-    /// or a NULL character.
     fn decodeAttribute(self: *Markdown, attribute: *const md.c.MD_ATTRIBUTE, value: *std.ArrayList(u8)) !void {
         var i: usize = 0;
         while (attribute.substr_offsets[i] < attribute.size) : (i += 1) {
@@ -350,12 +279,6 @@ const Markdown = struct {
 const heading_open = [_][]const u8{ "<h1>", "<h2>", "<h3>", "<h4>", "<h5>", "<h6>" };
 const heading_close = [_][]const u8{ "</h1>\n", "</h2>\n", "</h3>\n", "</h4>\n", "</h5>\n", "</h6>\n" };
 
-/// Whether the address `url` is one that is safe to write into a page. The scheme
-/// of the address -- the run up to the first colon, with the whitespace and
-/// control characters a browser ignores taken out -- is refused when it could run
-/// code. A link is held to more than an image: `data:` in a link is another
-/// document to open, while an image loaded from `data:` is how a picture is
-/// written without a host to fetch it from.
 fn safeAddress(url: []const u8, is_link: bool) bool {
     var buffer: [16]u8 = undefined;
     const scheme = schemeOf(url, &buffer);
@@ -369,16 +292,9 @@ fn safeAddress(url: []const u8, is_link: bool) bool {
     return true;
 }
 
-/// The scheme of `url`, lower case and with the characters a browser skips taking
-/// out, written into `buffer`: letters up to and including the first colon, or an
-/// empty string for an address with no scheme, such as a relative one. This is
-/// how a browser reads the scheme, so a `java\tscript:` or a ` javascript:` is
-/// seen as the scheme it is.
 fn schemeOf(url: []const u8, buffer: []u8) []const u8 {
     var n: usize = 0;
     for (url) |byte| {
-        // A browser drops leading whitespace and control characters, and any
-        // inside the scheme, before it reads it.
         if (byte <= ' ' or byte == 0x7f) continue;
         if (byte == ':' or byte == '/' or byte == '?' or byte == '#') {
             if (byte == ':' and n < buffer.len) {
@@ -426,7 +342,6 @@ test "the characters that mean something in HTML are written as themselves" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    // Every one of them, and a string with none of them left as it was.
     try escape("<a href=\"x\">&'</a>", &out.writer);
     try std.testing.expectEqualStrings("&lt;a href=&quot;x&quot;&gt;&amp;&#x27;&lt;/a&gt;", out.written());
 
@@ -435,7 +350,6 @@ test "the characters that mean something in HTML are written as themselves" {
     try std.testing.expectEqualStrings("plain text 123", out.written());
 }
 
-/// Renders `text` as markdown and checks it against `expected`.
 fn expectMarkdown(expected: []const u8, text: []const u8) !void {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -449,7 +363,6 @@ test "a paragraph is one block, however the model wrapped it" {
         "<p>one line\nwrapped onto two</p>\n",
         "one line\nwrapped onto two\n",
     );
-    // Two paragraphs are two blocks.
     try expectMarkdown("<p>first</p>\n<p>second</p>\n", "first\n\nsecond\n");
 }
 
@@ -463,7 +376,6 @@ test "markup in the text is shown as text" {
 test "headings are written by their level" {
     try expectMarkdown("<h1>Title</h1>\n", "# Title\n");
     try expectMarkdown("<h3>Deeper</h3>\n", "### Deeper\n");
-    // Seven `#`, or a `#` with no space, is not a heading.
     try expectMarkdown("<p>####### no</p>\n", "####### no\n");
     try expectMarkdown("<p>#no</p>\n", "#no\n");
 }
@@ -471,19 +383,13 @@ test "headings are written by their level" {
 test "lists are written as lists, and do not run into a paragraph" {
     try expectMarkdown("<ul>\n<li>one</li>\n<li>two</li>\n</ul>\n", "- one\n- two\n");
     try expectMarkdown("<ol>\n<li>one</li>\n<li>two</li>\n</ol>\n", "1. one\n2. two\n");
-    // A change of kind closes one list and opens the other.
     try expectMarkdown(
         "<ul>\n<li>one</li>\n</ul>\n<ol>\n<li>two</li>\n</ol>\n",
         "- one\n1. two\n",
     );
-    // An unindented line after an item continues it, the way CommonMark reads
-    // a list; a blank line ends it, and then a paragraph is its own block.
     try expectMarkdown("<ul>\n<li>one\nafter</li>\n</ul>\n", "- one\nafter\n");
     try expectMarkdown("<ul>\n<li>one</li>\n</ul>\n<p>after</p>\n", "- one\n\nafter\n");
 
-    // A blank line between items does not end the list, and does not restart its
-    // numbering: the items are still one list, written as one. It does make the
-    // list "loose", so each item holds a paragraph, which is CommonMark.
     try expectMarkdown(
         "<ol>\n<li><p>one</p>\n</li>\n<li><p>two</p>\n</li>\n</ol>\n",
         "1. one\n\n2. two\n",
@@ -492,26 +398,19 @@ test "lists are written as lists, and do not run into a paragraph" {
         "<ul>\n<li><p>one</p>\n</li>\n<li><p>two</p>\n</li>\n</ul>\n",
         "- one\n\n- two\n",
     );
-    // A blank line, then something that is not an item, ends the list.
     try expectMarkdown(
         "<ol>\n<li>one</li>\n</ol>\n<p>after</p>\n",
         "1. one\n\nafter\n",
     );
-    // Blank lines, however many, do not end a list: the next item continues it,
-    // and the list is written as one loose list.
     try expectMarkdown(
         "<ol>\n<li><p>one</p>\n</li>\n<li><p>two</p>\n</li>\n</ol>\n",
         "1. one\n\n\n2. two\n",
     );
 
-    // A list starting at a number other than 1 keeps it, so it does not show as
-    // 1 where the model wrote 3.
     try expectMarkdown(
         "<ol start=\"3\">\n<li>three</li>\n<li>four</li>\n</ol>\n",
         "3. three\n4. four\n",
     );
-    // Every item written as 1 is still one list that counts up, which is how a
-    // model that numbers every item `1.` is meant to read.
     try expectMarkdown(
         "<ol>\n<li>one</li>\n<li>two</li>\n<li>three</li>\n</ol>\n",
         "1. one\n1. two\n1. three\n",
@@ -523,13 +422,11 @@ test "a code block is kept as it was written, and nothing in it is markup" {
         "<pre><code>const x = 1;\nif (x &lt; 2) return;\n</code></pre>\n",
         "```\nconst x = 1;\nif (x < 2) return;\n```\n",
     );
-    // A language names the block, and a tilde fence works like a backtick one.
     try expectMarkdown(
         "<pre><code class=\"language-zig\">x\n</code></pre>\n",
         "```zig\nx\n```\n",
     );
     try expectMarkdown("<pre><code>y\n</code></pre>\n", "~~~\ny\n~~~\n");
-    // A block the text ended inside is still closed.
     try expectMarkdown("<pre><code>x\n</code></pre>\n", "```\nx\n");
 }
 
@@ -543,7 +440,6 @@ test "a quote gathers its lines into one paragraph" {
 test "a rule is a rule, and not a list" {
     try expectMarkdown("<hr>\n", "---\n");
     try expectMarkdown("<hr>\n", "***\n");
-    // Fewer than three is not a rule.
     try expectMarkdown("<p>--</p>\n", "--\n");
 }
 
@@ -553,7 +449,6 @@ test "inline markdown is laid out inside a line" {
     try expectMarkdown("<p><strong>bold</strong></p>\n", "__bold__\n");
     try expectMarkdown("<p><em>italic</em></p>\n", "*italic*\n");
     try expectMarkdown("<p><em>italic</em></p>\n", "_italic_\n");
-    // Mixed, and nested: strong inside a paragraph, code inside strong.
     try expectMarkdown(
         "<p>a <strong>b and <code>c</code></strong> d</p>\n",
         "a **b and `c`** d\n",
@@ -561,21 +456,14 @@ test "inline markdown is laid out inside a line" {
 }
 
 test "code can hold a backtick, opened and closed by a longer run" {
-    // A run of backticks is closed by a run of the same length, which is the
-    // only way to write code that has a backtick in it.
     try expectMarkdown("<p><code>a ` b</code></p>\n", "``a ` b``\n");
-    // The spaces that set the body off from the backticks are not part of it.
     try expectMarkdown("<p><code>x</code></p>\n", "`` x ``\n");
-    // A run with nothing to close it is left as it is.
     try expectMarkdown("<p>no close `here</p>\n", "no close `here\n");
-    // Two spans in a line are two spans.
     try expectMarkdown("<p><code>a</code> <code>b</code></p>\n", "`a` `b`\n");
 }
 
 test "an underscore inside a word is part of the word" {
-    // A coding reply is full of these, so they are not emphasis.
     try expectMarkdown("<p>session_id and foo_bar_baz</p>\n", "session_id and foo_bar_baz\n");
-    // But one that starts and ends a word is.
     try expectMarkdown("<p><em>em</em> here</p>\n", "_em_ here\n");
 }
 
@@ -589,32 +477,23 @@ test "a link is written with an escaped address, and a dangerous one is not foll
         "<p><a href=\"https://example.com/a?b=1&amp;c=2\">the spec</a></p>\n",
         "[the spec](https://example.com/a?b=1&c=2)\n",
     );
-    // A relative address stays on the same host.
     try expectMarkdown("<p><a href=\"/docs\">docs</a></p>\n", "[docs](/docs)\n");
 
-    // A scheme that runs code is written as a link that goes nowhere, so the
-    // text of it reads but clicking it does nothing. See `safeAddress`.
     try expectMarkdown("<p><a href=\"#\">x</a></p>\n", "[x](javascript:alert(1))\n");
     try expectMarkdown("<p><a href=\"#\">x</a></p>\n", "[x](data:text/html,<b>)\n");
 }
 
 test "a scheme that could run code is refused however it is spelled" {
-    // The scheme is read the way a browser reads it: leading whitespace and
-    // control characters are skipped, and it is compared without regard to case.
     try std.testing.expect(!safeAddress("javascript:alert(1)", true));
     try std.testing.expect(!safeAddress(" javascript:alert(1)", true));
     try std.testing.expect(!safeAddress("java\tscript:alert(1)", true));
     try std.testing.expect(!safeAddress("JavaScript:alert(1)", true));
     try std.testing.expect(!safeAddress("vbscript:x", true));
 
-    // A `data:` address is another document to open, so a link may not use one;
-    // an image loaded from `data:` is how a picture is written without a host,
-    // so an image may.
     try std.testing.expect(!safeAddress("data:text/html,x", true));
     try std.testing.expect(!safeAddress("data:image/png;base64,x", true));
     try std.testing.expect(safeAddress("data:image/png;base64,x", false));
 
-    // An address with nothing to run is left alone.
     try std.testing.expect(safeAddress("https://example.com", true));
     try std.testing.expect(safeAddress("mailto:a@b.c", true));
     try std.testing.expect(safeAddress("/docs", true));
@@ -623,8 +502,6 @@ test "a scheme that could run code is refused however it is spelled" {
 }
 
 test "a scheme spelled with entities is caught" {
-    // A `javascript:` scheme can be hidden in entities. The address is decoded
-    // before it is read, so it is refused all the same.
     try expectMarkdown("<p><a href=\"#\">x</a></p>\n", "[x](jav&#x61;script:alert(1))\n");
     try expectMarkdown("<p><a href=\"#\">x</a></p>\n", "[x](javascript&colon;alert(1))\n");
 }
@@ -638,9 +515,6 @@ test "an image may be a data: image, but a link may not" {
 }
 
 test "a reply cannot forge an address attribute" {
-    // Raw HTML is off and text is escaped, so a reply that writes an attribute
-    // writes the text of one; only the markdown parser's own attributes are
-    // checked.
     try expectMarkdown(
         "<p>an &lt;a href=&quot;javascript:x&quot;&gt; tag</p>\n",
         "an <a href=\"javascript:x\"> tag\n",
@@ -648,8 +522,6 @@ test "a reply cannot forge an address attribute" {
 }
 
 test "a nested list is a nested list" {
-    // The shape the old renderer got wrong: a numbered item with detail indented
-    // under it.
     try expectMarkdown(
         "<ol>\n<li>one<ul>\n<li>nested</li>\n</ul>\n</li>\n<li>two</li>\n</ol>\n",
         "1. one\n   - nested\n2. two\n",
@@ -657,7 +529,6 @@ test "a nested list is a nested list" {
 }
 
 test "the GitHub extensions a reply uses are on" {
-    // Tables, strikethrough, task lists: the extensions a reply reaches for.
     try expectMarkdown(
         "<table>\n<thead>\n<tr>\n<th>a</th>\n<th>b</th>\n</tr>\n</thead>\n" ++
             "<tbody>\n<tr>\n<td>1</td>\n<td>2</td>\n</tr>\n</tbody>\n</table>\n",
@@ -705,33 +576,20 @@ test "a diff of code is escaped like any other text" {
     try diffLines(lines, &out.writer);
     try std.testing.expect(std.mem.find(u8, out.written(), "a &lt; b") != null);
     try std.testing.expect(std.mem.find(u8, out.written(), "a &gt; b") != null);
-    // The tags of the diff itself are still tags.
     try std.testing.expect(std.mem.find(u8, out.written(), "<span class=\"removed\">") != null);
 }
 
-/// Writes an element holding `text`, with the text escaped. The tag and the
-/// class are billy's own, written as they are; only the text comes from outside.
 fn element(comptime tag: []const u8, class: []const u8, text: []const u8, out: *std.Io.Writer) !void {
     try out.print("<{s} class=\"{s}\">", .{ tag, class });
     try escape(text, out);
     try out.print("</{s}>\n", .{tag});
 }
 
-/// The pill a tool call shows between its name and what it acted on: a
-/// fixed-width chip that holds the status the call exited with, so a status is
-/// always in the same place and the description after it always lines up.
-///
-/// Null, where one of these is taken, means the call has no status to show,
-/// which is every tool but bash.
 const Status = union(enum) {
-    /// The call is still running, so its status is not known yet.
     running,
-    /// The call has finished: the status it exited with, or null for a result
-    /// that carries none, as one stored before billy wrote the status does.
     finished: ?Tools.Exit,
 };
 
-/// Whether `call` is a bash call, the only kind with an exit status to show.
 fn showsStatus(call: Tools.Call) bool {
     return switch (call) {
         .bash => true,
@@ -739,15 +597,6 @@ fn showsStatus(call: Tools.Call) bool {
     };
 }
 
-/// Writes the pill for `status`: grey with three dots while the call runs, the
-/// colour of the exit and the code once it has one, and grey and empty for a
-/// finished call whose status was never recorded. The element is the same width
-/// in every case, so the description after it starts in the same place on every
-/// row and the row does not move when the call ends.
-///
-/// The dots are three elements of their own rather than an ellipsis character,
-/// since the page is what animates them: each comes and goes in turn, which is
-/// what the page's own stylesheet does with them.
 fn pill(status: Status, out: *std.Io.Writer) !void {
     switch (status) {
         .running => try out.writeAll(
@@ -771,38 +620,20 @@ fn pill(status: Status, out: *std.Io.Writer) !void {
     }
 }
 
-/// Writes the `<summary>` of a tool call's `<details>`: the name of the tool,
-/// the pill of its status when it has one, and what the call acted on. A
-/// collapsed call shows this line and nothing else, so it says which tool ran,
-/// what it ran on, and whether it worked.
-///
-/// No glyph: a tool call is already drawn as a folded block of its own, and the
-/// marks that tell one apart from a prompt in the terminal have nothing to add
-/// to a page, which has room to draw that difference itself.
 fn toolSummary(call: Tools.Call, result: []const u8, status: ?Status, out: *std.Io.Writer) !void {
     const head = Tools.Heading.of(call);
     try out.writeAll("<summary class=\"tool-head\">");
-    // The name is billy's own for a tool it implements, and the model's own for
-    // one it does not: a call naming a tool that is not there is headed by
-    // whatever it was called. So the name is text from outside, like the target
-    // under it, and is escaped the same way.
     try out.writeAll("<span class=\"name\">");
     try escape(head.name, out);
     try out.writeAll("</span>");
-    // What the call acts on. A bash call's heading carries the model's
-    // description of what the command does, or the command's first line when a
-    // call from before the tool asked for one has no description.
     const target = head.target;
     if (target.len > 0) {
         try out.writeAll(" <span class=\"target\">");
         try escape(target, out);
         try out.writeAll("</span>");
     }
-    // What the call produced, on a row of its own under the head: the status a
-    // bash call exited with, and the sources a web search found. It is written
-    // after the head in the markup, which is what puts it on the next row, so a
-    // long target is never cut short to make room for it. Both are in the
-    // summary, so a page shows them whether the call is open or collapsed.
+    // What the call produced, on a row of its own under the head: the status a bash call exited
+    // with, and the sources a web search found.
     if (status != null or call == .web_search) {
         try out.writeAll("<span class=\"produced\">");
         if (status) |state| try pill(state, out);
@@ -812,39 +643,20 @@ fn toolSummary(call: Tools.Call, result: []const u8, status: ?Status, out: *std.
     try out.writeAll("</summary>\n");
 }
 
-/// Writes the body of a tool call: what a page shows once the call is expanded.
-/// That is what the call meant to do -- an edit's diff, or the command a bash
-/// call runs -- and then what it produced. A call that is still running has
-/// nothing produced yet, and its result is the empty string, so the body is what
-/// it means to do and nothing more.
 fn toolBody(gpa: std.mem.Allocator, call: Tools.Call, result: []const u8, out: *std.Io.Writer) !void {
     switch (call) {
-        // The change the call means to make, from the call alone, so a replayed
-        // session shows the same diff the run did.
         .edit => |args| {
             const lines = try diff.lines(gpa, args.old_string, args.new_string);
             defer gpa.free(lines);
             if (lines.len > 0) try diffLines(lines, out);
         },
-        // A bash call shows the command it runs, as the model wrote it. The
-        // terminal lays it out with a format script; a page has no need of one.
         .bash => |args| try element("pre", "command", std.mem.trimEnd(u8, args.command, "\n"), out),
         else => {},
     }
     try toolResult(call, result, out);
 }
 
-/// Writes what a tool call produced, which is the other half of its body.
-///
-/// A write shows the content it put in the file rather than its result, since
-/// that content is what it produced; an edit shows nothing, since its result
-/// would only repeat the diff above it; a bash call shows the streams the
-/// command filled, without the status line the summary already carries; and a
-/// call that failed shows billy's message for the failure whatever it was asked
-/// to do. Anything else shows the text the call returned.
 fn toolResult(call: Tools.Call, result: []const u8, out: *std.Io.Writer) !void {
-    // A call still running has produced nothing, so there is no result to show
-    // and no empty element to leave behind.
     if (result.len == 0) return;
     const text = std.mem.trimEnd(u8, result, "\n");
     if (std.mem.startsWith(u8, result, "error: ")) {
@@ -854,11 +666,6 @@ fn toolResult(call: Tools.Call, result: []const u8, out: *std.Io.Writer) !void {
         .write => |args| try element("pre", "result", std.mem.trimEnd(u8, args.content, "\n"), out),
         .edit => {},
         .bash => {
-            // The status is the badge in the summary, so the body is only what
-            // the command printed. A result billy did not write is shown as it
-            // is, so a session saved before the status was written still shows
-            // everything. A call that has not run yet has no output, and the
-            // guard at the top has already left.
             const output = Tools.bashOutput(result) orelse
                 return element("pre", "result", text, out);
             if (output.stdout.len > 0)
@@ -872,41 +679,18 @@ fn toolResult(call: Tools.Call, result: []const u8, out: *std.Io.Writer) !void {
     }
 }
 
-/// Writes one block of a run as HTML. This is where the web's rendering of a
-/// session comes together: the blocks a run is made of, each as the element a
-/// page shows it as.
-///
-/// The text of a prompt and a reply is markdown, so it is laid out; everything
-/// else is the text it is, escaped. The classes name what a block is, so the
-/// page can style each kind without the renderer saying how it should look.
-///
-/// `gpa` is for what showing a block builds, which is an edit's diff; it is the
-/// caller's, freed before this returns.
+/// Writes one block of a run as HTML.
 pub fn block(gpa: std.mem.Allocator, b: Agent.Block, out: *std.Io.Writer) !void {
     switch (b) {
         .prompt => |text| try titled(gpa, "»", "prompt", text, out),
         .answer => |text| try titled(gpa, "◆", "answer", text, out),
-        // A tool call is one `<details>`, whose summary is the head and whose
-        // body is everything the call did. Each of the two blocks is a *whole*
-        // element: the `tool_begin` one a collapsed call with an empty body, and
-        // the `tool_end` one the same call with its body and its status filled
-        // in. Writing them next to each other -- as a stored conversation does --
-        // would leave two calls, so `Page` writes the call from its end alone;
-        // the stream, which sends them apart, shows the first and then replaces
-        // it with the second.
+        // A tool call is one `<details>`, whose summary is the head and whose body is everything
+        // the call did.
         .tool_begin => |call| {
             try out.writeAll("<details class=\"tool\">");
-            // A call still running shows a grey pill with an ellipsis, which the
-            // result replaces with the status when it arrives. Only bash has a
-            // status, so any other tool shows no pill. A call has no result yet,
-            // so a search shows no favicons while it runs.
             try toolSummary(call, "", if (showsStatus(call)) .running else null, out);
-            // What the call means to do is already known, so it is shown while
-            // the call runs: the command a bash call is about to run, and the
-            // change an edit means to make. Without it a long command would be
-            // invisible until it finished, which is the one moment a reader most
-            // wants to see what is being run. What the call produces is not known
-            // yet, so there is none of that.
+            // What the call means to do is already known, so it is shown while the call runs: the
+            // command a bash call is about to run, and the change an edit means to make.
             try out.writeAll("<div class=\"tool-body\">");
             try toolBody(gpa, call, "", out);
             try out.writeAll("</div></details>\n");
@@ -922,17 +706,12 @@ pub fn block(gpa: std.mem.Allocator, b: Agent.Block, out: *std.Io.Writer) !void 
             try toolBody(gpa, tool.call, tool.result, out);
             try out.writeAll("</div></details>\n");
         },
-        // A compaction stands in for the messages it replaced. What it holds is
-        // the ask and the summary, which a page could show; for now it is the
-        // line the terminal shows it as.
         .compacted => try element("div", "compacted", "⊟ compacted", out),
         .notice => |text| try element("div", "notice", text, out),
         .hidden => |count| try out.print("<div class=\"elided\">… {d} earlier blocks</div>\n", .{count}),
     }
 }
 
-/// Writes a block that is headed by a mark and holds markdown: a prompt or a
-/// reply.
 fn titled(gpa: std.mem.Allocator, glyph: []const u8, name: []const u8, text: []const u8, out: *std.Io.Writer) !void {
     try out.print("<div class=\"block {s}\"><div class=\"head\">", .{name});
     try out.writeAll("<span class=\"glyph\">");
@@ -958,8 +737,6 @@ test "a tool call is rendered as a whole element, both halves" {
         .arguments = "{\"path\":\"a.zig\"}",
     } });
 
-    // The half a stream sends while the call runs: the whole call, collapsed,
-    // with an empty body for the result to be added to.
     try block(gpa, .{ .tool_begin = call }, &out.writer);
     try std.testing.expectEqualStrings(
         "<details class=\"tool\"><summary class=\"tool-head\">" ++
@@ -970,8 +747,6 @@ test "a tool call is rendered as a whole element, both halves" {
     );
     out.clearRetainingCapacity();
 
-    // The half sent when the result arrives: the whole call again, with the body
-    // filled in, so a page can replace the first with it.
     try block(gpa, .{ .tool_end = .{ .call = call, .result = "1\tconst x = 1;" } }, &out.writer);
     try std.testing.expectEqualStrings(
         "<details class=\"tool\"><summary class=\"tool-head\">" ++
@@ -991,11 +766,8 @@ test "a call naming a tool billy has not got is headed by its name as text" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    // A call billy cannot run is headed by the name it named, which is the
-    // model's own string and not one of billy's. It is written as text, so a
-    // name holding markup is shown as the characters it is made of: a page puts
-    // this HTML in whole, and an unescaped name would be a page running a
-    // reply's script.
+    // A call billy cannot run is headed by the name it named, which is the model's own string and
+    // not one of billy's.
     const unknown = Tools.parse(arena, .{ .id = "1", .function = .{
         .name = "<img src=x onerror=alert(1)>",
         .arguments = "{}",
@@ -1009,8 +781,6 @@ test "a call naming a tool billy has not got is headed by its name as text" {
     try std.testing.expect(std.mem.find(u8, out.written(), "<img") == null);
     out.clearRetainingCapacity();
 
-    // A known tool whose arguments could not be read carries a name too, and it
-    // is the same string: escaped, whole, and with nothing of it a tag.
     const malformed = Tools.parse(arena, .{ .id = "1", .function = .{
         .name = "read\" onclick=\"x",
         .arguments = "{",
@@ -1037,9 +807,6 @@ test "a bash call shows its exit status in the head and its streams in the body"
         .arguments = "{\"command\":\"make\"}",
     } });
 
-    // The status the command exited with is a pill right after the tool's name,
-    // before what it acted on, and the two streams are shown apart under it,
-    // without the status line repeated.
     try block(gpa, .{ .tool_end = .{
         .call = bash,
         .result = "exit code: 2\nbuilt\nstderr:\nboom\n",
@@ -1056,16 +823,16 @@ test "a bash call shows its exit status in the head and its streams in the body"
     );
     out.clearRetainingCapacity();
 
-    // A command that succeeded reads ok, and one that printed nothing says so
-    // rather than leaving the body empty.
+    // A command that succeeded reads ok, and one that printed nothing says so rather than leaving
+    // the body empty.
     try block(gpa, .{ .tool_end = .{ .call = bash, .result = "exit code: 0\n(no output)\n" } }, &out.writer);
     try std.testing.expect(std.mem.find(u8, out.written(), "<span class=\"exit ok\" title=\"exit code 0\">✓ 0</span>") != null);
     try std.testing.expect(std.mem.find(u8, out.written(), "<pre class=\"result\">(no output)</pre>") != null);
     out.clearRetainingCapacity();
 
-    // A bash result billy did not write -- a session saved before the status was
-    // -- is shown as it is, with an empty grey pill rather than the running one:
-    // the call has finished, so nothing should claim it is still going.
+    // A bash result billy did not write -- a session saved before the status was -- is shown as it
+    // is, with an empty grey pill rather than the running one: the call has finished, so nothing
+    // should claim it is still going.
     try block(gpa, .{ .tool_end = .{ .call = bash, .result = "make: nothing to be done" } }, &out.writer);
     try std.testing.expect(std.mem.find(u8, out.written(), "<span class=\"exit unknown\" title=\"the exit status was not recorded\"></span>") != null);
     try std.testing.expect(std.mem.find(u8, out.written(), "running") == null);
@@ -1086,9 +853,6 @@ test "a running call shows a grey pill, and a finished one the status" {
         .arguments = "{\"command\":\"make\",\"description\":\"build it\"}",
     } });
 
-    // The half a stream sends while the command runs: a grey pill holding the
-    // dots the page animates, where the status will go, and the command it is
-    // about to run, which is the one moment a reader most wants to see it.
     try block(gpa, .{ .tool_begin = bash }, &out.writer);
     try std.testing.expectEqualStrings(
         "<details class=\"tool\"><summary class=\"tool-head\">" ++
@@ -1101,13 +865,9 @@ test "a running call shows a grey pill, and a finished one the status" {
     );
     out.clearRetainingCapacity();
 
-    // The half sent when the result arrives: the same row with the status in the
-    // pill, so replacing the first with it turns the dots into the status.
     try block(gpa, .{ .tool_end = .{ .call = bash, .result = "exit code: 0\n" } }, &out.writer);
     try std.testing.expect(std.mem.find(u8, out.written(), "<span class=\"exit ok\" title=\"exit code 0\">✓ 0</span>") != null);
 
-    // A tool with no status has no pill: not while it runs, and not when it is
-    // done.
     out.clearRetainingCapacity();
     const read = Tools.parse(arena, .{ .id = "1", .function = .{
         .name = "read",
@@ -1135,10 +895,6 @@ test "a bash call shows its command, and a write shows what it wrote" {
     } });
     try toolSummary(bash, "", null, &out.writer);
     try toolBody(arena, bash, "some output", &out.writer);
-    // The command is escaped like any other text, and its trailing newline does
-    // not add a blank line; the result follows it in the same body. The head
-    // carries the first line of the command too, so a collapsed call says what it
-    // ran.
     try std.testing.expectEqualStrings(
         "<summary class=\"tool-head\">" ++
             "<span class=\"name\">bash</span> <span class=\"target\">ls -la &lt;x&gt;</span></summary>\n" ++
@@ -1148,8 +904,6 @@ test "a bash call shows its command, and a write shows what it wrote" {
     );
     out.clearRetainingCapacity();
 
-    // A command over several lines: the head shows its first line, the body the
-    // whole of it.
     const multi = Tools.parse(arena, .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"cd /tmp\\nls\"}",
@@ -1162,8 +916,6 @@ test "a bash call shows its command, and a write shows what it wrote" {
     );
     out.clearRetainingCapacity();
 
-    // The description the model gave stands in front of the command, so a
-    // collapsed call says what it is for; the command is no longer in the head.
     const described = Tools.parse(arena, .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"cargo test --all\",\"description\":\"run the test suite\"}",
@@ -1176,8 +928,6 @@ test "a bash call shows its command, and a write shows what it wrote" {
     );
     out.clearRetainingCapacity();
 
-    // A write shows the content it put in the file, not the result that says it
-    // did, which is what the terminal shows too.
     const write = Tools.parse(arena, .{ .id = "1", .function = .{
         .name = "write",
         .arguments = "{\"path\":\"a.zig\",\"content\":\"hello\"}",
@@ -1186,7 +936,6 @@ test "a bash call shows its command, and a write shows what it wrote" {
     try std.testing.expectEqualStrings("<pre class=\"result\">hello</pre>\n", out.written());
     out.clearRetainingCapacity();
 
-    // A failure is shown as billy's message for it, whatever the call was.
     try toolBody(arena, write, "error: cannot write a.zig: AccessDenied", &out.writer);
     try std.testing.expectEqualStrings(
         "<pre class=\"error\">error: cannot write a.zig: AccessDenied</pre>\n",
@@ -1208,10 +957,6 @@ test "a web search shows its sources as favicons in the summary" {
         .arguments = "{\"query\":\"zig lang\"}",
     } });
 
-    // The results as the search wrote them, parsed back into one bubble per
-    // source. A bubble holds the source's own favicon, is titled by its host and
-    // opens it in a new tab, and the letter behind the icon is there for a source
-    // whose favicon does not load.
     try block(gpa, .{ .tool_end = .{
         .call = call,
         .result = "1. Zig\n   https://ziglang.org\n   A language.\n\n2. Docs\n   https://ziglang.org/documentation\n",
@@ -1250,9 +995,8 @@ test "a search with nothing to link to shows no favicons" {
         .arguments = "{\"query\":\"nothing\"}",
     } });
 
-    // A search that matched nothing, and one whose only result is not an `http(s)`
-    // address, both leave no bubbles. The row they would have sat in is still
-    // there, empty, since a status and the sources share it.
+    // A search that matched nothing, and one whose only result is not an `http(s)` address, both
+    // leave no bubbles.
     for ([_][]const u8{ "(no results)", "1. Odd\n   javascript:alert(1)\n" }) |result| {
         try block(gpa, .{ .tool_end = .{ .call = call, .result = result } }, &out.writer);
         try std.testing.expect(std.mem.find(u8, out.written(), "<a class=\"fav\"") == null);
@@ -1275,8 +1019,8 @@ test "an edit is shown as the diff of the strings it worked on" {
         .arguments = "{\"path\":\"a.zig\",\"old_string\":\"old\",\"new_string\":\"new\"}",
     } });
     try toolSummary(edit, "", null, &out.writer);
-    // The diff is the body, and the result of the edit shows nothing of its own
-    // -- it would only repeat the diff.
+    // The diff is the body, and the result of the edit shows nothing of its own -- it would only
+    // repeat the diff.
     try toolBody(arena, edit, "replaced 1 occurrence(s) in a.zig", &out.writer);
     try std.testing.expectEqualStrings(
         "<summary class=\"tool-head\">" ++
@@ -1287,7 +1031,6 @@ test "an edit is shown as the diff of the strings it worked on" {
     );
     out.clearRetainingCapacity();
 
-    // An edit that changes nothing shows no body at all.
     try toolBody(arena, .{ .edit = .{ .path = "a.zig", .old_string = "same", .new_string = "same" } }, "replaced 0 occurrence(s) in a.zig", &out.writer);
     try std.testing.expectEqualStrings("", out.written());
 }
@@ -1297,7 +1040,6 @@ test "the blocks of a run are each rendered as what they are" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    // A prompt and a reply are markdown, so they are laid out.
     try block(gpa, .{ .prompt = "hi <there>" }, &out.writer);
     try std.testing.expectEqualStrings(
         "<div class=\"block prompt\"><div class=\"head\"><span class=\"glyph\">»</span> " ++
@@ -1310,8 +1052,6 @@ test "the blocks of a run are each rendered as what they are" {
     try std.testing.expect(std.mem.find(u8, out.written(), "<strong>done</strong>") != null);
     out.clearRetainingCapacity();
 
-    // A compaction, a line billy writes, and the count of what a trimmed
-    // conversation left out.
     try block(gpa, .{ .compacted = .{ .prompt = "ask", .summary = "sum" } }, &out.writer);
     try std.testing.expectEqualStrings("<div class=\"compacted\">⊟ compacted</div>\n", out.written());
     out.clearRetainingCapacity();
@@ -1324,19 +1064,8 @@ test "the blocks of a run are each rendered as what they are" {
     try std.testing.expectEqualStrings("<div class=\"elided\">… 7 earlier blocks</div>\n", out.written());
 }
 
-/// Writes a stored conversation as HTML, oldest block first: what the web page
-/// shows when a session is opened. `gpa` is the run's, for the scratch each block
-/// needs while it is written.
-///
-/// `blocks` is how much of the conversation to show, counted in blocks the way a
-/// replay counts them: only the last `blocks` are written, with the count of what
-/// was left out in their place. Zero writes the whole conversation.
-///
-/// A session of thousands of blocks is megabytes of HTML and some hundred
-/// thousand elements for the page to build, which a browser does not do without
-/// a pause; the cap is what keeps opening one responsive. What is left out is a
-/// count rather than a link, since reading the rest is what the terminal's own
-/// replay is for.
+/// Writes a stored conversation as HTML, oldest block first: what the web page shows when a session
+/// is opened.
 pub fn conversation(
     gpa: std.mem.Allocator,
     session: *const Session,
@@ -1347,13 +1076,9 @@ pub fn conversation(
     try Agent.walk(gpa, session, blocks, page.emitter());
 }
 
-/// Shows each block of a conversation as its element. It is the emitter `walk`
-/// takes, so a conversation is rendered by the same walk a terminal replay is.
 const Page = struct {
     gpa: std.mem.Allocator,
     out: *std.Io.Writer,
-    /// The emitter `walk` shows through. A written conversation is not watched,
-    /// so nothing reads its count; the interface holds it all the same.
     interface: Agent.Emitter = .{ .vtable = &vtable },
 
     const vtable: Agent.Emitter.VTable = .{ .block = show };
@@ -1364,10 +1089,8 @@ const Page = struct {
 
     fn show(e: *Agent.Emitter, b: Agent.Block) anyerror!void {
         const page: *Page = @alignCast(@fieldParentPtr("interface", e));
-        // A tool call is written from its `tool_end`, which is the whole call --
-        // head, body and status. The `tool_begin` half exists only for a stream
-        // that shows the head while the call runs, so a written conversation
-        // leaves it out rather than showing every call twice.
+        // A tool call is written from its `tool_end`, which is the whole call -- head, body and
+        // status.
         switch (b) {
             .tool_begin => return,
             else => {},
@@ -1385,9 +1108,6 @@ test "a whole conversation is rendered, a tool call and a compaction included" {
     var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
 
-    // A prompt and a reply, a tool call with its result, an edit with its diff,
-    // and a compaction standing in for the conversation before it. The system
-    // prompt is its own field, which the conversation does not show.
     try session.setSystemPrompt("be terse");
     try session.append(.{ .role = .user, .content = "read it" });
     try session.append(.{ .role = .assistant, .tool_calls = &.{.{
@@ -1408,34 +1128,22 @@ test "a whole conversation is rendered, a tool call and a compaction included" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    // The whole conversation: this test is about how a block is written.
     try conversation(gpa, &session, 0, &out.writer);
     const page = out.written();
 
-    // The prompt is a block of its own, and its text is laid out as markdown.
     try std.testing.expect(std.mem.find(u8, page, "<div class=\"block prompt\">") != null);
     try std.testing.expect(std.mem.find(u8, page, "<p>read it</p>") != null);
-    // The read call is headed and its result is the body, wrapped in one
-    // `<details>` that a page shows collapsed until it is opened.
     try std.testing.expect(std.mem.find(u8, page, "<details class=\"tool\">") != null);
     try std.testing.expect(std.mem.find(u8, page, "<summary class=\"tool-head\">") != null);
     try std.testing.expect(std.mem.find(u8, page, "<span class=\"name\">read</span>") != null);
     try std.testing.expect(std.mem.find(u8, page, "<pre class=\"result\">1\tconst x = 1;</pre>") != null);
     try std.testing.expect(std.mem.find(u8, page, "</div></details>\n") != null);
-    // Each call is written once, from its `tool_end`: the `tool_begin` half is
-    // for a stream, so a written conversation has one element per call -- the read
-    // and the edit -- not two.
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, page, "<details class=\"tool\">"));
-    // The details is not opened, so a page shows it collapsed to begin with.
     try std.testing.expect(std.mem.find(u8, page, "<details class=\"tool\" open>") == null);
-    // The edit is shown as its diff, and no result of its own.
     try std.testing.expect(std.mem.find(u8, page, "<span class=\"removed\">-old</span>") != null);
     try std.testing.expect(std.mem.find(u8, page, "<span class=\"added\">+new</span>") != null);
     try std.testing.expect(std.mem.find(u8, page, "replaced 1 occurrence") == null);
-    // The reply's markdown is laid out.
     try std.testing.expect(std.mem.find(u8, page, "<p>done <strong>now</strong></p>") != null);
-    // The compaction is one line, and neither the ask nor the summary is shown
-    // as a block of its own.
     try std.testing.expect(std.mem.find(u8, page, "<div class=\"compacted\">") != null);
     try std.testing.expect(std.mem.find(u8, page, "the summary so far") == null);
     try std.testing.expect(std.mem.find(u8, page, "summarize") == null);
@@ -1443,35 +1151,24 @@ test "a whole conversation is rendered, a tool call and a compaction included" {
     try std.testing.expect(std.mem.find(u8, page, "be terse") == null);
 }
 
-/// The line above a conversation: the session, the model it runs, the directory
-/// it works in, and how full the context window is. It is the
-/// same text the terminal puts above its prompt, laid out for a page.
+/// The line above a conversation: the session, the model it runs, the directory it works in, and
+/// how full the context window is.
 pub const Header = struct {
-    /// The session being shown.
     id: []const u8,
-    /// The provider and model the session runs, as `<provider>/<model>`, the
-    /// same choice the terminal header shows.
     model: []const u8,
-    /// The directory the session works in, shortened to `~` when it is inside
-    /// `home`.
     cwd: []const u8,
     home: ?[]const u8,
-    /// Tokens in the conversation as of the last request.
     context_tokens: usize,
-    /// The window, or null for a model billy does not know, which has no gauge.
     model_info: ?models.Metadata,
 };
 
-/// Writes the header as HTML. Every count is formatted by the same helpers the
-/// terminal header uses, so the two read the same numbers the same way.
+/// Writes the header as HTML.
 pub fn header(h: Header, out: *std.Io.Writer) !void {
     try out.writeAll("<div class=\"header\">");
     try part("id", h.id, out);
     try out.writeAll("<span class=\"sep\">·</span>");
     try part("model", h.model, out);
     try out.writeAll("<span class=\"sep\">·</span><span class=\"cwd\">");
-    // The directory is shortened by the same helper the terminal header uses,
-    // and escaped like every other value that reaches the page.
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     try escape(Agent.displayPath(&path_buffer, h.cwd, h.home), out);
     try out.writeAll("</span>");
@@ -1488,8 +1185,6 @@ pub fn header(h: Header, out: *std.Io.Writer) !void {
     try out.writeAll("</div>\n");
 }
 
-/// Writes one part of the header as a span classed by what it is, with the text
-/// escaped. The dot between parts is a part of its own, so a page can space it.
 fn part(class: []const u8, text: []const u8, out: *std.Io.Writer) !void {
     try out.print("<span class=\"{s}\">", .{class});
     try escape(text, out);
@@ -1510,7 +1205,6 @@ test "the header carries the model, the directory and the gauge" {
         .model_info = .{ .context_window = 128_000 },
     }, &out.writer);
 
-    // The same numbers the terminal header shows, each in a part of its own.
     try std.testing.expectEqualStrings(
         "<div class=\"header\">" ++
             "<span class=\"id\">01HF7YAT000000000000000000</span>" ++
@@ -1523,8 +1217,8 @@ test "the header carries the model, the directory and the gauge" {
     );
     out.clearRetainingCapacity();
 
-    // A model billy does not know has no window, so the gauge is left out rather
-    // than shown as zero.
+    // A model billy does not know has no window, so the gauge is left out rather than shown as
+    // zero.
     try header(.{
         .id = "dev",
         .model = "who-knows",
@@ -1543,7 +1237,6 @@ test "the header carries the model, the directory and the gauge" {
         out.written(),
     );
 
-    // A path a model or a directory could carry is escaped like any other text.
     out.clearRetainingCapacity();
     try header(.{
         .id = "x<y",

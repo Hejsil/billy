@@ -6,16 +6,13 @@ const Server = @import("billy").Server;
 const spaghet = @import("spaghet");
 const Terminal = @import("billy").Terminal;
 
-/// What billy is, shown at the top of its own help.
 const billy_about = "A small fast AI agent that works in your terminal.";
 
-/// What the `login` subcommand is for, shown in its help.
 const login_about =
     \\Store an API key for a service. With no service, list the services billy
     \\needs a key for and whether one is stored.
 ;
 
-/// What the `config` subcommand is for, shown in its help.
 const config_about =
     \\Set one setting in the configuration file, named by its dotted path, and
     \\write it back, so a setting can be changed without opening the file by
@@ -24,7 +21,6 @@ const config_about =
     \\has no value.
 ;
 
-/// What the `serve` subcommand is for, shown in its help.
 const serve_about =
     \\Run billy as a server with a web frontend instead of in the terminal.
     \\It listens on this machine only unless another address is asked for, and
@@ -32,22 +28,18 @@ const serve_about =
     \\so only listen where that is meant.
 ;
 
-/// What the `models` subcommand is for, shown in its help.
 const models_about =
     \\Show how many providers and models the cached catalog holds, or fetch it
     \\again from models.dev. The catalog is fetched automatically the first time
     \\a run needs it.
 ;
 
-/// What the `sessions` subcommand is for, shown in its help.
 const sessions_about =
     \\List the sessions billy has kept, the one written to most recently first,
     \\one to a line: the id to resume it by, and the title it was given. A
     \\session that has not been named yet is listed by its id alone.
 ;
 
-/// The subcommands billy itself has, and what each is for, shown in billy's own
-/// help.
 const billy_commands =
     \\  login [<service>]         store an API key, or list the services
     \\  config <setting> <value>  set a configuration setting by its path
@@ -56,25 +48,21 @@ const billy_commands =
     \\  serve                     run the web frontend
 ;
 
-/// The options billy itself takes.
 const run_options =
     \\  -r, --resume [<session>]  continue the session named, or with none named
     \\                            the one written to most recently in this directory
     \\  -h, --help                print this message
 ;
 
-/// The options the `models` subcommand takes.
 const models_options =
     \\      --refresh   fetch the catalog from models.dev again
     \\  -h, --help      print this message
 ;
 
-/// The options a subcommand takes, when it takes none but the usage itself.
 const command_options =
     \\  -h, --help  print this message
 ;
 
-/// The options the `serve` subcommand takes.
 const serve_options =
     \\  -p, --port <port>  the port to listen on, by default 8787
     \\      --host <addr>  the address to listen on, by default 127.0.0.1;
@@ -83,13 +71,6 @@ const serve_options =
     \\  -h, --help         print this message
 ;
 
-/// Prints a help message: how the command is invoked, what it is for, the
-/// subcommands it has, and the options it takes. Every message has those parts
-/// in that order, so billy's own help and a subcommand's read alike.
-///
-/// `commands` is what the command itself can be asked for, or null when it has
-/// none, as `login` and `config` do: a subcommand lists only the subcommands it
-/// has, and a command that has none says nothing of them.
 fn printHelp(
     out: Terminal.Writer,
     invocation: []const u8,
@@ -103,11 +84,7 @@ fn printHelp(
 }
 
 const Options = struct {
-    /// The session to continue, or `--resume` with none named, which is the one
-    /// written to most recently in the working directory. A new session is
-    /// started when this is null.
     resuming: ?Billy.Resume = null,
-    /// Whether the user asked for usage instead of a run.
     help: bool = false,
 
     command: Command = .none,
@@ -123,58 +100,37 @@ const Options = struct {
 
     const Login = struct {
         service: ?[]const u8 = null,
-        /// Whether the user asked for this subcommand's usage.
         help: bool = false,
     };
 
     const Models = struct {
-        /// Whether to fetch the catalog again instead of reading the cache.
         refresh: bool = false,
-        /// Whether the user asked for this subcommand's usage.
         help: bool = false,
     };
 
     const Config = struct {
-        /// The setting to change, named by its dotted path. Null when only the
-        /// usage was asked for.
         path: ?[]const u8 = null,
-        /// The text to set the setting to. Null when only the usage was asked
-        /// for.
         value: ?[]const u8 = null,
-        /// Whether the user asked for this subcommand's usage.
         help: bool = false,
     };
 
     const Serve = struct {
-        /// The address to listen on. Loopback unless asked otherwise, since the
-        /// server has no authentication and its routes run commands as the user.
         host: []const u8 = Server.default_host,
-        /// The port to listen on. Zero asks the system for a free one.
         port: u16 = Server.default_port,
-        /// Whether the user asked for this subcommand's usage.
         help: bool = false,
     };
 
-    /// The `sessions` subcommand takes nothing but its own usage.
     const Sessions = struct {
-        /// Whether the user asked for this subcommand's usage.
         help: bool = false,
     };
 };
 
-/// Runs what the command line asked for, and returns the code the process exits
-/// with. A failure is answered where it happens, so what comes back here is
-/// either nothing, or a failure nobody has put into words yet.
+/// Runs what the command line asked for, and returns the code the process exits with.
 pub fn main(init: std.process.Init) u8 {
     return run(init) catch |err| fail(err);
 }
 
-/// Reads the command line and answers it through one writer, which is pushed out
-/// on the way out of here rather than from a `defer`, so what a command printed
-/// is on its way before the code the run ended with is answered.
 fn run(init: std.process.Init) !u8 {
-    // Anything that lives as long as the process, including the conversation,
-    // is allocated here.
     const arena = init.arena.allocator();
     const io = init.io;
 
@@ -186,15 +142,11 @@ fn run(init: std.process.Init) !u8 {
         },
     };
 
-    // The writer is made once the command line is read, so the way out above has
-    // no buffer to push out, and the buffer it does hold is pushed out below
-    // rather than from a `defer`: what a command printed is on its way before
-    // the code the run ended with is answered.
+    // The writer is made once the command line is read, so the way out above has no buffer to push
+    // out, and the buffer it does hold is pushed out below rather than from a `defer`: what a
+    // command printed is on its way before the code the run ended with is answered.
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
-    // Everything billy prints goes through one writer, which decorates its blocks
-    // only when it is a terminal it is printing to. A subcommand that prints no
-    // blocks writes the same text either way.
     const out = Terminal.Writer.detect(&stdout_file_writer);
 
     const code = answer(init, out, options) catch |err| {
@@ -205,13 +157,6 @@ fn run(init: std.process.Init) !u8 {
     return code;
 }
 
-/// What a run answers when what it printed could not be written.
-///
-/// A reader that went away -- `billy list | head` -- is not a failure of the
-/// run's: the lines it asked for were written, and a shell that closed the pipe
-/// has what it wanted. Anything else is one, said once here in the words of the
-/// write that failed: the writer interface reports every failed write as
-/// `WriteFailed`, and the file writer behind it is what noticed the cause.
 fn writeFailure(stdout: *std.Io.File.Writer, err: anyerror) anyerror!u8 {
     const cause: anyerror = if (err == error.WriteFailed) stdout.err orelse err else err;
     if (cause == error.BrokenPipe) return 0;
@@ -219,16 +164,12 @@ fn writeFailure(stdout: *std.Io.File.Writer, err: anyerror) anyerror!u8 {
     return report.Reported;
 }
 
-/// Everything the command line asked for, through `out`: the code the process
-/// exits with, zero when it did what was asked.
 fn answer(init: std.process.Init, out: Terminal.Writer, options: Options) !u8 {
-    // A usage is answered before anything is read, so it works even when billy's
-    // own files cannot be: which of them asked is the command's own business, so
-    // it is printed here rather than in each arm below.
+    // A usage is answered before anything is read, so it works even when billy's own files cannot
+    // be: which of them asked is the command's own business, so it is printed here rather than in
+    // each arm below.
     if (try printAskedHelp(options, out)) return 0;
 
-    // Everything else needs billy's files, so they are read in once and each way
-    // of running billy is a method on what came back.
     var billy = try Billy.open(init, out);
     defer billy.deinit();
 
@@ -243,11 +184,6 @@ fn answer(init: std.process.Init, out: Terminal.Writer, options: Options) !u8 {
     return 0;
 }
 
-/// Reports a failure that got as far as here, and gives the code the process
-/// exits with. A failure a command has already put into words is only counted:
-/// the user has read it, and repeating it is what makes a mistyped flag read as
-/// a crash. Anything else is one nobody explained, so it is named here, with
-/// where it came from.
 fn fail(err: anyerror) u8 {
     if (err != report.Reported) {
         std.log.err("{s}", .{@errorName(err)});
@@ -256,9 +192,6 @@ fn fail(err: anyerror) u8 {
     return 1;
 }
 
-/// Prints the usage `options` asked for, and says whether it asked for one. A
-/// subcommand's usage is its own, so `billy serve --help` prints that rather
-/// than billy's.
 fn printAskedHelp(options: Options, out: Terminal.Writer) !bool {
     if (options.help) {
         try printHelp(out, "billy [command] [options]", billy_about, billy_commands, run_options);
@@ -302,23 +235,17 @@ fn printAskedHelp(options: Options, out: Terminal.Writer) !bool {
 
 const ParseError = error{InvalidArgument};
 
-/// Parses `slice`, which is the arguments of one command line with the program
-/// name left off, the way `main` parses the ones it is given.
 fn parseArgsSlice(slice: []const []const u8) ParseError!Options {
     var args = spaghet.Args.initSlice(slice);
     return parseArgs(&args);
 }
 
-/// Reads billy's arguments: what to run, and the options of whichever part of
-/// it was asked for.
 fn parseArgs(args: *spaghet.Args) ParseError!Options {
     var options: Options = .{};
     while (args.next()) {
         if (args.flag(&.{ "-h", "--help" }))
             options.help = true;
         if (args.option(&.{ "-r", "--resume" })) |id| {
-            // A value that names nothing is a resume with none to name, which is
-            // the one written to most recently.
             options.resuming = if (id.len == 0) Billy.Resume{ .latest = {} } else .{ .id = id };
         }
         if (args.flag(&.{ "-r", "--resume" }))
@@ -329,7 +256,6 @@ fn parseArgs(args: *spaghet.Args) ParseError!Options {
     return options;
 }
 
-/// Reads the subcommand `command`, which is the first argument of the line.
 fn parseCommand(args: *spaghet.Args, command: []const u8) ParseError!Options.Command {
     if (std.mem.eql(u8, command, "login"))
         return .{ .login = try parseLogin(args) };
@@ -344,8 +270,6 @@ fn parseCommand(args: *spaghet.Args, command: []const u8) ParseError!Options.Com
     return error.InvalidArgument;
 }
 
-/// Reads the arguments of the `login` subcommand: nothing, or the service to
-/// store a key for, and its own usage.
 fn parseLogin(args: *spaghet.Args) ParseError!Options.Login {
     var login: Options.Login = .{};
     while (args.next()) {
@@ -359,9 +283,6 @@ fn parseLogin(args: *spaghet.Args) ParseError!Options.Login {
     return login;
 }
 
-/// Reads the arguments of the `config` subcommand: a setting and the value to
-/// give it, and its own usage. Neither is optional: a setting with nothing to
-/// set it to names no change to make.
 fn parseConfig(args: *spaghet.Args) ParseError!Options.Config {
     var setting: Options.Config = .{};
     while (args.next()) {
@@ -380,8 +301,6 @@ fn parseConfig(args: *spaghet.Args) ParseError!Options.Config {
     return setting;
 }
 
-/// Reads the arguments of the `serve` subcommand: where it listens, and its own
-/// usage.
 fn parseServe(args: *spaghet.Args) ParseError!Options.Serve {
     var serve: Options.Serve = .{};
     while (args.next()) {
@@ -397,8 +316,6 @@ fn parseServe(args: *spaghet.Args) ParseError!Options.Serve {
     return serve;
 }
 
-/// Reads the arguments of the `models` subcommand: whether to fetch again, and
-/// its own usage.
 fn parseModels(args: *spaghet.Args) ParseError!Options.Models {
     var models: Options.Models = .{};
     while (args.next()) {
@@ -412,7 +329,6 @@ fn parseModels(args: *spaghet.Args) ParseError!Options.Models {
     return models;
 }
 
-/// Reads the arguments of the `sessions` subcommand: nothing but its own usage.
 fn parseSessions(args: *spaghet.Args) ParseError!Options.Sessions {
     var sessions: Options.Sessions = .{};
     while (args.next()) {
@@ -433,15 +349,12 @@ test "parseArgs" {
         .{ .argv = &.{ "-r", "dev" }, .expected = .{ .resuming = .{ .id = "dev" } } },
         .{ .argv = &.{"--resume=dev"}, .expected = .{ .resuming = .{ .id = "dev" } } },
         .{ .argv = &.{ "--help", "--resume=both" }, .expected = .{ .help = true, .resuming = .{ .id = "both" } } },
-        // A resume with no session to name asks for the one this directory was
-        // last asked in, however it is written.
         .{ .argv = &.{"--resume"}, .expected = .{ .resuming = .{ .latest = {} } } },
         .{ .argv = &.{"-r"}, .expected = .{ .resuming = .{ .latest = {} } } },
         .{ .argv = &.{"--resume="}, .expected = .{ .resuming = .{ .latest = {} } } },
     };
     for (cases) |case| try expectOptions(case.expected, try parseArgsSlice(case.argv));
 
-    // An option the run does not take, and a stray argument, are refused.
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{"--nope"}));
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{"extra"}));
 }
@@ -452,8 +365,6 @@ test "parseArgs reads the login subcommand on its own" {
         .{ .command = .{ .login = .{ .service = "tavily" } } },
         try parseArgsSlice(&.{ "login", "tavily" }),
     );
-    // The subcommand has its own usage, so `-h` after it is not read as a run
-    // option.
     try expectOptions(
         .{ .command = .{ .login = .{ .help = true } } },
         try parseArgsSlice(&.{ "login", "-h" }),
@@ -462,53 +373,39 @@ test "parseArgs reads the login subcommand on its own" {
         .{ .command = .{ .login = .{ .help = true } } },
         try parseArgsSlice(&.{ "login", "--help" }),
     );
-    // The subcommand owns the rest of the line, so a run option after it is not
-    // a run option, a second service is not an argument it takes, and a service
-    // beside the usage is not read.
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "login", "tavily", "extra" }));
 }
 
 test "parseArgs reads the serve subcommand on its own" {
-    // No port: the default, and no help.
     try expectOptions(.{ .command = .{ .serve = .{} } }, try parseArgsSlice(&.{"serve"}));
 
-    // The port is read, however it is written.
     try expectServe(9000, try parseArgsSlice(&.{ "serve", "--port", "9000" }));
     try expectServe(9000, try parseArgsSlice(&.{ "serve", "-p", "9000" }));
     try expectServe(9000, try parseArgsSlice(&.{ "serve", "--port=9000" }));
     try expectServe(0, try parseArgsSlice(&.{ "serve", "--port", "0" }));
 
-    // The address is read too, and both may be given in either order.
     try expectHost("0.0.0.0", try parseArgsSlice(&.{ "serve", "--host", "0.0.0.0" }));
     try expectHost("192.168.1.5", try parseArgsSlice(&.{ "serve", "--host=192.168.1.5" }));
     try expectHost("::1", try parseArgsSlice(&.{ "serve", "--host", "::1", "--port", "9" }));
     try expectHost("::1", try parseArgsSlice(&.{ "serve", "--port", "9", "--host", "::1" }));
-    // An address that is not given a value is refused, like a port.
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "serve", "--host" }));
-    // The default is to listen where only this machine can reach.
     try expectHost(Server.default_host, try parseArgsSlice(&.{"serve"}));
 
-    // The subcommand has its own usage.
     try expectOptions(.{ .command = .{ .serve = .{ .help = true } } }, try parseArgsSlice(&.{ "serve", "-h" }));
     try expectOptions(.{ .command = .{ .serve = .{ .help = true } } }, try parseArgsSlice(&.{ "serve", "--help" }));
 
-    // A port that is missing, or not a number, or out of range, is refused.
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "serve", "--port" }));
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "serve", "--port", "abc" }));
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "serve", "--port", "70000" }));
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "serve", "--port=-1" }));
-    // The subcommand owns the rest of the line, so a run option after it is not
-    // a run option.
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "serve", "--resume", "x" }));
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "serve", "extra" }));
 }
 
-/// Checks the port a serve parse read, since `expectOptions` cannot compare it.
 fn expectServe(expected: u16, actual: Options) !void {
     try std.testing.expectEqual(expected, actual.command.serve.port);
 }
 
-/// Checks the address a serve parse read.
 fn expectHost(expected: []const u8, actual: Options) !void {
     try std.testing.expectEqualStrings(expected, actual.command.serve.host);
 }
@@ -518,7 +415,6 @@ test "parseArgs reads the config subcommand on its own" {
         .{ .command = .{ .config = .{ .path = "tools.bash.timeout_s", .value = "300" } } },
         try parseArgsSlice(&.{ "config", "tools.bash.timeout_s", "300" }),
     );
-    // A value may look like an option or be empty; the path may not.
     try expectOptions(
         .{ .command = .{ .config = .{ .path = "tools.bash.timeout_s", .value = "--nope" } } },
         try parseArgsSlice(&.{ "config", "tools.bash.timeout_s", "--nope" }),
@@ -527,44 +423,33 @@ test "parseArgs reads the config subcommand on its own" {
         .{ .command = .{ .config = .{ .path = "tools.web_search.searxng.url", .value = "" } } },
         try parseArgsSlice(&.{ "config", "tools.web_search.searxng.url", "" }),
     );
-    // The subcommand has its own usage.
     try expectOptions(.{ .command = .{ .config = .{ .help = true } } }, try parseArgsSlice(&.{ "config", "-h" }));
     try expectOptions(.{ .command = .{ .config = .{ .help = true } } }, try parseArgsSlice(&.{ "config", "--help" }));
-    // A setting without a value, a value without a setting, an option-shaped
-    // setting, and trailing arguments are all refused.
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{"config"}));
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "config", "max_turns" }));
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "config", "max_turns", "1", "extra" }));
 }
 
 test "parseArgs reads the models subcommand on its own" {
-    // Reading the cache is the default; `--refresh` asks for a fetch.
     try expectOptions(.{ .command = .{ .models = .{} } }, try parseArgsSlice(&.{"models"}));
     try expectOptions(.{ .command = .{ .models = .{ .refresh = true } } }, try parseArgsSlice(&.{ "models", "--refresh" }));
 
-    // The subcommand has its own usage.
     try expectOptions(.{ .command = .{ .models = .{ .help = true } } }, try parseArgsSlice(&.{ "models", "-h" }));
     try expectOptions(.{ .command = .{ .models = .{ .help = true } } }, try parseArgsSlice(&.{ "models", "--help" }));
 
-    // It takes no argument besides the flag.
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "models", "extra" }));
 }
 
 test "parseArgs reads the sessions subcommand on its own" {
-    // It takes nothing, so the line is just the command.
     try expectOptions(.{ .command = .{ .sessions = .{} } }, try parseArgsSlice(&.{"sessions"}));
 
-    // The subcommand has its own usage.
     try expectOptions(.{ .command = .{ .sessions = .{ .help = true } } }, try parseArgsSlice(&.{ "sessions", "-h" }));
     try expectOptions(.{ .command = .{ .sessions = .{ .help = true } } }, try parseArgsSlice(&.{ "sessions", "--help" }));
 
-    // The subcommand owns the rest of the line, so an argument after it is not
-    // one it takes, and a run option after it is not a run option.
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "sessions", "extra" }));
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "sessions", "--resume", "x" }));
 }
 
-/// The slices in `Options` are compared by content rather than by pointer.
 fn expectOptions(expected: Options, actual: Options) !void {
     try std.testing.expectEqual(expected.help, actual.help);
     if (expected.resuming) |want| {
@@ -616,8 +501,6 @@ fn expectOptions(expected: Options, actual: Options) !void {
     }
 }
 
-/// A help message as `printHelp` writes it, for checking the shape all of them
-/// share.
 const help_messages = [_]struct {
     invocation: []const u8,
     description: []const u8,
@@ -666,9 +549,6 @@ test "every help message reads the same way" {
         try printHelp(.{ .out = &out.writer }, message.invocation, message.description, message.commands, message.options);
         const text = out.written();
 
-        // The parts come in one order: how it is invoked, what it is, the
-        // subcommands it has, and the options it takes. A command with no
-        // subcommands leaves that part out entirely.
         const usage_at = std.mem.find(u8, text, "usage: ").?;
         const description_at = std.mem.find(u8, text, message.description).?;
         const options_at = std.mem.find(u8, text, "Options:").?;
@@ -678,7 +558,6 @@ test "every help message reads the same way" {
             const commands_at = std.mem.find(u8, text, "Commands:").?;
             try std.testing.expect(description_at < commands_at);
             try std.testing.expect(commands_at < options_at);
-            // Each part is set off from the one before it by a blank line.
             try std.testing.expect(std.mem.find(u8, text, "\n\nCommands:\n") != null);
             try std.testing.expect(std.mem.find(u8, text, "\n\nOptions:\n") != null);
             try std.testing.expect(std.mem.find(u8, text, commands) != null);
@@ -687,8 +566,6 @@ test "every help message reads the same way" {
             try std.testing.expect(std.mem.find(u8, text, "\n\nOptions:\n") != null);
         }
 
-        // The invocation and the options are the ones the command has, and the
-        // options are the last part, with the message ending right after them.
         try std.testing.expect(std.mem.find(u8, text, message.invocation) != null);
         try std.testing.expectEqualStrings(
             message.options,
@@ -698,9 +575,7 @@ test "every help message reads the same way" {
 }
 
 test "a failure a command has reported exits non-zero and is not said again" {
-    // This passes only because nothing is logged: the test runner counts an
-    // error line against the test that caused it, which is the property wanted
-    // here. The message was the command's, and the process says the rest with
-    // its exit code, for anything scripted around billy to read.
+    // This passes only because nothing is logged: the test runner counts an error line against the
+    // test that caused it, which is the property wanted here.
     try std.testing.expectEqual(@as(u8, 1), fail(report.Reported));
 }

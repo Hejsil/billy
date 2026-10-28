@@ -1,5 +1,4 @@
-//! Web search: one query out to the backends the configuration named, in order,
-//! until one answers.
+//! Web search: one query out to the backends the configuration named, in order, until one answers.
 
 const std = @import("std");
 
@@ -12,33 +11,24 @@ pub const Result = @import("Search/Result.zig");
 
 const Search = @This();
 
-/// One backend to search with, and what it is asked with: the key `billy login`
-/// stored for it, and the instance for a backend that is the user's own.
+/// One backend to search with, and what it is asked with: the key `billy login` stored for it, and
+/// the instance for a backend that is the user's own.
 pub const Backend = struct {
     provider: web.Provider,
-    /// The key the backend is asked with. Empty for one that needs none, which
-    /// is SearXNG, whose instance the user runs.
     api_key: []const u8 = "",
-    /// Where the backend is reached, when it is not the address billy knows:
-    /// SearXNG's instance, or, in a test, the server standing in for a backend.
-    /// Null uses the backend's own address.
     endpoint: ?[]const u8 = null,
 };
 
-/// What the configuration says about searching, with the keys already resolved:
-/// the backends to try, in order, and how many results to ask for. A null of
-/// this in a tool set is what leaves web search out of a request.
+/// What the configuration says about searching, with the keys already resolved: the backends to
+/// try, in order, and how many results to ask for.
 pub const Config = struct {
     backends: []const Backend,
-    /// Results asked for per query. A backend may return fewer.
     max_results: usize,
 };
 
 query: []const u8,
 
-/// Runs one web search and writes its results as text. No backend is configured
-/// only when a resumed session carries the tool from a run that had one; the
-/// model is told so rather than the call failing outright.
+/// Runs one web search and writes its results as text.
 pub fn run(search: Search, gpa: std.mem.Allocator, http_client: *std.http.Client, config: ?Config, health: ?*Health, out: *std.Io.Writer) !void {
     const search_config = config orelse return Tools.fail(
         out,
@@ -49,8 +39,6 @@ pub fn run(search: Search, gpa: std.mem.Allocator, http_client: *std.http.Client
     const now_ms = std.Io.Clock.real.now(http_client.io).toMilliseconds();
     var failed: ?anyerror = null;
     for (search_config.backends) |backend| {
-        // A backend that failed not long ago is skipped, so a backend that is
-        // down, rate-limited or out of credit is not asked again yet.
         if (Health.isSetAside(health, @tagName(backend.provider), now_ms)) continue;
         const value = searchBackend(gpa, http_client, backend, search.query, search_config.max_results) catch |err| {
             Health.recordFailure(health, @tagName(backend.provider), null, now_ms);
@@ -74,11 +62,7 @@ pub fn run(search: Search, gpa: std.mem.Allocator, http_client: *std.http.Client
             },
         }
     }
-    // Every backend that could be asked was tried and failed.
     if (failed) |err| return Tools.fail(out, "search failed: {s}", .{@errorName(err)});
-    // A set with no backend in it names nothing to try, so nothing failed and
-    // nothing was set aside. Only a session carrying the tool from a run that
-    // had a backend reaches this.
     if (search_config.backends.len == 0) return Tools.fail(
         out,
         "no search backend is configured; add one to tools.web_search.providers",
@@ -91,7 +75,6 @@ pub fn run(search: Search, gpa: std.mem.Allocator, http_client: *std.http.Client
     );
 }
 
-/// Runs one query against one backend, whichever it is.
 fn searchBackend(
     gpa: std.mem.Allocator,
     http_client: *std.http.Client,
@@ -99,18 +82,14 @@ fn searchBackend(
     query: []const u8,
     max_results: usize,
 ) !web.Answer {
-    // The same cap for every backend, whatever the configuration says.
     const asked = @min(max_results, Result.result_limit);
 
     const descriptor = backend.provider.descriptor();
     const spec = descriptor.search orelse return error.NotASearchProvider;
     const base = backend.endpoint orelse descriptor.search_endpoint orelse return error.MissingSearchUrl;
-    // A provider whose address the configuration names lives under a known path
-    // on that instance; one whose address the table gives is used whole.
     const location = try web.address(gpa, base, if (descriptor.search_endpoint == null) spec.configured_path else "");
     defer gpa.free(location);
 
-    // A GET asks in the url and a POST in a body; one of the two is built here.
     var payload: ?[]const u8 = null;
     defer if (payload) |body| gpa.free(body);
     var asked_url: ?[]const u8 = null;
@@ -155,8 +134,6 @@ test "the backends are tried in order until one answers" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    // The first reply is a server error and the second is results, so the first
-    // backend fails and the second answers.
     var mock = try Mock.start("/search", 2, struct {
         fn answer(number: usize, _: []const u8) Mock.Answer {
             if (number == 1) return .{ .status = .internal_server_error, .body = "{}" };
@@ -169,8 +146,8 @@ test "the backends are tried in order until one answers" {
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    // Two backends, both standing in for the same server, so what is tested is
-    // the order rather than which backend it is.
+    // Two backends, both standing in for the same server, so what is tested is the order rather
+    // than which backend it is.
     const config: Config = .{
         .backends = &.{
             .{ .provider = .tavily, .api_key = "a", .endpoint = mock.url },
@@ -184,7 +161,6 @@ test "the backends are tried in order until one answers" {
     try run(.{ .query = "zig lang" }, gpa, &http_client, config, null, &out.writer);
     try mock.await();
 
-    // Both were tried: the first failed and the second answered.
     try std.testing.expectEqual(@as(usize, 2), mock.served);
     try std.testing.expectEqualStrings("1. Zig\n   https://ziglang.org\n   A language.\n", out.written());
 }
@@ -228,8 +204,8 @@ test "a backend that failed is set aside, so the next search skips it" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Three requests: Tavily fails the first search, Brave answers it, and Brave
-    // answers the second search, which never asks Tavily again.
+    // Three requests: Tavily fails the first search, Brave answers it, and Brave answers the second
+    // search, which never asks Tavily again.
     var mock = try Mock.start("/search", 3, struct {
         fn answer(number: usize, _: []const u8) Mock.Answer {
             if (number == 1) return .{ .status = .internal_server_error, .body = "{}" };
@@ -256,16 +232,11 @@ test "a backend that failed is set aside, so the next search skips it" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    // The first search falls through Tavily, which fails, to Brave, which
-    // answers, and Tavily is left set aside.
     try run(.{ .query = "zig lang" }, gpa, &http_client, config, &health, &out.writer);
     try std.testing.expectEqualStrings("1. Zig\n   https://ziglang.org\n   A language.\n", out.written());
     try std.testing.expect(health.skips("tavily", std.Io.Clock.real.now(io).toMilliseconds()));
     try std.testing.expect(!health.skips("brave", std.Io.Clock.real.now(io).toMilliseconds()));
 
-    // The second search is Brave alone: Tavily posts its query as a body and
-    // Brave asks in the url, so the third request arriving with no body is
-    // Brave answering, not Tavily being asked again.
     out.clearRetainingCapacity();
     try run(.{ .query = "zig lang" }, gpa, &http_client, config, &health, &out.writer);
     try mock.await();
@@ -296,7 +267,6 @@ test "brave is asked for no more results than billy allows any backend" {
     try mock.await();
 
     try std.testing.expectEqualStrings("/search?q=zig&count=20", mock.targets.items[0]);
-    // Brave is told the reply is JSON as well as being asked in its own header.
     try std.testing.expectEqualStrings("application/json", mock.header("accept").?);
 }
 
@@ -307,8 +277,6 @@ test "each provider is asked the way its table says" {
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    // Tavily: the query and the count as its JSON body, the key as a bearer
-    // token.
     {
         var mock = try Mock.start("/search", 1, Mock.fixed("{\"results\":[]}"));
         defer mock.deinit();
@@ -329,7 +297,6 @@ test "each provider is asked the way its table says" {
         try std.testing.expectEqualStrings("Bearer secret", mock.header("authorization").?);
     }
 
-    // Exa: its own camelCase body, and its key in `x-api-key`.
     {
         var mock = try Mock.start("/search", 1, Mock.fixed("{\"results\":[]}"));
         defer mock.deinit();
@@ -404,8 +371,8 @@ test "a search with no backend named says one is not configured" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    // An empty set is a configuration that names no backend: nothing was tried,
-    // so saying that every backend failed and was set aside would be a lie.
+    // An empty set is a configuration that names no backend: nothing was tried, so saying that
+    // every backend failed and was set aside would be a lie.
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 

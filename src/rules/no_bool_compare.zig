@@ -1,10 +1,7 @@
-//! Disallows comparing against `true` or `false`, which is a test written the
-//! long way round: `x == false` is `!x`, `x == true` is `x`, and `x != false` is
-//! `x`. The negation is easier to read than a comparison with a constant, and it
-//! cannot be misread as two changing things being compared.
+//! Disallows comparing against `true` or `false`, which is a test written the long way round: `x ==
+//! false` is `!x`, `x == true` is `x`, and `x != false` is `x`.
 
 pub const Config = struct {
-    /// The severity (off, warning, error).
     severity: zlinter.rules.LintProblemSeverity = .@"error",
 };
 
@@ -24,8 +21,8 @@ fn run(
 
     const arena = session.runtime.sessionArena();
     const tree = doc.tree(session);
-    // The problems are taken from the session's own arena, which frees them
-    // once this rule has had its say, so the list needs no cleanup of its own.
+    // The problems are taken from the session's own arena, which frees them once this rule has had
+    // its say, so the list needs no cleanup of its own.
     // zlinter-disable-next-line require_errdefer_dealloc - the session's arena owns it
     var problems: std.ArrayList(zlinter.results.LintProblem) = .empty;
 
@@ -37,8 +34,6 @@ fn run(
             else => continue,
         }
         const lhs, const rhs = tree.nodeData(node).node_and_node;
-        // Whichever side the constant is on, the token it sits on is what is
-        // pointed at: it is the part that says nothing.
         const literal = boolLiteral(tree, lhs) orelse boolLiteral(tree, rhs) orelse continue;
         try problems.append(arena, .{
             .rule_id = rule.rule_id,
@@ -55,8 +50,6 @@ fn run(
         null;
 }
 
-/// The token of `node`, if it is `true` or `false` and nothing else, so that
-/// `x.false` or a field named `true` is not mistaken for the literal.
 fn boolLiteral(tree: Ast, node: Ast.Node.Index) ?Ast.TokenIndex {
     var current = node;
     while (tree.nodeTag(current) == .grouped_expression)

@@ -1,8 +1,5 @@
-//! A stand-in provider for the tests: a real HTTP server a client can be pointed
-//! at instead of a live service.
-//!
-//! Only a test may use it: it runs on `std.testing.allocator` and `std.testing.io`,
-//! so nothing outside one may reach it.
+//! A stand-in provider for the tests: a real HTTP server a client can be pointed at instead of a
+//! live service.
 
 const std = @import("std");
 
@@ -10,61 +7,40 @@ const Mock = @This();
 
 gpa: std.mem.Allocator,
 
-/// How many requests to answer before it stops
 requests: usize,
 
-/// What to answer a request with, given the request's number (1-based) and its
-/// body as it arrived
 answer: *const fn (number: usize, body: []const u8) Answer,
 
-/// The address it listens on, as the full URL a client is pointed at
 url: []const u8,
 
-/// The socket it accepts on.
 listener: std.Io.net.Server,
 
-/// How many requests it has answered, and how many connections it accepted
 served: usize = 0,
 connections: usize = 0,
 
-/// The body of each request, in the order they arrived
 bodies: std.ArrayList([]const u8) = .empty,
 
-/// The target (path and query) of each request, in the order they arrived
 targets: std.ArrayList([]const u8) = .empty,
 
-/// The length the last request announced, when it carried one
 content_length: ?u64 = null,
 
-/// The headers the last request carried, in the order they arrived
 headers: std.ArrayList(Header) = .empty,
 
-/// The first failure the server ran into
 err: ?anyerror = null,
 
 group: std.Io.Group = .init,
 
-/// One header a request carried
 pub const Header = struct { name: []const u8, value: []const u8 };
 
-/// What one request is answered with
 pub const Answer = struct {
     body: []const u8,
     status: std.http.Status = .ok,
     keep_alive: bool = false,
-    /// The `Content-Type` to send the body with, or none.
     content_type: ?[]const u8 = null,
-    /// The `Content-Encoding` the body is sent as, or none for a body that is
-    /// sent as it is.
     content_encoding: ?[]const u8 = null,
-    /// Headers to send beside the body's own, such as the `Retry-After` a
-    /// provider that is rate-limiting itself sends to say when to come back.
     headers: []const std.http.Header = &.{},
 };
 
-/// Starts a mock listening on a free port, at `path` -- `/chat/completions` for
-/// a model, `/search` for the search backend. The caller starts `serve` in a
-/// group and then points a client at `mock.url`.
 pub fn start(
     path: []const u8,
     requests: usize,
@@ -87,7 +63,6 @@ pub fn start(
     };
 }
 
-/// Stops listening and frees everything the mock recorded
 pub fn deinit(mock: *Mock) void {
     const io = std.testing.io;
     mock.listener.deinit(io);
@@ -100,8 +75,6 @@ pub fn deinit(mock: *Mock) void {
     mock.headers.deinit(mock.gpa);
 }
 
-/// The value the last request carried for `name`, or null when it carried none.
-/// The name is matched the way HTTP does, ignoring case.
 pub fn header(mock: *const Mock, name: []const u8) ?[]const u8 {
     var found: ?[]const u8 = null;
     for (mock.headers.items) |one| {
@@ -118,32 +91,21 @@ fn clearHeaders(mock: *Mock) void {
     mock.headers.clearRetainingCapacity();
 }
 
-/// Starts the accept loop in a group, and then runs the mock until it has answered
 pub fn serve(mock: *Mock) !void {
     try mock.group.concurrent(std.testing.io, Mock.serveInGroup, .{mock});
 }
 
-/// Waits for the mock to answer every request it was started for, and returns
-/// the first failure it ran into, which is what a test does once the run it is
-/// about is over.
 pub fn await(mock: *Mock) !void {
     try mock.group.await(std.testing.io);
     if (mock.err) |err| return err;
 }
 
-/// Stops the mock wherever it is and returns the first failure it ran into,
-/// ignoring the cancelation that stopping it is.
-///
-/// A test about how many requests a run makes cannot wait on a mock that was
-/// started for more of them than that: `await` would wait for a request that
-/// is never coming, which hangs the test instead of failing it. Cancelling
-/// finishes the task where it waits, so what it did can be read afterwards.
 pub fn stop(mock: *Mock) !void {
     mock.group.cancel(std.testing.io);
     const err = mock.err orelse return;
     mock.err = null;
-    // The task was still waiting for a request when it was stopped, which is the
-    // whole reason to stop it rather than wait.
+    // The task was still waiting for a request when it was stopped, which is the whole reason to
+    // stop it rather than wait.
     if (err == error.Canceled) return;
     return err;
 }
@@ -166,9 +128,6 @@ fn run(mock: *Mock) !void {
     }
 }
 
-/// Answers requests on one connection until the client closes it or a reply asks
-/// not to keep it alive, which is what the client does after a reply it does not
-/// intend to reuse.
 fn serveConnection(mock: *Mock, io: std.Io, stream: std.Io.net.Stream) !void {
     var in_buffer: [4096]u8 = undefined;
     var out_buffer: [4096]u8 = undefined;
@@ -206,9 +165,8 @@ fn serveConnection(mock: *Mock, io: std.Io, stream: std.Io.net.Stream) !void {
             extra[extra_count] = .{ .name = "content-encoding", .value = value };
             extra_count += 1;
         }
-        // What the answer asked to be sent beside its body, as many as there is
-        // room for: a test that wanted more would be answered with fewer rather
-        // than overrunning the array.
+        // What the answer asked to be sent beside its body, as many as there is room for: a test
+        // that wanted more would be answered with fewer rather than overrunning the array.
         for (answer.headers) |one| {
             if (extra_count == extra.len) break;
             extra[extra_count] = one;
@@ -223,8 +181,6 @@ fn serveConnection(mock: *Mock, io: std.Io, stream: std.Io.net.Stream) !void {
     }
 }
 
-/// The answer of a mock that sends the same `reply` every time. Tests that vary
-/// their reply write their own function.
 pub fn fixed(comptime reply: []const u8) *const fn (usize, []const u8) Answer {
     return struct {
         fn answer(_: usize, _: []const u8) Answer {
@@ -233,10 +189,8 @@ pub fn fixed(comptime reply: []const u8) *const fn (usize, []const u8) Answer {
     }.answer;
 }
 
-/// The answer of a mock whose reply is a completion carrying `content`: the
-/// shape a model provider sends back when it was asked to stream. The whole
-/// content arrives as one delta and the usage with it, which is enough for a test
-/// that is not about the stream itself.
+/// The answer of a mock whose reply is a completion carrying `content`: the shape a model provider
+/// sends back when it was asked to stream.
 pub fn completion(comptime content: []const u8) *const fn (usize, []const u8) Answer {
     return struct {
         fn answer(_: usize, _: []const u8) Answer {
@@ -250,8 +204,8 @@ pub fn completion(comptime content: []const u8) *const fn (usize, []const u8) An
     }.answer;
 }
 
-/// The answer of a mock that sends `reply` as a stream of events, the shape a
-/// provider answers with when it was asked to stream.
+/// The answer of a mock that sends `reply` as a stream of events, the shape a provider answers with
+/// when it was asked to stream.
 pub fn eventStream(comptime reply: []const u8) *const fn (usize, []const u8) Answer {
     return struct {
         fn answer(_: usize, _: []const u8) Answer {

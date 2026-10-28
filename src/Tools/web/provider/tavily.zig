@@ -1,14 +1,10 @@
-//! Tavily's request bodies and replies: a search and an extraction, both posted
-//! as JSON. The address, the key and the method are the table's in `web.zig`;
-//! what stays here is the shape of a Tavily body and the reply it answers.
+//! Tavily's request bodies and replies: a search and an extraction, both posted as JSON.
 
 const std = @import("std");
 
 const SearchResult = @import("../Search/Result.zig");
 
-/// The body a Tavily search is posted with. `basic` depth is the fast, cheaper
-/// one and is enough to rank sources; no synthesized answer is asked for, since
-/// the model reads the sources itself.
+/// The body a Tavily search is posted with.
 pub fn searchBody(gpa: std.mem.Allocator, query: []const u8, max_results: usize) ![]const u8 {
     return std.json.Stringify.valueAlloc(gpa, Request{
         .query = query,
@@ -30,8 +26,7 @@ pub fn fetchBody(gpa: std.mem.Allocator, url: []const u8) ![]const u8 {
     }, .{ .emit_null_optional_fields = false });
 }
 
-/// A Tavily extraction reply as the url's text. A url the backend could not read
-/// comes back as `error.UrlUnreadable`, which is not a failure of the backend.
+/// A Tavily extraction reply as the url's text.
 pub fn renderFetch(gpa: std.mem.Allocator, reply: []const u8) ![]const u8 {
     const parsed = try parse(ExtractResponse, gpa, reply);
     defer parsed.deinit();
@@ -45,8 +40,6 @@ pub fn renderFetch(gpa: std.mem.Allocator, reply: []const u8) ![]const u8 {
     return gpa.dupe(u8, parsed.value.results[0].raw_content);
 }
 
-/// Parses a provider reply, which is the provider's own shape: a reply that does
-/// not parse is the provider's failure, reported as the shared one.
 fn parse(T: type, gpa: std.mem.Allocator, reply: []const u8) !std.json.Parsed(T) {
     return std.json.parseFromSlice(T, gpa, reply, .{
         .ignore_unknown_fields = true,
@@ -57,7 +50,6 @@ fn parse(T: type, gpa: std.mem.Allocator, reply: []const u8) !std.json.Parsed(T)
     };
 }
 
-/// The body a Tavily search is posted with.
 const Request = struct {
     query: []const u8,
     max_results: usize,
@@ -65,26 +57,20 @@ const Request = struct {
     include_answer: bool = false,
 };
 
-/// The part of a Tavily search response billy uses. The rest, such as the answer
-/// and the scores, is ignored.
 const Response = struct {
     results: []const Result = &.{},
 };
 
-/// One Tavily result: its snippet is the `content` field.
 const Result = struct {
     title: []const u8 = "",
     url: []const u8 = "",
     content: []const u8 = "",
 };
 
-/// The body a Tavily extraction is posted with.
 const ExtractRequest = struct {
     urls: []const []const u8,
 };
 
-/// The part of a Tavily extraction response billy uses: the content of each url
-/// it read, and why it could not read the others.
 const ExtractResponse = struct {
     results: []const ExtractResult = &.{},
     failed_results: []const ExtractFailure = &.{},
@@ -99,7 +85,6 @@ const ExtractFailure = struct {
     @"error": []const u8 = "",
 };
 
-/// Answers `reply` and compares the text it becomes to `expected`.
 fn expectSearch(expected: []const u8, reply: []const u8) !void {
     const gpa = std.testing.allocator;
     const text = try renderSearch(gpa, reply, 3);

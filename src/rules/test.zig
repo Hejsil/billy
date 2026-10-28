@@ -1,7 +1,4 @@
-//! The root the rules are tested from. Nothing in billy imports a rule -- they
-//! are read by the linter, which is its own program -- so their tests are
-//! reached from here, one line per file, and `build.zig` builds this instead of
-//! naming them.
+//! The root the rules are tested from.
 
 test {
     _ = @import("comment_budget.zig");

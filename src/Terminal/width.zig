@@ -1,18 +1,9 @@
 //! How wide text is on a terminal, and how long its characters are.
-//!
-//! A character here is a grapheme cluster: a base codepoint with whatever extends
-//! it, such as a combining mark, a variation selector, a skin-tone modifier, the
-//! parts of an emoji joined by a zero-width joiner, or the two halves of a flag.
-//! Counting and stepping by cluster is what lets a whole emoji be one character,
-//! and a wide one (CJK, emoji) two columns rather than one, so a line of them
-//! folds where the terminal folds it and the cursor lands where the terminal
-//! draws it.
 
 const std = @import("std");
 
-/// Columns `text` takes on a terminal: none for a control, or a codepoint that
-/// only extends another, or an ANSI escape; two for a wide character; one
-/// otherwise. Malformed text counts a column per byte.
+/// Columns `text` takes on a terminal: none for a control, or a codepoint that only extends
+/// another, or an ANSI escape; two for a wide character; one otherwise.
 pub fn columns(text: []const u8) usize {
     var width: usize = 0;
     var i: usize = 0;
@@ -27,10 +18,8 @@ pub fn columns(text: []const u8) usize {
     return width;
 }
 
-/// Byte offset of the column `count` columns into `text`, clamped to its end: the
-/// walk `columns` takes, stopped once `count` columns are behind it. It skips the
-/// same escapes and steps the same characters, so the prefix cut here holds
-/// exactly those columns and no character is split.
+/// Byte offset of the column `count` columns into `text`, clamped to its end: the walk `columns`
+/// takes, stopped once `count` columns are behind it.
 pub fn columnOffset(text: []const u8, count: usize) usize {
     var i: usize = 0;
     var seen: usize = 0;
@@ -45,8 +34,7 @@ pub fn columnOffset(text: []const u8, count: usize) usize {
     return i;
 }
 
-/// Bytes the character at the start of `text` takes, at least one; zero only for
-/// empty text. A base codepoint, and the codepoints that extend it.
+/// Bytes the character at the start of `text` takes, at least one; zero only for empty text.
 pub fn charLen(text: []const u8) usize {
     const base = decode(text);
     if (base.len == 0) return 0;
@@ -55,7 +43,6 @@ pub fn charLen(text: []const u8) usize {
     while (len < text.len) {
         const next = decode(text[len..]);
         if (isJoiner(next.cp)) {
-            // The joiner and the character it joins are part of the same one.
             if (len + next.len >= text.len) break;
             len += next.len + decode(text[len + next.len ..]).len;
         } else if (extends(next.cp)) {
@@ -68,9 +55,7 @@ pub fn charLen(text: []const u8) usize {
     return len;
 }
 
-/// Bytes the character at the end of `text` takes, at least one; zero only for
-/// empty text. The mirror of `charLen`, so stepping back and forward over the
-/// same text lands in the same places.
+/// Bytes the character at the end of `text` takes, at least one; zero only for empty text.
 pub fn prevLen(text: []const u8) usize {
     if (text.len == 0) return 0;
     var end = text.len;
@@ -81,7 +66,6 @@ pub fn prevLen(text: []const u8) usize {
         const before = decodeBack(text, end);
         if (before.len == 0) break;
         if (isJoiner(before.cp)) {
-            // A joiner before the character pulls in the one it joins.
             len += before.len;
             end -= before.len;
             last = decodeBack(text, end);
@@ -100,8 +84,6 @@ pub fn prevLen(text: []const u8) usize {
     return len;
 }
 
-/// Columns the character at the start of `text` takes: none for a control or a
-/// codepoint that only extends another, two for a wide one, one otherwise.
 fn charWidth(text: []const u8) usize {
     const cp = decode(text).cp;
     if (cp < 0x20 or (cp >= 0x7f and cp < 0xa0)) return 0;
@@ -110,9 +92,6 @@ fn charWidth(text: []const u8) usize {
     return 1;
 }
 
-/// Bytes the ANSI escape sequence starting at `text[i]` takes, or null when
-/// `text[i]` begins none. Only the CSI form is recognised, which is what colours
-/// a prompt; anything else is counted as the text it looks like.
 fn escaped(text: []const u8, i: usize) ?usize {
     if (text[i] != 0x1b or i + 1 >= text.len or text[i + 1] != '[') return null;
     var j = i + 2;
@@ -124,22 +103,18 @@ fn escaped(text: []const u8, i: usize) ?usize {
 
 const Codepoint = struct { cp: u21, len: usize };
 
-/// The codepoint at the start of `text`, and the bytes it takes. A malformed
-/// byte is a codepoint of its own, so stepping still moves.
 fn decode(text: []const u8) Codepoint {
     if (text.len == 0) return .{ .cp = 0, .len = 0 };
     const len = @min(std.unicode.utf8ByteSequenceLength(text[0]) catch 1, text.len);
-    // Decoding the codepoint a sequence of known width spells has no replacement
-    // yet: ziglang/zig#23096 leaves `utf8Decode` alone because it "needs a new
-    // API first", and std still calls it itself. The suppression is what finds
-    // these two places again when that API lands.
+    // Decoding the codepoint a sequence of known width spells has no replacement yet:
+    // ziglang/zig#23096 leaves `utf8Decode` alone because it "needs a new API first",
+    // and std still calls it itself. The suppression is what finds these two places
+    // again when that API lands.
     // zlinter-disable-next-line no_deprecated - std has no replacement yet
     const cp = std.unicode.utf8Decode(text[0..len]) catch return .{ .cp = text[0], .len = 1 };
     return .{ .cp = cp, .len = len };
 }
 
-/// The codepoint that ends at `end` in `text`, and the bytes it takes. The mirror
-/// of `decode`, reading back over the continuation bytes to the lead byte.
 fn decodeBack(text: []const u8, end: usize) Codepoint {
     if (end == 0) return .{ .cp = 0, .len = 0 };
     var start = end - 1;
@@ -154,8 +129,6 @@ fn isContinuation(byte: u8) bool {
     return byte & 0xc0 == 0x80;
 }
 
-/// Whether `cp` only adjusts the character before it, so it takes no column and
-/// does not begin a character: a combining mark, or a variation selector.
 fn extends(cp: u21) bool {
     return cp == 0xfe0e or cp == 0xfe0f or
         (cp >= 0x0300 and cp <= 0x036f) or
@@ -174,9 +147,6 @@ fn isRegional(cp: u21) bool {
     return cp >= 0x1f1e6 and cp <= 0x1f1ff;
 }
 
-/// Whether `cp` is drawn two columns wide: the CJK and emoji ranges a terminal
-/// lays out double. A heuristic, not a full width table, which is what a line
-/// editor needs to fold a line where the terminal does.
 fn isWide(cp: u21) bool {
     return cp >= 0x1100 and (cp <= 0x115f or
         cp == 0x2329 or cp == 0x232a or
@@ -214,15 +184,12 @@ test "a column is a character, and malformed text counts bytes" {
 }
 
 test "a wide character is two columns, a narrow one is one" {
-    // CJK and the emoji ranges a terminal lays out double.
     try std.testing.expectEqual(2, columns("漢"));
     try std.testing.expectEqual(4, columns("漢字"));
     try std.testing.expectEqual(2, columns("\u{1f600}"));
     try std.testing.expectEqual(3, columns("a漢"));
-    // Hiragana and fullwidth forms too.
     try std.testing.expectEqual(2, columns("\u{3042}"));
     try std.testing.expectEqual(2, columns("\u{ff21}"));
-    // Something narrow outside those ranges stays one.
     try std.testing.expectEqual(1, columns("·"));
 }
 
@@ -245,12 +212,8 @@ test "columnOffset is the inverse of columns" {
     };
     for (cases) |text| {
         try std.testing.expectEqual(@as(usize, 0), columnOffset(text, 0));
-        // Past the last column it is the whole text.
         try std.testing.expectEqual(text.len, columnOffset(text, columns(text) + 1));
 
-        // Stepping the way `columns` does, asking for any column a character
-        // covers lands on the boundary just past it, so the two agree column by
-        // column and no character is split. Column zero is the start.
         var i: usize = 0;
         var col: usize = 0;
         while (i < text.len) {
@@ -272,17 +235,13 @@ test "columnOffset is the inverse of columns" {
 }
 
 test "a character is a grapheme cluster, not a codepoint" {
-    // A combining mark extends the letter before it.
     try std.testing.expectEqual(1, columns("e\u{0301}"));
     try std.testing.expectEqual("e\u{0301}".len, charLen("e\u{0301}x"));
-    // A skin-tone modifier extends the emoji before it.
     try std.testing.expectEqual(2, columns("\u{1f44d}\u{1f3fd}"));
     try std.testing.expectEqualStrings("\u{1f44d}\u{1f3fd}", "\u{1f44d}\u{1f3fd}"[0..charLen("\u{1f44d}\u{1f3fd}")]);
-    // Emoji joined by a zero-width joiner are one character.
     const family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
     try std.testing.expectEqual(family.len, charLen(family ++ "x"));
     try std.testing.expectEqual(2, columns(family));
-    // Two regional indicators are one flag.
     const flag = "\u{1f1ee}\u{1f1f9}";
     try std.testing.expectEqual(flag.len, charLen(flag ++ "x"));
 }
@@ -303,7 +262,6 @@ test "stepping back is the mirror of stepping forward" {
         var i: usize = 0;
         while (i < text.len) {
             const forward = i + charLen(text[i..]);
-            // Every boundary forward reaches is a boundary back reaches too.
             try std.testing.expectEqual(i, forward - prevLen(text[0..forward]));
             i = forward;
         }

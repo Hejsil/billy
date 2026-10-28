@@ -1,8 +1,4 @@
 //! Interactive line editor for the user prompt.
-//!
-//! The terminal is put into raw mode so the user can move the cursor and fix
-//! typos before submitting. When stdin is not a terminal the line is read
-//! without editing, which keeps the harness usable from a pipe.
 
 const std = @import("std");
 
@@ -11,13 +7,9 @@ const terminal_width = @import("Terminal/width.zig");
 
 const LineEditor = @This();
 
-/// A decoded key press. Bytes that are not printable or bound to an action are
-/// reported as `.none` and ignored.
 const Key = union(enum) {
-    /// One whole UTF-8 character, zero-padded, so a line only ever holds valid text.
     char: [4]u8,
     enter,
-    /// Shift+Enter: insert a line break instead of submitting.
     newline,
     backspace,
     delete,
@@ -36,63 +28,28 @@ const Key = union(enum) {
     none,
 };
 
-/// Most a continuation row will ever be indented: the prompt is two columns
-/// wide in practice, so this only bounds a pathological one.
 const max_indent = 64;
-/// A content width no row can overflow, used when the terminal width is unknown
-/// or too narrow to wrap the line against.
 const no_wrap = std.math.maxInt(usize) / 4;
 
 io: std.Io,
-/// Destination for the prompt, the echoed line and the redraws.
 out: *std.Io.Writer,
-/// Owns the pool and the history, which outlive the call that filled them. The
-/// editor frees what it allocates in `deinit`, so the caller need not hold an
-/// allocator for it.
 gpa: std.mem.Allocator,
-/// Every submitted line, concatenated, each ended by a NUL. One growing buffer
-/// holds the whole history, so a line costs its bytes rather than an allocation
-/// of its own, and the history is a list of offsets into it.
 strings: std.ArrayList(u8) = .empty,
-/// Where each submitted line starts in `strings`, oldest first. The line runs
-/// from there to the NUL that ends it.
 history: std.ArrayList(usize) = .empty,
-/// Bytes read from stdin but not yet consumed by the key decoder.
 in_buf: [256]u8 = undefined,
 in_pos: usize = 0,
 in_len: usize = 0,
-/// Terminal rows painted by the last redraw, and the row the cursor was left
-/// on within that region. They are used to erase and repaint a prompt that
-/// may span several lines.
 last_rows: usize = 0,
 last_cursor_row: usize = 0,
-/// Column the cursor aims for during a run of up/down presses, so crossing a
-/// short row does not lose the horizontal position. Cleared by any other key.
 goal_col: ?usize = null,
-/// Terminal width in columns, or 0 when it is unknown and the line is left
-/// for the terminal to fold. Re-read for every input, so a resize is noticed.
 width: usize = 0,
-/// The width `last_rows` and `last_cursor_row` were painted at. When it no
-/// longer matches `width`, the terminal has reflowed the painted region, and
-/// it is measured against `width` instead.
 painted_width: usize = 0,
-/// Whether the bytes now arriving are a paste rather than typing. The terminal
-/// wraps a paste in `ESC[200~` and `ESC[201~`, and everything between is
-/// inserted as it is: a newline a user pasted is a line break in the line,
-/// where a newline from the keyboard submits it. That is what keeps a pasted
-/// block of text from going out as one prompt per line.
 pasting: bool = false,
-/// Whether the last byte of a paste was a carriage return, so a `\r\n` pair in
-/// one is a single line break. A terminal that sends `\r\n` for a pasted line
-/// ending would otherwise open a blank line after every line.
 paste_cr: bool = false,
-/// Whether the line is a secret: the prompt is shown but what is typed behind it
-/// is not, so a key is not left on the screen or in the scrollback. Set by
-/// `readSecret` and cleared by `readLine`.
 quiet: bool = false,
 
-/// `gpa` backs the line pool and the history the editor keeps; both are the
-/// editor's own and are freed by `deinit`.
+/// `gpa` backs the line pool and the history the editor keeps; both are the editor's own and are
+/// freed by `deinit`.
 pub fn init(io: std.Io, out: *std.Io.Writer, gpa: std.mem.Allocator) LineEditor {
     return .{ .io = io, .out = out, .gpa = gpa };
 }
@@ -103,51 +60,28 @@ pub fn deinit(ed: *LineEditor) void {
     ed.history.deinit(ed.gpa);
 }
 
-/// The text of history entry `index`, up to the NUL that ends it.
 fn historyLine(ed: *const LineEditor, index: usize) []const u8 {
     return std.mem.sliceTo(ed.strings.items[ed.history.items[index]..], 0);
 }
 
-/// Reads one line for the caller to act on, above the run's `header` and behind
-/// `prompt`: the header is shown on its own line while the line is being edited.
-/// Both it and the prompt belong to the editing alone: on submit the whole region
-/// is erased and the cursor is left on the row it began on, so nothing of the
-/// input is left in the output. The caller prints what the line was in its place,
-/// a block that ends with a blank line. Neither may contain a newline. When stdin
-/// is not a terminal there is no line being typed, so neither is shown, and it is
-/// left to the caller to write the line out.
-///
-/// Returns null when stdin is exhausted: end of a piped stdin, or Ctrl-D on
-/// an empty line. The returned slice is kept in the editor's pool, so it is
-/// valid until the next line is submitted.
+/// Reads one line for the caller to act on, above the run's `header` and behind `prompt`: the
+/// header is shown on its own line while the line is being edited.
 pub fn readLine(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
     ed.quiet = false;
     return ed.read(header, prompt);
 }
 
-/// Reads a secret behind `prompt`: what is typed is not shown, so a key is not
-/// left on the screen or in the scrollback. Only the prompt is drawn, and it is
-/// left standing when the line is submitted, since there is no block to replace
-/// it with. No header is shown, a secret being read on its own rather than under
-/// the run's; otherwise this reads as `readLine` does, returning null when stdin
-/// is exhausted and a slice of the editor's pool.
+/// Reads a secret behind `prompt`: what is typed is not shown, so a key is not left on the screen
+/// or in the scrollback.
 pub fn readSecret(ed: *LineEditor, prompt: []const u8) !?[]const u8 {
     ed.quiet = true;
     return ed.read("", prompt);
 }
 
-/// The one reader behind `readLine` and `readSecret`, which differ only in
-/// `ed.quiet`.
 fn read(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
     const interactive = try std.Io.File.stdin().isTty(ed.io);
-    // The width is only wanted to fold a line being edited, which cannot
-    // happen without a terminal.
+    // The width is only wanted to fold a line being edited, which cannot happen without a terminal.
     ed.width = if (interactive) ed.terminalWidth() else 0;
-    // The caller leaves the cursor below the blank line every block it shows
-    // ends with, so the header and the prompt the user types behind are drawn
-    // there, a row below the block above them. With no terminal there is no
-    // line being typed, so neither is shown: the caller prints the line it read
-    // as the block the emitter would.
     if (interactive) {
         if (header.len > 0) {
             try ed.out.writeAll(header);
@@ -160,41 +94,28 @@ fn read(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
     if (!interactive) return ed.readLinePiped();
 
     const saved = try ed.enterRaw();
-    // The line is read raw and the terminal given back here rather than from a
-    // `defer`: the restore is the same handful of writes either way, and one
-    // place that says so runs it after the read on both of the read's paths. A
-    // terminal that will not be given back is reported over the read's own
-    // failure, since that is the state the caller is left in.
+    // The line is read raw and the terminal given back here rather than from a `defer`: the restore
+    // is the same handful of writes either way, and one place that says so runs it after the read
+    // on both of the read's paths.
     const line = ed.readKeys(header, prompt);
     try ed.restore(saved);
     return line;
 }
 
-/// Turns the paste marking on and reads a line with the terminal in raw mode,
-/// which `read` has done by the time it is called: everything it changes is put
-/// back by `restore`, once this has returned however it did.
 fn readKeys(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
-    // Ask the terminal to mark where a paste begins and ends, so the bytes in
-    // one can be told from what the user types.
     try ed.out.writeAll("\x1b[?2004h");
     try ed.out.flush();
 
-    // The prompt alone is what is on screen before any key arrives, and it is
-    // one row: an empty line submitted without a redraw is still measured, so
-    // the region can be erased from the start.
     ed.last_rows = 1;
     ed.last_cursor_row = 0;
     ed.goal_col = null;
     ed.painted_width = ed.width;
-    // The text on each row fits the same number of columns, since the prompt
-    // and the continuation indent are the same width.
     var content_width = ed.contentWidth(columns(prompt));
 
     var line: std.ArrayList(u8) = .empty;
     defer line.deinit(ed.gpa);
-    // The line being edited, kept aside while a history walk is on a stored
-    // entry, so stepping back to the start returns to it rather than an empty
-    // line.
+    // The line being edited, kept aside while a history walk is on a stored entry, so stepping back
+    // to the start returns to it rather than an empty line.
     var draft: std.ArrayList(u8) = .empty;
     defer draft.deinit(ed.gpa);
     var cursor: usize = 0;
@@ -203,17 +124,12 @@ fn readKeys(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u
 
     while (true) {
         const key = try ed.nextKey();
-        // The width is read again for every input, including the timeout that
-        // reports `.none`, so a resize is picked up without a signal handler.
-        // A change only asks for a repaint: the redraw below knows to measure
-        // the region it is about to erase at the new width.
         ed.width = ed.terminalWidth();
         if (ed.width != ed.painted_width) {
             content_width = ed.contentWidth(columns(prompt));
             dirty = true;
         }
         // A run of up/down presses aims for one column; any other key ends it.
-        // Timeouts report `.none` and must not break the run.
         switch (key) {
             .up, .down, .none => {},
             else => ed.goal_col = null,
@@ -232,15 +148,8 @@ fn readKeys(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u
                 dirty = true;
             },
             .enter => {
-                // The whole prompt is erased, and no newline is written: the
-                // caller prints the prompt's own block in its place, and that
-                // block ends the line. An empty line is not printed at all, and
-                // the cursor is already back on the row the prompt stood on, so
-                // the next prompt draws over the same place rather than leaving
-                // a blank line behind.
-                //
-                // A secret has no block to replace the region with, so its
-                // prompt is left standing and the line is ended here instead.
+                // The whole prompt is erased, and no newline is written: the caller prints the
+                // prompt's own block in its place, and that block ends the line.
                 if (ed.quiet) {
                     try ed.out.writeAll("\n");
                 } else {
@@ -313,14 +222,10 @@ fn readKeys(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u
                 }
             },
             .interrupt => {
-                // The abandoned line is dropped, header and all, and so is a
-                // paste that was still arriving.
                 ed.pasting = false;
                 ed.paste_cr = false;
                 try ed.endPrompt(header);
                 try ed.out.writeAll("\x1b[K^C\r\n");
-                // The user is still at a prompt, so show the header again;
-                // the redraw below repaints the prompt under it.
                 if (header.len > 0) {
                     try ed.out.writeAll(header);
                     try ed.out.writeAll("\n");
@@ -343,10 +248,6 @@ fn readKeys(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u
                 dirty = true;
             },
         }
-        // Redraw only once the typed-ahead bytes are consumed, so pasting a
-        // long line does not repaint the terminal for every byte. A secret is
-        // painted as an empty line, so only the prompt is drawn and nothing
-        // typed is left on the screen.
         if (dirty and ed.drained()) {
             try ed.redraw(prompt, content_width, if (ed.quiet) "" else line.items, if (ed.quiet) 0 else cursor);
             dirty = false;
@@ -354,18 +255,11 @@ fn readKeys(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u
     }
 }
 
-/// Puts the terminal back as `read` found it: the settings it saved, the paste
-/// marking off, and what is buffered on its way, so the shell that runs after
-/// billy starts on a terminal it recognises.
 fn restore(ed: *LineEditor, saved: std.posix.termios) !void {
-    // Each of the three is attempted even when one fails, since a terminal that
-    // will not take its old settings may still take the escape that turns the
-    // paste marking off; the failure returned is the first of them.
     const settings_err = settings.set(std.posix.STDIN_FILENO, saved);
 
-    // Bracketed paste is a property of the terminal rather than of this process,
-    // so it is turned back off when the line is done; left on, it would wrap
-    // pastes in whatever the user runs next.
+    // Bracketed paste is a property of the terminal rather than of this process, so it is turned
+    // back off when the line is done; left on, it would wrap pastes in whatever the user runs next.
     const write_err = ed.out.writeAll("\x1b[?2004l");
     const flush_err = ed.out.flush();
     ed.pasting = false;
@@ -392,9 +286,6 @@ fn readLinePiped(ed: *LineEditor) !?[]const u8 {
     return @as(?[]const u8, try ed.submit(line.items));
 }
 
-/// Records `line` in the history and returns it as the caller keeps it, out of
-/// the pool so it outlives the call. An empty line is not remembered, since
-/// there is nothing to recall, but is still returned as an empty slice.
 fn submit(ed: *LineEditor, line: []const u8) ![]const u8 {
     const start = ed.strings.items.len;
     if (line.len > 0) {
@@ -405,13 +296,6 @@ fn submit(ed: *LineEditor, line: []const u8) ![]const u8 {
     return ed.strings.items[start..][0..line.len];
 }
 
-/// Repaints the prompt and the current line. The line may contain embedded
-/// newlines (from Shift+Enter) and may be wider than the terminal, in which
-/// case it is folded into further rows here rather than left to the terminal.
-/// Folding it ourselves is what keeps the row count and the cursor position
-/// exact, since a row the terminal folded behind our back would be neither
-/// erased nor counted. The whole region is erased and rewritten so that edits
-/// on any row are reflected.
 fn redraw(
     ed: *LineEditor,
     prompt: []const u8,
@@ -419,23 +303,16 @@ fn redraw(
     line: []const u8,
     cursor: usize,
 ) !void {
-    // Continuation rows are indented to line up under the first row, so the
-    // prompt and the indent are the same width and every row holds the same
-    // number of columns of text.
     const prompt_width = columns(prompt);
     var spaces: [max_indent]u8 = @splat(' ');
     const indent = spaces[0..@min(prompt_width, spaces.len)];
 
-    // Locate the cursor and count the terminal rows the new render needs.
     const rows = rowCount(line, content_width);
     const at = rowAt(line, content_width, cursor);
     const cursor_col = prompt_width + columns(line[at.start..cursor]);
 
-    // After a resize the terminal has reflowed the rows on screen, so they
-    // are no longer the rows the last paint laid out. Erasing what is there
-    // now is what clears the region; erasing the old layout would leave the
-    // parts a fold moved behind. Every other redraw keeps the layout it
-    // painted and erases that.
+    // After a resize the terminal has reflowed the rows on screen, so they are no longer the rows
+    // the last paint laid out.
     if (ed.width != ed.painted_width) {
         if (ed.width != 0 and ed.painted_width != 0) {
             const shown = reflowed(
@@ -453,8 +330,6 @@ fn redraw(
         }
     }
 
-    // Return to the top-left corner of the previously painted region and
-    // erase it row by row.
     if (ed.last_cursor_row > 0) try ed.out.print("\x1b[{d}A", .{ed.last_cursor_row});
     try ed.out.writeAll("\r");
     if (ed.last_rows == 0) {
@@ -469,7 +344,6 @@ fn redraw(
         try ed.out.writeAll("\r");
     }
 
-    // Paint the prompt and the content, folding a row as soon as it is full.
     var row: usize = 0;
     var start: usize = 0;
     while (true) {
@@ -489,15 +363,8 @@ fn redraw(
         start = end + 1;
     }
 
-    // The prompt is the last thing on the screen, so every row below it is
-    // stale and can be cleared. A resize is what leaves such rows: the
-    // terminal reflows what it was showing, which is not always what was
-    // just painted, and can end up with more rows than this render has. The
-    // cursor is at the end of the region here, so this clears exactly the
-    // space under it.
     try ed.out.writeAll("\x1b[J");
 
-    // Move from the end of the render back to the cursor.
     const up = rows - 1 - at.index;
     if (up > 0) try ed.out.print("\x1b[{d}A", .{up});
     try ed.out.writeAll("\r");
@@ -509,16 +376,7 @@ fn redraw(
     try ed.out.flush();
 }
 
-/// Ends the editable line by erasing the whole region it painted. The header
-/// and the line typed under it are both deleted, and the cursor is left at the
-/// start of the first row they occupied, so the caller prints the prompt in
-/// their place. What the region held is the editing of the line, not what was
-/// said, so none of it is left behind.
 fn endPrompt(ed: *LineEditor, header: []const u8) !void {
-    // The header sits directly above the prompt region and may itself span
-    // several rows on a narrow terminal, so both it and the line are deleted,
-    // moving the cursor up into the space they held. The cursor starts within
-    // the line, so the walk up is past its own row and then the header's.
     const header_rows = ed.headerRows(header);
     const deleted = header_rows + ed.last_rows;
     if (deleted == 0) return;
@@ -529,11 +387,6 @@ fn endPrompt(ed: *LineEditor, header: []const u8) !void {
     try ed.out.writeAll("\r");
 }
 
-/// The terminal width in columns, asked of whichever standard stream is a
-/// terminal. Zero when none of them is, which leaves the line unwrapped
-/// rather than folded against a guessed width. The input terminal is among
-/// the candidates, and it is a terminal whenever a line is being edited, so
-/// in practice the width is known whenever it is wanted.
 fn terminalWidth(ed: *LineEditor) usize {
     for ([_]std.Io.File{ std.Io.File.stdout(), std.Io.File.stdin(), std.Io.File.stderr() }) |file| {
         if (ed.widthOf(file)) |width| return width;
@@ -541,8 +394,6 @@ fn terminalWidth(ed: *LineEditor) usize {
     return 0;
 }
 
-/// The columns `file` is, or null when it is not a terminal or its size
-/// cannot be read.
 fn widthOf(ed: *LineEditor, file: std.Io.File) ?usize {
     const tty = file.isTty(ed.io) catch return null;
     if (!tty) return null;
@@ -557,15 +408,10 @@ fn widthOf(ed: *LineEditor, file: std.Io.File) ?usize {
     return size.col;
 }
 
-/// Columns of text available on a row once the prompt is taken off, which is
-/// where the line is folded. The terminal is too narrow to fold against when
-/// it cannot hold the prompt, so the line is left alone then.
 fn contentWidth(ed: *const LineEditor, prompt_width: usize) usize {
     return contentWidthFor(ed.width, prompt_width);
 }
 
-/// Rows the header takes on the terminal. Unlike the line it is written
-/// unindented, so it folds at the full width.
 fn headerRows(ed: *const LineEditor, header: []const u8) usize {
     if (header.len == 0) return 0;
     const columns_wide = columns(header);
@@ -573,15 +419,6 @@ fn headerRows(ed: *const LineEditor, header: []const u8) usize {
     return (columns_wide + ed.width - 1) / ed.width;
 }
 
-/// Walks the history by one entry: `direction` is -1 for older, 1 for newer, and
-/// true is returned when the walk moved. The position is what `recalled` holds,
-/// `null` meaning the line being edited; the walk is not reset by editing, so it
-/// carries on from where it was after a recalled line is changed.
-///
-/// The line being edited is kept in `draft` when the walk steps off it, so
-/// walking back to the start returns to it rather than an empty line. A stored
-/// entry is copied into the line, so editing one does not change what the history
-/// holds, and stepping off it drops the edit.
 fn recall(
     ed: *LineEditor,
     line: *std.ArrayList(u8),
@@ -593,7 +430,6 @@ fn recall(
     const history = ed.history.items;
     if (history.len == 0) return false;
 
-    // Where the walk lands: a stored entry, or `null` for the line being edited.
     const landing: ?usize = land: {
         if (recalled.*) |here| {
             if (direction < 0) {
@@ -606,7 +442,6 @@ fn recall(
         break :land history.len - 1;
     };
 
-    // Stepping off the line being edited: keep it, so the walk can return to it.
     if (recalled.* == null) {
         draft.clearRetainingCapacity();
         try draft.appendSlice(ed.gpa, line.items);
@@ -631,11 +466,8 @@ fn nextKey(ed: *LineEditor) !Key {
         return ed.nextEscape();
     }
     if (byte == '\r' or byte == '\n') {
-        // A newline from the keyboard submits the line; a newline the user
-        // pasted is a line break in it, like Shift+Enter.
         if (!ed.pasting) return .enter;
         if (byte == '\n' and ed.paste_cr) {
-            // The LF half of a `\r\n` whose CR already opened the line.
             ed.paste_cr = false;
             return .none;
         }
@@ -657,8 +489,6 @@ fn nextKey(ed: *LineEditor) !Key {
     };
 }
 
-/// Reads the rest of the character `first` begins. A character that is cut short
-/// or malformed is dropped, so the line never holds half of one.
 fn readChar(ed: *LineEditor, first: u8) !Key {
     const len = std.unicode.utf8ByteSequenceLength(first) catch return .none;
     var char: [4]u8 = @splat(0);
@@ -668,23 +498,16 @@ fn readChar(ed: *LineEditor, first: u8) !Key {
     return .{ .char = char };
 }
 
-/// Decodes the `CSI`/`SS3` sequences for the arrow and navigation keys, as
-/// well as the encodings terminals use for Shift+Enter and the markers that
-/// bracket a paste.
 fn nextEscape(ed: *LineEditor) !Key {
     const introducer = (try ed.nextByte()) orelse return .none;
-    // Some terminals report Shift+Enter as ESC followed by a carriage return.
     if (introducer == '\r' or introducer == '\n') return .newline;
     if (introducer != '[' and introducer != 'O') return .none;
 
-    // Collect the parameter/intermediate bytes up to the final byte.
     var params: [16]u8 = undefined;
     var len: usize = 0;
     while (true) {
         const byte = (try ed.nextByte()) orelse return .none;
         if (byte >= 0x40 and byte <= 0x7e) {
-            // `ESC[200~` opens a paste and `ESC[201~` closes it. Both are the
-            // terminal talking, not the user, so neither is a key of its own.
             if (byte == '~') {
                 if (std.mem.eql(u8, params[0..len], "200")) {
                     ed.pasting = true;
@@ -718,8 +541,6 @@ fn finalKey(params: []const u8, final: u8) Key {
             else => .none,
         };
     }
-    // Shift+Enter under the kitty keyboard protocol (CSI 13;2u) and xterm's
-    // modifyOtherKeys (CSI 27;2;13~).
     if (final == 'u' and std.mem.eql(u8, params, "13;2")) return .newline;
     if (final == '~' and std.mem.eql(u8, params, "27;2;13")) return .newline;
 
@@ -737,8 +558,8 @@ fn finalKey(params: []const u8, final: u8) Key {
 
 fn nextByte(ed: *LineEditor) !?u8 {
     if (ed.in_pos == ed.in_len) {
-        // Raw mode is configured with VMIN=0/VTIME=1, so a zero-length read
-        // means "no input within the timeout" rather than end of file.
+        // Raw mode is configured with VMIN=0/VTIME=1, so a zero-length read means "no input within
+        // the timeout" rather than end of file.
         const len = try std.posix.read(std.posix.STDIN_FILENO, &ed.in_buf);
         ed.in_pos = 0;
         ed.in_len = len;
@@ -748,8 +569,6 @@ fn nextByte(ed: *LineEditor) !?u8 {
     return ed.in_buf[ed.in_pos];
 }
 
-/// Disables canonical mode and echo. Returns the previous settings, which
-/// the caller must restore.
 fn enterRaw(ed: *LineEditor) !std.posix.termios {
     _ = ed;
     const fd = std.posix.STDIN_FILENO;
@@ -767,26 +586,14 @@ fn enterRaw(ed: *LineEditor) !std.posix.termios {
     return saved;
 }
 
-/// The reflowed geometry of a line: how many rows the region the terminal shows
-/// now needs, and which of them the cursor is on.
 const Reflow = struct { rows: usize, cursor_row: usize };
 
-/// The columns of text a row holds once the prompt is off, for terminal width
-/// `width`. A terminal too narrow to hold the prompt leaves the line unfolded.
 fn contentWidthFor(width: usize, prompt_width: usize) usize {
     if (width == 0 or width <= prompt_width) return no_wrap;
     if (prompt_width > max_indent) return no_wrap;
     return width - prompt_width;
 }
 
-/// How the region is laid out after the terminal is resized. A terminal reflows
-/// by wrapping each row already on screen at the new width, and those rows were
-/// the folds of `line` at `old_content` columns, so the region after a resize is
-/// those same folds wrapped again, not the line folded for the new width. That
-/// gap is why the erase has to be measured here after a resize and at the
-/// painted width otherwise. Every painted row is `prompt_width` columns of
-/// prompt or indent followed by its text, so a fold of `n` columns is a row of
-/// `prompt_width + n` columns and wraps into `ceil((prompt_width + n) / width)`.
 fn reflowed(line: []const u8, prompt_width: usize, old_content: usize, width: usize, cursor: usize) Reflow {
     const old_at = rowAt(line, old_content, cursor);
     const cursor_col = prompt_width + columns(line[old_at.start..cursor]);
@@ -803,7 +610,6 @@ fn reflowed(line: []const u8, prompt_width: usize, old_content: usize, width: us
             pos = from + columnOffset(line[from..end], old_content);
             const wrapped = rowsFor(prompt_width + columns(line[from..pos]), width);
             if (from == old_at.start) {
-                // The cursor is on this painted row; it wrapped `cursor_col` in.
                 cursor_row = rows + @min(cursor_col / width, wrapped - 1);
             }
             rows += wrapped;
@@ -821,29 +627,18 @@ fn wordStart(line: []const u8, cursor: usize) usize {
     return start;
 }
 
-/// Where the character before `cursor` starts, so a cursor on a character
-/// boundary stays on one. A character is a grapheme cluster, so the cursor steps
-/// over a whole emoji rather than one of its codepoints.
 fn prevChar(line: []const u8, cursor: usize) usize {
     if (cursor == 0) return 0;
     return cursor - terminal_width.prevLen(line[0..cursor]);
 }
 
-/// Where the character at `cursor` ends, one grapheme cluster along.
 fn nextChar(line: []const u8, cursor: usize) usize {
     if (cursor >= line.len) return line.len;
     return @min(line.len, cursor + terminal_width.charLen(line[cursor..]));
 }
 
-/// A visual row of the rendered line: a run of the line that fits on one
-/// terminal row, `start..end` in bytes, on row `index` counted from the first.
 const Row = struct { index: usize, start: usize, end: usize };
 
-/// Moves `cursor` to the same column on the row above (negative `direction`) or
-/// below, where a row is a visual row: a line wider than the terminal has
-/// several of them. `goal_col` remembers the column across a run of presses so
-/// crossing a short row does not lose it. Returns whether the cursor moved; it
-/// does not when there is no row in that direction.
 fn moveCursorVertical(
     goal_col: *?usize,
     line: []const u8,
@@ -866,10 +661,6 @@ fn moveCursorVertical(
     return true;
 }
 
-/// The row `cursor` falls in. A cursor on the fold between two rows belongs to
-/// the later one, so that it points at the character it comes before; at the end
-/// of a source row it stays on the last row, which is where the next character
-/// will go.
 fn rowAt(line: []const u8, content_width: usize, cursor: usize) Row {
     var index: usize = 0;
     var start: usize = 0;
@@ -894,7 +685,6 @@ fn rowAt(line: []const u8, content_width: usize, cursor: usize) Row {
     }
 }
 
-/// The row `index`, counted from the first.
 fn rowRange(line: []const u8, content_width: usize, index: usize) struct { start: usize, end: usize } {
     var row: usize = 0;
     var start: usize = 0;
@@ -917,7 +707,6 @@ fn rowRange(line: []const u8, content_width: usize, index: usize) struct { start
     }
 }
 
-/// Number of terminal rows `line` needs, folds and newlines alike.
 fn rowCount(line: []const u8, content_width: usize) usize {
     var rows: usize = 0;
     var start: usize = 0;
@@ -930,17 +719,11 @@ fn rowCount(line: []const u8, content_width: usize) usize {
     }
 }
 
-/// Rows `cols` columns need. A row that fills the width exactly does not open
-/// another one, since a terminal only folds once the next character arrives; an
-/// empty row takes one.
 fn rowsFor(cols: usize, content_width: usize) usize {
     if (cols <= content_width) return 1;
     return (cols + content_width - 1) / content_width;
 }
 
-/// The columns `text` takes, and the byte offset of a column into it, both from
-/// `Terminal/width.zig`: a wide character is two columns, a grapheme cluster is
-/// one character, and the two walks skip the same escapes.
 const columns = terminal_width.columns;
 const columnOffset = terminal_width.columnOffset;
 
@@ -949,21 +732,18 @@ test "wordStart skips trailing whitespace then the word" {
     try std.testing.expectEqual(0, wordStart("hello  ", 7));
     try std.testing.expectEqual(6, wordStart("hello world", 11));
     try std.testing.expectEqual(6, wordStart("hello world", 9));
-    // At the start of "world" the whitespace and the word before it are removed.
     try std.testing.expectEqual(0, wordStart("hello world", 6));
     try std.testing.expectEqual(4, wordStart("one two", 7));
     try std.testing.expectEqual(0, wordStart("", 0));
 }
 
 test "the cursor steps over whole characters, not bytes" {
-    // "a", "é" (2 bytes), "€" (3 bytes), "😀" (4 bytes), "b".
     const line = "a\u{e9}\u{20ac}\u{1f600}b";
     try std.testing.expectEqual(1, nextChar(line, 0));
     try std.testing.expectEqual(3, nextChar(line, 1));
     try std.testing.expectEqual(6, nextChar(line, 3));
     try std.testing.expectEqual(10, nextChar(line, 6));
     try std.testing.expectEqual(11, nextChar(line, 10));
-    // At the end there is nothing to step over.
     try std.testing.expectEqual(11, nextChar(line, 11));
 
     try std.testing.expectEqual(10, prevChar(line, 11));
@@ -974,11 +754,6 @@ test "the cursor steps over whole characters, not bytes" {
     try std.testing.expectEqual(0, prevChar(line, 0));
 }
 
-/// Decodes `bytes` into the keys the editor would read from them, with no
-/// terminal behind it: one character per key, a typed byte as itself, a line
-/// break as `\n`, a submit as `E`, a key with no effect as `.` and any other key
-/// as `?`. `std.testing.allocator` owns the result. The bytes go in the read
-/// buffer, which the decoder drains before it would ask a terminal for more.
 fn decodeKeys(bytes: []const u8) ![]u8 {
     var sink: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sink.deinit();
@@ -1003,40 +778,32 @@ fn decodeKeys(bytes: []const u8) ![]u8 {
 }
 
 test "a newline in a paste is a line break and only enter submits" {
-    // Text pasted between the markers: its newlines break the line, and the
-    // carriage return typed after the paste is what submits it. The end marker is
-    // what makes that carriage return a submit, so the markers left no trace.
     const keys = try decodeKeys("\x1b[200~one\ntwo\x1b[201~more\r");
     defer std.testing.allocator.free(keys);
     try std.testing.expectEqualStrings(".one\ntwo.moreE", keys);
 }
 
 test "a carriage return from the keyboard still submits outside a paste" {
-    // Typing a line and pressing enter, and the same with a line feed, both
-    // submit: neither is inside a paste.
     const keys = try decodeKeys("hi\rhi\n");
     defer std.testing.allocator.free(keys);
     try std.testing.expectEqualStrings("hiEhiE", keys);
 }
 
 test "a CRLF in a paste opens a single line, not one and a blank" {
-    // The CR opens the line and the LF that follows it is the same line ending,
-    // so the CRLF pair is one break, not two.
     const keys = try decodeKeys("\x1b[200~a\r\nb\x1b[201~");
     defer std.testing.allocator.free(keys);
     try std.testing.expectEqualStrings(".a\n.b.", keys);
 }
 
 test "a shifted enter and the arrow keys still decode" {
-    // Shift+Enter is a line break outside a paste, as before, and an arrow key is
-    // its own key rather than the digits of its escape sequence.
+    // Shift+Enter is a line break outside a paste, as before, and an arrow key is its own key
+    // rather than the digits of its escape sequence.
     const keys = try decodeKeys("a\x1b[13;2ub\x1b[Du\r");
     defer std.testing.allocator.free(keys);
     try std.testing.expectEqualStrings("a\nb?uE", keys);
 }
 
 test "a multi-byte character is one key, and a malformed byte is none" {
-    // "é" arrives as two bytes and is one key, shown as `#` by the decoder.
     const keys = try decodeKeys("a\u{e9}b\u{1f600}c");
     defer std.testing.allocator.free(keys);
     try std.testing.expectEqualStrings("a#b#c", keys);
@@ -1052,21 +819,17 @@ test "columns and offsets count characters, and stay safe on malformed text" {
     try std.testing.expectEqual(4, columns(line));
     try std.testing.expectEqual(3, columnOffset(line, 2));
     try std.testing.expectEqual(line.len, columnOffset(line, 10));
-    // A stray byte counts as a character and moves on, so nothing loops or panics.
     try std.testing.expectEqual(2, columns("\xff\xff"));
     try std.testing.expectEqual(1, nextChar("\xff\xff", 0));
 }
 
 test "a wide character is two columns and one step, and a grapheme steps whole" {
-    // A wide character folds and is walked over as the two columns it takes.
     const wide = "a漢b";
     try std.testing.expectEqual(4, columns(wide));
     try std.testing.expectEqual(4, columnOffset(wide, 3));
     try std.testing.expectEqual(4, nextChar(wide, 1));
     try std.testing.expectEqual(1, prevChar(wide, 4));
 
-    // An emoji joined by zero-width joiners is one character: one step over it,
-    // not one per codepoint.
     const family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
     const line = family ++ "!";
     try std.testing.expectEqual(@as(usize, family.len), nextChar(line, 0));
@@ -1081,15 +844,12 @@ test "the history keeps the submitted lines in one pool" {
     var ed = LineEditor.init(std.testing.io, &out.writer, gpa);
     defer ed.deinit();
 
-    // Two lines are stored back to back and each is read back whole, so the
-    // second one is found at its own offset and not at the first line's.
     try std.testing.expectEqualStrings("hello", try ed.submit("hello"));
     try std.testing.expectEqualStrings("world", try ed.submit("world"));
     try std.testing.expectEqual(@as(usize, 2), ed.history.items.len);
     try std.testing.expectEqualStrings("hello", ed.historyLine(0));
     try std.testing.expectEqualStrings("world", ed.historyLine(1));
 
-    // An empty line is returned but not remembered: there is nothing to recall.
     try std.testing.expectEqualStrings("", try ed.submit(""));
     try std.testing.expectEqual(@as(usize, 2), ed.history.items.len);
 }
@@ -1110,11 +870,9 @@ test "recall walks the history, keeping the line it started from" {
     var cursor: usize = 0;
     var recalled: ?usize = null;
 
-    // A line is being edited when the walk starts; it is what the walk returns to.
     try line.appendSlice(gpa, "half typed");
     cursor = line.items.len;
 
-    // Up recalls the most recent line, then the older one; the oldest is the end.
     try std.testing.expect(try ed.recall(&line, &cursor, &draft, &recalled, -1));
     try std.testing.expectEqualStrings("two", line.items);
     try std.testing.expectEqual(@as(usize, 3), cursor);
@@ -1123,19 +881,15 @@ test "recall walks the history, keeping the line it started from" {
     try std.testing.expect(!try ed.recall(&line, &cursor, &draft, &recalled, -1));
     try std.testing.expectEqualStrings("one", line.items);
 
-    // Down comes back to the newer one.
     try std.testing.expect(try ed.recall(&line, &cursor, &draft, &recalled, 1));
     try std.testing.expectEqualStrings("two", line.items);
 
-    // Editing a recalled line does not reset the walk: Up still reaches the line
-    // older than the one shown, and the edit is not written into the history.
     try line.appendSlice(gpa, "!");
     try std.testing.expect(try ed.recall(&line, &cursor, &draft, &recalled, -1));
     try std.testing.expectEqualStrings("one", line.items);
     try std.testing.expect(try ed.recall(&line, &cursor, &draft, &recalled, 1));
     try std.testing.expectEqualStrings("two", line.items);
 
-    // Down past the newest returns to the line being edited, which was kept.
     try std.testing.expect(try ed.recall(&line, &cursor, &draft, &recalled, 1));
     try std.testing.expectEqualStrings("half typed", line.items);
     try std.testing.expectEqual(@as(usize, 10), cursor);
@@ -1146,8 +900,6 @@ test "columns ignore ANSI escapes" {
     try std.testing.expectEqual(2, columns("> "));
     try std.testing.expectEqual(0, columns("\x1b[31m\x1b[0m"));
     try std.testing.expectEqual(5, columns("\x1b[1mbilly\x1b[0m"));
-    // A multi-byte character is one column, not one per byte. The header uses
-    // the middle dot between its parts, so this is the width it is measured by.
     try std.testing.expectEqual(1, columns("·"));
     try std.testing.expectEqual(3, columns("a·b"));
 }
@@ -1159,25 +911,18 @@ test "endPrompt erases the header and the line it heads" {
     var ed = LineEditor.init(std.testing.io, &out.writer, gpa);
     defer ed.deinit();
 
-    // One row of input: up to the header, delete it and the line, back to column
-    // zero where the prompt's own block is printed.
     ed.last_rows = 1;
     ed.last_cursor_row = 0;
     try ed.endPrompt("billy · m · /w");
     try std.testing.expectEqualStrings("\x1b[1A\r\x1b[2M\r", out.written());
     out.clearRetainingCapacity();
 
-    // Three rows of input with the cursor on the last: the whole region is taken
-    // back, five rows counting the header, from the cursor up to the top.
     ed.last_rows = 3;
     ed.last_cursor_row = 2;
     try ed.endPrompt("billy · m · /w");
     try std.testing.expectEqualStrings("\x1b[3A\r\x1b[4M\r", out.written());
     out.clearRetainingCapacity();
 
-    // A header wider than the terminal folds, so its rows count too; the ten
-    // column terminal folds the 16 column header in two, and both are erased
-    // along with the line below them.
     ed.width = 10;
     ed.last_rows = 1;
     ed.last_cursor_row = 0;
@@ -1186,14 +931,12 @@ test "endPrompt erases the header and the line it heads" {
     out.clearRetainingCapacity();
     ed.width = 0;
 
-    // Without a header only the line is erased.
     ed.last_rows = 3;
     ed.last_cursor_row = 1;
     try ed.endPrompt("");
     try std.testing.expectEqualStrings("\x1b[1A\r\x1b[3M\r", out.written());
     out.clearRetainingCapacity();
 
-    // Nothing painted, nothing to erase.
     ed.last_rows = 0;
     ed.last_cursor_row = 0;
     try ed.endPrompt("");
@@ -1228,8 +971,6 @@ test "rowAt and rowCount treat trailing newlines as an empty row" {
     try std.testing.expectEqual(1, rowCount("hi", no_wrap));
     try std.testing.expectEqual(2, rowCount("hi\n", no_wrap));
     try std.testing.expectEqual(3, rowCount("a\nb\nc", no_wrap));
-    // The cursor after the newline is on the empty row; the one before it is at
-    // the end of the row that came first.
     try std.testing.expectEqual(1, rowAt("hi\n", no_wrap, 3).index);
     try std.testing.expectEqual(3, rowAt("hi\n", no_wrap, 3).start);
     try std.testing.expectEqual(0, rowAt("hi\n", no_wrap, 2).index);
@@ -1245,19 +986,15 @@ test "a line wider than the terminal folds into several rows" {
     try std.testing.expectEqual(20, rowRange(line, 10, 2).start);
     try std.testing.expectEqual(26, rowRange(line, 10, 2).end);
 
-    // A cursor on the fold points at the character after it.
     try std.testing.expectEqual(1, rowAt(line, 10, 10).index);
     try std.testing.expectEqual(10, rowAt(line, 10, 10).start);
-    // One at the very end has no row after it to move to, so it stays put.
     try std.testing.expectEqual(2, rowAt(line, 10, 26).index);
 
-    // A row that fills the width exactly does not open another one.
     try std.testing.expectEqual(2, rowCount(&@as([20]u8, @splat('z')), 10));
     try std.testing.expectEqual(1, rowAt(&@as([20]u8, @splat('z')), 10, 20).index);
 }
 
 test "folding repeats within every source row" {
-    // A newline starts a new row even when the row before it happened to fold.
     const line = "abcd\nefghij";
     try std.testing.expectEqual(3, rowCount(line, 4));
     try std.testing.expectEqual(1, rowAt(line, 4, 5).index); // just past the newline
@@ -1266,14 +1003,12 @@ test "folding repeats within every source row" {
 }
 
 test "a multi-byte character is never cut by a fold" {
-    // Two characters per row: the middle dot is two bytes but one column.
     const line = "a·b·c·d";
     try std.testing.expectEqual(4, rowCount(line, 2));
     try std.testing.expectEqual(0, rowRange(line, 2, 0).start);
     try std.testing.expectEqual(3, rowRange(line, 2, 0).end); // "a·", whole
     try std.testing.expectEqual(3, rowRange(line, 2, 1).start);
     try std.testing.expectEqual(6, rowRange(line, 2, 1).end); // "b·"
-    // The cursor between the dot and the following character is on the next row.
     try std.testing.expectEqual(1, rowAt(line, 2, 3).index);
     try std.testing.expectEqual(3, rowAt(line, 2, 3).start);
 }
@@ -1299,7 +1034,6 @@ test "redraw folds a line that is wider than the terminal" {
     var ed = LineEditor.init(std.testing.io, &out.writer, gpa);
     defer ed.deinit();
 
-    // Four columns of text per row, which is a six column terminal for "> ".
     try ed.redraw("> ", 4, "abcdefgh", 8);
     try std.testing.expectEqualStrings(
         "\r\x1b[K" ++ // nothing painted yet: clear the line the prompt is on
@@ -1309,11 +1043,9 @@ test "redraw folds a line that is wider than the terminal" {
             "\r\x1b[6C", // the cursor at the end of the second row
         out.written(),
     );
-    // Both rows are remembered, so the next redraw can erase them.
     try std.testing.expectEqual(2, ed.last_rows);
     try std.testing.expectEqual(1, ed.last_cursor_row);
 
-    // Three rows now: up one, erase both old rows, and paint the three.
     out.clearRetainingCapacity();
     try ed.redraw("> ", 4, "abcdefghi", 9);
     try std.testing.expectEqualStrings(
@@ -1337,13 +1069,11 @@ test "a redraw after a resize erases the rows the new width needs" {
     defer ed.deinit();
 
     const line = "abcdefghijklmnopqrstuvwxyz0123456789"; // 36 characters
-    // One row at 78 columns wide was painted, and the cursor is on it.
     ed.width = 78;
     ed.painted_width = 78;
     ed.last_rows = 1;
     ed.last_cursor_row = 0;
     try ed.redraw("> ", 76, line, 36);
-    // The old row is erased and the line repainted on one row, cursor at its end.
     try std.testing.expectEqualStrings(
         "\r\x1b[K\r" ++
             "> abcdefghijklmnopqrstuvwxyz0123456789" ++
@@ -1353,9 +1083,7 @@ test "a redraw after a resize erases the rows the new width needs" {
     );
     out.clearRetainingCapacity();
 
-    // The terminal is resized to 20 columns. Its reflow makes the painted row two
-    // rows, so the erase has to measure the region at that width; erasing the one
-    // row of the old geometry would leave the folded remainder behind.
+    // The terminal is resized to 20 columns.
     ed.width = 20;
     try ed.redraw("> ", 18, line, 36);
     try std.testing.expectEqualStrings(
@@ -1372,26 +1100,15 @@ test "a redraw after a resize erases the rows the new width needs" {
 }
 
 test "reflowed measures a shrunk region by its folds and not the whole line" {
-    // 62 characters, folded into two rows of 38 and 24 at the old width.
     const line = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
     const prompt_width = 2;
-    // Shrunk to 24 columns: each painted row, being 40 and 26 columns with the
-    // prompt, wraps into two, so the region is four rows and the cursor, at the
-    // end, is on the last of them.
     try std.testing.expectEqual(Reflow{ .rows = 4, .cursor_row = 3 }, reflowed(line, prompt_width, 38, 24, line.len));
-    // Grown to 60: each painted row still fits, so they stay as they were.
     try std.testing.expectEqual(Reflow{ .rows = 2, .cursor_row = 1 }, reflowed(line, prompt_width, 38, 60, line.len));
-    // The same line folded at 22 columns makes three painted rows.
     try std.testing.expectEqual(Reflow{ .rows = 3, .cursor_row = 2 }, reflowed(line, prompt_width, 22, 60, line.len));
 }
 
 test "reflowed keeps the cursor on the painted row it was on" {
-    // "abcd\nefgh" at four columns is two painted rows, each "  abcd" wide once
-    // the two column prompt is on. At four columns of terminal each of those
-    // wraps into two rows, so the region is four rows with the cursor at its end.
     const line = "abcd\nefgh";
     try std.testing.expectEqual(Reflow{ .rows = 4, .cursor_row = 3 }, reflowed(line, 2, 4, 4, line.len));
-    // A cursor two characters into the last painted row lands one row down, in
-    // the row the wrap made of it.
     try std.testing.expectEqual(Reflow{ .rows = 4, .cursor_row = 3 }, reflowed(line, 2, 4, 4, 7));
 }
