@@ -4,6 +4,8 @@
 
 const std = @import("std");
 
+const entities = @import("entities.zig");
+
 const spaces = " \t";
 pub const max_columns = 32;
 /// The most lists that can be set inside one another.
@@ -132,6 +134,8 @@ pub const Parser = struct {
     nests: [max_nesting]Nest = @splat(.{}),
     depth: usize = 0,
     item_open: bool = false,
+    /// Where a link's label and address are decoded into: a reference is not as long as its bytes.
+    scratch: std.ArrayList(u8) = .empty,
     paragraph: bool = false,
     after_blank: bool = false,
 
@@ -166,6 +170,7 @@ pub const Parser = struct {
 
     fn deinit(self: *Parser) void {
         self.pending.deinit(self.gpa);
+        self.scratch.deinit(self.gpa);
         self.dropTable();
     }
 
@@ -490,7 +495,7 @@ pub const Parser = struct {
 
     fn isMark(byte: u8) bool {
         return switch (byte) {
-            '\\', '`', '*', '_', '~', '[', '!' => true,
+            '\\', '`', '*', '_', '~', '[', '!', '&' => true,
             else => false,
         };
     }
@@ -508,7 +513,7 @@ pub const Parser = struct {
         switch (mark) {
             '\\' => {
                 if (i + 1 == bytes.len) return if (self.final) .literal else .hold;
-                if (std.mem.findScalar(u8, "\\`*_{}[]()#+-.!~|", bytes[i + 1]) == null) return .literal;
+                if (std.mem.findScalar(u8, "\\`*_{}[]()#+-.!~|&", bytes[i + 1]) == null) return .literal;
                 try self.emit(bytes[i + 1 .. i + 2]);
                 return .{ .taken = 2 };
             },
@@ -549,6 +554,19 @@ pub const Parser = struct {
                 try self.out.show(.{ .span_begin = .em });
                 return .{ .taken = 1 };
             },
+            '&' => switch (entities.lookup(bytes[i..])) {
+                .named => |reference| {
+                    try self.emit(reference.text);
+                    return .{ .taken = reference.len };
+                },
+                .numeric => |number| {
+                    var buffer: [4]u8 = undefined;
+                    try self.emit(entities.encode(number.codepoint, &buffer));
+                    return .{ .taken = number.len };
+                },
+                // A reference that never completed is the text it was written as.
+                .none, .incomplete => return if (self.final) .literal else .hold,
+            },
             '[' => return self.link(bytes, i, .link),
             '!' => {
                 if (i + 1 == bytes.len) return if (self.final) .literal else .hold;
@@ -561,6 +579,24 @@ pub const Parser = struct {
 
     const Destination = enum { link, image };
 
+    /// The `)` that closes a destination, which may hold parentheses of its own.
+    fn destinationEnd(bytes: []const u8, from: usize) ?usize {
+        var depth: usize = 1;
+        var i = from;
+        while (i < bytes.len) : (i += 1) {
+            switch (bytes[i]) {
+                '\n' => return null,
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if (depth == 0) return i;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
     /// Hands on `label` as the link to `url`, or as the alt text of an image.
     fn link(self: *Parser, bytes: []const u8, i: usize, kind: Destination) !Markup {
         const open = if (kind == .image) i + 1 else i;
@@ -570,21 +606,58 @@ pub const Parser = struct {
         };
         if (close + 1 == bytes.len) return if (self.final) .literal else .hold;
         if (bytes[close + 1] != '(') return .literal;
-        const end = find(bytes, close + 2, ')') orelse {
+        const end = destinationEnd(bytes, close + 2) orelse {
             if (find(bytes, close + 2, '\n') != null or self.final) return .literal;
             return .hold;
         };
 
-        const label = bytes[open + 1 .. close];
-        const url = bytes[close + 2 .. end];
+        const address = try self.decode(bytes[open + 1 .. close], bytes[close + 2 .. end]);
         if (kind == .image) {
-            try self.out.show(.{ .image = .{ .url = url, .label = label } });
+            try self.out.show(.{ .image = .{ .url = address.url, .label = address.label } });
         } else {
-            try self.out.show(.{ .link_begin = url });
-            try self.emit(label);
+            try self.out.show(.{ .link_begin = address.url });
+            try self.emit(address.label);
             try self.out.show(.link_end);
         }
         return .{ .taken = end - i + 1 };
+    }
+
+    const Address = struct { label: []const u8, url: []const u8 };
+
+    /// A link's label and address as their references stand for them, in one buffer so both stay whole.
+    fn decode(self: *Parser, label: []const u8, url: []const u8) !Address {
+        if (std.mem.findScalar(u8, label, '&') == null and std.mem.findScalar(u8, url, '&') == null) {
+            return .{ .label = label, .url = url };
+        }
+        self.scratch.clearRetainingCapacity();
+        try self.decodeInto(label);
+        const split = self.scratch.items.len;
+        try self.decodeInto(url);
+        return .{ .label = self.scratch.items[0..split], .url = self.scratch.items[split..] };
+    }
+
+    fn decodeInto(self: *Parser, text: []const u8) !void {
+        var i: usize = 0;
+        while (i < text.len) : (i += 1) {
+            if (text[i] == '&') {
+                switch (entities.lookup(text[i..])) {
+                    .named => |reference| {
+                        try self.scratch.appendSlice(self.gpa, reference.text);
+                        i += reference.len - 1;
+                        continue;
+                    },
+                    .numeric => |number| {
+                        var buffer: [4]u8 = undefined;
+                        try self.scratch.appendSlice(self.gpa, entities.encode(number.codepoint, &buffer));
+                        i += number.len - 1;
+                        continue;
+                    },
+                    // An address is whole here, so a reference that did not finish is text.
+                    .none, .incomplete => {},
+                }
+            }
+            try self.scratch.append(self.gpa, text[i]);
+        }
     }
 
     /// Hands on the body of a fenced code block, a line at a time, and ends it at the fence that
@@ -916,6 +989,48 @@ test "an inline form is a span around the text it holds" {
             "+code\ntext:d\n-code\ntext: \nlink:u\ntext:l\n/link\ntext: \nimage:v|i\nnewline\n" ++
             "paragraph_end\n",
         "**b** and *c* `d` [l](u) ![i](v)\n",
+    );
+}
+
+test "a reference is handed on as what it stands for" {
+    try expectEvents(
+        "paragraph_begin\nline\ntext:a \ntext:&\ntext: b\nnewline\nparagraph_end\n",
+        "a &amp; b\n",
+    );
+    try expectEvents("paragraph_begin\nline\ntext:&\ntext:>\nnewline\nparagraph_end\n", "&amp;&gt;\n");
+    try expectEvents("paragraph_begin\nline\ntext:A\nnewline\nparagraph_end\n", "&#65;\n");
+    // A reference that never finishes is the text it was written as.
+    try expectEvents(
+        "paragraph_begin\nline\ntext:&\ntext:amp x\nnewline\nparagraph_end\n",
+        "&amp x\n",
+    );
+}
+
+test "a reference in a link is decoded before the address is read" {
+    try expectEvents(
+        "paragraph_begin\nline\nlink:javascript:alert(1)\ntext:x\n/link\nnewline\nparagraph_end\n",
+        "[x](javascript&colon;alert(1))\n",
+    );
+    try expectEvents(
+        "paragraph_begin\nline\nlink:/docs\ntext:a & b\n/link\nnewline\nparagraph_end\n",
+        "[a &amp; b](/docs)\n",
+    );
+}
+
+test "a reference still arriving is held until the rest of it comes" {
+    const gpa = std.testing.allocator;
+    var transcript: Transcript = .{ .out = .init(gpa) };
+    defer transcript.out.deinit();
+
+    var stream = Stream.open(gpa, transcript.renderer());
+    defer stream.deinit();
+    try stream.feed("a &am");
+    try std.testing.expectEqualStrings("paragraph_begin\nline\ntext:a \n", transcript.out.written());
+    try stream.feed("p; b\n");
+    try stream.close();
+    try std.testing.expectEqualStrings(
+        "paragraph_begin\nline\ntext:a \ntext:&\ntext: b\nnewline\nparagraph_end\n",
+        transcript.out.written(),
     );
 }
 
