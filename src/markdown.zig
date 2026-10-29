@@ -1,6 +1,5 @@
-//! Parsing markdown: the blocks a reply is made of and the inline forms inside them, decided as the
-//! text arrives and written to a `Renderer` as events. Nothing here names a terminal or a page, so
-//! one parse can be set both ways.
+//! Parsing markdown: the blocks a reply is made of and the inline forms inside them, handed to a
+//! `Renderer` as events as the text arrives. Nothing here names a terminal or a page.
 
 const std = @import("std");
 
@@ -657,7 +656,9 @@ pub const Parser = struct {
             return .hold;
         };
 
-        const address = try self.decode(bytes[open + 1 .. close], bytes[close + 2 .. end]);
+        // A title follows the address after a space, and nothing here shows it.
+        const written = std.mem.trim(u8, bytes[close + 2 .. end], spaces);
+        const address = try self.decode(bytes[open + 1 .. close], written[0 .. find(written, 0, ' ') orelse written.len]);
         if (kind == .image) {
             try self.out.show(.{ .image = .{ .url = address.url, .label = address.label } });
         } else {
@@ -1059,6 +1060,11 @@ test "a reference in a link is decoded before the address is read" {
     try expectEvents(
         "paragraph_begin\nline\nlink:/docs\ntext:a & b\n/link\nnewline\nparagraph_end\n",
         "[a &amp; b](/docs)\n",
+    );
+    // A title is not part of the address.
+    try expectEvents(
+        "paragraph_begin\nline\nlink:https://example.com\ntext:x\n/link\nnewline\nparagraph_end\n",
+        "[x](https://example.com \"the site\")\n",
     );
 }
 
