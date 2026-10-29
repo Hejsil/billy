@@ -3,6 +3,8 @@
 
 const std = @import("std");
 
+const terminal_width = @import("width.zig");
+
 const Writer = @This();
 
 /// What a terminal takes of the decoration billy writes: nothing, or the escape codes every
@@ -27,11 +29,16 @@ pub const Color = enum(u8) {
 };
 
 style: Style = .plain,
+/// Columns the terminal shows, or zero when it cannot be asked, which is when nothing may be drawn
+/// that billy would have to take back.
+width: usize = 0,
 out: *std.Io.Writer,
 
 pub fn detect(file_writer: *std.Io.File.Writer) Writer {
+    const style = Style.detect(file_writer.io, file_writer.file);
     return .{
-        .style = Style.detect(file_writer.io, file_writer.file),
+        .style = style,
+        .width = if (style == .ansi) terminal_width.terminal(file_writer.io) else 0,
         .out = &file_writer.interface,
     };
 }

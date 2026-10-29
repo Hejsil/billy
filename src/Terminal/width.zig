@@ -26,37 +26,37 @@ fn ofTty(io: std.Io, file: std.Io.File) ?usize {
 
 /// What a piece of text took of the screen, which is what has to be taken back to write it again.
 pub const Laid = struct {
-    /// The lines it occupies.
-    lines: usize = 0,
-    /// Whether the cursor is at the start of the line after it.
-    at_line_start: bool = true,
+    /// The rows the cursor moved down, which is how far up it has to go back to the start.
+    rows: usize = 0,
 };
 
 /// Writes `text` with its lines broken to `width` columns, so that billy knows what it takes of the
 /// screen; only the columns a terminal shows are counted, and an escape is never broken by a break.
 pub fn wrap(text: []const u8, out: *std.Io.Writer, width: usize) !Laid {
     var laid: Laid = .{};
-    if (text.len == 0) return laid;
     var rest = text;
-    while (true) {
+    while (rest.len > 0) {
         const cut = std.mem.findScalar(u8, rest, '\n');
         const line = if (cut) |at| rest[0..at] else rest;
-        laid.lines += 1 + try broken(line, out, width);
+        laid.rows += try broken(line, out, width);
         if (cut) |at| {
             try out.writeAll("\n");
+            laid.rows += 1;
             rest = rest[at + 1 ..];
             continue;
         }
-        laid.at_line_start = false;
         return laid;
     }
+    return laid;
 }
 
 fn broken(line: []const u8, out: *std.Io.Writer, width: usize) !usize {
     var breaks: usize = 0;
     var rest = line;
     while (width > 0 and columns(rest) > width) {
-        const at = breakAt(rest, width);
+        // A character wider than the line is a line of its own, so that a break always takes one.
+        var at = breakAt(rest, width);
+        if (at == 0) at = if (escaped(rest, 0)) |len| len else charLen(rest);
         try out.writeAll(rest[0..at]);
         try out.writeAll("\n");
         breaks += 1;
@@ -358,10 +358,7 @@ fn expectWrapped(expected: []const u8, text: []const u8, width: usize) !void {
     defer out.deinit();
     const laid = try wrap(text, &out.writer, width);
     try std.testing.expectEqualStrings(expected, out.written());
-    const breaks = std.mem.count(u8, expected, "\n");
-    const ends = std.mem.endsWith(u8, expected, "\n");
-    try std.testing.expectEqual(ends, laid.at_line_start);
-    try std.testing.expectEqual(if (ends) breaks else breaks + 1, laid.lines);
+    try std.testing.expectEqual(std.mem.count(u8, expected, "\n"), laid.rows);
 }
 
 test "a line that fits is written as it stands" {
@@ -372,8 +369,8 @@ test "a line that fits is written as it stands" {
 
 test "a line that does not fit is broken at its last space" {
     try expectWrapped("one two\nthree", "one two three", 8);
-    try expectWrapped("one\ntwo\nthree", "one two three", 3);
-    try expectWrapped("one\ntwo", "one two", 0);
+    try expectWrapped("one\ntwo\nthr\nee", "one two three", 3);
+    try expectWrapped("one two", "one two", 0);
 }
 
 test "a word wider than the line is broken at the column" {
@@ -388,5 +385,5 @@ test "an escape is not counted, and is never broken by a break" {
 }
 
 test "a break does not split a wide character" {
-    try expectWrapped("\u{4e2d}\n\u{4e2d}", "\u{4e2d}\u{4e2d}", 1);
+    try expectWrapped("\u{4e2d}\n\u{4e2d}\n", "\u{4e2d}\u{4e2d}", 1);
 }

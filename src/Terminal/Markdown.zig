@@ -18,6 +18,13 @@ gpa: std.mem.Allocator,
 writer: Writer,
 err: ?anyerror = null,
 
+/// Where the answer is written when a block is not being gathered.
+out: *std.Io.Writer,
+/// Where a block's own bytes are gathered, so that a block can be written again on its own.
+recording: std.Io.Writer.Allocating,
+/// The document the blocks are being gathered into, when a document is read for them.
+document: ?*Document = null,
+
 pending_newlines: usize = 0,
 at_line_start: bool = true,
 
@@ -56,7 +63,8 @@ const Row = struct {
 
 /// Writes `text`, read as markdown, as the terminal shows it.
 pub fn write(gpa: std.mem.Allocator, text: []const u8, writer: Writer) !void {
-    var render = Markdown{ .gpa = gpa, .writer = writer };
+    var render: Markdown = .{ .gpa = gpa, .writer = writer, .out = writer.out, .recording = .init(gpa) };
+    defer render.recording.deinit();
     defer render.deinit();
 
     var callbacks = md.parser(Markdown);
@@ -67,55 +75,45 @@ pub fn write(gpa: std.mem.Allocator, text: []const u8, writer: Writer) !void {
     if (render.err) |err| return err;
 }
 
-/// A renderer and the streaming parser driving it, kept together so the parser's `userdata` pointer
-/// stays valid for as long as the document does.
-pub const Stream = struct {
+/// What a block of a document is written as, on its own.
+pub const Block = struct {
+    /// The bytes it took, with the blank line before it; it does not end with the line that follows.
+    text: []const u8,
+};
+
+/// A document as the blocks it is made of, each written on its own so that one that is not finished
+/// can be written again without disturbing the ones before it.
+pub const Document = struct {
     gpa: std.mem.Allocator,
-    renderer: *Markdown,
-    stream: md.Stream,
+    blocks: std.ArrayList(Block) = .empty,
 
-    /// Starts a document.
-    pub fn open(gpa: std.mem.Allocator, writer: Writer) !Stream {
-        const renderer = try gpa.create(Markdown);
-        errdefer gpa.destroy(renderer);
-        renderer.* = .{ .gpa = gpa, .writer = writer };
-        errdefer renderer.deinit();
-
-        var callbacks = md.parser(Markdown);
-        return .{
-            .gpa = gpa,
-            .renderer = renderer,
-            .stream = try md.Stream.init(&callbacks, renderer),
-        };
-    }
-
-    /// Writes more of the reply.
-    pub fn feed(self: *Stream, text: []const u8) !void {
-        self.stream.feed(text) catch |err| return self.renderer.err orelse err;
-    }
-
-    /// Ends the document, writing the last line and closing the blocks still open, and frees what
-    /// was held for it.
-    pub fn close(self: *Stream) !void {
-        var failure = self.renderer.err;
-        if (!self.stream.failed and failure == null) {
-            self.stream.flush() catch |err| {
-                failure = self.renderer.err orelse err;
-            };
-        }
-        self.stream.deinit();
-        self.renderer.deinit();
-        self.gpa.destroy(self.renderer);
-        if (failure) |err| return err;
-    }
-
-    /// Drops a document that will not be finished, without writing more of it.
-    pub fn deinit(self: *Stream) void {
-        self.stream.deinit();
-        self.renderer.deinit();
-        self.gpa.destroy(self.renderer);
+    pub fn deinit(self: *Document) void {
+        for (self.blocks.items) |block| self.gpa.free(block.text);
+        self.blocks.deinit(self.gpa);
     }
 };
+
+/// Reads `text` as the blocks it is made of, each written as the terminal shows it.
+pub fn read(gpa: std.mem.Allocator, text: []const u8, writer: Writer) !Document {
+    var render: Markdown = .{
+        .gpa = gpa,
+        .writer = writer,
+        .out = writer.out,
+        .recording = .init(gpa),
+    };
+    defer render.recording.deinit();
+    defer render.deinit();
+
+    var document: Document = .{ .gpa = gpa };
+    errdefer document.deinit();
+    render.document = &document;
+
+    var callbacks = md.parser(Markdown);
+    try md.parse(text, &callbacks, &render);
+    try render.closeDocument();
+    if (render.err) |err| return err;
+    return document;
+}
 
 fn deinit(self: *Markdown) void {
     self.image_label.deinit(self.gpa);
@@ -197,15 +195,39 @@ const Head = enum { heading, body };
 
 fn beginBlock(self: *Markdown, head: Head) bool {
     if (self.container_depth != 0) return true;
+    if (self.document != null) self.writer.out = &self.recording.writer;
     if (self.emitted and self.need_blank and !self.blank()) return false;
     self.emitted = true;
     self.block_head = head == .heading;
     return true;
 }
 
-fn endBlock(self: *Markdown) void {
-    if (self.container_depth != 0) return;
+fn endBlock(self: *Markdown) bool {
+    if (self.container_depth != 0) return true;
     self.need_blank = !self.block_head;
+    if (self.document == null) return true;
+    // The lines that end a block are its own, so that the block after it starts on a line of its own.
+    return self.flush() and self.gather();
+}
+
+/// Keeps what the block that has ended was written as, and turns to the next one.
+fn gather(self: *Markdown) bool {
+    const document = self.document orelse return true;
+    if (self.recording.written().len > 0) {
+        const text = self.gpa.dupe(u8, self.recording.written()) catch return self.fail();
+        errdefer self.gpa.free(text);
+        document.blocks.append(self.gpa, .{ .text = text }) catch return self.fail();
+        self.recording.clearRetainingCapacity();
+    }
+    return true;
+}
+
+/// Ends the gathering: the newlines a document leaves pending are not a block of their own.
+fn closeDocument(self: *Markdown) !void {
+    self.pending_newlines = 0;
+    if (!self.gather()) return self.err orelse error.MarkdownFailed;
+    self.writer.out = self.out;
+    self.document = null;
 }
 
 pub fn enterBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
@@ -265,33 +287,33 @@ pub fn leaveBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyo
             if (!self.raw(self.writer.reset())) return false;
             self.quote_depth -= 1;
             self.container_depth -= 1;
-            self.endBlock();
+            if (!self.endBlock()) return false;
         },
         md.c.MD_BLOCK_UL, md.c.MD_BLOCK_OL => {
             self.endLine();
             self.list_depth -= 1;
             self.container_depth -= 1;
-            self.endBlock();
+            if (!self.endBlock()) return false;
         },
         md.c.MD_BLOCK_LI => self.container_depth -= 1,
         md.c.MD_BLOCK_HR => {
             self.endLine();
-            self.endBlock();
+            if (!self.endBlock()) return false;
         },
         md.c.MD_BLOCK_H => {
             if (!self.raw(self.writer.reset())) return false;
             self.endLine();
-            self.endBlock();
+            if (!self.endBlock()) return false;
         },
         md.c.MD_BLOCK_CODE => {
             if (!self.raw(self.writer.reset())) return false;
             self.in_code = false;
             self.endLine();
-            self.endBlock();
+            if (!self.endBlock()) return false;
         },
         md.c.MD_BLOCK_P => {
             self.endLine();
-            self.endBlock();
+            if (!self.endBlock()) return false;
         },
         md.c.MD_BLOCK_TABLE => return self.closeTable(),
         md.c.MD_BLOCK_THEAD, md.c.MD_BLOCK_TBODY => {},
@@ -374,7 +396,7 @@ fn closeTable(self: *Markdown) bool {
     self.table = false;
     if (self.rows.items.len == 0) {
         self.endLine();
-        self.endBlock();
+        if (!self.endBlock()) return false;
         return true;
     }
 
@@ -400,7 +422,7 @@ fn closeTable(self: *Markdown) bool {
         self.endLine();
         if (row.header and !self.writeRule(&widths, columns)) return false;
     }
-    self.endBlock();
+    if (!self.endBlock()) return false;
     return true;
 }
 
@@ -691,36 +713,4 @@ test "a list nested past the indent cap is still shown" {
 test "a block is set off from the one before it" {
     try expectPlain("one\n\ntwo", "one\n\ntwo");
     try expectPlain("Title\nthe body", "# Title\nthe body");
-}
-
-test "a reply read in pieces is laid out like one read whole" {
-    const gpa = std.testing.allocator;
-    const text =
-        "# Title\n" ++
-        "\n" ++
-        "Hello **world**, and `code`.\n" ++
-        "\n" ++
-        "- one\n" ++
-        "- two\n" ++
-        "\n" ++
-        "| name | age |\n" ++
-        "| --- | --- |\n" ++
-        "| ana | 3 |\n";
-
-    var whole: std.Io.Writer.Allocating = .init(gpa);
-    defer whole.deinit();
-    try write(gpa, text, .{ .out = &whole.writer });
-
-    var streamed: std.Io.Writer.Allocating = .init(gpa);
-    defer streamed.deinit();
-    var stream = try Stream.open(gpa, .{ .out = &streamed.writer });
-    var rest: []const u8 = text;
-    while (rest.len > 0) {
-        const count = @min(rest.len, 3);
-        try stream.feed(rest[0..count]);
-        rest = rest[count..];
-    }
-    try stream.close();
-
-    try std.testing.expectEqualStrings(whole.written(), streamed.written());
 }

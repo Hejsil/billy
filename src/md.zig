@@ -1,5 +1,4 @@
-//! The md4cs binding: billy's whole contact with the C markdown parser, the callbacks its renderers
-//! are driven through, and the streaming state the terminal reads a reply with.
+//! The md4cs binding: billy's contact with the C markdown parser and its renderers' callbacks.
 
 const std = @import("std");
 
@@ -120,36 +119,3 @@ fn writeText(T: type) *const fn (c.MD_TEXTTYPE, [*c]const c.MD_CHAR, c.MD_SIZE, 
         }
     }.callback;
 }
-
-pub const Stream = struct {
-    ctx: *c.MD_PARSER_CTX,
-    failed: bool = false,
-
-    pub fn init(callbacks: *const c.MD_PARSER, userdata: ?*anyopaque) !Stream {
-        var ctx: ?*c.MD_PARSER_CTX = null;
-        if (c.md_stream_init(callbacks, userdata, &ctx) != 0)
-            return error.MarkdownFailed;
-        return .{ .ctx = ctx orelse return error.MarkdownFailed };
-    }
-
-    pub fn feed(self: *Stream, text: []const u8) !void {
-        var rest = text;
-        while (rest.len > 0) {
-            const count: c_uint = @intCast(@min(rest.len, std.math.maxInt(c_uint)));
-            if (c.md_stream_feed(self.ctx, rest.ptr, count) != 0) {
-                self.failed = true;
-                return error.MarkdownFailed;
-            }
-            rest = rest[count..];
-        }
-    }
-
-    pub fn flush(self: *Stream) !void {
-        if (c.md_stream_flush(self.ctx) != 0)
-            return error.MarkdownFailed;
-    }
-
-    pub fn deinit(self: *Stream) void {
-        c.md_stream_finish(self.ctx);
-    }
-};

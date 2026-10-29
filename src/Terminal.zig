@@ -6,6 +6,8 @@ const Agent = @import("Agent.zig");
 
 pub const tool = @import("Terminal/tool.zig");
 
+const Answer = @import("Terminal/Answer.zig");
+
 pub const Markdown = @import("Terminal/Markdown.zig");
 pub const Writer = @import("Terminal/Writer.zig");
 
@@ -14,7 +16,7 @@ const Terminal = @This();
 io: std.Io,
 writer: Writer,
 scratch: std.mem.Allocator,
-stream: ?Markdown.Stream = null,
+answer: ?Answer = null,
 reasoning: bool = false,
 reasoning_at_line_start: bool = true,
 interface: Agent.Emitter = .{ .vtable = &vtable },
@@ -37,18 +39,18 @@ fn showDelta(e: *Agent.Emitter, delta: Agent.Delta) anyerror!void {
     if (delta.reasoning) |text| {
         // Reasoning that arrives after the answer has begun would split the answer block, so it is
         // left out; providers send it first.
-        if (self.stream == null and text.len > 0) try self.streamReasoning(text);
+        if (self.answer == null and text.len > 0) try self.streamReasoning(text);
     }
 
     const text = delta.content orelse return;
     if (text.len == 0) return;
 
     try self.endReasoning();
-    if (self.stream == null) {
+    if (self.answer == null) {
         try marks.answer.header("answer", "", self.writer);
-        self.stream = try Markdown.Stream.open(self.scratch, self.writer);
+        self.answer = Answer.open(self.scratch, self.writer);
     }
-    if (self.stream) |*stream| try stream.feed(text);
+    if (self.answer) |*answer| try answer.push(text);
     try self.writer.flush();
 }
 
@@ -75,20 +77,22 @@ fn endReasoning(self: *Terminal) !void {
 }
 
 fn endStream(self: *Terminal) !bool {
-    if (self.stream == null) return false;
-    var stream = self.stream.?;
-    self.stream = null;
+    if (self.answer == null) return false;
+    var answer = self.answer.?;
+    self.answer = null;
+    defer answer.deinit();
 
-    const closed = stream.close();
-    try self.writer.write("\n\n");
+    const closed = answer.close();
+    // The answer's last block ends its own line, so this is the blank line after it.
+    try self.writer.write("\n");
     try self.writer.flush();
     try closed;
     return true;
 }
 
 fn dropStream(self: *Terminal) void {
-    if (self.stream) |*stream| stream.deinit();
-    self.stream = null;
+    if (self.answer) |*answer| answer.deinit();
+    self.answer = null;
 }
 
 fn show(e: *Agent.Emitter, block: Agent.Block) anyerror!void {
@@ -212,9 +216,9 @@ test "a streamed answer is written as it arrives, and is not written again" {
     try emit.showDelta(.{ .content = "hel" });
     try std.testing.expectEqualStrings("◆ answer\n", out.written());
 
-    // The newline lets the first line out.
+    // One paragraph, so nothing is a block yet: a block is only written once it has ended.
     try emit.showDelta(.{ .content = "lo\n**world**\n" });
-    try std.testing.expectEqualStrings("◆ answer\nhello", out.written());
+    try std.testing.expectEqualStrings("◆ answer\n", out.written());
 
     try emit.show(.{ .answer = "hello\n**world**\n" });
     try std.testing.expectEqualStrings("◆ answer\nhello\nworld\n\n", out.written());
