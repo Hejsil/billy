@@ -6,7 +6,7 @@ const Agent = @import("Agent.zig");
 
 pub const tool = @import("Terminal/tool.zig");
 
-pub const Markdown = @import("Terminal/Markdown.zig");
+pub const markdown = @import("Terminal/markdown.zig");
 pub const Writer = @import("Terminal/Writer.zig");
 
 const Terminal = @This();
@@ -14,7 +14,7 @@ const Terminal = @This();
 io: std.Io,
 writer: Writer,
 scratch: std.mem.Allocator,
-stream: ?Markdown.Stream = null,
+stream: ?markdown.Stream = null,
 reasoning: bool = false,
 reasoning_at_line_start: bool = true,
 interface: Agent.Emitter = .{ .vtable = &vtable },
@@ -46,7 +46,7 @@ fn showDelta(e: *Agent.Emitter, delta: Agent.Delta) anyerror!void {
     try self.endReasoning();
     if (self.stream == null) {
         try marks.answer.header("answer", "", self.writer);
-        self.stream = try Markdown.Stream.open(self.scratch, self.writer);
+        self.stream = try markdown.Stream.open(self.scratch, self.writer);
     }
     if (self.stream) |*stream| try stream.feed(text);
     try self.writer.flush();
@@ -143,7 +143,7 @@ fn selfOf(e: *Agent.Emitter) *Terminal {
 
 fn printPrompt(gpa: std.mem.Allocator, writer: Writer, text: []const u8) !void {
     try marks.prompt.header("prompt", "", writer);
-    try Markdown.write(gpa, text, writer);
+    try markdown.write(gpa, text, writer);
     try writer.write("\n\n");
 }
 
@@ -153,7 +153,7 @@ fn printAnswer(gpa: std.mem.Allocator, writer: Writer, content: ?[]const u8) !vo
     if (text.len == 0) {
         try writer.print("{s}(empty reply){s}", .{ writer.dim(), writer.reset() });
     } else {
-        try Markdown.write(gpa, text, writer);
+        try markdown.write(gpa, text, writer);
     }
     try writer.write("\n\n");
     try writer.flush();
