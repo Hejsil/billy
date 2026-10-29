@@ -424,7 +424,7 @@ test "a block is set off from the one before it" {
     try expectPlain("Title\nthe body", "# Title\nthe body");
 }
 
-test "what arrives is written before the line ends" {
+test "text is written as it arrives, and a mark waits for the mark that closes it" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -432,9 +432,11 @@ test "what arrives is written before the line ends" {
     defer stream.deinit();
 
     try stream.feed("hello, **wor");
-    try std.testing.expectEqualStrings("hello, wor", out.written());
+    try std.testing.expectEqualStrings("hello, ", out.written());
     try stream.feed("ld** and `co");
-    try std.testing.expectEqualStrings("hello, world and co", out.written());
+    try std.testing.expectEqualStrings("hello, world and ", out.written());
+    try stream.feed("de` here");
+    try std.testing.expectEqualStrings("hello, world and code here", out.written());
 }
 
 test "a reply read in pieces is laid out like one read whole" {

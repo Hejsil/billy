@@ -92,8 +92,8 @@ pub fn write(gpa: std.mem.Allocator, text: []const u8, renderer: Renderer) !void
     try parser.finish();
 }
 
-/// A parse kept for a reply read in pieces: what arrives is written, and only a prefix or a marker
-/// that may still grow is held back.
+/// A parse kept for a reply read in pieces: what arrives is written, and only a prefix, a marker
+/// that may still grow, or a mark whose partner has not arrived is held back.
 pub const Stream = struct {
     parser: Parser,
 
@@ -114,7 +114,6 @@ pub const Stream = struct {
     }
 };
 
-/// The parse itself: the state a line is read in, and the only thing a `Stream` holds.
 pub const Parser = struct {
     gpa: std.mem.Allocator,
     out: Renderer,
@@ -127,13 +126,11 @@ pub const Parser = struct {
     bold: bool = false,
     italic: bool = false,
     strike: bool = false,
-    span: bool = false,
     final: bool = false,
     table: ?Buffered = null,
     quotes: usize = 0,
     nests: [max_nesting]Nest = @splat(.{}),
     depth: usize = 0,
-    item_open: bool = false,
     /// Where a link's label and address are decoded into: a reference is not as long as its bytes.
     scratch: std.ArrayList(u8) = .empty,
     paragraph: bool = false,
@@ -146,6 +143,8 @@ pub const Parser = struct {
         /// Columns where its content starts, so a list inside it is set further in.
         content_column: usize = 0,
         ordered: bool = false,
+        /// Whether an item of this list is open, which a list inside it does not close.
+        item: bool = false,
     };
 
     const Kind = enum { text, heading, item };
@@ -207,11 +206,9 @@ pub const Parser = struct {
         if (self.bold) try self.out.show(.{ .span_end = .strong });
         if (self.italic) try self.out.show(.{ .span_end = .em });
         if (self.strike) try self.out.show(.{ .span_end = .strike });
-        if (self.span) try self.out.show(.{ .span_end = .code });
         self.bold = false;
         self.italic = false;
         self.strike = false;
-        self.span = false;
         try self.out.show(end);
         self.at_line_start = true;
         self.last = '\n';
@@ -234,15 +231,15 @@ pub const Parser = struct {
     }
 
     fn beginItem(self: *Parser, item: Item) !void {
-        self.item_open = true;
+        self.nests[self.depth - 1].item = true;
         try self.out.show(.{ .item_begin = item });
         try self.beginParagraph();
     }
 
     fn closeItem(self: *Parser) !void {
-        if (!self.item_open) return;
+        if (self.depth == 0 or !self.nests[self.depth - 1].item) return;
         try self.endParagraph();
-        self.item_open = false;
+        self.nests[self.depth - 1].item = false;
         try self.out.show(.item_end);
     }
 
@@ -310,7 +307,6 @@ pub const Parser = struct {
         while (self.quotes < depth) : (self.quotes += 1) try self.out.show(.quote_begin);
     }
 
-    /// A line of text: a paragraph's next line, or a paragraph of its own.
     fn openText(self: *Parser) !void {
         if (self.after_blank) try self.closeLists();
         try self.beginParagraph();
@@ -382,9 +378,9 @@ pub const Parser = struct {
                 var end = i;
                 while (end < bytes.len and bytes[end] == '#') end += 1;
                 if (end == bytes.len) return false;
-                if (bytes[end] == ' ' or bytes[end] == '\n') {
+                if (end - i <= 6 and (bytes[end] == ' ' or bytes[end] == '\n')) {
                     taken = if (bytes[end] == ' ') end + 1 else end;
-                    lead.heading = @intCast(@min(end - i, 6));
+                    lead.heading = @intCast(end - i);
                     kind = .heading;
                 }
             },
@@ -457,8 +453,7 @@ pub const Parser = struct {
         return marks >= 3;
     }
 
-    /// Hands on the current line as text, through the inline forms, up to its end or a form that
-    /// cannot be decided yet.
+    /// Hands on the line's text, through the inline forms, up to its end or a form not yet decided.
     fn body(self: *Parser) !bool {
         const bytes = self.pending.items;
         var run: usize = 0;
@@ -509,7 +504,6 @@ pub const Parser = struct {
     /// Hands on the inline form `bytes[i..]` starts, or says how it is read.
     fn markup(self: *Parser, bytes: []const u8, i: usize) !Markup {
         const mark = bytes[i];
-        if (self.span and mark != '`') return .literal;
         switch (mark) {
             '\\' => {
                 if (i + 1 == bytes.len) return if (self.final) .literal else .hold;
@@ -518,9 +512,25 @@ pub const Parser = struct {
                 return .{ .taken = 2 };
             },
             '`' => {
-                self.span = !self.span;
-                try self.out.show(if (self.span) .{ .span_begin = .code } else .{ .span_end = .code });
-                return .{ .taken = 1 };
+                var run: usize = 1;
+                while (i + run < bytes.len and bytes[i + run] == '`') run += 1;
+                if (i + run == bytes.len and !self.final) return .hold;
+                const end = closingRun(bytes, i + run, run) orelse {
+                    // Until the line ends, the run that closes it may still arrive.
+                    if (self.final or find(bytes, i + run, '\n') != null) return .literal;
+                    return .hold;
+                };
+                // A span that begins and ends with a space is written without the outer one.
+                var text = bytes[i + run .. end];
+                if (text.len > 2 and text[0] == ' ' and text[text.len - 1] == ' ' and
+                    std.mem.trim(u8, text, " ").len > 0)
+                {
+                    text = text[1 .. text.len - 1];
+                }
+                try self.out.show(.{ .span_begin = .code });
+                try self.emit(text);
+                try self.out.show(.{ .span_end = .code });
+                return .{ .taken = end + run - i };
             },
             '*', '_', '~' => {
                 var count: usize = 1;
@@ -545,6 +555,12 @@ pub const Parser = struct {
                 }
                 if (after == ' ' or after == '\t' or after == '\n') return .literal;
                 if (mark == '_' and isWord(self.last) and isWord(after)) return .literal;
+                // A mark with nothing to close it is a character of the text.
+                const closer = closingMark(bytes, i + count, mark, if (count >= 2) 2 else 1);
+                if (closer != .found) {
+                    if (closer == .unknown and !self.final) return .hold;
+                    return .literal;
+                }
                 if (count >= 2) {
                     self.bold = true;
                     try self.out.show(.{ .span_begin = .strong });
@@ -578,6 +594,36 @@ pub const Parser = struct {
     }
 
     const Destination = enum { link, image };
+
+    const Closing = enum { found, absent, unknown };
+
+    /// Whether a run of `mark` that could close a span opened by `count` of them comes later on the line.
+    fn closingMark(bytes: []const u8, from: usize, mark: u8, count: usize) Closing {
+        var i = from;
+        while (i < bytes.len) : (i += 1) {
+            if (bytes[i] == '\n') return .absent;
+            if (bytes[i] != mark) continue;
+            var run: usize = 1;
+            while (i + run < bytes.len and bytes[i + run] == mark) run += 1;
+            if (run >= count) return .found;
+            i += run - 1;
+        }
+        return .unknown;
+    }
+
+    /// Where the run of exactly `run` backticks that closes a code span starts, within the line.
+    fn closingRun(bytes: []const u8, from: usize, run: usize) ?usize {
+        var i = from;
+        while (i < bytes.len) : (i += 1) {
+            if (bytes[i] == '\n') return null;
+            if (bytes[i] != '`') continue;
+            var count: usize = 1;
+            while (i + count < bytes.len and bytes[i + count] == '`') count += 1;
+            if (count == run) return i;
+            i += count - 1;
+        }
+        return null;
+    }
 
     /// The `)` that closes a destination, which may hold parentheses of its own.
     fn destinationEnd(bytes: []const u8, from: usize) ?usize {
@@ -660,8 +706,7 @@ pub const Parser = struct {
         }
     }
 
-    /// Hands on the body of a fenced code block, a line at a time, and ends it at the fence that
-    /// closes it.
+    /// Hands on a fenced block's body a line at a time, and ends it at the fence that closes it.
     fn code(self: *Parser) !bool {
         const bytes = self.pending.items;
         if (self.at_line_start) {
@@ -955,8 +1000,8 @@ test "a list set inside an item is that item's, and another mark is another list
         "list_begin ordered=true number=1\nitem_begin number=1\nparagraph_begin\nline\ntext:one\n" ++
             "newline\nparagraph_end\nlist_begin ordered=false number=-\nitem_begin bullet\n" ++
             "paragraph_begin\nline indent=3\ntext:nested\nnewline\nparagraph_end\nitem_end\n" ++
-            "list_end\nitem_begin number=2\nparagraph_begin\nline\ntext:two\nnewline\nparagraph_end\n" ++
-            "item_end\nlist_end\n",
+            "list_end\nitem_end\nitem_begin number=2\nparagraph_begin\nline\ntext:two\nnewline\n" ++
+            "paragraph_end\nitem_end\nlist_end\n",
         "1. one\n   - nested\n2. two\n",
     );
     try expectEvents(

@@ -14,7 +14,6 @@ pub const http = @import("http.zig");
 pub const LineEditor = @import("LineEditor.zig");
 pub const llm = @import("llm.zig");
 pub const markdown = @import("markdown.zig");
-pub const md = @import("md.zig");
 pub const models = @import("models.zig");
 pub const report = @import("report.zig");
 pub const Server = @import("Server.zig");
