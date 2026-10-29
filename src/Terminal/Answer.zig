@@ -39,10 +39,10 @@ pub fn close(self: *Answer) !void {
 
 fn finish(self: *Answer) !void {
     try self.undo();
-    var document = try markdown.read(self.gpa, self.text.items, self.writer);
+    var document = try markdown.read(self.gpa, self.text.items, self.writer, self.finished);
     defer document.deinit();
-    for (document.blocks.items[self.finished..]) |block| try self.writer.write(block.text);
-    self.finished = document.blocks.items.len;
+    for (document.blocks.items) |block| try self.writer.write(block.text);
+    self.finished += document.blocks.items.len;
 }
 
 fn show(self: *Answer) !void {
@@ -51,13 +51,12 @@ fn show(self: *Answer) !void {
 
 fn repaint(self: *Answer) !void {
     try self.undo();
-    var document = try markdown.read(self.gpa, self.text.items, self.writer);
+    var document = try markdown.read(self.gpa, self.text.items, self.writer, self.finished);
     defer document.deinit();
     const blocks = document.blocks.items;
-    if (blocks.len <= self.finished) return;
-    while (self.finished + 1 < blocks.len) : (self.finished += 1) {
-        try self.writer.write(blocks[self.finished].text);
-    }
+    if (blocks.len == 0) return;
+    for (blocks[0 .. blocks.len - 1]) |block| try self.writer.write(block.text);
+    self.finished += blocks.len - 1;
     try self.draw(blocks[blocks.len - 1].text);
 }
 

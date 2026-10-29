@@ -24,6 +24,11 @@ out: *std.Io.Writer,
 recording: std.Io.Writer.Allocating,
 /// The document the blocks are being gathered into, when a document is read for them.
 document: ?*Document = null,
+/// How many blocks are already written elsewhere, and where their bytes go instead of a block.
+skip: usize = 0,
+seen: usize = 0,
+discard: ?*std.Io.Writer = null,
+skipping: bool = false,
 
 pending_newlines: usize = 0,
 at_line_start: bool = true,
@@ -94,12 +99,18 @@ pub const Document = struct {
 };
 
 /// Reads `text` as the blocks it is made of, each written as the terminal shows it.
-pub fn read(gpa: std.mem.Allocator, text: []const u8, writer: Writer) !Document {
+pub fn read(gpa: std.mem.Allocator, text: []const u8, writer: Writer, skip: usize) !Document {
+    // The blocks before `skip` are on the screen already: they are read for the state they leave,
+    // and written where nothing keeps them.
+    var nothing: [1]u8 = undefined;
+    var discard: std.Io.Writer.Discarding = .init(&nothing);
     var render: Markdown = .{
         .gpa = gpa,
         .writer = writer,
         .out = writer.out,
         .recording = .init(gpa),
+        .skip = skip,
+        .discard = if (skip > 0) &discard.writer else null,
     };
     defer render.recording.deinit();
     defer render.deinit();
@@ -195,7 +206,10 @@ const Head = enum { heading, body };
 
 fn beginBlock(self: *Markdown, head: Head) bool {
     if (self.container_depth != 0) return true;
-    if (self.document != null) self.writer.out = &self.recording.writer;
+    if (self.document != null) {
+        self.skipping = self.seen < self.skip;
+        self.writer.out = if (self.skipping) self.discard.? else &self.recording.writer;
+    }
     if (self.emitted and self.need_blank and !self.blank()) return false;
     self.emitted = true;
     self.block_head = head == .heading;
@@ -207,7 +221,13 @@ fn endBlock(self: *Markdown) bool {
     self.need_blank = !self.block_head;
     if (self.document == null) return true;
     // The lines that end a block are its own, so that the block after it starts on a line of its own.
-    return self.flush() and self.gather();
+    if (!self.flush()) return false;
+    if (self.skipping) {
+        self.seen += 1;
+        self.writer.out = &self.recording.writer;
+        return true;
+    }
+    return self.gather();
 }
 
 /// Keeps what the block that has ended was written as, and turns to the next one.
