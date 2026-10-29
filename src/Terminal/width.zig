@@ -1,6 +1,90 @@
-//! How wide text is on a terminal, and how long its characters are.
+//! How wide text is on a terminal, how long its characters are, and how it is broken to fit.
 
 const std = @import("std");
+
+/// The width of the terminal, in columns, or zero when there is no terminal to ask.
+pub fn terminal(io: std.Io) usize {
+    for ([_]std.Io.File{ std.Io.File.stdout(), std.Io.File.stdin(), std.Io.File.stderr() }) |file| {
+        if (ofTty(io, file)) |width| return width;
+    }
+    return 0;
+}
+
+fn ofTty(io: std.Io, file: std.Io.File) ?usize {
+    const tty = file.isTty(io) catch return null;
+    if (!tty) return null;
+    var size: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
+    const result = io.operate(.{ .device_io_control = .{
+        .file = file,
+        .code = std.posix.T.IOCGWINSZ,
+        .arg = &size,
+    } }) catch return null;
+    if (result.device_io_control < 0) return null;
+    if (size.col == 0) return null;
+    return size.col;
+}
+
+/// What a piece of text took of the screen, which is what has to be taken back to write it again.
+pub const Laid = struct {
+    /// The lines it occupies.
+    lines: usize = 0,
+    /// Whether the cursor is at the start of the line after it.
+    at_line_start: bool = true,
+};
+
+/// Writes `text` with its lines broken to `width` columns, so that billy knows what it takes of the
+/// screen; only the columns a terminal shows are counted, and an escape is never broken by a break.
+pub fn wrap(text: []const u8, out: *std.Io.Writer, width: usize) !Laid {
+    var laid: Laid = .{};
+    if (text.len == 0) return laid;
+    var rest = text;
+    while (true) {
+        const cut = std.mem.findScalar(u8, rest, '\n');
+        const line = if (cut) |at| rest[0..at] else rest;
+        laid.lines += 1 + try broken(line, out, width);
+        if (cut) |at| {
+            try out.writeAll("\n");
+            rest = rest[at + 1 ..];
+            continue;
+        }
+        laid.at_line_start = false;
+        return laid;
+    }
+}
+
+fn broken(line: []const u8, out: *std.Io.Writer, width: usize) !usize {
+    var breaks: usize = 0;
+    var rest = line;
+    while (width > 0 and columns(rest) > width) {
+        const at = breakAt(rest, width);
+        try out.writeAll(rest[0..at]);
+        try out.writeAll("\n");
+        breaks += 1;
+        rest = rest[at..];
+        while (rest.len > 0 and rest[0] == ' ') rest = rest[1..];
+    }
+    try out.writeAll(rest);
+    return breaks;
+}
+
+/// Where a line is broken: after the last space before `width`, or at the column if no space fits.
+fn breakAt(line: []const u8, width: usize) usize {
+    var i: usize = 0;
+    var seen: usize = 0;
+    var space: ?usize = null;
+    while (i < line.len) {
+        if (escaped(line, i)) |len| {
+            i += len;
+            continue;
+        }
+        const length = charLen(line[i..]);
+        if (seen + charWidth(line[i..]) > width) break;
+        seen += charWidth(line[i..]);
+        i += length;
+        if (line[i - 1] == ' ' or line[i - 1] == '\t') space = i - 1;
+    }
+    return space orelse i;
+}
 
 /// Columns `text` takes on a terminal: none for a control, or a codepoint that only extends
 /// another, or an ANSI escape; two for a wide character; one otherwise.
@@ -267,4 +351,42 @@ test "stepping back is the mirror of stepping forward" {
         }
         try std.testing.expectEqual(text.len, i);
     }
+}
+
+fn expectWrapped(expected: []const u8, text: []const u8, width: usize) !void {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    const laid = try wrap(text, &out.writer, width);
+    try std.testing.expectEqualStrings(expected, out.written());
+    const breaks = std.mem.count(u8, expected, "\n");
+    const ends = std.mem.endsWith(u8, expected, "\n");
+    try std.testing.expectEqual(ends, laid.at_line_start);
+    try std.testing.expectEqual(if (ends) breaks else breaks + 1, laid.lines);
+}
+
+test "a line that fits is written as it stands" {
+    try expectWrapped("hello", "hello", 20);
+    try expectWrapped("one\ntwo", "one\ntwo", 3);
+    try expectWrapped("", "", 20);
+}
+
+test "a line that does not fit is broken at its last space" {
+    try expectWrapped("one two\nthree", "one two three", 8);
+    try expectWrapped("one\ntwo\nthree", "one two three", 3);
+    try expectWrapped("one\ntwo", "one two", 0);
+}
+
+test "a word wider than the line is broken at the column" {
+    try expectWrapped("abcde\nfghij", "abcdefghij", 5);
+}
+
+test "an escape is not counted, and is never broken by a break" {
+    const bold = "\x1b[1m";
+    const reset = "\x1b[0m";
+    const expected = bold ++ "one two\nthree" ++ reset;
+    try expectWrapped(expected, bold ++ "one two three" ++ reset, 8);
+}
+
+test "a break does not split a wide character" {
+    try expectWrapped("\u{4e2d}\n\u{4e2d}", "\u{4e2d}\u{4e2d}", 1);
 }
