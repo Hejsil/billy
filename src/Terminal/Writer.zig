@@ -29,8 +29,7 @@ pub const Color = enum(u8) {
 };
 
 style: Style = .plain,
-/// Columns the terminal shows, or zero when it cannot be asked, which is when nothing may be drawn
-/// that billy would have to take back.
+/// Columns the terminal shows, or zero when it cannot be asked: then nothing can be taken back.
 width: usize = 0,
 out: *std.Io.Writer,
 
@@ -81,6 +80,22 @@ pub fn boldColor(writer: Writer, hue: Color) []const u8 {
 
 pub fn reset(writer: Writer) []const u8 {
     return writer.code("0");
+}
+
+/// Brackets a burst of output so a terminal shows all of it at once, rather than the cleared space
+/// before it. It is a private mode rather than a colour, so it does not end in `m`.
+pub fn syncBegin(writer: Writer) []const u8 {
+    return switch (writer.style) {
+        .plain => "",
+        .ansi => "\x1b[?2026h",
+    };
+}
+
+pub fn syncEnd(writer: Writer) []const u8 {
+    return switch (writer.style) {
+        .plain => "",
+        .ansi => "\x1b[?2026l",
+    };
 }
 
 pub fn linkOpen(writer: Writer) []const u8 {

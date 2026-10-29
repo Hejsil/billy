@@ -1,7 +1,6 @@
 //! A reply on the terminal as it arrives: the text is kept, markdown is read again from the start
-//! every time more of it comes, and the block still being written is taken back and written again,
-//! so the screen shows the reply rather than every attempt at it. The blocks before it are written
-//! once, in the form the terminal wraps itself, and left alone.
+//! every time more of it comes, and the block still being written is taken back and written again.
+//! The blocks before it are written once, in the form the terminal wraps itself, and left alone.
 
 const std = @import("std");
 
@@ -35,15 +34,22 @@ pub fn push(self: *Answer, delta: []const u8) !void {
 
 /// Ends the reply: the block that was still being written is written for the last time, unwrapped.
 pub fn close(self: *Answer) !void {
+    try self.frame(finish);
+}
+
+fn finish(self: *Answer) !void {
     try self.undo();
     var document = try markdown.read(self.gpa, self.text.items, self.writer);
     defer document.deinit();
     for (document.blocks.items[self.finished..]) |block| try self.writer.write(block.text);
     self.finished = document.blocks.items.len;
-    try self.writer.flush();
 }
 
 fn show(self: *Answer) !void {
+    try self.frame(repaint);
+}
+
+fn repaint(self: *Answer) !void {
     try self.undo();
     var document = try markdown.read(self.gpa, self.text.items, self.writer);
     defer document.deinit();
@@ -53,6 +59,19 @@ fn show(self: *Answer) !void {
         try self.writer.write(blocks[self.finished].text);
     }
     try self.draw(blocks[blocks.len - 1].text);
+}
+
+/// Writes one frame: all of it is shown at once, so the taken-back block is never seen alone.
+fn frame(self: *Answer, body: *const fn (self: *Answer) anyerror!void) !void {
+    // A frame is only worth declaring when something in it is drawn again and taken back.
+    const bracketed = self.writer.width > 0;
+    if (bracketed) try self.writer.write(Writer.syncBegin(self.writer));
+    body(self) catch |err| {
+        if (bracketed) try self.writer.write(Writer.syncEnd(self.writer));
+        try self.writer.flush();
+        return err;
+    };
+    if (bracketed) try self.writer.write(Writer.syncEnd(self.writer));
     try self.writer.flush();
 }
 
@@ -67,7 +86,6 @@ fn undo(self: *Answer) !void {
     self.drawn = null;
     if (drawn.rows > 0) try self.writer.print("\x1b[{d}A", .{drawn.rows});
     try self.writer.write("\r\x1b[0J");
-    try self.writer.flush();
 }
 
 /// What a terminal shows after `text` was written, so a test can say what a reply looks like.
