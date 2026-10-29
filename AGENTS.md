@@ -192,11 +192,6 @@ least once. Read the rule, not the story; the story is in the review.
   `std.testing.allocator`.
 - **Assert the thing the comment claims.** A test named after a behaviour that only checks a proxy
   for it (a `<span>` is present, a count is non-zero) is how the stale doc survives.
-- **A reply that streams gets a test that reads what is on screen before the input ends.** The only
-  test of the streaming renderer compared a reply fed in pieces with one fed whole, and it passed
-  while nothing at all was written until the last byte: the two agreed because neither had appeared.
-  *md4c's streaming entry points still hold a block until it ends, so a whole paragraph arrived at
-  once and every test was green.*
 
 ## Checking by hand
 

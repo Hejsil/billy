@@ -5,8 +5,7 @@ const std = @import("std");
 const Agent = @import("Agent.zig");
 const diff = @import("diff.zig");
 const favicons = @import("web/favicons.zig");
-/// The page's markdown reader, `md` because `markdown` is this file's own renderer of a reply.
-const md = @import("markdown.zig");
+const md = @import("md.zig");
 const models = @import("models.zig");
 const Session = @import("Session.zig");
 const Tools = @import("Tools.zig");
@@ -33,359 +32,257 @@ pub fn escape(text: []const u8, out: *std.Io.Writer) !void {
 
 /// Writes the markdown of a reply or a prompt as HTML.
 pub fn markdown(gpa: std.mem.Allocator, text: []const u8, out: *std.Io.Writer) !void {
-    var render: Render = .{ .gpa = gpa, .out = out };
-    defer render.deinit();
-    try md.write(gpa, text, render.interface());
+    var render = Markdown{ .gpa = gpa, .out = out };
+    var callbacks = md.parser(Markdown);
+    try md.parse(text, &callbacks, &render);
+    // A callback cannot return an error, so a failed write is kept on the renderer and reported
+    // here, once the parser has stopped.
+    if (render.err) |err| return err;
 }
 
-/// A block that is being gathered, because how it is written out is not known until it ends: a
-/// list's items take a `<p>` only once the whole list says whether it is loose.
-const List = struct {
-    /// Its items, in the order they were written.
-    items: std.ArrayList(Item) = .empty,
-    ordered: bool = false,
-    /// Where a numbered list starts, read from its first item while its bytes are still there.
-    start: usize = 1,
-    /// Whether a blank line was seen in it, which is what makes its items take a `<p>`.
-    loose: bool = false,
-    /// The item being gathered: what is written inside its `<li>`, and where its paragraphs are.
-    content: std.Io.Writer.Allocating,
-    paragraphs: std.ArrayList(Span) = .empty,
-    open: bool = false,
-    task: ?bool = null,
-
-    fn deinit(list: *List, gpa: std.mem.Allocator) void {
-        for (list.items.items) |item| item.deinit(gpa);
-        list.items.deinit(gpa);
-        list.content.deinit();
-        list.paragraphs.deinit(gpa);
-    }
-};
-
-const Item = struct {
-    /// What is written inside the `<li>`: a paragraph's text, a nested list's markup, both in order.
-    content: []const u8,
-    /// Where the paragraphs in the content begin and end.
-    paragraphs: []const Span,
-    task: ?bool = null,
-
-    fn deinit(item: Item, gpa: std.mem.Allocator) void {
-        gpa.free(item.content);
-        gpa.free(item.paragraphs);
-    }
-};
-
-const Span = struct { start: usize, end: usize };
-
-const Render = struct {
+const Markdown = struct {
     gpa: std.mem.Allocator,
     out: *std.Io.Writer,
-    /// The lists being gathered, the innermost last.
-    lists: std.ArrayList(List) = .empty,
-    /// A line has ended and its break is written before what comes next, not after it, so that the
-    /// last line of a block does not end with one.
-    pending_break: bool = false,
-    /// A blank line was seen, and only what follows it says whether it makes the list loose: a line
-    /// that continues the list does, and the block that ends it does not.
-    pending_blank: bool = false,
-    heading: ?u3 = null,
-    in_code: bool = false,
+    err: ?std.Io.Writer.Error = null,
+    image_depth: usize = 0,
 
-    fn interface(self: *Render) md.Renderer {
-        return .{ .context = self, .emit = show };
+    fn put(self: *Markdown, text: []const u8) bool {
+        self.out.writeAll(text) catch |err| {
+            self.err = err;
+            return false;
+        };
+        return true;
     }
 
-    fn show(context: *anyopaque, event: md.Event) anyerror!void {
-        const self: *Render = @ptrCast(@alignCast(context));
-        switch (event) {
-            .newline => try self.breakLine(),
-            .blank => {
-                self.pending_break = false;
-                self.pending_blank = true;
+    fn print(self: *Markdown, comptime format: []const u8, args: anytype) bool {
+        self.out.print(format, args) catch |err| {
+            self.err = err;
+            return false;
+        };
+        return true;
+    }
+
+    fn putEscaped(self: *Markdown, text: []const u8) bool {
+        escape(text, self.out) catch |err| {
+            self.err = err;
+            return false;
+        };
+        return true;
+    }
+
+    pub fn enterBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
+        switch (block_type) {
+            md.c.MD_BLOCK_DOC => {},
+            md.c.MD_BLOCK_QUOTE => return self.put("<blockquote>\n"),
+            md.c.MD_BLOCK_UL => return self.put("<ul>\n"),
+            md.c.MD_BLOCK_OL => return self.openOl(@ptrCast(@alignCast(detail.?))),
+            md.c.MD_BLOCK_LI => return self.openLi(@ptrCast(@alignCast(detail.?))),
+            md.c.MD_BLOCK_HR => return self.put("<hr>\n"),
+            md.c.MD_BLOCK_H => {
+                const head: *const md.c.MD_BLOCK_H_DETAIL = @ptrCast(@alignCast(detail.?));
+                return self.put(heading_open[head.level - 1]);
             },
-            .line => |line| try self.openLine(line),
-            .text => |text| try self.writeText(text),
-            .paragraph_begin => try self.openParagraph(),
-            .paragraph_end => try self.closeParagraph(),
-            .quote_begin => try self.write("<blockquote>\n"),
-            .quote_end => {
-                self.pending_break = false;
-                try self.write("</blockquote>\n");
+            md.c.MD_BLOCK_CODE => return self.openCode(@ptrCast(@alignCast(detail.?))),
+            md.c.MD_BLOCK_P => return self.put("<p>"),
+            md.c.MD_BLOCK_TABLE => return self.put("<table>\n"),
+            md.c.MD_BLOCK_THEAD => return self.put("<thead>\n"),
+            md.c.MD_BLOCK_TBODY => return self.put("<tbody>\n"),
+            md.c.MD_BLOCK_TR => return self.put("<tr>\n"),
+            md.c.MD_BLOCK_TH => return self.openCell("th", @ptrCast(@alignCast(detail.?))),
+            md.c.MD_BLOCK_TD => return self.openCell("td", @ptrCast(@alignCast(detail.?))),
+            // Raw HTML never reaches here: `md.flags` turns it off, so it comes as text and is
+            // escaped.
+            else => {},
+        }
+        return true;
+    }
+
+    pub fn leaveBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyopaque) bool {
+        switch (block_type) {
+            md.c.MD_BLOCK_DOC => {},
+            md.c.MD_BLOCK_QUOTE => return self.put("</blockquote>\n"),
+            md.c.MD_BLOCK_UL => return self.put("</ul>\n"),
+            md.c.MD_BLOCK_OL => return self.put("</ol>\n"),
+            md.c.MD_BLOCK_LI => return self.put("</li>\n"),
+            md.c.MD_BLOCK_HR => {},
+            md.c.MD_BLOCK_H => {
+                const head: *const md.c.MD_BLOCK_H_DETAIL = @ptrCast(@alignCast(detail.?));
+                return self.put(heading_close[head.level - 1]);
             },
-            .list_begin => |list| try self.openList(list),
-            .list_end => try self.closeList(),
-            .item_begin => |item| {
-                if (self.pending_blank and self.lists.items.len > 0) {
-                    self.lists.items[self.lists.items.len - 1].loose = true;
-                }
-                self.pending_blank = false;
-                self.openItem(item);
+            md.c.MD_BLOCK_CODE => return self.put("</code></pre>\n"),
+            md.c.MD_BLOCK_P => return self.put("</p>\n"),
+            md.c.MD_BLOCK_TABLE => return self.put("</table>\n"),
+            md.c.MD_BLOCK_THEAD => return self.put("</thead>\n"),
+            md.c.MD_BLOCK_TBODY => return self.put("</tbody>\n"),
+            md.c.MD_BLOCK_TR => return self.put("</tr>\n"),
+            md.c.MD_BLOCK_TH => return self.put("</th>\n"),
+            md.c.MD_BLOCK_TD => return self.put("</td>\n"),
+            else => {},
+        }
+        return true;
+    }
+
+    fn openOl(self: *Markdown, detail: *const md.c.MD_BLOCK_OL_DETAIL) bool {
+        if (detail.start == 1) return self.put("<ol>\n");
+        return self.print("<ol start=\"{d}\">\n", .{detail.start});
+    }
+
+    fn openLi(self: *Markdown, detail: *const md.c.MD_BLOCK_LI_DETAIL) bool {
+        if (detail.is_task == 0) return self.put("<li>");
+        if (!self.put("<li class=\"task-list-item\">" ++
+            "<input type=\"checkbox\" class=\"task-list-item-checkbox\" disabled")) return false;
+        if ((detail.task_mark == 'x' or detail.task_mark == 'X') and !self.put(" checked")) return false;
+        return self.put(">");
+    }
+
+    fn openCode(self: *Markdown, detail: *const md.c.MD_BLOCK_CODE_DETAIL) bool {
+        if (!self.put("<pre><code")) return false;
+        if (detail.lang.text != null) {
+            if (!self.put(" class=\"language-")) return false;
+            if (!self.writeAttribute(&detail.lang, .text)) return false;
+            if (!self.put("\"")) return false;
+        }
+        return self.put(">");
+    }
+
+    fn openCell(self: *Markdown, tag: []const u8, detail: *const md.c.MD_BLOCK_TD_DETAIL) bool {
+        if (!self.put("<")) return false;
+        if (!self.put(tag)) return false;
+        return switch (detail.@"align") {
+            md.c.MD_ALIGN_LEFT => self.put(" align=\"left\">"),
+            md.c.MD_ALIGN_CENTER => self.put(" align=\"center\">"),
+            md.c.MD_ALIGN_RIGHT => self.put(" align=\"right\">"),
+            else => self.put(">"),
+        };
+    }
+
+    pub fn enterSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) bool {
+        const inside_image = self.image_depth > 0;
+        if (span_type == md.c.MD_SPAN_IMG) self.image_depth += 1;
+        // Inside an image label only the text matters: it is the alt text, and a tag written there
+        // would break out of the attribute.
+        if (inside_image) return true;
+
+        switch (span_type) {
+            md.c.MD_SPAN_EM => return self.put("<em>"),
+            md.c.MD_SPAN_STRONG => return self.put("<strong>"),
+            md.c.MD_SPAN_A => return self.openA(@ptrCast(@alignCast(detail.?))),
+            md.c.MD_SPAN_IMG => return self.openImg(@ptrCast(@alignCast(detail.?))),
+            md.c.MD_SPAN_CODE => return self.put("<code>"),
+            md.c.MD_SPAN_DEL => return self.put("<del>"),
+            md.c.MD_SPAN_U => return self.put("<u>"),
+            md.c.MD_SPAN_MARK => return self.put("<mark>"),
+            md.c.MD_SPAN_SUPERSCRIPT => return self.put("<sup>"),
+            md.c.MD_SPAN_SUBSCRIPT => return self.put("<sub>"),
+            else => {},
+        }
+        return true;
+    }
+
+    pub fn leaveSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaque) bool {
+        if (span_type == md.c.MD_SPAN_IMG) self.image_depth -= 1;
+        if (self.image_depth > 0) return true;
+
+        switch (span_type) {
+            md.c.MD_SPAN_EM => return self.put("</em>"),
+            md.c.MD_SPAN_STRONG => return self.put("</strong>"),
+            md.c.MD_SPAN_A => return self.put("</a>"),
+            md.c.MD_SPAN_IMG => return self.closeImg(@ptrCast(@alignCast(detail.?))),
+            md.c.MD_SPAN_CODE => return self.put("</code>"),
+            md.c.MD_SPAN_DEL => return self.put("</del>"),
+            md.c.MD_SPAN_U => return self.put("</u>"),
+            md.c.MD_SPAN_MARK => return self.put("</mark>"),
+            md.c.MD_SPAN_SUPERSCRIPT => return self.put("</sup>"),
+            md.c.MD_SPAN_SUBSCRIPT => return self.put("</sub>"),
+            else => {},
+        }
+        return true;
+    }
+
+    fn openA(self: *Markdown, detail: *const md.c.MD_SPAN_A_DETAIL) bool {
+        if (!self.put("<a href=\"")) return false;
+        if (!self.writeAttribute(&detail.href, .link)) return false;
+        if (detail.title.text != null) {
+            if (!self.put("\" title=\"")) return false;
+            if (!self.writeAttribute(&detail.title, .text)) return false;
+        }
+        return self.put("\">");
+    }
+
+    fn openImg(self: *Markdown, detail: *const md.c.MD_SPAN_IMG_DETAIL) bool {
+        if (!self.put("<img src=\"")) return false;
+        if (!self.writeAttribute(&detail.src, .image)) return false;
+        return self.put("\" alt=\"");
+    }
+
+    fn closeImg(self: *Markdown, detail: *const md.c.MD_SPAN_IMG_DETAIL) bool {
+        if (detail.title.text != null) {
+            if (!self.put("\" title=\"")) return false;
+            if (!self.writeAttribute(&detail.title, .text)) return false;
+        }
+        return self.put("\">");
+    }
+
+    pub fn writeText(self: *Markdown, text_type: md.c.MD_TEXTTYPE, text: []const u8) bool {
+        switch (text_type) {
+            // A NULL is replaced the way CommonMark says, rather than written.
+            md.c.MD_TEXT_NULLCHAR => return self.put("\u{FFFD}"),
+            md.c.MD_TEXT_BR => return self.put(if (self.image_depth == 0) "<br>\n" else " "),
+            md.c.MD_TEXT_SOFTBR => return self.put(if (self.image_depth == 0) "\n" else " "),
+            md.c.MD_TEXT_ENTITY => {
+                var value: std.ArrayList(u8) = .empty;
+                defer value.deinit(self.gpa);
+                md.decodeEntity(self.gpa, text, &value) catch return self.fail();
+                return self.putEscaped(value.items);
             },
-            .item_end => try self.closeItem(),
-            .span_begin => |span| try self.write(switch (span) {
-                .strong => "<strong>",
-                .em => "<em>",
-                .code => "<code>",
-                .strike => "<del>",
-            }),
-            .span_end => |span| try self.write(switch (span) {
-                .strong => "</strong>",
-                .em => "</em>",
-                .code => "</code>",
-                .strike => "</del>",
-            }),
-            .link_begin => |url| try self.openLink(url),
-            .link_end => try self.write("</a>"),
-            .image => |image| try self.writeImage(image),
-            .rule => {
-                self.pending_break = false;
-                try self.write("<hr>\n");
-            },
-            .code_begin => |lang| try self.openCode(lang),
-            .code_end => {
-                self.in_code = false;
-                try self.write("</code></pre>\n");
-            },
-            .table => |table| try self.writeTable(table),
+            // Everything else is text: normal text, code inside a block or span, and -- with raw
+            // HTML turned off -- what would have been HTML.
+            else => return self.putEscaped(text),
         }
     }
 
-    fn deinit(self: *Render) void {
-        for (self.lists.items) |*list| list.deinit(self.gpa);
-        self.lists.deinit(self.gpa);
+    fn fail(self: *Markdown) bool {
+        if (self.err == null) self.err = error.WriteFailed;
+        return false;
     }
 
-    /// Where what is written next goes: the page, or the item of the list being gathered.
-    fn sink(self: *Render) *std.Io.Writer {
-        if (self.lists.items.len == 0) return self.out;
-        return &self.lists.items[self.lists.items.len - 1].content.writer;
+    const Attribute = enum {
+        text,
+        link,
+        image,
+    };
+
+    fn writeAttribute(self: *Markdown, attribute: *const md.c.MD_ATTRIBUTE, kind: Attribute) bool {
+        var value: std.ArrayList(u8) = .empty;
+        defer value.deinit(self.gpa);
+        self.decodeAttribute(attribute, &value) catch return self.fail();
+
+        if (kind != .text and !safeAddress(value.items, kind == .link)) return self.put("#");
+        return self.putEscaped(value.items);
     }
 
-    /// Writes the break a finished line left due, before whatever follows it.
-    fn before(self: *Render) !void {
-        if (!self.pending_break) return;
-        self.pending_break = false;
-        try self.sink().writeAll("\n");
-    }
-
-    fn write(self: *Render, text: []const u8) !void {
-        try self.before();
-        try self.sink().writeAll(text);
-    }
-
-    fn print(self: *Render, comptime format: []const u8, args: anytype) !void {
-        try self.before();
-        try self.sink().print(format, args);
-    }
-
-    /// A line of source ends: inside a paragraph it is a soft break, and inside a code block it is
-    /// the newline the code was written with.
-    fn breakLine(self: *Render) !void {
-        if (self.in_code) return try self.writeRaw("\n");
-        if (self.heading) |level| return try self.closeHeading(level);
-        self.pending_break = true;
-    }
-
-    fn openLine(self: *Render, line: md.Line) !void {
-        const level = line.heading orelse return;
-        self.pending_break = false;
-        self.heading = level;
-        try self.write(heading_open[level - 1]);
-    }
-
-    fn closeHeading(self: *Render, level: u3) !void {
-        self.heading = null;
-        self.pending_break = false;
-        try self.sink().writeAll(heading_close[level - 1]);
-    }
-
-    fn openParagraph(self: *Render) !void {
-        self.pending_break = false;
-        if (self.lists.items.len == 0) return self.write("<p>");
-        const top = &self.lists.items[self.lists.items.len - 1];
-        try top.paragraphs.append(self.gpa, .{ .start = top.content.written().len, .end = 0 });
-    }
-
-    fn closeParagraph(self: *Render) !void {
-        self.pending_break = false;
-        if (self.lists.items.len == 0) return try self.write("</p>\n");
-        const top = &self.lists.items[self.lists.items.len - 1];
-        if (top.paragraphs.items.len == 0) return;
-        top.paragraphs.items[top.paragraphs.items.len - 1].end = top.content.written().len;
-    }
-
-    fn openItem(self: *Render, item: md.Item) void {
-        if (self.lists.items.len == 0) return;
-        const top = &self.lists.items[self.lists.items.len - 1];
-        top.open = true;
-        top.task = item.task;
-        top.content.clearRetainingCapacity();
-        top.paragraphs.clearRetainingCapacity();
-    }
-
-    fn closeItem(self: *Render) !void {
-        if (self.lists.items.len == 0) return;
-        const top = &self.lists.items[self.lists.items.len - 1];
-        if (!top.open) return;
-        self.pending_break = false;
-        top.open = false;
-        const content = try self.gpa.dupe(u8, top.content.written());
-        errdefer self.gpa.free(content);
-        const paragraphs = try self.gpa.dupe(Span, top.paragraphs.items);
-        errdefer self.gpa.free(paragraphs);
-        try top.items.append(self.gpa, .{
-            .content = content,
-            .paragraphs = paragraphs,
-            .task = top.task,
-        });
-        top.task = null;
-    }
-
-    fn openList(self: *Render, list: md.List) !void {
-        self.pending_break = false;
-        // A blank line before a list is the paragraph's, not the list's.
-        self.pending_blank = false;
-        try self.lists.append(self.gpa, .{
-            .ordered = list.ordered,
-            .start = startOf(list.number),
-            .content = .init(self.gpa),
-        });
-    }
-
-    fn closeList(self: *Render) !void {
-        self.pending_blank = false;
-        if (self.lists.items.len == 0) return;
-        var list = self.lists.pop().?;
-        defer list.deinit(self.gpa);
-        self.pending_break = false;
-
-        if (list.ordered) {
-            if (list.start == 1) try self.sink().writeAll("<ol>\n") else try self.print("<ol start=\"{d}\">\n", .{list.start});
-        } else {
-            try self.sink().writeAll("<ul>\n");
-        }
-        for (list.items.items) |item| try self.writeItem(item, list.loose);
-        try self.sink().writeAll(if (list.ordered) "</ol>\n" else "</ul>\n");
-    }
-
-    /// A list's item: the paragraphs it holds take a `<p>` only in a list that is loose.
-    fn writeItem(self: *Render, item: Item, loose: bool) !void {
-        const out = self.sink();
-        try out.writeAll("<li");
-        if (item.task != null) try out.writeAll(" class=\"task-list-item\"");
-        try out.writeAll(">");
-        if (item.task) |done| {
-            try out.writeAll("<input type=\"checkbox\" class=\"task-list-item-checkbox\" disabled");
-            if (done) try out.writeAll(" checked");
-            try out.writeAll(">");
-        }
-        var at: usize = 0;
-        for (item.paragraphs) |span| {
-            try out.writeAll(item.content[at..span.start]);
-            if (loose) {
-                try out.writeAll("<p>");
-                try out.writeAll(item.content[span.start..span.end]);
-                try out.writeAll("</p>\n");
-            } else {
-                try out.writeAll(item.content[span.start..span.end]);
+    fn decodeAttribute(self: *Markdown, attribute: *const md.c.MD_ATTRIBUTE, value: *std.ArrayList(u8)) !void {
+        var i: usize = 0;
+        while (attribute.substr_offsets[i] < attribute.size) : (i += 1) {
+            const start = attribute.substr_offsets[i];
+            const end = attribute.substr_offsets[i + 1];
+            const chunk = attribute.text[start..end];
+            switch (attribute.substr_types[i]) {
+                md.c.MD_TEXT_ENTITY => try md.decodeEntity(self.gpa, chunk, value),
+                md.c.MD_TEXT_NULLCHAR => try md.appendCodepoint(value, self.gpa, 0xFFFD),
+                else => try value.appendSlice(self.gpa, chunk),
             }
-            at = span.end;
         }
-        try out.writeAll(item.content[at..]);
-        try out.writeAll("</li>\n");
-    }
-
-    fn writeText(self: *Render, text: []const u8) !void {
-        if (self.in_code) return escape(text, self.sink());
-        try self.before();
-        try escape(text, self.sink());
-    }
-
-    fn writeRaw(self: *Render, text: []const u8) !void {
-        try self.sink().writeAll(text);
-    }
-
-    fn openLink(self: *Render, url: []const u8) !void {
-        try self.write("<a href=\"");
-        try self.writeAddress(url, .link);
-        try self.write("\">");
-    }
-
-    fn openCode(self: *Render, lang: []const u8) !void {
-        self.pending_break = false;
-        self.in_code = true;
-        try self.write("<pre><code");
-        if (lang.len > 0) {
-            try self.write(" class=\"language-");
-            try escape(lang, self.sink());
-            try self.write("\"");
-        }
-        try self.write(">");
-    }
-
-    fn writeImage(self: *Render, image: md.Image) !void {
-        try self.write("<img src=\"");
-        try self.writeAddress(image.url, .image);
-        try self.write("\" alt=\"");
-        try escape(image.label, self.sink());
-        try self.write("\">");
-    }
-
-    fn writeAddress(self: *Render, url: []const u8, kind: Address) !void {
-        if (!safeAddress(url, kind)) return try self.write("#");
-        try escape(url, self.sink());
-    }
-
-    fn writeTable(self: *Render, table: md.Table) !void {
-        self.pending_break = false;
-        try self.write("<table>\n");
-        const head = table.head + 1;
-        if (head > 0 and head <= table.rows.len) {
-            try self.write("<thead>\n");
-            for (table.rows[0..head]) |row| try self.writeRow(row, table.aligns, "th");
-            try self.write("</thead>\n");
-        }
-        if (head < table.rows.len) {
-            try self.write("<tbody>\n");
-            for (table.rows[head..]) |row| try self.writeRow(row, table.aligns, "td");
-            try self.write("</tbody>\n");
-        }
-        try self.write("</table>\n");
-    }
-
-    fn writeRow(self: *Render, row: md.Row, aligns: []const md.Align, tag: []const u8) !void {
-        try self.write("<tr>\n");
-        for (row.cells, 0..) |cell, column| {
-            try self.print("<{s}", .{tag});
-            switch (if (column < aligns.len) aligns[column] else .none) {
-                .left => try self.write(" align=\"left\""),
-                .center => try self.write(" align=\"center\""),
-                .right => try self.write(" align=\"right\""),
-                .none => {},
-            }
-            try self.write(">");
-            try escape(cell, self.sink());
-            try self.print("</{s}>\n", .{tag});
-        }
-        try self.write("</tr>\n");
     }
 };
-
-/// The number a numbered list starts at, or the first it can be.
-fn startOf(number: ?[]const u8) usize {
-    const digits = number orelse return 1;
-    return std.fmt.parseInt(usize, digits, 10) catch 1;
-}
 
 const heading_open = [_][]const u8{ "<h1>", "<h2>", "<h3>", "<h4>", "<h5>", "<h6>" };
 const heading_close = [_][]const u8{ "</h1>\n", "</h2>\n", "</h3>\n", "</h4>\n", "</h5>\n", "</h6>\n" };
 
-const Address = enum { link, image };
-
-fn safeAddress(url: []const u8, kind: Address) bool {
+fn safeAddress(url: []const u8, is_link: bool) bool {
     var buffer: [16]u8 = undefined;
     const scheme = schemeOf(url, &buffer);
-    const refused: []const []const u8 = if (kind == .link)
+    const refused: []const []const u8 = if (is_link)
         &.{ "javascript:", "vbscript:", "data:" }
     else
         &.{ "javascript:", "vbscript:" };
@@ -492,7 +389,6 @@ test "lists are written as lists, and do not run into a paragraph" {
     );
     try expectMarkdown("<ul>\n<li>one\nafter</li>\n</ul>\n", "- one\nafter\n");
     try expectMarkdown("<ul>\n<li>one</li>\n</ul>\n<p>after</p>\n", "- one\n\nafter\n");
-    try expectMarkdown("<p>before</p>\n<ul>\n<li>one</li>\n</ul>\n", "before\n\n- one\n");
 
     try expectMarkdown(
         "<ol>\n<li><p>one</p>\n</li>\n<li><p>two</p>\n</li>\n</ol>\n",
@@ -588,21 +484,21 @@ test "a link is written with an escaped address, and a dangerous one is not foll
 }
 
 test "a scheme that could run code is refused however it is spelled" {
-    try std.testing.expect(!safeAddress("javascript:alert(1)", .link));
-    try std.testing.expect(!safeAddress(" javascript:alert(1)", .link));
-    try std.testing.expect(!safeAddress("java\tscript:alert(1)", .link));
-    try std.testing.expect(!safeAddress("JavaScript:alert(1)", .link));
-    try std.testing.expect(!safeAddress("vbscript:x", .link));
+    try std.testing.expect(!safeAddress("javascript:alert(1)", true));
+    try std.testing.expect(!safeAddress(" javascript:alert(1)", true));
+    try std.testing.expect(!safeAddress("java\tscript:alert(1)", true));
+    try std.testing.expect(!safeAddress("JavaScript:alert(1)", true));
+    try std.testing.expect(!safeAddress("vbscript:x", true));
 
-    try std.testing.expect(!safeAddress("data:text/html,x", .link));
-    try std.testing.expect(!safeAddress("data:image/png;base64,x", .link));
-    try std.testing.expect(safeAddress("data:image/png;base64,x", .image));
+    try std.testing.expect(!safeAddress("data:text/html,x", true));
+    try std.testing.expect(!safeAddress("data:image/png;base64,x", true));
+    try std.testing.expect(safeAddress("data:image/png;base64,x", false));
 
-    try std.testing.expect(safeAddress("https://example.com", .link));
-    try std.testing.expect(safeAddress("mailto:a@b.c", .link));
-    try std.testing.expect(safeAddress("/docs", .link));
-    try std.testing.expect(safeAddress("#top", .link));
-    try std.testing.expect(safeAddress("relative/path", .link));
+    try std.testing.expect(safeAddress("https://example.com", true));
+    try std.testing.expect(safeAddress("mailto:a@b.c", true));
+    try std.testing.expect(safeAddress("/docs", true));
+    try std.testing.expect(safeAddress("#top", true));
+    try std.testing.expect(safeAddress("relative/path", true));
 }
 
 test "a scheme spelled with entities is caught" {

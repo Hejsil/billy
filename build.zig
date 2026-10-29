@@ -1,4 +1,5 @@
 const std = @import("std");
+const Translator = @import("translate_c").Translator;
 const zlinter = @import("zlinter");
 
 pub fn build(b: *std.Build) void {
@@ -6,15 +7,57 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const filters = b.option([]const []const u8, "filter", "Run only tests whose names contain this substring") orelse &.{};
 
+    // md4cs is the one markdown parser: mdflow's md4c, streamed for a reply as it arrives and batch
+    // for a stored block, so the two frontends cannot drift.
+    const mdflow = b.dependency("mdflow", .{
+        .target = target,
+        .optimize = optimize,
+    });
     const spaghet = b.dependency("spaghet", .{
         .target = target,
         .optimize = optimize,
     });
 
+    const translate_c = b.dependency("translate_c", .{});
+    const md4cs_zig: Translator = .init(translate_c, .{
+        .name = "md4cs",
+        .c_source_file = b.path("src/md4cs_binding.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    md4cs_zig.addIncludePath(mdflow.path("src"));
+    md4cs_zig.defineCMacro("MD4C_USE_UTF8", null);
+    md4cs_zig.defineCMacro("MD4C_STREAMING", null);
+    md4cs_zig.defineCMacro("md_parse", "md4cs_parse_stream");
+
     const mod = b.addModule("billy", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
+    });
+    mod.addImport("md4cs", md4cs_zig.mod);
+    mod.addIncludePath(mdflow.path("src"));
+    mod.addCSourceFiles(.{
+        .root = mdflow.path("src"),
+        .files = &.{ "md4cs.c", "entity.c" },
+        // C99, because the library is written in it, so a compiler whose default is newer or older
+        // does not decide whether it builds.
+        .flags = &.{
+            "-std=c99",
+            "-DMD4C_USE_UTF8",
+            "-DMD4C_STREAMING",
+            "-Dmd_parse=md4cs_parse_stream",
+        },
+    });
+    mod.addCSourceFiles(.{
+        .root = mdflow.path("src"),
+        .files = &.{"md4cs.c"},
+        .flags = &.{
+            "-std=c99",
+            "-DMD4C_USE_UTF8",
+            "-Dmd_parse=md4cs_parse_batch",
+        },
     });
 
     const exe = b.addExecutable(.{
@@ -29,17 +72,24 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // Dropping unreachable sections keeps the markdown library's unused code out of the binary, and
+    // it is also what lets a build that links libc work here at all: this system's `crt1.o` carries
+    // an `.sframe` section whose relocations the linker cannot resolve, and something has to remove
+    // it.
+    exe.link_gc_sections = true;
     b.installArtifact(exe);
 
     const mod_tests = b.addTest(.{
         .root_module = mod,
         .filters = filters,
     });
+    mod_tests.link_gc_sections = true;
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
+    exe_tests.link_gc_sections = true;
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     // The lint rules are billy's own source, but nothing imports them, so the module above never

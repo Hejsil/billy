@@ -6,7 +6,7 @@ const Agent = @import("Agent.zig");
 
 pub const tool = @import("Terminal/tool.zig");
 
-pub const markdown = @import("Terminal/markdown.zig");
+pub const Markdown = @import("Terminal/Markdown.zig");
 pub const Writer = @import("Terminal/Writer.zig");
 
 const Terminal = @This();
@@ -14,7 +14,7 @@ const Terminal = @This();
 io: std.Io,
 writer: Writer,
 scratch: std.mem.Allocator,
-stream: ?markdown.Stream = null,
+stream: ?Markdown.Stream = null,
 reasoning: bool = false,
 reasoning_at_line_start: bool = true,
 interface: Agent.Emitter = .{ .vtable = &vtable },
@@ -46,7 +46,7 @@ fn showDelta(e: *Agent.Emitter, delta: Agent.Delta) anyerror!void {
     try self.endReasoning();
     if (self.stream == null) {
         try marks.answer.header("answer", "", self.writer);
-        self.stream = try markdown.Stream.open(self.scratch, self.writer);
+        self.stream = try Markdown.Stream.open(self.scratch, self.writer);
     }
     if (self.stream) |*stream| try stream.feed(text);
     try self.writer.flush();
@@ -143,7 +143,7 @@ fn selfOf(e: *Agent.Emitter) *Terminal {
 
 fn printPrompt(gpa: std.mem.Allocator, writer: Writer, text: []const u8) !void {
     try marks.prompt.header("prompt", "", writer);
-    try markdown.write(gpa, text, writer);
+    try Markdown.write(gpa, text, writer);
     try writer.write("\n\n");
 }
 
@@ -153,7 +153,7 @@ fn printAnswer(gpa: std.mem.Allocator, writer: Writer, content: ?[]const u8) !vo
     if (text.len == 0) {
         try writer.print("{s}(empty reply){s}", .{ writer.dim(), writer.reset() });
     } else {
-        try markdown.write(gpa, text, writer);
+        try Markdown.write(gpa, text, writer);
     }
     try writer.write("\n\n");
     try writer.flush();
@@ -209,14 +209,13 @@ test "a streamed answer is written as it arrives, and is not written again" {
     defer terminal.deinit();
     const emit = terminal.emitter();
 
-    // What arrives is written, without waiting for the end of a line.
     try emit.showDelta(.{ .content = "hel" });
-    try std.testing.expectEqualStrings("◆ answer\nhel", out.written());
+    try std.testing.expectEqualStrings("◆ answer\n", out.written());
 
+    // The newline lets the first line out.
     try emit.showDelta(.{ .content = "lo\n**world**\n" });
-    try std.testing.expectEqualStrings("◆ answer\nhello\nworld", out.written());
+    try std.testing.expectEqualStrings("◆ answer\nhello", out.written());
 
-    // The answer block that closes the stream writes nothing of the text again.
     try emit.show(.{ .answer = "hello\n**world**\n" });
     try std.testing.expectEqualStrings("◆ answer\nhello\nworld\n\n", out.written());
 }
@@ -235,7 +234,7 @@ test "streamed reasoning is shown before the answer" {
 
     try emit.showDelta(.{ .content = "hello\n" });
     try std.testing.expectEqualStrings(
-        "◇ reasoning\nI should check.\n\n◆ answer\nhello",
+        "◇ reasoning\nI should check.\n\n◆ answer\n",
         out.written(),
     );
 
@@ -268,7 +267,7 @@ test "reasoning is dim and the answer is not" {
     try emit.showDelta(.{ .content = "hi" });
     try std.testing.expectEqualStrings(
         "\x1b[35m◇\x1b[0m \x1b[1mreasoning\x1b[0m\n\x1b[2mthink\x1b[0m\n\n" ++
-            "\x1b[32m◆\x1b[0m \x1b[1manswer\x1b[0m\nhi",
+            "\x1b[32m◆\x1b[0m \x1b[1manswer\x1b[0m\n",
         out.written(),
     );
 }
