@@ -6,6 +6,8 @@ const std = @import("std");
 
 const spaces = " \t";
 pub const max_columns = 32;
+/// The most lists that can be set inside one another.
+pub const max_nesting = 16;
 
 pub const Align = enum { none, left, center, right };
 
@@ -19,8 +21,15 @@ pub const Line = struct {
     quote_depth: usize = 0,
     /// Columns the line set its text in from the left.
     indent: usize = 0,
-    item: ?Item = null,
     heading: ?u3 = null,
+};
+
+/// A list a line begins or ends.
+pub const List = struct {
+    /// Whether its items are numbered.
+    ordered: bool = false,
+    /// The digits its first item is written with, when it is numbered.
+    number: ?[]const u8 = null,
 };
 
 pub const Span = enum { strong, em, code, strike };
@@ -43,6 +52,14 @@ pub const Event = union(enum) {
     blank,
     line: Line,
     text: []const u8,
+    paragraph_begin,
+    paragraph_end,
+    quote_begin,
+    quote_end,
+    list_begin: List,
+    list_end,
+    item_begin: Item,
+    item_end,
     span_begin: Span,
     span_end: Span,
     /// Its label follows, up to `link_end`.
@@ -111,6 +128,23 @@ pub const Parser = struct {
     span: bool = false,
     final: bool = false,
     table: ?Buffered = null,
+    quotes: usize = 0,
+    nests: [max_nesting]Nest = @splat(.{}),
+    depth: usize = 0,
+    item_open: bool = false,
+    paragraph: bool = false,
+    after_blank: bool = false,
+
+    /// A list that is open, and where a list inside it would be set.
+    const Nest = struct {
+        /// Columns the item's own marker is set in from the left.
+        indent: usize = 0,
+        /// Columns where its content starts, so a list inside it is set further in.
+        content_column: usize = 0,
+        ordered: bool = false,
+    };
+
+    const Kind = enum { text, heading, item };
 
     fn feed(self: *Parser, text: []const u8) !void {
         try self.pending.appendSlice(self.gpa, text);
@@ -150,6 +184,12 @@ pub const Parser = struct {
             try self.out.show(.{ .text = self.pending.items });
             self.drop(self.pending.items.len);
         }
+        if (self.in_code) {
+            self.in_code = false;
+            try self.out.show(.code_end);
+        }
+        try self.closeBlock();
+        try self.openQuotes(0);
     }
 
     fn emit(self: *Parser, text: []const u8) !void {
@@ -176,6 +216,101 @@ pub const Parser = struct {
         return std.mem.findScalarPos(u8, bytes, from, byte);
     }
 
+    fn beginParagraph(self: *Parser) !void {
+        if (self.paragraph) return;
+        self.paragraph = true;
+        try self.out.show(.paragraph_begin);
+    }
+
+    fn endParagraph(self: *Parser) !void {
+        if (!self.paragraph) return;
+        self.paragraph = false;
+        try self.out.show(.paragraph_end);
+    }
+
+    fn beginItem(self: *Parser, item: Item) !void {
+        self.item_open = true;
+        try self.out.show(.{ .item_begin = item });
+        try self.beginParagraph();
+    }
+
+    fn closeItem(self: *Parser) !void {
+        if (!self.item_open) return;
+        try self.endParagraph();
+        self.item_open = false;
+        try self.out.show(.item_end);
+    }
+
+    fn closeLists(self: *Parser) !void {
+        while (self.depth > 0) {
+            try self.closeItem();
+            self.depth -= 1;
+            try self.out.show(.list_end);
+        }
+    }
+
+    /// Closes what a line of its own ends: the list it is not in, and the paragraph before it.
+    fn closeBlock(self: *Parser) !void {
+        try self.closeLists();
+        try self.endParagraph();
+    }
+
+    /// Opens the list a line's marker begins, and everything the line closes on the way.
+    fn openItem(self: *Parser, indent: usize, width: usize, item: Item) !void {
+        const ordered = item.number != null;
+        while (self.depth > 0 and indent < self.nests[self.depth - 1].indent) {
+            try self.closeItem();
+            self.depth -= 1;
+            try self.out.show(.list_end);
+        }
+        if (self.depth == 0) return self.openList(indent, width, item);
+
+        const top = self.nests[self.depth - 1];
+        if (indent >= top.content_column) {
+            // Set inside the item that is open, so that item is not the one this ends.
+            try self.endParagraph();
+            return self.openList(indent, width, item);
+        }
+        if (top.ordered != ordered) {
+            // Another mark is another list, whatever column it is set in.
+            try self.closeItem();
+            self.depth -= 1;
+            try self.out.show(.list_end);
+            return self.openList(indent, width, item);
+        }
+        try self.closeItem();
+        try self.beginItem(item);
+    }
+
+    fn openList(self: *Parser, indent: usize, width: usize, item: Item) !void {
+        if (self.depth == max_nesting) {
+            try self.closeItem();
+            return self.beginItem(item);
+        }
+        self.nests[self.depth] = .{
+            .indent = indent,
+            .content_column = indent + width,
+            .ordered = item.number != null,
+        };
+        self.depth += 1;
+        try self.out.show(.{ .list_begin = .{ .ordered = item.number != null, .number = item.number } });
+        try self.beginItem(item);
+    }
+
+    /// Opens the quotes the line is inside and closes the ones it is not, which are its blocks too.
+    fn openQuotes(self: *Parser, depth: usize) !void {
+        if (depth == self.quotes) return;
+        try self.closeBlock();
+        while (self.quotes > depth) : (self.quotes -= 1) try self.out.show(.quote_end);
+        while (self.quotes < depth) : (self.quotes += 1) try self.out.show(.quote_begin);
+    }
+
+    /// A line of text: a paragraph's next line, or a paragraph of its own.
+    fn openText(self: *Parser) !void {
+        if (self.after_blank) try self.closeLists();
+        try self.beginParagraph();
+    }
+
     /// Reads the start of the line and hands on what it asks for, or returns false when more of it
     /// is needed to tell.
     fn start(self: *Parser) !bool {
@@ -195,6 +330,8 @@ pub const Parser = struct {
         if (i == bytes.len) return false;
         const indent = i - indented;
 
+        try self.openQuotes(quotes);
+
         if (self.table != null) {
             if (bytes[i] != '|') {
                 try self.endTable();
@@ -205,6 +342,8 @@ pub const Parser = struct {
 
         if (bytes[i] == '\n') {
             self.drop(i + 1);
+            try self.endParagraph();
+            self.after_blank = true;
             try self.next(.blank);
             return true;
         }
@@ -215,16 +354,24 @@ pub const Parser = struct {
                 const end = find(bytes, i, '\n') orelse return false;
                 self.close_fence = bytes[i];
                 self.in_code = true;
+                try self.closeBlock();
+                self.after_blank = false;
                 try self.out.show(.{ .code_begin = std.mem.trim(u8, bytes[i + 3 .. end], spaces) });
                 self.drop(end + 1);
                 return true;
             }
         }
 
-        if (bytes[i] == '|') return self.row();
+        if (bytes[i] == '|') {
+            try self.closeBlock();
+            self.after_blank = false;
+            return self.row();
+        }
 
         var lead: Line = .{ .quote_depth = quotes, .indent = indent };
         var taken = i;
+        var kind: Kind = .text;
+        var item: Item = .{};
         switch (bytes[i]) {
             '#' => {
                 var end = i;
@@ -233,6 +380,7 @@ pub const Parser = struct {
                 if (bytes[end] == ' ' or bytes[end] == '\n') {
                     taken = if (bytes[end] == ' ') end + 1 else end;
                     lead.heading = @intCast(@min(end - i, 6));
+                    kind = .heading;
                 }
             },
             '-', '*', '+', '_' => {
@@ -241,6 +389,8 @@ pub const Parser = struct {
                     const end = find(bytes, i, '\n') orelse bytes.len;
                     if (isRule(bytes[i..end])) {
                         self.drop(@min(end + 1, bytes.len));
+                        try self.closeBlock();
+                        self.after_blank = false;
                         try self.out.show(.rule);
                         try self.next(.newline);
                         return true;
@@ -249,14 +399,14 @@ pub const Parser = struct {
                 }
                 if (bytes[i + 1] == ' ' and bytes[i] != '_') {
                     taken = i + 2;
-                    lead.item = .{};
+                    kind = .item;
                     if (std.mem.startsWith(u8, bytes[i + 2 ..], "[ ] ")) {
-                        lead.item = .{ .task = false };
+                        item = .{ .task = false };
                         taken = i + 6;
                     } else if (std.mem.startsWith(u8, bytes[i + 2 ..], "[x] ") or
                         std.mem.startsWith(u8, bytes[i + 2 ..], "[X] "))
                     {
-                        lead.item = .{ .task = true };
+                        item = .{ .task = true };
                         taken = i + 6;
                     }
                 }
@@ -267,14 +417,21 @@ pub const Parser = struct {
                 if (end + 1 >= bytes.len) return false;
                 if ((bytes[end] == '.' or bytes[end] == ')') and bytes[end + 1] == ' ') {
                     taken = end + 2;
-                    lead.item = .{ .number = bytes[i..end] };
+                    kind = .item;
+                    item = .{ .number = bytes[i..end] };
                 }
             },
             else => {},
         }
 
+        switch (kind) {
+            .item => try self.openItem(indent, taken - i, item),
+            .heading => try self.closeBlock(),
+            .text => try self.openText(),
+        }
+        self.after_blank = false;
+
         try self.out.show(.{ .line = lead });
-        // A marker, if the line had one, ends on a space: an underscore after it opens emphasis.
         self.last = ' ';
         self.drop(taken);
         self.at_line_start = false;
@@ -609,14 +766,26 @@ const Transcript = struct {
                 try out.writeAll("line");
                 if (line.quote_depth > 0) try out.print(" quote={d}", .{line.quote_depth});
                 if (line.indent > 0) try out.print(" indent={d}", .{line.indent});
-                if (line.item) |item| {
-                    if (item.number) |number| try out.print(" number={s}", .{number});
-                    if (item.task) |done| try out.print(" task={s}", .{if (done) "x" else " "});
-                    if (item.number == null and item.task == null) try out.writeAll(" bullet");
-                }
                 if (line.heading) |level| try out.print(" heading={d}", .{level});
                 try out.writeAll("\n");
             },
+            .paragraph_begin => try out.writeAll("paragraph_begin\n"),
+            .paragraph_end => try out.writeAll("paragraph_end\n"),
+            .quote_begin => try out.writeAll("quote_begin\n"),
+            .quote_end => try out.writeAll("quote_end\n"),
+            .list_begin => |list| try out.print("list_begin ordered={} number={s}\n", .{
+                list.ordered,
+                list.number orelse "-",
+            }),
+            .list_end => try out.writeAll("list_end\n"),
+            .item_begin => |item| {
+                try out.writeAll("item_begin");
+                if (item.number) |number| try out.print(" number={s}", .{number});
+                if (item.task) |done| try out.print(" task={s}", .{if (done) "x" else " "});
+                if (item.number == null and item.task == null) try out.writeAll(" bullet");
+                try out.writeAll("\n");
+            },
+            .item_end => try out.writeAll("item_end\n"),
             .text => |text| try out.print("text:{s}\n", .{text}),
             .span_begin => |span| try out.print("+{s}\n", .{@tagName(span)}),
             .span_end => |span| try out.print("-{s}\n", .{@tagName(span)}),
@@ -656,36 +825,96 @@ fn expectEvents(expected: []const u8, text: []const u8) !void {
 
 test "a line is read as the blocks it is in, not as the columns it is set in" {
     try expectEvents(
-        "line heading=1\ntext:Title\nnewline\nline\ntext:the body\nnewline\n",
+        "line heading=1\ntext:Title\nnewline\nparagraph_begin\nline\ntext:the body\nnewline\n" ++
+            "paragraph_end\n",
         "# Title\nthe body\n",
     );
-    try expectEvents("line quote=1 indent=2 bullet\ntext:one\nnewline\n", ">   - one\n");
-    try expectEvents("line indent=2\ntext:set in\nnewline\n", "  set in\n");
+    try expectEvents(
+        "quote_begin\nlist_begin ordered=false number=-\nitem_begin bullet\nparagraph_begin\n" ++
+            "line quote=1 indent=2\ntext:one\nnewline\nparagraph_end\nitem_end\nlist_end\nquote_end\n",
+        ">   - one\n",
+    );
+    try expectEvents("paragraph_begin\nline indent=2\ntext:set in\nnewline\nparagraph_end\n", "  set in\n");
 }
 
 test "a blank line ends the block before it, and a wrapped one does not" {
     try expectEvents(
-        "line\ntext:one\nnewline\nblank\nline\ntext:two\nnewline\n",
+        "paragraph_begin\nline\ntext:one\nnewline\nparagraph_end\nblank\nparagraph_begin\n" ++
+            "line\ntext:two\nnewline\nparagraph_end\n",
         "one\n\ntwo\n",
     );
-    try expectEvents("line\ntext:one\nnewline\nline\ntext:two\nnewline\n", "one\ntwo\n");
+    try expectEvents(
+        "paragraph_begin\nline\ntext:one\nnewline\nline\ntext:two\nnewline\nparagraph_end\n",
+        "one\ntwo\n",
+    );
+}
+
+test "a list stays open across its items, and a blank line only makes it loose" {
+    try expectEvents(
+        "list_begin ordered=false number=-\nitem_begin bullet\nparagraph_begin\nline\ntext:one\n" ++
+            "newline\nparagraph_end\nitem_end\nitem_begin bullet\nparagraph_begin\nline\ntext:two\n" ++
+            "newline\nparagraph_end\nitem_end\nlist_end\n",
+        "- one\n- two\n",
+    );
+    try expectEvents(
+        "list_begin ordered=false number=-\nitem_begin bullet\nparagraph_begin\nline\ntext:one\n" ++
+            "newline\nparagraph_end\nblank\nitem_end\nitem_begin bullet\nparagraph_begin\nline\n" ++
+            "text:two\nnewline\nparagraph_end\nitem_end\nlist_end\n",
+        "- one\n\n- two\n",
+    );
+    // The blank ends the item, so the line after it is not in the list at all.
+    try expectEvents(
+        "list_begin ordered=false number=-\nitem_begin bullet\nparagraph_begin\nline\ntext:one\n" ++
+            "newline\nparagraph_end\nblank\nitem_end\nlist_end\nparagraph_begin\nline\ntext:after\n" ++
+            "newline\nparagraph_end\n",
+        "- one\n\nafter\n",
+    );
+    // A line with no marker of its own carries the item on.
+    try expectEvents(
+        "list_begin ordered=false number=-\nitem_begin bullet\nparagraph_begin\nline\ntext:one\n" ++
+            "newline\nline\ntext:after\nnewline\nparagraph_end\nitem_end\nlist_end\n",
+        "- one\nafter\n",
+    );
+}
+
+test "a list set inside an item is that item's, and another mark is another list" {
+    try expectEvents(
+        "list_begin ordered=true number=1\nitem_begin number=1\nparagraph_begin\nline\ntext:one\n" ++
+            "newline\nparagraph_end\nlist_begin ordered=false number=-\nitem_begin bullet\n" ++
+            "paragraph_begin\nline indent=3\ntext:nested\nnewline\nparagraph_end\nitem_end\n" ++
+            "list_end\nitem_begin number=2\nparagraph_begin\nline\ntext:two\nnewline\nparagraph_end\n" ++
+            "item_end\nlist_end\n",
+        "1. one\n   - nested\n2. two\n",
+    );
+    try expectEvents(
+        "list_begin ordered=false number=-\nitem_begin bullet\nparagraph_begin\nline\ntext:one\n" ++
+            "newline\nparagraph_end\nitem_end\nlist_end\nlist_begin ordered=true number=1\n" ++
+            "item_begin number=1\nparagraph_begin\nline\ntext:two\nnewline\nparagraph_end\n" ++
+            "item_end\nlist_end\n",
+        "- one\n1. two\n",
+    );
 }
 
 test "an item is numbered as it was written, and a task keeps its box" {
     try expectEvents(
-        "line number=3\ntext:three\nnewline\nline task=x\ntext:done\nnewline\n",
+        "list_begin ordered=true number=3\nitem_begin number=3\nparagraph_begin\nline\ntext:three\n" ++
+            "newline\nparagraph_end\nitem_end\nlist_end\nlist_begin ordered=false number=-\n" ++
+            "item_begin task=x\nparagraph_begin\nline\ntext:done\nnewline\nparagraph_end\n" ++
+            "item_end\nlist_end\n",
         "3. three\n- [x] done\n",
     );
 }
 
-test "a fence names the language it is written in" {
+test "a fence names the language it is written in, and ends even when it is not closed" {
     try expectEvents("code:zig\ntext:let x = 1;\nnewline\n/code\n", "```zig\nlet x = 1;\n```\n");
+    try expectEvents("code:\ntext:x\nnewline\n/code\n", "```\nx\n");
 }
 
 test "an inline form is a span around the text it holds" {
     try expectEvents(
-        "line\n+strong\ntext:b\n-strong\ntext: and \n+em\ntext:c\n-em\ntext: \n" ++
-            "+code\ntext:d\n-code\ntext: \nlink:u\ntext:l\n/link\ntext: \nimage:v|i\nnewline\n",
+        "paragraph_begin\nline\n+strong\ntext:b\n-strong\ntext: and \n+em\ntext:c\n-em\ntext: \n" ++
+            "+code\ntext:d\n-code\ntext: \nlink:u\ntext:l\n/link\ntext: \nimage:v|i\nnewline\n" ++
+            "paragraph_end\n",
         "**b** and *c* `d` [l](u) ![i](v)\n",
     );
 }

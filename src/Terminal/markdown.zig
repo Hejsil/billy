@@ -63,6 +63,8 @@ const Render = struct {
     code: usize = 0,
     strike: usize = 0,
     link: ?[]const u8 = null,
+    /// The marker of the item whose line is about to begin.
+    marker: ?markdown.Item = null,
     shown: u4 = 0,
 
     fn interface(self: *Render) markdown.Renderer {
@@ -80,6 +82,10 @@ const Render = struct {
             .link_begin => |url| try self.openLink(url),
             .link_end => try self.closeLink(),
             .image => |image| try self.emit(if (image.label.len > 0) image.label else image.url),
+            .item_begin => |item| self.marker = item,
+            // The blocks a terminal draws are the lines it writes, so the rest of them are silent.
+            .paragraph_begin, .paragraph_end, .quote_begin, .quote_end => {},
+            .list_begin, .list_end, .item_end => {},
             .rule => {
                 try self.flush();
                 try self.plain(0);
@@ -166,11 +172,12 @@ const Render = struct {
         const capped = @min(line.indent, 2 * (max_list_depth - 1));
         var column: usize = 0;
         while (column < capped) : (column += 1) try self.raw(" ");
-        if (line.item) |item| try self.marker(item);
+        if (self.marker) |item| try self.writeMarker(item);
+        self.marker = null;
         self.at_line_start = false;
     }
 
-    fn marker(self: *Render, item: markdown.Item) !void {
+    fn writeMarker(self: *Render, item: markdown.Item) !void {
         if (item.number) |number| return try self.print("{s}. ", .{number});
         if (item.task) |done| return try self.raw(if (done) "- [x] " else "- [ ] ");
         return try self.raw("- ");
