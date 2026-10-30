@@ -237,7 +237,7 @@ fn runSession(
         header.clearRetainingCapacity();
         try header.writer.print("{f}", .{Agent.SessionHeader.of(
             session,
-            setup.sessionModel(&billy.config, &billy.catalog, session),
+            Agent.sessionModel(&billy.catalog, session, billy.config.stored.model),
             options.home,
         )});
         const line = (try editor.readLine(header.written(), input_prompt)) orelse break;

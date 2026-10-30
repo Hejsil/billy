@@ -42,10 +42,6 @@ pub const Backends = struct {
     }
 };
 
-pub fn sessionModel(config: *const Config, catalog: *const models.Catalog, session: *const Session) endpoint.Model {
-    return endpoint.modelOf(session.modelChoice(config.stored.model), catalog);
-}
-
 pub fn toolSettings(config: *const Config, backends: Backends, health: ?*Health) Tools.Settings {
     const stored = &config.stored;
     return .{
@@ -241,35 +237,6 @@ test "a fetch backend is asked for its key, and raw for none" {
 
     none.stored.tools.web_fetch.providers = &.{};
     try std.testing.expect((try fetchConfig(arena, &credentials, &none)) == .none);
-}
-
-test "a header names the model the session goes to, not the one billy is pointed at" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = Config.file_name,
-        .data = "{\"model\":\"deepseek/deepseek-flash\"}",
-    });
-    var config = try Config.open(std.testing.io, tmp.dir, gpa);
-    defer config.deinit();
-
-    var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
-    defer session.deinit();
-    try session.setModel("opencode-go/kimi-k2.7-code");
-
-    const recorded = sessionModel(&config, &models.test_catalog, &session);
-    try std.testing.expectEqualStrings("opencode-go/kimi-k2.7-code", recorded.choice);
-    try std.testing.expectEqual(@as(usize, 262_144), recorded.info.?.context_window);
-
-    // A session that recorded none is sent where the configuration points, so that is what its
-    // header names.
-    var older = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
-    defer older.deinit();
-    const configured = sessionModel(&config, &models.test_catalog, &older);
-    try std.testing.expectEqualStrings("deepseek/deepseek-flash", configured.choice);
-    try std.testing.expectEqual(@as(usize, 1_000_000), configured.info.?.context_window);
 }
 
 test "a target names bytes of its own, not a slice of the session's pool" {

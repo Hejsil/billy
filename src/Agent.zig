@@ -346,8 +346,8 @@ fn clientFor(agent: *Agent, session: *Session) !llm.Client {
     };
 }
 
-fn sessionModel(agent: *const Agent, session: *const Session) endpoint.Model {
-    return endpoint.modelOf(session.modelChoice(agent.config.stored.model), agent.catalog);
+pub fn sessionModel(catalog: *const models.Catalog, session: *const Session, fallback: []const u8) endpoint.Model {
+    return endpoint.modelOf(session.modelChoice(fallback), catalog);
 }
 
 pub const Waiting = union(enum) {
@@ -806,7 +806,7 @@ const compact_prompt =
 
 fn compactThreshold(agent: *const Agent, session: *const Session) usize {
     if (agent.behaviour.compact_at == 0) return 0;
-    const info = agent.sessionModel(session).info orelse return 0;
+    const info = sessionModel(agent.catalog, session, agent.config.stored.model).info orelse return 0;
     return info.context_window * agent.behaviour.compact_at / 100;
 }
 
@@ -1006,6 +1006,28 @@ test "header names the session, the model and the working directory" {
         "billy · 01HF7YAT000000000000000000 · deepseek-flash · /work",
         testHeader("deepseek-flash", "/work"),
     );
+}
+
+test "a header names the model the session goes to, not the one billy is pointed at" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    try session.setModel("opencode-go/kimi-k2.7-code");
+
+    const recorded = sessionModel(&models.test_catalog, &session, "");
+    try std.testing.expectEqualStrings("opencode-go/kimi-k2.7-code", recorded.choice);
+    try std.testing.expectEqual(@as(usize, 262_144), recorded.info.?.context_window);
+
+    // A session that recorded none is sent where the configuration points, so that is what its
+    // header names.
+    var older = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    defer older.deinit();
+    const configured = sessionModel(&models.test_catalog, &older, "deepseek/deepseek-flash");
+    try std.testing.expectEqualStrings("deepseek/deepseek-flash", configured.choice);
+    try std.testing.expectEqual(@as(usize, 1_000_000), configured.info.?.context_window);
 }
 
 test "header shortens a path inside the home directory" {
