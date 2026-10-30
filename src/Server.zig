@@ -52,6 +52,7 @@ config: *const Config,
 catalog: *const models.Catalog,
 credentials: Credentials,
 health: *Health,
+http_client: *std.http.Client,
 cwd: []const u8,
 environ: *const std.process.Environ.Map,
 backends: setup.Backends,
@@ -79,9 +80,6 @@ pub fn serve(server: *const Server, host: []const u8, port: u16) !void {
     var listener = try address.listen(server.io, .{ .reuse_address = true });
     defer listener.deinit(server.io);
 
-    var http_client: std.http.Client = .{ .allocator = server.gpa, .io = server.io };
-    defer http_client.deinit();
-
     var registry = Registry{ .io = server.io, .gpa = server.gpa };
     defer registry.deinit();
 
@@ -102,7 +100,7 @@ pub fn serve(server: *const Server, host: []const u8, port: u16) !void {
             slots.post(server.io);
             return err;
         };
-        group.concurrent(server.io, handle, .{ server, &registry, &http_client, stream, &slots }) catch |err| {
+        group.concurrent(server.io, handle, .{ server, &registry, stream, &slots }) catch |err| {
             // A connection that cannot be given a task is one to let go of, rather than one to
             // bring the server down over.
             slots.post(server.io);
@@ -154,7 +152,6 @@ const Registry = struct {
 fn handle(
     server: *const Server,
     registry: *Registry,
-    http_client: *std.http.Client,
     stream: std.Io.net.Stream,
     slots: *std.Io.Semaphore,
 ) void {
@@ -179,7 +176,7 @@ fn handle(
     var request = http_server.receiveHead() catch return;
 
     var r = Request{ .server = server, .request = &request };
-    route(&r, registry, http_client) catch |err| {
+    route(&r, registry) catch |err| {
         // A failure that already said what went wrong, in the log this task writes to, is not said
         // again here: what is left is to answer the browser with a status rather than let the
         // connection drop.
@@ -240,7 +237,7 @@ const Request = struct {
     }
 };
 
-fn route(r: *Request, registry: *Registry, http_client: *std.http.Client) !void {
+fn route(r: *Request, registry: *Registry) !void {
     const target = r.request.head.target;
     const path = target[0 .. std.mem.findScalar(u8, target, '?') orelse target.len];
 
@@ -258,7 +255,7 @@ fn route(r: *Request, registry: *Registry, http_client: *std.http.Client) !void 
 
     if (std.mem.eql(u8, path, "/api/sessions")) switch (r.request.head.method) {
         .GET => return try writeListing(r),
-        .POST => return try createSession(r, registry, http_client),
+        .POST => return try createSession(r, registry),
         else => return try r.replyNotAllowed(),
     };
 
@@ -268,7 +265,7 @@ fn route(r: *Request, registry: *Registry, http_client: *std.http.Client) !void 
         const id = path[sessions_prefix.len..id_end];
 
         if (std.mem.eql(u8, path[id_end..], "/message")) switch (r.request.head.method) {
-            .POST => return try askSession(r, registry, http_client, id),
+            .POST => return try askSession(r, registry, id),
             else => return try r.replyNotAllowed(),
         };
 
@@ -553,7 +550,7 @@ fn parsePrompt(gpa: std.mem.Allocator, body: []const u8) !std.json.Parsed(Prompt
     });
 }
 
-fn createSession(r: *Request, registry: *Registry, http_client: *std.http.Client) !void {
+fn createSession(r: *Request, registry: *Registry) !void {
     const gpa = r.server.gpa;
     const parsed = (try readPrompt(r)) orelse return;
     defer parsed.deinit();
@@ -566,10 +563,10 @@ fn createSession(r: *Request, registry: *Registry, http_client: *std.http.Client
     if (parsed.value.text.len == 0)
         return r.reply(.text, "the prompt is empty\n", .bad_request);
 
-    try serveTurn(r, http_client, &session, r.server.options(), parsed.value.text, .announce);
+    try serveTurn(r, &session, r.server.options(), parsed.value.text, .announce);
 }
 
-fn askSession(r: *Request, registry: *Registry, http_client: *std.http.Client, id: []const u8) !void {
+fn askSession(r: *Request, registry: *Registry, id: []const u8) !void {
     const parsed = (try readPrompt(r)) orelse return;
     defer parsed.deinit();
     if (parsed.value.text.len == 0)
@@ -581,21 +578,20 @@ fn askSession(r: *Request, registry: *Registry, http_client: *std.http.Client, i
     var session = (try r.open(id)) orelse return;
     defer session.deinit();
 
-    try serveTurn(r, http_client, &session, r.server.options(), parsed.value.text, .quiet);
+    try serveTurn(r, &session, r.server.options(), parsed.value.text, .quiet);
 }
 
 const Announce = enum { announce, quiet };
 
 fn serveTurn(
     r: *Request,
-    http_client: *std.http.Client,
     session: *Session,
     run_options: Agent.Options,
     text: []const u8,
     announce: Announce,
 ) !void {
     const gpa = r.server.gpa;
-    var agent = try Agent.init(r.server.io, gpa, run_options, session.cwd(), http_client);
+    var agent = try Agent.init(r.server.io, gpa, run_options, session.cwd(), r.server.http_client);
     defer agent.deinit();
     try agent.prepare(session);
 
@@ -719,7 +715,7 @@ const TestServer = struct {
     environ: *std.process.Environ.Map,
     health: *Health,
     registry: Registry,
-    http: std.http.Client,
+    http: *std.http.Client,
 
     fn init() !TestServer {
         const gpa = std.testing.allocator;
@@ -741,6 +737,10 @@ const TestServer = struct {
         errdefer gpa.destroy(health);
         health.* = try Health.load(std.testing.io, gpa, tmp.dir);
         errdefer health.deinit();
+        const http = try gpa.create(std.http.Client);
+        errdefer gpa.destroy(http);
+        http.* = .{ .allocator = gpa, .io = std.testing.io };
+        errdefer http.deinit();
 
         return .{
             .tmp = tmp,
@@ -748,7 +748,7 @@ const TestServer = struct {
             .environ = environ,
             .health = health,
             .registry = .{ .io = std.testing.io, .gpa = gpa },
-            .http = .{ .allocator = gpa, .io = std.testing.io },
+            .http = http,
             .server = .{
                 .io = std.testing.io,
                 .gpa = gpa,
@@ -758,6 +758,7 @@ const TestServer = struct {
                 .catalog = &models.test_catalog,
                 .credentials = .{},
                 .health = health,
+                .http_client = http,
                 .cwd = ".",
                 .environ = environ,
                 .backends = .{ .search = null, .fetch = null },
@@ -767,6 +768,7 @@ const TestServer = struct {
 
     fn deinit(server: *TestServer) void {
         server.http.deinit();
+        std.testing.allocator.destroy(server.http);
         server.registry.deinit();
         server.server.session_dir.close(std.testing.io);
         server.health.deinit();
@@ -779,7 +781,7 @@ const TestServer = struct {
     }
 
     fn exchange(server: *TestServer, method: std.http.Method, path: []const u8, body: ?[]const u8) !Exchange {
-        return try Exchange.run(&server.server, &server.registry, &server.http, method, path, body);
+        return try Exchange.run(&server.server, &server.registry, method, path, body);
     }
 
     fn session(server: *TestServer, title: ?[]const u8) ![]const u8 {
@@ -806,7 +808,6 @@ const Exchange = struct {
     fn run(
         server: *const Server,
         registry: *Registry,
-        http_client: *std.http.Client,
         method: std.http.Method,
         path: []const u8,
         body: ?[]const u8,
@@ -834,7 +835,7 @@ const Exchange = struct {
         var request = try http_server.receiveHead();
 
         var r = Request{ .server = server, .request = &request };
-        try route(&r, registry, http_client);
+        try route(&r, registry);
 
         exchange.answered = r.answered;
         try exchange.written.writer.writeAll(writer.buffered());

@@ -24,6 +24,7 @@ io: std.Io,
 gpa: std.mem.Allocator,
 arena: std.mem.Allocator,
 environ: *const std.process.Environ.Map,
+http_client: std.http.Client,
 
 dirs: Dirs,
 credentials: Credentials,
@@ -62,6 +63,7 @@ pub fn open(init: std.process.Init) !Billy {
         .gpa = init.gpa,
         .arena = arena,
         .environ = environ,
+        .http_client = .{ .allocator = init.gpa, .io = io },
         .dirs = dirs,
         .credentials = credentials,
         .config = config,
@@ -71,6 +73,7 @@ pub fn open(init: std.process.Init) !Billy {
 }
 
 pub fn deinit(billy: *Billy) void {
+    billy.http_client.deinit();
     billy.health.deinit();
     billy.config.deinit();
     billy.dirs.deinit(billy.io);
@@ -219,10 +222,8 @@ fn runTerminal(
 ) !void {
     const io = billy.io;
     const gpa = billy.gpa;
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
 
-    var agent = try Agent.init(io, gpa, options, session.cwd(), &http_client);
+    var agent = try Agent.init(io, gpa, options, session.cwd(), &billy.http_client);
     defer agent.deinit();
     const resumed = session.messages.items.len > 0;
     if (resumed) try agent.prepare(session);
@@ -356,6 +357,7 @@ pub fn serve(billy: *Billy, host: []const u8, port: u16) !void {
         .catalog = &billy.catalog,
         .credentials = billy.credentials,
         .health = &billy.health,
+        .http_client = &billy.http_client,
         .cwd = billy.cwd,
         .environ = billy.environ,
         .backends = try setup.Backends.build(arena, &billy.config, &billy.credentials),
