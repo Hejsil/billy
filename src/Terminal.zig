@@ -211,7 +211,7 @@ pub fn run(
         header.clearRetainingCapacity();
         try header.writer.print("{f}", .{Agent.SessionHeader.of(
             session,
-            Agent.sessionModel(options.catalog, session, options.config.stored.model),
+            agent.modelChoice(session),
             options.home,
         )});
         const line = (try editor.readLine(header.written(), input_prompt)) orelse break;

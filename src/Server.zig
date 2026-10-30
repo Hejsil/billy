@@ -633,7 +633,7 @@ fn serveTurn(
 }
 
 fn writeHeader(server: *const Server, session: *const Session, out: *std.Io.Writer) !void {
-    const shown = Agent.sessionModel(server.catalog, session, server.config.stored.model);
+    const shown = Agent.sessionModelChoice(server.catalog, session, server.config.stored.model);
     try html.header(.{
         .id = session.id(),
         .model = shown.choice,

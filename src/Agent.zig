@@ -346,7 +346,11 @@ fn clientFor(agent: *Agent, session: *Session) !llm.Client {
     };
 }
 
-pub fn sessionModel(catalog: *const models.Catalog, session: *const Session, fallback: []const u8) endpoint.Model {
+pub fn modelChoice(agent: *const Agent, session: *const Session) endpoint.Model {
+    return sessionModelChoice(agent.catalog, session, agent.config.stored.model);
+}
+
+pub fn sessionModelChoice(catalog: *const models.Catalog, session: *const Session, fallback: []const u8) endpoint.Model {
     return endpoint.modelOf(session.modelChoice(fallback), catalog);
 }
 
@@ -380,12 +384,11 @@ pub fn take(agent: *Agent, emitter: *Emitter, session: *Session, line: []const u
     }
 
     var client = (try agent.resolvedClient(emitter, session)) orelse return .unresolved;
-
     _ = agent.compact(emitter, session, &client, .when_needed);
 
     const named = try nameFromPrompt(session, line);
-
-    if (session.messages.items.len == 0) try agent.prepare(session);
+    if (session.messages.items.len == 0)
+        try agent.prepare(session);
 
     return .{
         .prompt = .{
@@ -398,9 +401,10 @@ pub fn take(agent: *Agent, emitter: *Emitter, session: *Session, line: []const u
 fn resolvedClient(agent: *Agent, emitter: *Emitter, session: *Session) !?llm.Client {
     return agent.clientFor(session) catch |err| switch (err) {
         error.MissingApiKey, error.UnknownProvider => {
+            const model = agent.modelChoice(session);
+
             var notice: [256]u8 = undefined;
-            const choice = session.modelChoice(agent.config.stored.model);
-            try emitter.show(.{ .notice = endpoint.unreachableModel(&notice, err, choice) });
+            try emitter.show(.{ .notice = endpoint.unreachableModel(&notice, err, model.choice) });
             return null;
         },
         else => |other| return other,
@@ -806,7 +810,7 @@ const compact_prompt =
 
 fn compactThreshold(agent: *const Agent, session: *const Session) usize {
     if (agent.behaviour.compact_at == 0) return 0;
-    const info = sessionModel(agent.catalog, session, agent.config.stored.model).info orelse return 0;
+    const info = agent.modelChoice(session).info orelse return 0;
     return info.context_window * agent.behaviour.compact_at / 100;
 }
 
@@ -1017,7 +1021,7 @@ test "a header names the model the session goes to, not the one billy is pointed
     defer session.deinit();
     try session.setModel("opencode-go/kimi-k2.7-code");
 
-    const recorded = sessionModel(&models.test_catalog, &session, "");
+    const recorded = sessionModelChoice(&models.test_catalog, &session, "");
     try std.testing.expectEqualStrings("opencode-go/kimi-k2.7-code", recorded.choice);
     try std.testing.expectEqual(@as(usize, 262_144), recorded.info.?.context_window);
 
@@ -1025,7 +1029,7 @@ test "a header names the model the session goes to, not the one billy is pointed
     // header names.
     var older = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer older.deinit();
-    const configured = sessionModel(&models.test_catalog, &older, "deepseek/deepseek-flash");
+    const configured = sessionModelChoice(&models.test_catalog, &older, "deepseek/deepseek-flash");
     try std.testing.expectEqualStrings("deepseek/deepseek-flash", configured.choice);
     try std.testing.expectEqual(@as(usize, 1_000_000), configured.info.?.context_window);
 }
