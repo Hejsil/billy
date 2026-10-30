@@ -8,7 +8,6 @@ const Agent = @import("Agent.zig");
 const Config = @import("Config.zig");
 const Credentials = @import("Credentials.zig");
 const Dirs = @import("Dirs.zig");
-const endpoint = @import("endpoint.zig");
 const Health = @import("Health.zig");
 const LineEditor = @import("LineEditor.zig");
 const models = @import("models.zig");

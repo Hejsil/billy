@@ -42,8 +42,6 @@ const Command = union(enum) {
     }
 };
 
-const Target = endpoint.Target;
-
 /// What a run is given, in one value: what each turn's target is resolved from, how its agent
 /// behaves on it, what its tools run with, and the home directory and instructions the run reads
 /// outside the session.
@@ -770,28 +768,23 @@ const title_prompt =
 fn titleSession(agent: *Agent, session: *Session, client: *llm.Client) !void {
     const raw = try agent.askWith(session, client, title_prompt) orelse return;
     defer agent.gpa.free(raw);
-    const title = try cleanTitle(agent.gpa, raw) orelse return;
-    defer agent.gpa.free(title);
+    const title = titleFrom(raw) orelse return;
     try session.setTitle(title);
     try session.save();
 }
 
-fn cleanTitle(gpa: std.mem.Allocator, raw: []const u8) !?[]u8 {
-    const line = std.mem.sliceTo(raw, '\n');
-    const unquoted = std.mem.trim(u8, std.mem.trim(u8, line, " \t\r"), "\"'`");
-    const text = std.mem.trim(u8, unquoted, " \t\r");
-    if (text.len == 0) return null;
-    return try gpa.dupe(u8, text);
-}
-
-fn provisionalTitle(text: []const u8) []const u8 {
+/// The title `text` gives: its first line with the space around it off, and null when that line is
+/// empty. A title the model wrote and the first line of a prompt are taken the same way.
+fn titleFrom(text: []const u8) ?[]const u8 {
     const line = std.mem.sliceTo(text, '\n');
-    return std.mem.trim(u8, line, " \t\r");
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    return if (trimmed.len == 0) null else trimmed;
 }
 
 fn nameFromPrompt(session: *Session, text: []const u8) !bool {
     if (session.title() != null) return false;
-    try session.setTitle(provisionalTitle(text));
+    const title = titleFrom(text) orelse return false;
+    try session.setTitle(title);
     return true;
 }
 
@@ -2525,33 +2518,20 @@ test "the first turn names the session, and the naming is not part of it" {
     }
 }
 
-test "a title is cut to one clean line, or dropped when there is none" {
-    const gpa = std.testing.allocator;
-
-    try expectCleanTitle(gpa, "Fix the parser", "Fix the parser\nand more");
-    try expectCleanTitle(gpa, "Fix it", "  \"Fix it\"  ");
-    try expectCleanTitle(gpa, "Fix it", "`Fix it`");
-    try expectCleanTitle(gpa, "just one line", "just one line\nextra");
-
-    try std.testing.expect((try cleanTitle(gpa, "")) == null);
-    try std.testing.expect((try cleanTitle(gpa, "   \n  ")) == null);
-
-    const too_long: [200]u8 = @splat('x');
-    const long = (try cleanTitle(gpa, &too_long)).?;
-    defer gpa.free(long);
-    try std.testing.expectEqual(@as(usize, 200), long.len);
-
+test "a title is the first line of what was written, or nothing when there is none" {
+    try std.testing.expectEqualStrings("Fix the parser", titleFrom("Fix the parser\nand more").?);
+    try std.testing.expectEqualStrings("just one line", titleFrom("just one line\nextra").?);
+    try std.testing.expectEqualStrings("short", titleFrom("   short   ").?);
     try std.testing.expectEqualStrings(
         "add a title to sessions",
-        provisionalTitle("add a title to sessions\nand lots of detail follows"),
+        titleFrom("add a title to sessions\nand lots of detail follows").?,
     );
-    try std.testing.expectEqualStrings("short", provisionalTitle("   short   "));
-}
 
-fn expectCleanTitle(gpa: std.mem.Allocator, expected: []const u8, raw: []const u8) !void {
-    const title = (try cleanTitle(gpa, raw)).?;
-    defer gpa.free(title);
-    try std.testing.expectEqualStrings(expected, title);
+    try std.testing.expect(titleFrom("") == null);
+    try std.testing.expect(titleFrom("   \n  ") == null);
+
+    const too_long: [200]u8 = @splat('x');
+    try std.testing.expectEqual(@as(usize, 200), titleFrom(&too_long).?.len);
 }
 
 test "a turn is sent to the model the session records when it begins" {
