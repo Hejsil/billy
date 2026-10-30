@@ -22,11 +22,11 @@ const Command = union(enum) {
     pub fn of(text: []const u8) ?Command {
         const spaces = " \t\r\n";
 
-        const line = std.mem.trim(u8, text, spaces);
-        const typed = std.mem.cutPrefix(u8, line, "/") orelse return null;
-        const split = std.mem.findAny(u8, typed, spaces) orelse typed.len;
-        const name = typed[0..split];
-        const argument = std.mem.trim(u8, typed[split..], spaces);
+        var it = std.mem.tokenizeAny(u8, text, spaces);
+        const command = it.next() orelse return null;
+        const argument = std.mem.trimEnd(u8, it.rest(), spaces);
+
+        const name = std.mem.cutPrefix(u8, command, "/") orelse return null;
 
         const fields = @typeInfo(Command).@"union";
         inline for (fields.field_names, fields.field_types) |field_name, argument_type| {
