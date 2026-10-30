@@ -219,7 +219,7 @@ pub fn run(
         const waiting = try agent.take(self.emitter(), session, line);
         const text = switch (waiting) {
             .prompt => |asked| asked.text,
-            .ran, .unresolved => {
+            .ran => {
                 try out.flush();
                 continue;
             },

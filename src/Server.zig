@@ -610,10 +610,10 @@ fn serveTurn(
     const emitter = stream.emitter();
 
     // The line is given to the agent before the session is announced, because a command is answered
-    // without the session being started at all: a `/compact` on a page with a session that has
-    // nothing to fold must leave the page with no new session to show.
+    // without a turn being run: a `/model` typed first must not put a session in the list that has
+    // nothing in it.
     const waiting = try agent.take(emitter, session, text);
-    if (waiting == .ran or waiting == .unresolved) {
+    if (waiting == .ran) {
         try r.server.sendHeader(gpa, session, &stream);
         try stream.done();
         return;

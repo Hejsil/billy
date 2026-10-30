@@ -15,7 +15,6 @@ const Tools = @import("Tools.zig");
 const Agent = @This();
 
 const Command = union(enum) {
-    compact,
     model: ?[]const u8,
     cwd: ?[]const u8,
 
@@ -352,7 +351,6 @@ pub fn sessionModelChoice(catalog: *const models.Catalog, session: *const Sessio
 pub const Waiting = union(enum) {
     prompt: Prompt,
     ran,
-    unresolved,
 
     pub const Prompt = struct {
         text: []const u8,
@@ -367,19 +365,11 @@ pub fn take(agent: *Agent, emitter: *Emitter, session: *Session, line: []const u
     // cannot be reached is exactly the one `/model` has to be able to move.
     if (Command.of(line)) |cmd| {
         switch (cmd) {
-            .compact => {
-                var client = (try agent.resolvedClient(emitter, session)) orelse return .unresolved;
-                if (agent.compact(emitter, session, &client, .now) != .done)
-                    try emitter.show(.{ .notice = "nothing to compact" });
-            },
             .model => |choice| try agent.selectModel(emitter, session, choice),
             .cwd => |path| try agent.changeCwd(emitter, session, path),
         }
         return .ran;
     }
-
-    var client = (try agent.resolvedClient(emitter, session)) orelse return .unresolved;
-    _ = agent.compact(emitter, session, &client, .when_needed);
 
     const named = try nameFromPrompt(session, line);
     if (session.messages.items.len == 0)
@@ -477,27 +467,6 @@ fn cwdNotice(emitter: *Emitter, buffer: []u8, path: []const u8, err: anyerror) !
         "cannot work in {s}: {t}",
         .{ path, err },
     ) catch "cannot work in that directory" });
-}
-
-const Compaction = enum { done, nothing, failed };
-
-fn compact(
-    agent: *Agent,
-    emitter: *Emitter,
-    session: *Session,
-    client: *llm.Client,
-    when: enum { when_needed, now },
-) Compaction {
-    const compacted = (switch (when) {
-        .when_needed => agent.maybeCompact(emitter, session, client),
-        .now => agent.summarize(emitter, session, client),
-    }) catch |err| {
-        std.log.warn("compaction failed: {t}", .{err});
-        return .failed;
-    };
-    if (!compacted) return .nothing;
-    agent.refresh(session);
-    return .done;
 }
 
 fn refresh(agent: *Agent, session: *Session) void {
@@ -642,15 +611,19 @@ fn turn(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client
     var scratch_state = std.heap.ArenaAllocator.init(agent.tool_set.gpa);
     defer scratch_state.deinit();
 
-    var remaining: usize = agent.behaviour.max_turns;
     // The second bound on the loop: how many replies in a row may say nothing before the turn stops
     // asking.
     var retries: usize = max_retries;
-    // A compaction that failed is not tried again within the same turn, so a provider that will not
-    // summarize cannot turn every request of a long turn into a second failed one.
-    var compact_failed = false;
+    var remaining: usize = agent.behaviour.max_turns;
     while (remaining > 0 and retries > 0) : (remaining -= 1) {
-        if (!compact_failed) compact_failed = agent.compact(emitter, session, client, .when_needed) == .failed;
+        if (agent.shouldCompact(session)) {
+            agent.summarize(emitter, session, client) catch |err| {
+                std.log.warn("compaction failed: {t}", .{err});
+                retries -= 1;
+                continue;
+            };
+            agent.refresh(session);
+        }
 
         var stream = try client.complete(
             agent.gpa,
@@ -660,7 +633,8 @@ fn turn(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client
         );
         defer stream.deinit();
 
-        while (try stream.next()) |delta| try showDeltaText(emitter, delta);
+        while (try stream.next()) |delta|
+            try showDeltaText(emitter, delta);
 
         const message = try stream.message();
         const calls = message.tool_calls orelse &.{};
@@ -766,8 +740,9 @@ const title_prompt =
 ;
 
 fn titleSession(agent: *Agent, session: *Session, client: *llm.Client) !void {
-    const raw = try agent.askWith(session, client, title_prompt) orelse return;
+    const raw = try agent.askWith(session, client, title_prompt);
     defer agent.gpa.free(raw);
+
     const title = titleFrom(raw) orelse return;
     try session.setTitle(title);
     try session.save();
@@ -804,28 +779,21 @@ fn compactThreshold(agent: *const Agent, session: *const Session) usize {
     return info.context_window * agent.behaviour.compact_at / 100;
 }
 
-fn maybeCompact(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client) !bool {
+fn shouldCompact(agent: *const Agent, session: *const Session) bool {
     const threshold = agent.compactThreshold(session);
-    if (threshold == 0 or session.context_tokens < threshold) return false;
-    return try agent.summarize(emitter, session, client);
+    return threshold > 0 and session.context_tokens >= threshold;
 }
 
-fn summarize(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client) !bool {
-    // Nothing has been added since the last compaction, so there is nothing new to compact in:
-    // compacting again would only summarize the summary, and would do so on every request.
-    const sent_from = session.sentFrom();
-    if (session.messages.items.len - sent_from <= 1) return false;
-
-    const summary = try agent.askWith(session, client, compact_prompt) orelse return false;
+fn summarize(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client) !void {
+    const summary = try agent.askWith(session, client, compact_prompt);
     defer agent.gpa.free(summary);
 
     session.context_tokens = 0;
     try session.appendCompaction(compact_prompt, summary);
     try emitter.show(.{ .compacted = .{ .prompt = compact_prompt, .summary = summary } });
-    return true;
 }
 
-fn askWith(agent: *Agent, session: *Session, client: *llm.Client, question: []const u8) !?[]u8 {
+fn askWith(agent: *Agent, session: *Session, client: *llm.Client, question: []const u8) ![]u8 {
     const extra = [_]llm.Message{.{ .role = .user, .content = question }};
     var stream = try client.complete(
         agent.gpa,
@@ -836,7 +804,7 @@ fn askWith(agent: *Agent, session: *Session, client: *llm.Client, question: []co
     defer stream.deinit();
 
     while (try stream.next()) |_| {}
-    const content = (try stream.message()).content orelse return null;
+    const content = (try stream.message()).content orelse "";
     return try agent.gpa.dupe(u8, content);
 }
 
@@ -953,17 +921,19 @@ test "a model that cannot be resolved is a notice, and asks nothing" {
     const emitter = terminal.emitter();
 
     try session.setModel("nokey/m");
-    try std.testing.expect((try agent.take(emitter, &session, "hi")) == .unresolved);
+    // The line is taken first, the way both frontends do it; the model is only reached for when it
+    // is asked, and that is where a model that cannot be reached is answered.
+    _ = try agent.take(emitter, &session, "hi");
+    try agent.ask(emitter, &session, "hi");
     try std.testing.expect(std.mem.find(u8, out.written(), "the model nokey/m cannot be reached") != null);
     try std.testing.expect(std.mem.find(u8, out.written(), "billy login nokey") != null);
     try std.testing.expectEqual(@as(usize, 0), session.messages.items.len);
-    try std.testing.expect(session.systemPrompt() == null);
 
     // A provider neither the configuration nor the catalog names says where an address comes from
     // instead.
     out.clearRetainingCapacity();
     try session.setModel("who-knows/m");
-    try std.testing.expect((try agent.take(emitter, &session, "hi")) == .unresolved);
+    try agent.ask(emitter, &session, "hi");
     try std.testing.expect(std.mem.find(u8, out.written(), "the model who-knows/m cannot be reached") != null);
     try std.testing.expect(std.mem.find(u8, out.written(), "billy models --refresh") != null);
 
@@ -1364,7 +1334,7 @@ test "the compaction threshold is the configured share of the window, or off" {
     try std.testing.expectEqual(330_000, agent.compactThreshold(&session));
 }
 
-test "maybeCompact compacts the conversation once it has filled the window" {
+test "a conversation that has filled the window is summarized in place of itself" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1402,7 +1372,8 @@ test "maybeCompact compacts the conversation once it has filled the window" {
     defer out.deinit();
     var terminal = testTerminal(.{ .out = &out.writer });
     var client = try agent.clientFor(&session);
-    try std.testing.expect(try agent.maybeCompact(terminal.emitter(), &session, &client));
+    try std.testing.expect(agent.shouldCompact(&session));
+    try agent.summarize(terminal.emitter(), &session, &client);
 
     try mock.await();
 
@@ -1425,7 +1396,7 @@ test "maybeCompact compacts the conversation once it has filled the window" {
     try std.testing.expectEqualStrings("⊟ compacted\n\n", out.written());
 }
 
-test "maybeCompact does nothing below the threshold, off, or with nothing new" {
+test "compaction is due only once the conversation is over the threshold" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1439,38 +1410,26 @@ test "maybeCompact does nothing below the threshold, off, or with nothing new" {
 
     var setup = try TestSetup.init(gpa, "deepseek-flash");
     defer setup.deinit();
-
-    // Nothing is listening on this address, so a request made where the function should have
-    // returned first would fail the test rather than pass it.
-
     var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
+    try session.setModel("test/deepseek-flash");
 
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var terminal = testTerminal(.{ .out = &out.writer });
-    const emitter = terminal.emitter();
-    var client = try agent.clientFor(&session);
+    // Eighty per cent of the million-column window the model has, which is where it compacts.
+    session.context_tokens = 799_999;
+    try std.testing.expect(!agent.shouldCompact(&session));
+    session.context_tokens = 800_000;
+    try std.testing.expect(agent.shouldCompact(&session));
 
-    session.context_tokens = 100;
-    try std.testing.expect(!try agent.maybeCompact(emitter, &session, &client));
-    session.context_tokens = 999_900;
     agent.behaviour.compact_at = 0;
-    try std.testing.expect(!try agent.maybeCompact(emitter, &session, &client));
+    try std.testing.expect(!agent.shouldCompact(&session));
 
-    var unknown_setup = try TestSetup.init(gpa, "m");
-    defer unknown_setup.deinit();
-    var unknown = try testAgent(io, gpa, unknown_setup, null);
-    defer unknown.deinit();
-    session.context_tokens = 999_900;
-    var unknown_client = try unknown.clientFor(&session);
-    try std.testing.expect(!try unknown.maybeCompact(emitter, &session, &unknown_client));
-
-    try std.testing.expectEqual(1, session.messages.items.len);
-    try std.testing.expectEqualStrings("", out.written());
+    // A model the catalog says nothing about has no window, so no line to cross.
+    agent.behaviour.compact_at = 80;
+    try session.setModel("test/m");
+    try std.testing.expect(!agent.shouldCompact(&session));
 }
 
-test "a compaction asked for now compacts the conversation in whatever its size" {
+test "a summary is written into the conversation and announced" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1485,6 +1444,7 @@ test "a compaction asked for now compacts the conversation in whatever its size"
 
     var setup = try TestSetup.init(gpa, "m");
     defer setup.deinit();
+    // Summarizing asks nothing of how full the conversation is: whoever asks for it decides that.
     setup.behaviour.compact_at = 0;
 
     var mock = try Mock.start("/chat/completions", 1, Mock.completion("the summary"));
@@ -1502,23 +1462,19 @@ test "a compaction asked for now compacts the conversation in whatever its size"
     defer out.deinit();
     var terminal = testTerminal(.{ .out = &out.writer });
     var client = try agent.clientFor(&session);
-    try std.testing.expect(try agent.summarize(terminal.emitter(), &session, &client));
+    try agent.summarize(terminal.emitter(), &session, &client);
     try mock.await();
 
+    // The prompt that asked and the summary it produced, which is where a request starts from now.
     try std.testing.expectEqual(4, session.messages.items.len);
+    try std.testing.expectEqualStrings("the summary", session.contentOf(session.messages.items[3]).?);
+    try std.testing.expectEqual(3, session.sentFrom());
+    try std.testing.expect(session.isCompaction(3));
+    try std.testing.expectEqual(0, session.context_tokens);
     try std.testing.expect(std.mem.find(u8, out.written(), "compacted") != null);
-
-    // Asking again does nothing: the summary is the last message, so there is nothing new to
-    // compact in, and a request would only re-summarize it.
-    out.clearRetainingCapacity();
-    try std.testing.expect(!try agent.summarize(terminal.emitter(), &session, &client));
-    try std.testing.expectEqualStrings("", out.written());
 }
 
 test "a command is read from the whole line, and takes its argument with it" {
-    try std.testing.expectEqual(Command.compact, Command.of("/compact").?);
-    try std.testing.expectEqual(Command.compact, Command.of("  /compact\n").?);
-
     try std.testing.expectEqualStrings(
         "deepseek/deepseek-flash",
         Command.of("/model deepseek/deepseek-flash").?.model.?,
@@ -1540,39 +1496,6 @@ test "a command is read from the whole line, and takes its argument with it" {
     try std.testing.expect(Command.of("/") == null);
     try std.testing.expect(Command.of("hello") == null);
     try std.testing.expect(Command.of("/chat") == null);
-}
-
-test "maybeCompact does not compact a summary that stands alone" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
-    defer session.deinit();
-    try session.setSystemPrompt("s");
-    try session.appendCompaction("p", "a summary");
-
-    var setup = try TestSetup.init(gpa, "deepseek-flash");
-    defer setup.deinit();
-
-    // Over the threshold, but the last message is the summary itself, so there is nothing new to
-    // compact in and a request would only re-summarize it.
-    session.context_tokens = 900_000;
-    // Nothing is listening there, so a request made where this should have returned first would
-    // fail the test.
-    var agent = try testAgent(io, gpa, setup, null);
-    defer agent.deinit();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var terminal = testTerminal(.{ .out = &out.writer });
-    var client = try agent.clientFor(&session);
-    try std.testing.expect(!try agent.maybeCompact(terminal.emitter(), &session, &client));
-
-    try std.testing.expectEqual(2, session.messages.items.len);
-    try std.testing.expectEqualStrings("", out.written());
 }
 
 test "refreshLead replaces the prompt, the project instructions and the tools" {
