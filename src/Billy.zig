@@ -202,26 +202,24 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resuming: ?Resume) !void {
         .instructions = billy.dirs.config,
     };
 
+    var terminal = Terminal{ .writer = out, .io = billy.io, .scratch = billy.gpa };
+    defer terminal.deinit();
+
     if (resume_id != null) {
-        try Agent.printTranscript(
-            billy.io,
-            billy.gpa,
-            out,
-            &session,
-            billy.config.stored.resume_blocks,
-        );
+        try terminal.printTranscript(&session, billy.config.stored.resume_blocks);
     }
-    try billy.runTerminal(out, options, &session);
+    try billy.runSession(&terminal, options, &session);
 }
 
-fn runTerminal(
+fn runSession(
     billy: *Billy,
-    out: Terminal.Writer,
+    terminal: *Terminal,
     options: Agent.Options,
     session: *Session,
 ) !void {
     const io = billy.io;
     const gpa = billy.gpa;
+    const out = terminal.writer;
 
     var agent = try Agent.init(io, gpa, options, session.cwd(), &billy.http_client);
     defer agent.deinit();
@@ -231,8 +229,6 @@ fn runTerminal(
     var editor = LineEditor.init(io, out.out, gpa);
     defer editor.deinit();
 
-    var terminal = Terminal{ .writer = out, .io = io, .scratch = gpa };
-    defer terminal.deinit();
     const emitter = terminal.emitter();
 
     var header: std.Io.Writer.Allocating = .init(gpa);

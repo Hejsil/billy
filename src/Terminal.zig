@@ -3,6 +3,8 @@
 const std = @import("std");
 
 const Agent = @import("Agent.zig");
+const llm = @import("llm.zig");
+const Session = @import("Session.zig");
 
 pub const tool = @import("Terminal/tool.zig");
 
@@ -173,6 +175,13 @@ fn printElided(count: usize, writer: Writer) !void {
     try writer.print("{s}… {d} earlier blocks{s}\n\n", .{ writer.dim(), count, writer.reset() });
 }
 
+/// Replays a stored conversation on the terminal as the blocks it was made of, so remembering the
+/// context of an earlier run is not left to the user.
+pub fn printTranscript(self: *Terminal, session: *const Session, blocks: usize) !void {
+    try Agent.walk(self.scratch, session, blocks, self.emitter());
+    try self.writer.flush();
+}
+
 /// The marks the blocks of a run are headed by, which is the vocabulary both frontends show a block
 /// in: the terminal colours them and the web gives them classes, but a prompt is a prompt in
 /// either.
@@ -303,5 +312,253 @@ test "an answer that arrives as a block ends the reasoning before it" {
         "\x1b[35m◇\x1b[0m \x1b[1mreasoning\x1b[0m\n\x1b[2mthink\x1b[0m\n\n" ++
             "\x1b[32m◆\x1b[0m \x1b[1manswer\x1b[0m\ndone\n\n",
         out.written(),
+    );
+}
+
+fn expectTranscript(
+    expected: []const u8,
+    messages: []const llm.Message,
+    style: Writer.Style,
+) !void {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    for (messages) |message| try session.append(message);
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // Plain, since what these cover is how a message is headed and laid out rather than how a
+    // terminal decorates it.
+    var terminal = Terminal{
+        .writer = .{ .style = style, .out = &out.writer },
+        .io = io,
+        .scratch = gpa,
+    };
+    defer terminal.deinit();
+    try terminal.printTranscript(&session, 0);
+    try std.testing.expectEqualStrings(expected, out.written());
+}
+
+test "a transcript shows only the last blocks and counts the rest" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    try session.append(.{ .role = .user, .content = "one" });
+    try session.append(.{ .role = .assistant, .tool_calls = &.{
+        .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" } },
+        .{ .id = "call_2", .function = .{ .name = "read", .arguments = "{\"path\":\"b.zig\"}" } },
+    } });
+    try session.append(.{ .role = .tool, .tool_call_id = "call_1", .content = "contents a" });
+    try session.append(.{ .role = .tool, .tool_call_id = "call_2", .content = "contents b" });
+    try session.append(.{ .role = .assistant, .content = "done" });
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var terminal = Terminal{ .writer = .{ .out = &out.writer }, .io = io, .scratch = gpa };
+    defer terminal.deinit();
+
+    try terminal.printTranscript(&session, 2);
+    try std.testing.expectEqualStrings(
+        "… 2 earlier blocks\n\n" ++
+            "▸ read b.zig\n▾ output\ncontents b\n\n" ++
+            "◆ answer\ndone\n\n",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+
+    try terminal.printTranscript(&session, 10);
+    try std.testing.expect(std.mem.find(u8, out.written(), "earlier blocks") == null);
+    try std.testing.expect(std.mem.startsWith(u8, out.written(), "» prompt\none\n\n"));
+    out.clearRetainingCapacity();
+
+    try terminal.printTranscript(&session, 0);
+    try std.testing.expect(std.mem.find(u8, out.written(), "earlier blocks") == null);
+    try std.testing.expect(std.mem.startsWith(u8, out.written(), "» prompt\none\n\n"));
+}
+
+test "a transcript replays a conversation as the blocks it was made of" {
+    // The system prompt is never shown while running, the tool result only as the output of the
+    // call it belongs to.
+    try expectTranscript(
+        "» prompt\nhello\n\n" ++
+            "▸ read a.zig\n▾ output\n1\tconst x = 1;\n\n" ++
+            "◆ answer\ndone\n\n",
+        &.{
+            .{ .role = .system, .content = "ignore me" },
+            .{ .role = .user, .content = "hello" },
+            .{ .role = .assistant, .tool_calls = &.{.{
+                .id = "call_1",
+                .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" },
+            }} },
+            .{ .role = .tool, .tool_call_id = "call_1", .content = "1\tconst x = 1;" },
+            .{ .role = .assistant, .content = "done" },
+        },
+        .plain,
+    );
+}
+
+test "a transcript leaves out the system prompt and an unpaired tool result" {
+    // A result whose call is not in the session has nothing to belong to, and a system prompt is
+    // never shown at all.
+    try expectTranscript(
+        "",
+        &.{
+            .{ .role = .system, .content = "ignore me" },
+            .{ .role = .tool, .tool_call_id = "call_1", .content = "1\tconst x = 1;" },
+        },
+        .plain,
+    );
+}
+
+test "a transcript shows a compaction as a single line" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    try session.setSystemPrompt("be terse");
+    try session.append(.{ .role = .user, .content = "one" });
+    try session.append(.{ .role = .assistant, .content = "a1" });
+    try session.appendCompaction("summarize this", "the summary");
+    try session.append(.{ .role = .user, .content = "two" });
+    try session.append(.{ .role = .assistant, .content = "a2" });
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var terminal = Terminal{ .writer = .{ .out = &out.writer }, .io = io, .scratch = gpa };
+    defer terminal.deinit();
+
+    try terminal.printTranscript(&session, 0);
+    try std.testing.expectEqualStrings(
+        "» prompt\none\n\n" ++
+            "◆ answer\na1\n\n" ++
+            "⊟ compacted\n\n" ++
+            "» prompt\ntwo\n\n" ++
+            "◆ answer\na2\n\n",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+
+    try terminal.printTranscript(&session, 3);
+    try std.testing.expectEqualStrings(
+        "… 2 earlier blocks\n\n" ++
+            "⊟ compacted\n\n" ++
+            "» prompt\ntwo\n\n" ++
+            "◆ answer\na2\n\n",
+        out.written(),
+    );
+}
+
+test "a compaction is headed by its own mark, and hides what it stands for" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    try session.setSystemPrompt("s");
+    try session.append(.{ .role = .user, .content = "hi" });
+    try session.appendCompaction("ASKEDFORTHEcompaction", "THESUMMARYTEXT");
+    try session.append(.{ .role = .user, .content = "next" });
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var terminal = Terminal{ .writer = .{ .style = .ansi, .out = &out.writer }, .io = io, .scratch = gpa };
+    defer terminal.deinit();
+    try terminal.printTranscript(&session, 0);
+
+    try std.testing.expect(std.mem.find(u8, out.written(), "\x1b[33m⊟\x1b[0m \x1b[1mcompacted\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "ASKEDFORTHEcompaction") == null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "THESUMMARYTEXT") == null);
+}
+
+test "a transcript gives each call the result that names it" {
+    try expectTranscript(
+        "▸ read a.zig\n▾ output\ncontents of a\n\n" ++
+            "▸ read b.zig\n▾ output\ncontents of b\n\n",
+        &.{
+            .{ .role = .assistant, .tool_calls = &.{
+                .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" } },
+                .{ .id = "call_2", .function = .{ .name = "read", .arguments = "{\"path\":\"b.zig\"}" } },
+            } },
+            .{ .role = .tool, .tool_call_id = "call_1", .content = "contents of a" },
+            .{ .role = .tool, .tool_call_id = "call_2", .content = "contents of b" },
+        },
+        .plain,
+    );
+}
+
+test "a transcript rebuilds an edit's diff from the stored call" {
+    try expectTranscript(
+        "✎ edit a.zig\n▾ diff\n-old\n+new\n\n",
+        &.{
+            .{ .role = .assistant, .tool_calls = &.{.{
+                .id = "call_1",
+                .function = .{
+                    .name = "edit",
+                    .arguments = "{\"path\":\"a.zig\",\"old_string\":\"old\",\"new_string\":\"new\"}",
+                },
+            }} },
+            .{ .role = .tool, .tool_call_id = "call_1", .content = "replaced 1 occurrence(s) in a.zig" },
+        },
+        .plain,
+    );
+}
+
+test "a reply is headed by its own header, and its markdown laid out" {
+    try expectTranscript(
+        "◆ answer\nhi\n\n",
+        &.{.{ .role = .assistant, .content = "**hi**" }},
+        .plain,
+    );
+
+    try expectTranscript(
+        "◆ answer\n(empty reply)\n\n",
+        &.{.{ .role = .assistant, .content = "" }},
+        .plain,
+    );
+}
+
+test "a prompt from the session is headed and laid out like a reply" {
+    try expectTranscript(
+        "» prompt\nhi\n\n",
+        &.{.{ .role = .user, .content = "**hi**" }},
+        .plain,
+    );
+}
+
+test "an empty reply is shown under its header, in place of the text" {
+    try expectTranscript(
+        "◆ answer\n(empty reply)\n\n",
+        &.{.{ .role = .assistant, .content = "" }},
+        .plain,
+    );
+}
+
+test "a prompt and a reply are headed alike, in the colours of the display" {
+    try expectTranscript(
+        "\x1b[34m»\x1b[0m \x1b[1mprompt\x1b[0m\nhello\n\n" ++
+            "\x1b[32m◆\x1b[0m \x1b[1manswer\x1b[0m\nhi\n\n",
+        &.{
+            .{ .role = .user, .content = "hello" },
+            .{ .role = .assistant, .content = "hi" },
+        },
+        .ansi,
     );
 }
