@@ -14,7 +14,7 @@ pub fn run(edit: Edit, gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, out:
         return Tools.fail(out, "old_string must not be empty", .{});
 
     const contents = dir.readFileAlloc(io, edit.path, gpa, .unlimited) catch |err|
-        return Tools.fail(out, "cannot read {s}: {s}", .{ edit.path, @errorName(err) });
+        return Tools.fail(out, "cannot read {s}: {t}", .{ edit.path, err });
     defer gpa.free(contents);
 
     const amount: Amount = if (edit.replace_all) .all else .one;
@@ -30,7 +30,7 @@ pub fn run(edit: Edit, gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, out:
         .applied => |*applied| {
             defer applied.text.deinit(gpa);
             Tools.writeFile(io, dir, edit.path, applied.text.items) catch |err|
-                return Tools.fail(out, "cannot write {s}: {s}", .{ edit.path, @errorName(err) });
+                return Tools.fail(out, "cannot write {s}: {t}", .{ edit.path, err });
 
             try out.print("replaced {d} occurrence(s) in {s}", .{ applied.count, edit.path });
         },

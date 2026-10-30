@@ -41,7 +41,7 @@ fn parse(T: type, gpa: std.mem.Allocator, reply: []const u8) !std.json.Parsed(T)
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     }) catch |err| {
-        std.log.warn("exa: cannot read the reply: {s}", .{@errorName(err)});
+        std.log.warn("exa: cannot read the reply: {t}", .{err});
         return error.BadReply;
     };
 }

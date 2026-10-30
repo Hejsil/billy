@@ -124,7 +124,7 @@ pub fn clear(self: *Health, name: []const u8) void {
 }
 
 fn lost(what: []const u8, name: []const u8, err: anyerror) void {
-    std.log.warn("cannot {s} {s}: {s}", .{ what, name, @errorName(err) });
+    std.log.warn("cannot {s} {s}: {t}", .{ what, name, err });
 }
 
 pub fn isSetAside(health: ?*Health, name: []const u8, now_ms: i64) bool {

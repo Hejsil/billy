@@ -190,8 +190,8 @@ fn dispatch(tools: *Tools, call: Call, out: *std.Io.Writer) !void {
         .unknown => |name| try fail(out, "unknown tool '{s}'", .{name}),
         .malformed => |bad| try fail(
             out,
-            "invalid arguments for {s}: {s}",
-            .{ bad.name, @errorName(bad.reason) },
+            "invalid arguments for {s}: {t}",
+            .{ bad.name, bad.reason },
         ),
     }
 }

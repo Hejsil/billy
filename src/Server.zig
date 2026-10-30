@@ -71,8 +71,8 @@ fn options(server: *const Server) Agent.Options {
 pub fn serve(server: *const Server, host: []const u8, port: u16) !void {
     const address = listenAddress(host, port) catch |err| {
         std.log.err(
-            "cannot listen on '{s}': {s}; give an address such as 127.0.0.1, 0.0.0.0 or 192.168.1.5",
-            .{ host, @errorName(err) },
+            "cannot listen on '{s}': {t}; give an address such as 127.0.0.1, 0.0.0.0 or 192.168.1.5",
+            .{ host, err },
         );
         return report.Reported;
     };
@@ -106,7 +106,7 @@ pub fn serve(server: *const Server, host: []const u8, port: u16) !void {
             // A connection that cannot be given a task is one to let go of, rather than one to
             // bring the server down over.
             slots.post(server.io);
-            std.log.err("cannot serve a connection: {s}", .{@errorName(err)});
+            std.log.err("cannot serve a connection: {t}", .{err});
             var copy = stream;
             copy.close(server.io);
             continue;
@@ -183,7 +183,7 @@ fn handle(
         // A failure that already said what went wrong, in the log this task writes to, is not said
         // again here: what is left is to answer the browser with a status rather than let the
         // connection drop.
-        if (err != report.Reported) std.log.err("cannot answer a request: {s}", .{@errorName(err)});
+        if (err != report.Reported) std.log.err("cannot answer a request: {t}", .{err});
         // Nothing has been sent, so the browser can be told what happened rather than only watching
         // the connection drop.
         if (!r.answered) request.respond("billy: internal error\n", .{
@@ -628,7 +628,7 @@ fn serveTurn(
     if (waiting.prompt.title) |title| try stream.send("title", TitleEvent{ .title = title });
 
     agent.ask(emitter, session, text) catch |err| {
-        std.log.err("could not show the turn: {s}", .{@errorName(err)});
+        std.log.err("could not show the turn: {t}", .{err});
         try stream.fail(@errorName(err));
     };
 
@@ -816,10 +816,10 @@ const Exchange = struct {
         errdefer exchange.written.deinit();
 
         const request_text = if (body) |payload|
-            try gpa.print("{s} {s} HTTP/1.1\r\nhost: billy\r\ncontent-type: application/json\r\n" ++
-                "content-length: {d}\r\n\r\n{s}", .{ @tagName(method), path, payload.len, payload })
+            try gpa.print("{t} {s} HTTP/1.1\r\nhost: billy\r\ncontent-type: application/json\r\n" ++
+                "content-length: {d}\r\n\r\n{s}", .{ method, path, payload.len, payload })
         else
-            try gpa.print("{s} {s} HTTP/1.1\r\nhost: billy\r\n\r\n", .{ @tagName(method), path });
+            try gpa.print("{t} {s} HTTP/1.1\r\nhost: billy\r\n\r\n", .{ method, path });
         defer gpa.free(request_text);
 
         var in_buffer: [4096]u8 = undefined;

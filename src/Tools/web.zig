@@ -270,7 +270,7 @@ pub fn requestJson(
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     }) catch |err| {
-        std.log.warn("{s}: cannot read the reply: {s}", .{ what, @errorName(err) });
+        std.log.warn("{s}: cannot read the reply: {t}", .{ what, err });
         return error.BadReply;
     };
     return .{ .parsed = parsed };

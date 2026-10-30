@@ -10,7 +10,7 @@ pub fn renderSearch(gpa: std.mem.Allocator, reply: []const u8, max_results: usiz
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     }) catch |err| {
-        std.log.warn("searxng: cannot read the reply: {s}", .{@errorName(err)});
+        std.log.warn("searxng: cannot read the reply: {t}", .{err});
         return error.BadReply;
     };
     defer parsed.deinit();

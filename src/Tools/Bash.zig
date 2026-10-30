@@ -38,7 +38,7 @@ pub fn run(
             "command did not finish within {d}s and was killed",
             .{timeout.toSeconds()},
         ),
-        else => return Tools.fail(out, "cannot run command: {s}", .{@errorName(err)}),
+        else => return Tools.fail(out, "cannot run command: {t}", .{err}),
     };
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);

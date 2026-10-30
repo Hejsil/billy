@@ -134,19 +134,19 @@ fn reportSearchFailure(err: anyerror, provider: Tools.web.Provider) void {
         error.MissingApiKey => {
             const service = provider.service().?;
             std.log.err(
-                "run `billy login {s}` to use {s}, or clear tools.web_search in the configuration",
-                .{ service, @tagName(provider) },
+                "run `billy login {s}` to use {t}, or clear tools.web_search in the configuration",
+                .{ service, provider },
             );
         },
         error.MissingSearchUrl => std.log.err(
-            "set tools.web_search.{s}.url to your {s} instance, or clear tools.web_search in the configuration",
-            .{ @tagName(provider), @tagName(provider) },
+            "set tools.web_search.{t}.url to your {t} instance, or clear tools.web_search in the configuration",
+            .{ provider, provider },
         ),
         // Nothing this function knows about: it is the last word on the failure, so it says what it
         // has rather than nothing at all.
         else => |other| std.log.err(
-            "cannot use the {s} search backend: {s}",
-            .{ @tagName(provider), @errorName(other) },
+            "cannot use the {t} search backend: {t}",
+            .{ provider, other },
         ),
     }
 }
@@ -156,13 +156,13 @@ fn reportFetchFailure(err: anyerror, provider: Tools.web.Provider) void {
         error.MissingApiKey => {
             const service = provider.service().?;
             std.log.err(
-                "run `billy login {s}` to use {s}, or clear tools.web_fetch in the configuration",
-                .{ service, @tagName(provider) },
+                "run `billy login {s}` to use {t}, or clear tools.web_fetch in the configuration",
+                .{ service, provider },
             );
         },
         else => |other| std.log.err(
-            "cannot use the {s} fetch backend: {s}",
-            .{ @tagName(provider), @errorName(other) },
+            "cannot use the {t} fetch backend: {t}",
+            .{ provider, other },
         ),
     }
 }

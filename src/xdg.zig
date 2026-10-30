@@ -32,7 +32,7 @@ pub fn dir(
 /// Opens `path` as a directory, creating it and any of its parents.
 pub fn openDir(io: std.Io, path: []const u8, what: []const u8) !std.Io.Dir {
     return std.Io.Dir.cwd().createDirPathOpen(io, path, .{}) catch |err| {
-        std.log.err("cannot use {s} for {s}: {s}", .{ path, what, @errorName(err) });
+        std.log.err("cannot use {s} for {s}: {t}", .{ path, what, err });
         return report.Reported;
     };
 }
@@ -41,7 +41,7 @@ pub fn openDir(io: std.Io, path: []const u8, what: []const u8) !std.Io.Dir {
 /// the path out: a `![]const u8`, before the error has been looked at.
 pub fn openDirBuilt(io: std.Io, built: anytype, what: []const u8) !std.Io.Dir {
     const path = built catch |err| {
-        std.log.err("cannot find where to store {s}: {s}", .{ what, @errorName(err) });
+        std.log.err("cannot find where to store {s}: {t}", .{ what, err });
         return report.Reported;
     };
     return openDir(io, path, what);

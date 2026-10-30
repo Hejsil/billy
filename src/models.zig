@@ -113,12 +113,12 @@ pub fn ensure(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator, dir:
         // A file that is half written, from another version or edited by hand is fetched again
         // rather than left to blind the run until the user runs the refresh command.
         error.CorruptCatalog, error.UnsupportedCatalogVersion => {
-            std.log.warn("the model catalog cannot be used ({s}); fetching it again", .{@errorName(err)});
+            std.log.warn("the model catalog cannot be used ({t}); fetching it again", .{err});
             return fetchThenLoad(io, arena, gpa, dir);
         },
         // Nothing about a directory billy cannot read is made better by fetching.
         else => {
-            std.log.warn("could not read the model catalog: {s}", .{@errorName(err)});
+            std.log.warn("could not read the model catalog: {t}", .{err});
             return .{};
         },
     };
@@ -126,11 +126,11 @@ pub fn ensure(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator, dir:
 
 fn fetchThenLoad(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator, dir: std.Io.Dir) Catalog {
     _ = refresh(io, gpa, dir) catch |err| {
-        std.log.warn("could not fetch the model catalog: {s}", .{@errorName(err)});
+        std.log.warn("could not fetch the model catalog: {t}", .{err});
         return .{};
     };
     return load(io, arena, dir) catch |err| {
-        std.log.warn("could not read the model catalog: {s}", .{@errorName(err)});
+        std.log.warn("could not read the model catalog: {t}", .{err});
         return .{};
     };
 }

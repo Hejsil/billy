@@ -171,7 +171,7 @@ fn run(init: std.process.Init) !u8 {
 fn writeFailure(stdout: *std.Io.File.Writer, err: anyerror) anyerror!u8 {
     const cause: anyerror = if (err == error.WriteFailed) stdout.err orelse err else err;
     if (cause == error.BrokenPipe) return 0;
-    std.log.err("cannot write to stdout: {s}", .{@errorName(cause)});
+    std.log.err("cannot write to stdout: {t}", .{cause});
     return report.Reported;
 }
 
@@ -198,7 +198,7 @@ fn answer(init: std.process.Init, out: Terminal.Writer, options: Options) !u8 {
 
 fn fail(err: anyerror) u8 {
     if (err != report.Reported) {
-        std.log.err("{s}", .{@errorName(err)});
+        std.log.err("{t}", .{err});
         if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
     }
     return 1;

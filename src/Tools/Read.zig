@@ -14,7 +14,7 @@ pub fn run(read: Read, gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, out:
         read.path,
         gpa,
         .limited(16 << 20),
-    ) catch |err| return Tools.fail(out, "cannot read {s}: {s}", .{ read.path, @errorName(err) });
+    ) catch |err| return Tools.fail(out, "cannot read {s}: {t}", .{ read.path, err });
     defer gpa.free(contents);
 
     // A trailing newline would otherwise read as a final empty line.

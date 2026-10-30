@@ -46,15 +46,15 @@ pub fn run(fetch: Fetch, gpa: std.mem.Allocator, http_client: *std.http.Client, 
         if (Health.isSetAside(health, @tagName(backend.provider), now_ms)) continue;
         const value = fetchBackend(gpa, http_client, backend, fetch.url) catch |err| {
             if (err == error.UrlUnreadable) {
-                std.log.warn("fetch: {s} could not read the url, trying the next", .{
-                    @tagName(backend.provider),
+                std.log.warn("fetch: {t} could not read the url, trying the next", .{
+                    backend.provider,
                 });
                 unreadable = true;
                 continue;
             }
             Health.recordFailure(health, @tagName(backend.provider), null, now_ms);
-            std.log.warn("fetch: {s} failed: {s}, trying the next", .{
-                @tagName(backend.provider), @errorName(err),
+            std.log.warn("fetch: {t} failed: {t}, trying the next", .{
+                backend.provider, err,
             });
             failed = err;
             continue;
@@ -67,13 +67,13 @@ pub fn run(fetch: Fetch, gpa: std.mem.Allocator, http_client: *std.http.Client, 
             },
             .retry_after_ms => |ms| {
                 Health.recordFailure(health, @tagName(backend.provider), ms, now_ms);
-                std.log.warn("fetch: {s} is set aside for {d}ms, trying the next", .{
-                    @tagName(backend.provider), ms,
+                std.log.warn("fetch: {t} is set aside for {d}ms, trying the next", .{
+                    backend.provider, ms,
                 });
             },
         }
     }
-    if (failed) |err| return Tools.fail(out, "fetch failed: {s}", .{@errorName(err)});
+    if (failed) |err| return Tools.fail(out, "fetch failed: {t}", .{err});
     // A backend answered and could not read this url, so it is read directly: a page billy can
     // reach itself is still worth having.
     if (unreadable) return readDirectly(gpa, http_client, fetch.url, out);
@@ -87,7 +87,7 @@ pub fn run(fetch: Fetch, gpa: std.mem.Allocator, http_client: *std.http.Client, 
 
 fn readDirectly(gpa: std.mem.Allocator, http_client: *std.http.Client, url: []const u8, out: *std.Io.Writer) !void {
     const answer = fetchBackend(gpa, http_client, .{ .provider = .raw }, url) catch |err|
-        return Tools.fail(out, "cannot read {s}: {s}", .{ url, @errorName(err) });
+        return Tools.fail(out, "cannot read {s}: {t}", .{ url, err });
     switch (answer) {
         .text => |text| {
             defer gpa.free(text);

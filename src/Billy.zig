@@ -42,12 +42,12 @@ pub fn open(init: std.process.Init, out: Terminal.Writer) !Billy {
     errdefer dirs.deinit(io);
 
     const credentials = Credentials.load(io, dirs.data, arena) catch |err| {
-        std.log.err("cannot read the credentials: {s}", .{@errorName(err)});
+        std.log.err("cannot read the credentials: {t}", .{err});
         return report.Reported;
     };
 
     var opened = Config.open(io, dirs.config, init.gpa) catch |err| {
-        std.log.err("cannot read the configuration: {s}", .{@errorName(err)});
+        std.log.err("cannot read the configuration: {t}", .{err});
         return report.Reported;
     };
     errdefer opened.config.deinit();
@@ -55,7 +55,7 @@ pub fn open(init: std.process.Init, out: Terminal.Writer) !Billy {
     if (opened.created) try out.write("wrote the default configuration\n");
 
     const cwd = std.process.currentPathAlloc(io, arena) catch |err| {
-        std.log.err("cannot find the working directory: {s}", .{@errorName(err)});
+        std.log.err("cannot find the working directory: {t}", .{err});
         return report.Reported;
     };
 
@@ -113,7 +113,7 @@ pub fn login(billy: *Billy, out: Terminal.Writer, service: ?[]const u8) !void {
 
     try billy.credentials.put(billy.arena, name, key);
     billy.credentials.save(billy.io, billy.dirs.data) catch |err| {
-        std.log.err("cannot write the credentials: {s}", .{@errorName(err)});
+        std.log.err("cannot write the credentials: {t}", .{err});
         return report.Reported;
     };
     try out.print("stored the {s} key\n", .{name});
@@ -144,7 +144,7 @@ pub fn configSet(billy: *Billy, out: Terminal.Writer, path: []const u8, value: [
         else => |other| return other,
     };
     billy.config.save(billy.io, billy.dirs.config) catch |err| {
-        std.log.err("cannot write the configuration: {s}", .{@errorName(err)});
+        std.log.err("cannot write the configuration: {t}", .{err});
         return report.Reported;
     };
     try out.print("set {s} to {s}\n", .{ path, value });
@@ -256,7 +256,7 @@ fn runTerminal(
             },
         };
         agent.ask(emitter, session, text) catch |err|
-            std.log.err("could not show the turn: {s}", .{@errorName(err)});
+            std.log.err("could not show the turn: {t}", .{err});
         try out.flush();
     }
     try out.flush();
@@ -270,7 +270,7 @@ fn resumeId(billy: *Billy, resuming: ?Resume) !?[]const u8 {
     }
 
     const found = Session.latest(billy.io, billy.dirs.sessions, billy.arena, billy.cwd) catch |err| {
-        std.log.err("cannot list the sessions: {s}", .{@errorName(err)});
+        std.log.err("cannot list the sessions: {t}", .{err});
         return report.Reported;
     };
     return found orelse {
@@ -287,11 +287,11 @@ fn ensureCatalog(billy: *Billy) void {
 pub fn showModels(billy: *Billy, out: Terminal.Writer, refresh: bool) !void {
     if (refresh) {
         const counts = models.refresh(billy.io, billy.gpa, billy.dirs.cache) catch |err| {
-            std.log.err("cannot refresh the model catalog: {s}", .{@errorName(err)});
+            std.log.err("cannot refresh the model catalog: {t}", .{err});
             return report.Reported;
         };
         billy.catalog = models.load(billy.io, billy.arena, billy.dirs.cache) catch |err| {
-            std.log.err("the model catalog was fetched but cannot be read: {s}", .{@errorName(err)});
+            std.log.err("the model catalog was fetched but cannot be read: {t}", .{err});
             return report.Reported;
         };
         try out.print("fetched {d} providers and {d} models\n", .{ counts.providers, counts.models });
@@ -307,7 +307,7 @@ pub fn showModels(billy: *Billy, out: Terminal.Writer, refresh: bool) !void {
 
 pub fn listSessions(billy: *Billy, out: Terminal.Writer) !void {
     const listed = Session.list(billy.io, billy.dirs.sessions, billy.gpa) catch |err| {
-        std.log.err("cannot list the sessions: {s}", .{@errorName(err)});
+        std.log.err("cannot list the sessions: {t}", .{err});
         return report.Reported;
     };
     defer {

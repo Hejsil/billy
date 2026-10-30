@@ -291,7 +291,7 @@ pub fn init(
     http_client: *std.http.Client,
 ) !Agent {
     var work_dir = std.Io.Dir.openDirAbsolute(io, cwd, .{}) catch |err| {
-        std.log.err("cannot work in {s}: {s}", .{ cwd, @errorName(err) });
+        std.log.err("cannot work in {s}: {t}", .{ cwd, err });
         return report.Reported;
     };
     errdefer work_dir.close(io);
@@ -426,7 +426,7 @@ fn selectModel(agent: *Agent, emitter: *Emitter, session: *Session, choice: ?[]c
     // A session that has messages is a file already, and the model it goes to is part of it, so the
     // move is written down now rather than at the next turn.
     if (session.messages.items.len > 0) session.save() catch |err|
-        std.log.warn("could not write the session: {s}", .{@errorName(err)});
+        std.log.warn("could not write the session: {t}", .{err});
 
     return emitter.show(.{ .notice = std.mem.print(&notice, "the model is now {s}", .{asked}) catch
         "the model is set" });
@@ -475,8 +475,8 @@ fn changeCwd(agent: *Agent, emitter: *Emitter, session: *Session, asked: ?[]cons
 fn cwdNotice(emitter: *Emitter, buffer: []u8, path: []const u8, err: anyerror) !void {
     return emitter.show(.{ .notice = std.mem.print(
         buffer,
-        "cannot work in {s}: {s}",
-        .{ path, @errorName(err) },
+        "cannot work in {s}: {t}",
+        .{ path, err },
     ) catch "cannot work in that directory" });
 }
 
@@ -493,7 +493,7 @@ fn compact(
         .when_needed => agent.maybeCompact(emitter, session, client),
         .now => agent.summarize(emitter, session, client),
     }) catch |err| {
-        std.log.warn("compaction failed: {s}", .{@errorName(err)});
+        std.log.warn("compaction failed: {t}", .{err});
         return .failed;
     };
     if (!compacted) return .nothing;
@@ -503,7 +503,7 @@ fn compact(
 
 fn refresh(agent: *Agent, session: *Session) void {
     agent.refreshLead(agent.tool_set.definitions(), session) catch |err|
-        std.log.warn("could not refresh the prompt and tools: {s}", .{@errorName(err)});
+        std.log.warn("could not refresh the prompt and tools: {t}", .{err});
 }
 
 /// Asks `session` one thing and shows how the answer is reached: the prompt, the tool calls it
@@ -521,20 +521,20 @@ pub fn ask(agent: *Agent, emitter: *Emitter, session: *Session, text: []const u8
     // conversation rather than only in a log.
     const shown_before = emitter.shown;
     agent.turn(emitter, session, &client) catch |err| {
-        std.log.err("a request failed: {s}", .{@errorName(err)});
+        std.log.err("a request failed: {t}", .{err});
         var notice: [256]u8 = undefined;
         return emitter.show(.{ .notice = failureNotice(&notice, err, emitter.shown > shown_before) });
     };
 
     if (first_turn and agent.behaviour.title) {
         agent.titleSession(session, &client) catch |err|
-            std.log.warn("could not title the session: {s}", .{@errorName(err)});
+            std.log.warn("could not title the session: {t}", .{err});
     }
 }
 
 fn failureNotice(buffer: []u8, err: anyerror, shown: bool) []const u8 {
     const outcome = if (shown) "the turn stopped partway" else "nothing was sent";
-    return std.mem.print(buffer, "the request failed: {s} — {s}, try again", .{ @errorName(err), outcome }) catch
+    return std.mem.print(buffer, "the request failed: {t} — {s}, try again", .{ err, outcome }) catch
         (if (shown)
             "the request failed, and the turn stopped partway — try again"
         else

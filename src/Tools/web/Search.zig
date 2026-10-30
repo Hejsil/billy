@@ -42,8 +42,8 @@ pub fn run(search: Search, gpa: std.mem.Allocator, http_client: *std.http.Client
         if (Health.isSetAside(health, @tagName(backend.provider), now_ms)) continue;
         const value = searchBackend(gpa, http_client, backend, search.query, search_config.max_results) catch |err| {
             Health.recordFailure(health, @tagName(backend.provider), null, now_ms);
-            std.log.warn("search: {s} failed: {s}, trying the next", .{
-                @tagName(backend.provider), @errorName(err),
+            std.log.warn("search: {t} failed: {t}, trying the next", .{
+                backend.provider, err,
             });
             failed = err;
             continue;
@@ -56,13 +56,13 @@ pub fn run(search: Search, gpa: std.mem.Allocator, http_client: *std.http.Client
             },
             .retry_after_ms => |ms| {
                 Health.recordFailure(health, @tagName(backend.provider), ms, now_ms);
-                std.log.warn("search: {s} is set aside for {d}ms, trying the next", .{
-                    @tagName(backend.provider), ms,
+                std.log.warn("search: {t} is set aside for {d}ms, trying the next", .{
+                    backend.provider, ms,
                 });
             },
         }
     }
-    if (failed) |err| return Tools.fail(out, "search failed: {s}", .{@errorName(err)});
+    if (failed) |err| return Tools.fail(out, "search failed: {t}", .{err});
     if (search_config.backends.len == 0) return Tools.fail(
         out,
         "no search backend is configured; add one to tools.web_search.providers",

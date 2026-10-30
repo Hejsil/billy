@@ -415,7 +415,7 @@ pub const Stream = struct {
             // reading, so it is reported and dropped.
             error.OutOfMemory => return error.OutOfMemory,
             else => {
-                std.log.warn("a streamed delta could not be read: {s}: {s}", .{ @errorName(err), self.data.items });
+                std.log.warn("a streamed delta could not be read: {t}: {s}", .{ err, self.data.items });
                 return null;
             },
         };
