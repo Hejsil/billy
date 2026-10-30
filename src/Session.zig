@@ -441,7 +441,7 @@ pub fn save(session: *const Session) !void {
     var file_writer = atomic.file.writer(session.io, &file_buf);
 
     try session.write(&file_writer.interface);
-    try file_writer.end();
+    try file_writer.flush();
     try atomic.replace(session.io);
 }
 

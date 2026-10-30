@@ -159,7 +159,7 @@ pub fn writeFile(io: std.Io, dir: std.Io.Dir, path: []const u8, bytes: []const u
     var buffer: [std.heap.page_size_min]u8 = undefined;
     var file = atomic.file.writer(io, &buffer);
     try file.interface.writeAll(bytes);
-    try file.end();
+    try file.flush();
     try atomic.replace(io);
 }
 

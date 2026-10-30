@@ -1,5 +1,6 @@
 test {
     _ = @import("atomic_write.zig");
+    _ = @import("atomic_write_finish.zig");
     _ = @import("comment_budget.zig");
     _ = @import("discard_takes_no_buffer.zig");
     _ = @import("error_name_format.zig");
