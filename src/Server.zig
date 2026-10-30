@@ -619,9 +619,10 @@ fn serveTurn(
         return;
     }
 
-    if (announce == .announce) try stream.send("session", SessionEvent{ .id = session.id() });
-
-    if (waiting.prompt.title) |title| try stream.send("title", TitleEvent{ .title = title });
+    if (announce == .announce)
+        try stream.send("session", SessionEvent{ .id = session.id() });
+    if (waiting.prompt.title) |title|
+        try stream.send("title", TitleEvent{ .title = title });
 
     agent.ask(emitter, session, text) catch |err| {
         std.log.err("could not show the turn: {t}", .{err});
