@@ -151,8 +151,6 @@ pub fn configSet(billy: *Billy, out: Terminal.Writer, path: []const u8, value: [
     try out.print("set {s} to {s}\n", .{ path, value });
 }
 
-const input_prompt = "> ";
-
 pub const Resume = union(enum) {
     id: []const u8,
     latest,
@@ -208,53 +206,7 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resuming: ?Resume) !void {
     if (resume_id != null) {
         try terminal.printTranscript(&session, billy.config.stored.resume_blocks);
     }
-    try billy.runSession(&terminal, options, &session);
-}
-
-fn runSession(
-    billy: *Billy,
-    terminal: *Terminal,
-    options: Agent.Options,
-    session: *Session,
-) !void {
-    const io = billy.io;
-    const gpa = billy.gpa;
-    const out = terminal.writer;
-
-    var agent = try Agent.init(io, gpa, options, session.cwd(), &billy.http_client);
-    defer agent.deinit();
-    const resumed = session.messages.items.len > 0;
-    if (resumed) try agent.prepare(session);
-
-    var editor = LineEditor.init(io, out.out, gpa);
-    defer editor.deinit();
-
-    const emitter = terminal.emitter();
-
-    var header: std.Io.Writer.Allocating = .init(gpa);
-    defer header.deinit();
-    while (true) {
-        header.clearRetainingCapacity();
-        try header.writer.print("{f}", .{Agent.SessionHeader.of(
-            session,
-            Agent.sessionModel(&billy.catalog, session, billy.config.stored.model),
-            options.home,
-        )});
-        const line = (try editor.readLine(header.written(), input_prompt)) orelse break;
-        if (line.len == 0) continue;
-        const waiting = try agent.take(emitter, session, line);
-        const text = switch (waiting) {
-            .prompt => |asked| asked.text,
-            .ran, .unresolved => {
-                try out.flush();
-                continue;
-            },
-        };
-        agent.ask(emitter, session, text) catch |err|
-            std.log.err("could not show the turn: {t}", .{err});
-        try out.flush();
-    }
-    try out.flush();
+    try terminal.run(options, &session, &billy.http_client);
 }
 
 fn resumeId(billy: *Billy, resuming: ?Resume) !?[]const u8 {

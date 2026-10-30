@@ -3,6 +3,7 @@
 const std = @import("std");
 
 const Agent = @import("Agent.zig");
+const LineEditor = @import("LineEditor.zig");
 const llm = @import("llm.zig");
 const Session = @import("Session.zig");
 
@@ -180,6 +181,54 @@ fn printElided(count: usize, writer: Writer) !void {
 pub fn printTranscript(self: *Terminal, session: *const Session, blocks: usize) !void {
     try Agent.walk(self.scratch, session, blocks, self.emitter());
     try self.writer.flush();
+}
+
+const input_prompt = "> ";
+
+/// Runs a session here: reads the line the user types, gives it to the agent, and shows what comes
+/// back, until the input ends.
+pub fn run(
+    self: *Terminal,
+    options: Agent.Options,
+    session: *Session,
+    http_client: *std.http.Client,
+) !void {
+    const io = self.io;
+    const gpa = self.scratch;
+    const out = self.writer;
+
+    var agent = try Agent.init(io, gpa, options, session.cwd(), http_client);
+    defer agent.deinit();
+    const resumed = session.messages.items.len > 0;
+    if (resumed) try agent.prepare(session);
+
+    var editor = LineEditor.init(io, out.out, gpa);
+    defer editor.deinit();
+
+    var header: std.Io.Writer.Allocating = .init(gpa);
+    defer header.deinit();
+    while (true) {
+        header.clearRetainingCapacity();
+        try header.writer.print("{f}", .{Agent.SessionHeader.of(
+            session,
+            Agent.sessionModel(options.catalog, session, options.config.stored.model),
+            options.home,
+        )});
+        const line = (try editor.readLine(header.written(), input_prompt)) orelse break;
+        if (line.len == 0) continue;
+        const waiting = try agent.take(self.emitter(), session, line);
+        const text = switch (waiting) {
+            .prompt => |asked| asked.text,
+            .ran, .unresolved => {
+                try out.flush();
+                continue;
+            },
+        };
+        agent.ask(self.emitter(), session, text) catch |err|
+            std.log.err("could not show the turn: {t}", .{err});
+        try out.flush();
+    }
+    try out.flush();
 }
 
 /// The marks the blocks of a run are headed by, which is the vocabulary both frontends show a block
