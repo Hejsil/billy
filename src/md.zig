@@ -1,15 +1,8 @@
-//! The md4cs binding: billy's contact with the C markdown parser and its renderers' callbacks.
+//! The md4c binding: billy's contact with the C markdown parser and its renderers' callbacks.
 
 const std = @import("std");
 
-pub const c = @import("md4cs");
-
-extern fn md4cs_parse_batch(
-    text: [*c]const c.MD_CHAR,
-    size: c.MD_SIZE,
-    parser: [*c]const c.MD_PARSER,
-    userdata: ?*anyopaque,
-) c_int;
+pub const c = @import("md4c");
 
 /// The dialect billy reads, on top of plain CommonMark: the GitHub extensions a model reaches for
 /// -- tables, strikethrough, task lists, links written as bare addresses -- and no raw HTML, so a
@@ -22,7 +15,7 @@ pub const flags: c_uint = c.MD_FLAG_TABLES |
     c.MD_FLAG_NOHTMLSPANS;
 
 pub fn parse(text: []const u8, callbacks: *const c.MD_PARSER, userdata: ?*anyopaque) !void {
-    if (md4cs_parse_batch(text.ptr, @intCast(text.len), callbacks, userdata) < 0)
+    if (c.md_parse(text.ptr, @intCast(text.len), callbacks, userdata) < 0)
         return error.MarkdownFailed;
 }
 

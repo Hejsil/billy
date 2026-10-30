@@ -7,28 +7,24 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const filters = b.option([]const []const u8, "filter", "Run only tests whose names contain this substring") orelse &.{};
 
-    // md4cs is the one markdown parser: mdflow's md4c, streamed for a reply as it arrives and batch
-    // for a stored block, so the two frontends cannot drift.
-    const mdflow = b.dependency("mdflow", .{
-        .target = target,
-        .optimize = optimize,
-    });
+    // md4c is the one markdown parser, batch: a reply is read again from its start each time more of
+    // it arrives and a stored block is read once, so neither asks for the streaming entry points,
+    // and one parser serves both frontends, so they cannot drift.
+    const md4c = b.dependency("md4c", .{});
     const spaghet = b.dependency("spaghet", .{
         .target = target,
         .optimize = optimize,
     });
 
     const translate_c = b.dependency("translate_c", .{});
-    const md4cs_zig: Translator = .init(translate_c, .{
-        .name = "md4cs",
-        .c_source_file = b.path("src/md4cs_binding.h"),
+    const md4c_zig: Translator = .init(translate_c, .{
+        .name = "md4c",
+        .c_source_file = b.path("src/md4c_binding.h"),
         .target = target,
         .optimize = optimize,
     });
-    md4cs_zig.addIncludePath(mdflow.path("src"));
-    md4cs_zig.defineCMacro("MD4C_USE_UTF8", null);
-    md4cs_zig.defineCMacro("MD4C_STREAMING", null);
-    md4cs_zig.defineCMacro("md_parse", "md4cs_parse_stream");
+    md4c_zig.addIncludePath(md4c.path("src"));
+    md4c_zig.defineCMacro("MD4C_USE_UTF8", null);
 
     const mod = b.addModule("billy", .{
         .root_source_file = b.path("src/root.zig"),
@@ -36,27 +32,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    mod.addImport("md4cs", md4cs_zig.mod);
-    mod.addIncludePath(mdflow.path("src"));
+    mod.addImport("md4c", md4c_zig.mod);
+    mod.addIncludePath(md4c.path("src"));
     mod.addCSourceFiles(.{
-        .root = mdflow.path("src"),
-        .files = &.{ "md4cs.c", "entity.c" },
+        .root = md4c.path("src"),
+        .files = &.{ "md4c.c", "entity.c" },
         // C99, because the library is written in it, so a compiler whose default is newer or older
         // does not decide whether it builds.
         .flags = &.{
             "-std=c99",
             "-DMD4C_USE_UTF8",
-            "-DMD4C_STREAMING",
-            "-Dmd_parse=md4cs_parse_stream",
-        },
-    });
-    mod.addCSourceFiles(.{
-        .root = mdflow.path("src"),
-        .files = &.{"md4cs.c"},
-        .flags = &.{
-            "-std=c99",
-            "-DMD4C_USE_UTF8",
-            "-Dmd_parse=md4cs_parse_batch",
         },
     });
 
