@@ -327,15 +327,12 @@ pub fn prepare(agent: *Agent, session: *Session) !void {
     try session.ensureTools(agent.tool_set.definitions());
 }
 
-fn targetFor(agent: *Agent, session: *Session) !Target {
-    _ = agent.target_state.reset(.retain_capacity);
-    const choice = session.modelChoice(agent.config.stored.model);
-    if (session.model() == null) try session.setModel(choice);
-    return endpoint.targetFor(agent.config, agent.credentials, agent.catalog, agent.target_state.allocator(), choice);
-}
-
 fn clientFor(agent: *Agent, session: *Session) !llm.Client {
-    const target = try agent.targetFor(session);
+    const choice = session.modelChoice(agent.config.stored.model);
+    if (session.model() == null)
+        try session.setModel(choice);
+
+    const target = try endpoint.targetFor(agent.config, agent.credentials, agent.catalog, agent.target_state.allocator(), choice);
     return .{
         .gpa = agent.gpa,
         .io = agent.io,
