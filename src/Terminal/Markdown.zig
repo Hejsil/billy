@@ -102,8 +102,7 @@ pub const Document = struct {
 pub fn read(gpa: std.mem.Allocator, text: []const u8, writer: Writer, skip: usize) !Document {
     // The blocks before `skip` are on the screen already: they are read for the state they leave,
     // and written where nothing keeps them.
-    var nothing: [1]u8 = undefined;
-    var discard: std.Io.Writer.Discarding = .init(&nothing);
+    var discard: std.Io.Writer.Discarding = .init("");
     var render: Markdown = .{
         .gpa = gpa,
         .writer = writer,

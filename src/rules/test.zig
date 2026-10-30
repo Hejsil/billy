@@ -1,6 +1,7 @@
 test {
     _ = @import("atomic_write.zig");
     _ = @import("comment_budget.zig");
+    _ = @import("discard_takes_no_buffer.zig");
     _ = @import("method_by_receiver.zig");
     _ = @import("no_bool_compare.zig");
     _ = @import("no_flush_in_defer.zig");

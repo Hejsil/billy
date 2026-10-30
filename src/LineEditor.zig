@@ -81,7 +81,7 @@ pub fn readSecret(ed: *LineEditor, prompt: []const u8) !?[]const u8 {
 fn read(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
     const interactive = try std.Io.File.stdin().isTty(ed.io);
     // The width is only wanted to fold a line being edited, which cannot happen without a terminal.
-    ed.width = if (interactive) ed.terminalWidth() else 0;
+    ed.width = if (interactive) terminal_width.terminal(ed.io) else 0;
     if (interactive) {
         if (header.len > 0) {
             try ed.out.writeAll(header);
@@ -124,7 +124,8 @@ fn readKeys(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u
 
     while (true) {
         const key = try ed.nextKey();
-        ed.width = ed.terminalWidth();
+        // Asked again on every key, since the terminal can be resized while the line is edited.
+        ed.width = terminal_width.terminal(ed.io);
         if (ed.width != ed.painted_width) {
             content_width = ed.contentWidth(columns(prompt));
             dirty = true;
@@ -385,27 +386,6 @@ fn endPrompt(ed: *LineEditor, header: []const u8) !void {
     try ed.out.writeAll("\r");
     try ed.out.print("\x1b[{d}M", .{deleted});
     try ed.out.writeAll("\r");
-}
-
-fn terminalWidth(ed: *LineEditor) usize {
-    for ([_]std.Io.File{ std.Io.File.stdout(), std.Io.File.stdin(), std.Io.File.stderr() }) |file| {
-        if (ed.widthOf(file)) |width| return width;
-    }
-    return 0;
-}
-
-fn widthOf(ed: *LineEditor, file: std.Io.File) ?usize {
-    const tty = file.isTty(ed.io) catch return null;
-    if (!tty) return null;
-    var size: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-    const result = ed.io.operate(.{ .device_io_control = .{
-        .file = file,
-        .code = std.posix.T.IOCGWINSZ,
-        .arg = &size,
-    } }) catch return null;
-    if (result.device_io_control < 0) return null;
-    if (size.col == 0) return null;
-    return size.col;
 }
 
 fn contentWidth(ed: *const LineEditor, prompt_width: usize) usize {

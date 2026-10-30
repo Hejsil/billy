@@ -1,5 +1,4 @@
-//! Where the blocks of a run go, and where the escape codes billy writes for decoration are named:
-//! a style around the writer the text goes to.
+//! Where a run's blocks go, and the escape codes that decorate them: a style around the writer.
 
 const std = @import("std");
 
@@ -29,17 +28,22 @@ pub const Color = enum(u8) {
 };
 
 style: Style = .plain,
-/// Columns the terminal shows, or zero when it cannot be asked: then nothing can be taken back.
-width: usize = 0,
+/// Where the width comes from: asked when a block is drawn, since a resize leaves a kept one wrong.
+source: terminal_width.Source = .{ .fixed = 0 },
 out: *std.Io.Writer,
 
 pub fn detect(file_writer: *std.Io.File.Writer) Writer {
     const style = Style.detect(file_writer.io, file_writer.file);
     return .{
         .style = style,
-        .width = if (style == .ansi) terminal_width.terminal(file_writer.io) else 0,
+        .source = if (style == .ansi) .{ .terminal = file_writer.io } else .{ .fixed = 0 },
         .out = &file_writer.interface,
     };
+}
+
+/// Columns the terminal shows now, or zero when it cannot be asked: then nothing can be taken back.
+pub fn width(writer: Writer) usize {
+    return writer.source.columns();
 }
 
 pub fn write(writer: Writer, text: []const u8) !void {

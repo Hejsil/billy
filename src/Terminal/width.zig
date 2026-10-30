@@ -2,6 +2,21 @@
 
 const std = @import("std");
 
+/// Where the width billy lays a block out at comes from.
+pub const Source = union(enum) {
+    /// A terminal, asked each time because it can be resized while a run is going on.
+    terminal: std.Io,
+    /// Columns that do not change: a stream that is not a terminal, or a test's.
+    fixed: usize,
+
+    pub fn columns(source: Source) usize {
+        return switch (source) {
+            .terminal => |io| terminal(io),
+            .fixed => |width| width,
+        };
+    }
+};
+
 /// The width of the terminal, in columns, or zero when there is no terminal to ask.
 pub fn terminal(io: std.Io) usize {
     for ([_]std.Io.File{ std.Io.File.stdout(), std.Io.File.stdin(), std.Io.File.stderr() }) |file| {
@@ -48,6 +63,12 @@ pub fn wrap(text: []const u8, out: *std.Io.Writer, width: usize) !Laid {
         return laid;
     }
     return laid;
+}
+
+/// The rows `text` takes in `width` columns: what `wrap` counts, without writing any of it.
+pub fn rows(text: []const u8, width: usize) !usize {
+    var discard: std.Io.Writer.Discarding = .init("");
+    return (try wrap(text, &discard.writer, width)).rows;
 }
 
 fn broken(line: []const u8, out: *std.Io.Writer, width: usize) !usize {
@@ -190,10 +211,8 @@ const Codepoint = struct { cp: u21, len: usize };
 fn decode(text: []const u8) Codepoint {
     if (text.len == 0) return .{ .cp = 0, .len = 0 };
     const len = @min(std.unicode.utf8ByteSequenceLength(text[0]) catch 1, text.len);
-    // Decoding the codepoint a sequence of known width spells has no replacement yet:
-    // ziglang/zig#23096 leaves `utf8Decode` alone because it "needs a new API first",
-    // and std still calls it itself. The suppression is what finds these two places
-    // again when that API lands.
+    // Decoding a codepoint of known width has no replacement yet, and std calls `utf8Decode` itself
+    // still: ziglang/zig#23096. The suppressions find these places again when that API lands.
     // zlinter-disable-next-line no_deprecated - std has no replacement yet
     const cp = std.unicode.utf8Decode(text[0..len]) catch return .{ .cp = text[0], .len = 1 };
     return .{ .cp = cp, .len = len };
@@ -359,6 +378,7 @@ fn expectWrapped(expected: []const u8, text: []const u8, width: usize) !void {
     const laid = try wrap(text, &out.writer, width);
     try std.testing.expectEqualStrings(expected, out.written());
     try std.testing.expectEqual(std.mem.count(u8, expected, "\n"), laid.rows);
+    try std.testing.expectEqual(laid.rows, try rows(text, width));
 }
 
 test "a line that fits is written as it stands" {
