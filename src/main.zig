@@ -181,7 +181,7 @@ fn answer(init: std.process.Init, out: Terminal.Writer, options: Options) !u8 {
     // each arm below.
     if (try printAskedHelp(options, out)) return 0;
 
-    var billy = try Billy.open(init, out);
+    var billy = try Billy.open(init);
     defer billy.deinit();
 
     switch (options.command) {

@@ -10,11 +10,6 @@ const Config = @This();
 
 pub const file_name = "config.json";
 
-pub const Opened = struct {
-    config: Config,
-    created: bool,
-};
-
 pub const ToolSettings = struct {
     bash: Bash = .{},
     web_search: WebSearch = .{},
@@ -161,7 +156,7 @@ pub fn deinit(config: *Config) void {
 }
 
 /// Reads the configuration from `dir`, writing `file_name` with the defaults when it is missing.
-pub fn open(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator) !Opened {
+pub fn open(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator) !Config {
     var config = Config.init(gpa);
     errdefer config.deinit();
 
@@ -170,7 +165,7 @@ pub fn open(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator) !Opened {
     const text = dir.readFileAlloc(io, file_name, arena, .unlimited) catch |err| switch (err) {
         error.FileNotFound => {
             try config.save(io, dir);
-            return .{ .config = config, .created = true };
+            return config;
         },
         else => return err,
     };
@@ -181,7 +176,7 @@ pub fn open(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator) !Opened {
     }) catch return error.CorruptConfig;
 
     try config.stored.validate();
-    return .{ .config = config, .created = false };
+    return config;
 }
 
 /// Writes the configuration to `file_name` in `dir`.
@@ -289,7 +284,7 @@ fn isSettableValue(T: type) bool {
     };
 }
 
-fn openFrom(tmp: *std.testing.TmpDir, json: []const u8) !Opened {
+fn openFrom(tmp: *std.testing.TmpDir, json: []const u8) !Config {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = json });
     return Config.open(std.testing.io, tmp.dir, std.testing.allocator);
 }
@@ -299,14 +294,14 @@ test "open writes the defaults when the file is missing" {
     defer tmp.cleanup();
 
     var first = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
-    defer first.config.deinit();
-    try std.testing.expect(first.created);
-    try std.testing.expectEqual(Stored.default.max_turns, first.config.stored.max_turns);
+    defer first.deinit();
+    try std.testing.expectEqual(Stored.default.max_turns, first.stored.max_turns);
+    // What the open wrote is a file the next one reads rather than writes.
+    try tmp.dir.access(std.testing.io, file_name, .{});
 
     var second = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
-    defer second.config.deinit();
-    try std.testing.expect(!second.created);
-    try std.testing.expectEqual(Stored.default.max_turns, second.config.stored.max_turns);
+    defer second.deinit();
+    try std.testing.expectEqual(Stored.default.max_turns, second.stored.max_turns);
 }
 
 test "open reads the max_turns and the bash timeout from the file" {
@@ -314,52 +309,51 @@ test "open reads the max_turns and the bash timeout from the file" {
     defer tmp.cleanup();
 
     // An unknown field and a missing version must not stop the read.
-    var opened = try openFrom(&tmp, "{\"max_turns\":7,\"future\":true," ++
+    var config = try openFrom(&tmp, "{\"max_turns\":7,\"future\":true," ++
         "\"tools\":{\"bash\":{\"timeout_s\":30,\"unknown\":1}}}");
-    defer opened.config.deinit();
-    try std.testing.expect(!opened.created);
-    try std.testing.expectEqual(7, opened.config.stored.max_turns);
-    try std.testing.expectEqual(30, opened.config.stored.tools.bash.timeout_s);
-    try std.testing.expectEqual(Stored.default.resume_blocks, opened.config.stored.resume_blocks);
+    defer config.deinit();
+    try std.testing.expectEqual(7, config.stored.max_turns);
+    try std.testing.expectEqual(30, config.stored.tools.bash.timeout_s);
+    try std.testing.expectEqual(Stored.default.resume_blocks, config.stored.resume_blocks);
 }
 
 test "open reads the block count a resume replays from the file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var opened = try openFrom(&tmp, "{\"resume_blocks\":3}");
-    defer opened.config.deinit();
-    try std.testing.expectEqual(3, opened.config.stored.resume_blocks);
+    var config = try openFrom(&tmp, "{\"resume_blocks\":3}");
+    defer config.deinit();
+    try std.testing.expectEqual(3, config.stored.resume_blocks);
 
     var whole = try openFrom(&tmp, "{\"resume_blocks\":0}");
-    defer whole.config.deinit();
-    try std.testing.expectEqual(0, whole.config.stored.resume_blocks);
+    defer whole.deinit();
+    try std.testing.expectEqual(0, whole.stored.resume_blocks);
 }
 
 test "open reads the compaction threshold from the file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var opened = try openFrom(&tmp, "{\"compact_at\":50}");
-    defer opened.config.deinit();
-    try std.testing.expectEqual(50, opened.config.stored.compact_at);
+    var config = try openFrom(&tmp, "{\"compact_at\":50}");
+    defer config.deinit();
+    try std.testing.expectEqual(50, config.stored.compact_at);
 
     var bare = try openFrom(&tmp, "{}");
-    defer bare.config.deinit();
-    try std.testing.expectEqual(Stored.default.compact_at, bare.config.stored.compact_at);
+    defer bare.deinit();
+    try std.testing.expectEqual(Stored.default.compact_at, bare.stored.compact_at);
 
     var off = try openFrom(&tmp, "{\"compact_at\":0}");
-    defer off.config.deinit();
-    try std.testing.expectEqual(0, off.config.stored.compact_at);
+    defer off.deinit();
+    try std.testing.expectEqual(0, off.stored.compact_at);
 }
 
 test "a retired markdown setting in the file is ignored" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var opened = try openFrom(&tmp, "{\"markdown\":{\"format\":\"glow -\"},\"max_turns\":7}");
-    defer opened.config.deinit();
-    try std.testing.expectEqual(7, opened.config.stored.max_turns);
+    var config = try openFrom(&tmp, "{\"markdown\":{\"format\":\"glow -\"},\"max_turns\":7}");
+    defer config.deinit();
+    try std.testing.expectEqual(7, config.stored.max_turns);
 }
 
 test "open reads the bash timeout from the file" {
@@ -367,43 +361,43 @@ test "open reads the bash timeout from the file" {
     defer tmp.cleanup();
 
     var older = try openFrom(&tmp, "{\"max_turns\":7}");
-    defer older.config.deinit();
-    try std.testing.expectEqual(Stored.default.tools.bash.timeout_s, older.config.stored.tools.bash.timeout_s);
+    defer older.deinit();
+    try std.testing.expectEqual(Stored.default.tools.bash.timeout_s, older.stored.tools.bash.timeout_s);
 
-    var opened = try openFrom(&tmp, "{\"tools\":{\"bash\":{\"timeout_s\":30}}}");
-    defer opened.config.deinit();
-    try std.testing.expectEqual(30, opened.config.stored.tools.bash.timeout_s);
+    var config = try openFrom(&tmp, "{\"tools\":{\"bash\":{\"timeout_s\":30}}}");
+    defer config.deinit();
+    try std.testing.expectEqual(30, config.stored.tools.bash.timeout_s);
 }
 
 test "open reads a self-hosted backend's instance from the file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var opened = try openFrom(&tmp, "{\"tools\":{\"web_search\":{" ++
+    var config = try openFrom(&tmp, "{\"tools\":{\"web_search\":{" ++
         "\"providers\":[\"searxng\"],\"searxng\":{\"url\":\"https://searx.example.org\"}}}}");
-    defer opened.config.deinit();
-    try std.testing.expectEqual(Tools.web.Provider.searxng, opened.config.stored.tools.web_search.providers[0]);
-    try std.testing.expectEqualStrings("https://searx.example.org", opened.config.stored.tools.web_search.searxng.url.?);
+    defer config.deinit();
+    try std.testing.expectEqual(Tools.web.Provider.searxng, config.stored.tools.web_search.providers[0]);
+    try std.testing.expectEqualStrings("https://searx.example.org", config.stored.tools.web_search.searxng.url.?);
 
     var known = try openFrom(&tmp, "{\"tools\":{\"web_search\":{\"providers\":[\"exa\"]}}}");
-    defer known.config.deinit();
-    try std.testing.expect(known.config.stored.tools.web_search.searxng.url == null);
+    defer known.deinit();
+    try std.testing.expect(known.stored.tools.web_search.searxng.url == null);
 }
 
 test "open reads the web search backends and result count from the file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var opened = try openFrom(&tmp, "{\"tools\":{\"web_search\":{" ++
+    var config = try openFrom(&tmp, "{\"tools\":{\"web_search\":{" ++
         "\"providers\":[\"tavily\",\"brave\"],\"max_results\":3}}}");
-    defer opened.config.deinit();
-    try std.testing.expectEqualSlices(Tools.web.Provider, &.{ .tavily, .brave }, opened.config.stored.tools.web_search.providers);
-    try std.testing.expectEqual(3, opened.config.stored.tools.web_search.max_results);
+    defer config.deinit();
+    try std.testing.expectEqualSlices(Tools.web.Provider, &.{ .tavily, .brave }, config.stored.tools.web_search.providers);
+    try std.testing.expectEqual(3, config.stored.tools.web_search.max_results);
 
     var bare = try openFrom(&tmp, "{}");
-    defer bare.config.deinit();
-    try std.testing.expectEqual(@as(usize, 0), bare.config.stored.tools.web_search.providers.len);
-    try std.testing.expectEqual(Stored.default.tools.web_search.max_results, bare.config.stored.tools.web_search.max_results);
+    defer bare.deinit();
+    try std.testing.expectEqual(@as(usize, 0), bare.stored.tools.web_search.providers.len);
+    try std.testing.expectEqual(Stored.default.tools.web_search.max_results, bare.stored.tools.web_search.max_results);
 
     // A name that is not a backend makes the file unusable rather than reading as "no search", so a
     // typo is not silently dropped.
@@ -424,9 +418,9 @@ test "save round-trips a custom max_turns" {
     config.stored.max_turns = 3;
     try config.save(std.testing.io, tmp.dir);
 
-    var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
-    defer opened.config.deinit();
-    try std.testing.expectEqual(3, opened.config.stored.max_turns);
+    var reread = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer reread.deinit();
+    try std.testing.expectEqual(3, reread.stored.max_turns);
 }
 
 test "the file is indented, so it can be read and edited by hand" {
@@ -484,10 +478,10 @@ test "save round-trips a configured search backend" {
     config.stored.tools.web_search = .{ .providers = &.{.tavily}, .max_results = 4 };
     try config.save(std.testing.io, tmp.dir);
 
-    var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
-    defer opened.config.deinit();
-    try std.testing.expectEqual(Tools.web.Provider.tavily, opened.config.stored.tools.web_search.providers[0]);
-    try std.testing.expectEqual(4, opened.config.stored.tools.web_search.max_results);
+    var reread = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer reread.deinit();
+    try std.testing.expectEqual(Tools.web.Provider.tavily, reread.stored.tools.web_search.providers[0]);
+    try std.testing.expectEqual(4, reread.stored.tools.web_search.max_results);
 }
 
 test "open rejects damaged, future and unusable configurations" {
@@ -507,9 +501,9 @@ test "the model setting names a provider and a model of it" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var opened = try openFrom(&tmp, "{\"model\":\"opencode-go/glm-5.3-flash\"}");
-    defer opened.config.deinit();
-    const choice = opened.config.stored.choice();
+    var config = try openFrom(&tmp, "{\"model\":\"opencode-go/glm-5.3-flash\"}");
+    defer config.deinit();
+    const choice = config.stored.choice();
     try std.testing.expectEqualStrings("opencode-go", choice.provider());
     try std.testing.expectEqualStrings("glm-5.3-flash", choice.model());
 
@@ -533,26 +527,26 @@ test "the providers map names an endpoint of the user's own" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var opened = try openFrom(&tmp,
+    var config = try openFrom(&tmp,
         \\{"model":"mock/m","providers":{"mock":{"base_url":"http://127.0.0.1:8901/v1"}}}
     );
-    defer opened.config.deinit();
-    try std.testing.expectEqualStrings("http://127.0.0.1:8901/v1", opened.config.stored.providers.get("mock").?);
-    try std.testing.expect(opened.config.stored.providers.get("other") == null);
+    defer config.deinit();
+    try std.testing.expectEqualStrings("http://127.0.0.1:8901/v1", config.stored.providers.get("mock").?);
+    try std.testing.expect(config.stored.providers.get("other") == null);
 
-    try opened.config.save(std.testing.io, tmp.dir);
+    try config.save(std.testing.io, tmp.dir);
     var reread = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
-    defer reread.config.deinit();
-    try std.testing.expectEqualStrings("mock/m", reread.config.stored.model);
-    try std.testing.expectEqualStrings("http://127.0.0.1:8901/v1", reread.config.stored.providers.get("mock").?);
+    defer reread.deinit();
+    try std.testing.expectEqualStrings("mock/m", reread.stored.model);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8901/v1", reread.stored.providers.get("mock").?);
 }
 
 test "a model naming a provider the file does not define is refused" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var opened = try openFrom(&tmp, "{\"model\":\"opencode-go/glm-5.3-flash\"}");
-    defer opened.config.deinit();
+    var config = try openFrom(&tmp, "{\"model\":\"opencode-go/glm-5.3-flash\"}");
+    defer config.deinit();
 }
 
 test "a provider entry with no name or no url is refused" {
@@ -631,9 +625,9 @@ test "a setting set by path is written and read back" {
     try config.set("tools.web_search.searxng.url", "https://searx.example.org");
     try config.save(std.testing.io, tmp.dir);
 
-    var opened = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
-    defer opened.config.deinit();
+    var reread = try Config.open(std.testing.io, tmp.dir, std.testing.allocator);
+    defer reread.deinit();
 
-    try std.testing.expectEqual(45, opened.config.stored.tools.bash.timeout_s);
-    try std.testing.expectEqualStrings("https://searx.example.org", opened.config.stored.tools.web_search.searxng.url.?);
+    try std.testing.expectEqual(45, reread.stored.tools.bash.timeout_s);
+    try std.testing.expectEqualStrings("https://searx.example.org", reread.stored.tools.web_search.searxng.url.?);
 }

@@ -33,7 +33,7 @@ catalog: models.Catalog = .{},
 
 cwd: []const u8,
 
-pub fn open(init: std.process.Init, out: Terminal.Writer) !Billy {
+pub fn open(init: std.process.Init) !Billy {
     const io = init.io;
     const arena = init.arena.allocator();
     const environ = init.environ_map;
@@ -46,13 +46,11 @@ pub fn open(init: std.process.Init, out: Terminal.Writer) !Billy {
         return report.Reported;
     };
 
-    var opened = Config.open(io, dirs.config, init.gpa) catch |err| {
+    var config = Config.open(io, dirs.config, init.gpa) catch |err| {
         std.log.err("cannot read the configuration: {t}", .{err});
         return report.Reported;
     };
-    errdefer opened.config.deinit();
-
-    if (opened.created) try out.write("wrote the default configuration\n");
+    errdefer config.deinit();
 
     const cwd = std.process.currentPathAlloc(io, arena) catch |err| {
         std.log.err("cannot find the working directory: {t}", .{err});
@@ -66,7 +64,7 @@ pub fn open(init: std.process.Init, out: Terminal.Writer) !Billy {
         .environ = environ,
         .dirs = dirs,
         .credentials = credentials,
-        .config = opened.config,
+        .config = config,
         .health = try Health.load(io, init.gpa, dirs.data),
         .cwd = cwd,
     };

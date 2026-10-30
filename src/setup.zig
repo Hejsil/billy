@@ -252,14 +252,14 @@ test "a header names the model the session goes to, not the one billy is pointed
         .sub_path = Config.file_name,
         .data = "{\"model\":\"deepseek/deepseek-flash\"}",
     });
-    var opened = try Config.open(std.testing.io, tmp.dir, gpa);
-    defer opened.config.deinit();
+    var config = try Config.open(std.testing.io, tmp.dir, gpa);
+    defer config.deinit();
 
     var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
     try session.setModel("opencode-go/kimi-k2.7-code");
 
-    const recorded = sessionModel(&opened.config, &models.test_catalog, &session);
+    const recorded = sessionModel(&config, &models.test_catalog, &session);
     try std.testing.expectEqualStrings("opencode-go/kimi-k2.7-code", recorded.choice);
     try std.testing.expectEqual(@as(usize, 262_144), recorded.info.?.context_window);
 
@@ -267,7 +267,7 @@ test "a header names the model the session goes to, not the one billy is pointed
     // header names.
     var older = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer older.deinit();
-    const configured = sessionModel(&opened.config, &models.test_catalog, &older);
+    const configured = sessionModel(&config, &models.test_catalog, &older);
     try std.testing.expectEqualStrings("deepseek/deepseek-flash", configured.choice);
     try std.testing.expectEqual(@as(usize, 1_000_000), configured.info.?.context_window);
 }
@@ -285,17 +285,17 @@ test "a target names bytes of its own, not a slice of the session's pool" {
         .sub_path = Config.file_name,
         .data = "{\"model\":\"opencode-go/glm-5.3-flash\"}",
     });
-    var opened = try Config.open(std.testing.io, tmp.dir, gpa);
-    defer opened.config.deinit();
+    var config = try Config.open(std.testing.io, tmp.dir, gpa);
+    defer config.deinit();
     var credentials: Credentials = .{};
     try credentials.put(arena, "opencode-go", "k");
 
     var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
 
-    const choice = session.modelChoice(opened.config.stored.model);
+    const choice = session.modelChoice(config.stored.model);
     try std.testing.expectEqualStrings("opencode-go/glm-5.3-flash", choice);
-    const target = try endpoint.targetFor(&opened.config, &credentials, &models.test_catalog, arena, choice);
+    const target = try endpoint.targetFor(&config, &credentials, &models.test_catalog, arena, choice);
     // The model the session recorded is interned in its string pool, and a pointer into that pool
     // survives no write to it.
     try std.testing.expectEqualStrings("glm-5.3-flash", target.model);
