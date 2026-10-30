@@ -109,7 +109,7 @@ pub const Message = struct {
     }
 };
 
-pub const StoredDefinition = struct {
+pub const Tool = struct {
     name: StringIndex,
     description: StringIndex,
     parameters: StringIndex,
@@ -122,23 +122,14 @@ pub const Definition = struct {
 };
 
 io: std.Io,
-
 dir: std.Io.Dir,
-
 gpa: std.mem.Allocator,
-
 pool: Pool = .{},
-
 interned: Interned = .{},
-
 tool_calls: std.ArrayList(ToolCall) = .empty,
-
 messages: std.ArrayList(Message) = .empty,
-
 compactions: std.ArrayList(u32) = .empty,
-
-tools: []const StoredDefinition = &.{},
-
+tools: std.ArrayList(Tool) = .empty,
 context_tokens: usize = 0,
 
 pub fn open(
@@ -186,7 +177,7 @@ pub fn deinit(session: *Session) void {
     session.tool_calls.deinit(session.gpa);
     session.messages.deinit(session.gpa);
     session.compactions.deinit(session.gpa);
-    session.gpa.free(session.tools);
+    session.tools.deinit(session.gpa);
 }
 
 pub fn id(session: *const Session) []const u8 {
@@ -417,21 +408,20 @@ pub fn ensureSystemPrompt(session: *Session, system_prompt: []const u8) !void {
 }
 
 pub fn setTools(session: *Session, definitions: []const Definition) !void {
-    const tools = try session.gpa.alloc(StoredDefinition, definitions.len);
-    errdefer session.gpa.free(tools);
-    for (definitions, tools) |definition, *tool| {
-        tool.* = .{
+    try session.tools.ensureTotalCapacity(session.gpa, definitions.len);
+    session.tools.shrinkRetainingCapacity(0);
+
+    for (definitions) |definition| {
+        session.tools.appendAssumeCapacity(.{
             .name = try session.pool.intern(session.gpa, definition.name),
             .description = try session.pool.intern(session.gpa, definition.description),
             .parameters = try session.pool.intern(session.gpa, definition.parameters),
-        };
+        });
     }
-    session.gpa.free(session.tools);
-    session.tools = tools;
 }
 
 pub fn ensureTools(session: *Session, definitions: []const Definition) !void {
-    if (session.tools.len != 0) return;
+    if (session.tools.items.len != 0) return;
     try session.setTools(definitions);
 }
 
@@ -590,16 +580,14 @@ fn loadCompactions(session: *Session, stored: []const u32, lead: usize) !void {
 }
 
 fn loadTools(session: *Session, stored: []const StoredTool) !void {
-    const tools = try session.gpa.alloc(StoredDefinition, stored.len);
-    errdefer session.gpa.free(tools);
-    for (stored, tools) |stored_tool, *tool| {
-        tool.* = .{
+    try session.tools.ensureUnusedCapacity(session.gpa, stored.len);
+    for (stored) |stored_tool| {
+        session.tools.appendAssumeCapacity(.{
             .name = try session.pool.intern(session.gpa, stored_tool.function.name),
             .description = try session.pool.intern(session.gpa, stored_tool.function.description),
             .parameters = try session.internParameters(stored_tool.function.parameters),
-        };
+        });
     }
-    session.tools = tools;
 }
 
 fn repairTail(session: *Session) !void {
@@ -678,7 +666,7 @@ pub const ToolSet = struct {
     pub fn jsonStringify(self: ToolSet, json: anytype) !void {
         const session = self.session;
         try json.beginArray();
-        for (session.tools) |tool| {
+        for (session.tools.items) |tool| {
             try json.beginObject();
             try json.objectField("type");
             try json.write("function");
@@ -1059,7 +1047,7 @@ test "a new session is written out by its first message" {
 
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
-    try std.testing.expectEqual(1, resumed.tools.len);
+    try std.testing.expectEqual(1, resumed.tools.items.len);
     try std.testing.expect(resumed.systemPrompt() != null);
     try std.testing.expectEqualStrings("be terse", resumed.systemPrompt().?);
     try std.testing.expectEqual(1, resumed.messages.items.len);
@@ -1934,8 +1922,8 @@ test "ensureTools stores the tools and only sets them once" {
     var session = try newTestSession(&tmp);
     defer session.deinit();
     try session.ensureTools(&tools);
-    try std.testing.expectEqual(1, session.tools.len);
-    try std.testing.expectEqualStrings("read", session.pool.get(session.tools[0].name).?);
+    try std.testing.expectEqual(1, session.tools.items.len);
+    try std.testing.expectEqualStrings("read", session.pool.get(session.tools.items[0].name).?);
 
     try std.testing.expectError(
         error.FileNotFound,
@@ -1945,9 +1933,9 @@ test "ensureTools stores the tools and only sets them once" {
 
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
-    try std.testing.expectEqual(1, resumed.tools.len);
-    try std.testing.expectEqualStrings("read", resumed.pool.get(resumed.tools[0].name).?);
-    try std.testing.expectEqualStrings("Read a file.", resumed.pool.get(resumed.tools[0].description).?);
+    try std.testing.expectEqual(1, resumed.tools.items.len);
+    try std.testing.expectEqualStrings("read", resumed.pool.get(resumed.tools.items[0].name).?);
+    try std.testing.expectEqualStrings("Read a file.", resumed.pool.get(resumed.tools.items[0].description).?);
 
     const replaced = [_]Definition{.{
         .name = "bash",
@@ -1957,8 +1945,8 @@ test "ensureTools stores the tools and only sets them once" {
     var reopened = try reopenTestSession(&tmp, session.id());
     defer reopened.deinit();
     try reopened.ensureTools(&replaced);
-    try std.testing.expectEqual(1, reopened.tools.len);
-    try std.testing.expectEqualStrings("read", reopened.pool.get(reopened.tools[0].name).?);
+    try std.testing.expectEqual(1, reopened.tools.items.len);
+    try std.testing.expectEqualStrings("read", reopened.pool.get(reopened.tools.items[0].name).?);
 }
 
 test "a session saved without tools loads with none" {
@@ -1972,7 +1960,7 @@ test "a session saved without tools loads with none" {
 
     var session = try reopenTestSession(&tmp, "legacy");
     defer session.deinit();
-    try std.testing.expectEqual(0, session.tools.len);
+    try std.testing.expectEqual(0, session.tools.items.len);
 }
 
 test "the context size survives a save and resume" {

@@ -1633,7 +1633,7 @@ test "refreshLead replaces the prompt, the project instructions and the tools" {
     var resumed = try Session.open(io, tmp.dir, gpa, session.id(), "/work");
     defer resumed.deinit();
     try std.testing.expectEqualStrings(prompt_text, resumed.systemPrompt().?);
-    try std.testing.expectEqual(2, resumed.tools.len);
+    try std.testing.expectEqual(2, resumed.tools.items.len);
 }
 
 test "prepare gives a fresh session the user's instructions from the configuration" {
@@ -1684,7 +1684,7 @@ test "a first prompt gives the session its prompt and tools, and is asked as typ
     try std.testing.expectEqualStrings("do the thing", waiting.prompt.title.?);
     try std.testing.expectEqualStrings("do the thing", session.title().?);
     try std.testing.expect(session.systemPrompt() != null);
-    try std.testing.expect(session.tools.len > 0);
+    try std.testing.expect(session.tools.items.len > 0);
 }
 
 test "a prompt after the first leaves the session as it was set up" {
