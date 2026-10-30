@@ -13,15 +13,6 @@ pub const Target = struct {
     model: []const u8,
 };
 
-pub fn configured(
-    config: *const Config,
-    credentials: *const Credentials,
-    catalog: *const models.Catalog,
-    arena: std.mem.Allocator,
-) !Target {
-    return try targetFor(config, credentials, catalog, arena, config.stored.model);
-}
-
 pub fn targetFor(
     config: *const Config,
     credentials: *const Credentials,
@@ -197,23 +188,6 @@ test "the completions path is appended once, whatever the base carries" {
         "http://127.0.0.1:8901/v1/chat/completions",
         try completionsUrl(arena, "http://127.0.0.1:8901/v1"),
     );
-}
-
-test "the configured choice is the target the configuration points at" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var config = Config.init(gpa);
-    defer config.deinit();
-    try std.testing.expectEqualStrings("deepseek/deepseek-flash", config.stored.model);
-
-    var credentials: Credentials = .{};
-    try credentials.put(arena, "deepseek", "k");
-    const target = try configured(&config, &credentials, &models.test_catalog, arena);
-    try std.testing.expectEqualStrings("https://api.deepseek.com/chat/completions", target.url);
-    try std.testing.expectEqualStrings("deepseek-flash", target.model);
 }
 
 test "what is wrong with a model is said with what to do about it" {
