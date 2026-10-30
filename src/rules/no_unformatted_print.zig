@@ -9,6 +9,8 @@ pub fn buildRule(options: zlinter.rules.RuleOptions) zlinter.rules.LintRule {
     return .{ .rule_id = "no_unformatted_print", .run = &run };
 }
 
+const message = "nothing is formatted here: `writeAll` writes a constant";
+
 fn run(
     rule: zlinter.rules.LintRule,
     session: *zlinter.session.LintSession,
@@ -43,7 +45,7 @@ fn run(
             .severity = config.severity,
             .start = .startOfToken(tree, i + 2),
             .end = .endOfToken(tree, i + 2),
-            .message = "nothing is formatted here: `writeAll` writes a constant",
+            .message = try arena.dupe(u8, message),
         });
     }
 
@@ -69,7 +71,7 @@ test "a print of a constant is reported, and one that formats is not" {
             .rule_id = "no_unformatted_print",
             .severity = .@"error",
             .slice = "\"done\\n\"",
-            .message = "nothing is formatted here: `writeAll` writes a constant",
+            .message = message,
         }},
     );
 }

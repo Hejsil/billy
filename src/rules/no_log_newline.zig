@@ -9,6 +9,8 @@ pub fn buildRule(options: zlinter.rules.RuleOptions) zlinter.rules.LintRule {
     return .{ .rule_id = "no_log_newline", .run = &run };
 }
 
+const message = "a log message carries no newline of its own; the log format adds one";
+
 const levels = [_][]const u8{ "err", "warn", "info", "debug" };
 
 fn run(
@@ -42,7 +44,7 @@ fn run(
             .severity = config.severity,
             .start = .startOfToken(tree, i + 4),
             .end = .endOfToken(tree, i + 4),
-            .message = "a log message carries no newline of its own; the log format adds one",
+            .message = try arena.dupe(u8, message),
         });
     }
 
@@ -81,13 +83,13 @@ test "a log message that ends in a newline is reported, and one that does not is
                 .rule_id = "no_log_newline",
                 .severity = .@"error",
                 .slice = "\"started\\n\"",
-                .message = "a log message carries no newline of its own; the log format adds one",
+                .message = message,
             },
             .{
                 .rule_id = "no_log_newline",
                 .severity = .@"error",
                 .slice = "\"failed: {s}\\n\"",
-                .message = "a log message carries no newline of its own; the log format adds one",
+                .message = message,
             },
         },
     );

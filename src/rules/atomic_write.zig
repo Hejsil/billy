@@ -11,6 +11,8 @@ pub fn buildRule(options: zlinter.rules.RuleOptions) zlinter.rules.LintRule {
     return .{ .rule_id = "atomic_write", .run = &run };
 }
 
+const message = "written in place: write beside it and `replace`, so a failed write keeps the old file";
+
 const writes = [_][]const u8{ "writeFile", "writeFileAlloc", "createFile" };
 
 fn run(
@@ -46,7 +48,7 @@ fn run(
             .severity = config.severity,
             .start = .startOfToken(tree, i - 1),
             .end = .endOfToken(tree, i),
-            .message = "written in place: write beside it and `replace`, so a failed write keeps the old file",
+            .message = try arena.dupe(u8, message),
         });
     }
 
@@ -151,7 +153,7 @@ test "a file written in place is reported, and a fixture is not" {
             .rule_id = "atomic_write",
             .severity = .@"error",
             .slice = ".writeFile",
-            .message = "written in place: write beside it and `replace`, so a failed write keeps the old file",
+            .message = message,
         }},
     );
 }

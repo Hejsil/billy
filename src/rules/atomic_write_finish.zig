@@ -121,7 +121,7 @@ fn appendEnds(
             .severity = severity,
             .start = .startOfToken(tree, i + 2),
             .end = .endOfToken(tree, i + 2),
-            .message = message,
+            .message = try arena.dupe(u8, message),
         });
     }
 }

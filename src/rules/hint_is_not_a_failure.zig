@@ -9,6 +9,8 @@ pub fn buildRule(options: zlinter.rules.RuleOptions) zlinter.rules.LintRule {
     return .{ .rule_id = "hint_is_not_a_failure", .run = &run };
 }
 
+const message = "a wait that cannot be kept is a hint, not a failure: record it and carry on";
+
 const hints = [_][]const u8{ "record", "clear", "recordFailure", "recordAnswer" };
 
 fn run(
@@ -47,7 +49,7 @@ fn run(
             .severity = config.severity,
             .start = .startOfToken(tree, i),
             .end = .endOfToken(tree, j - 1),
-            .message = "a wait that cannot be kept is a hint, not a failure: record it and carry on",
+            .message = try arena.dupe(u8, message),
         });
         i = j;
     }
@@ -83,13 +85,13 @@ test "a wait whose failure is returned is reported, and one that is only recorde
                 .rule_id = "hint_is_not_a_failure",
                 .severity = .@"error",
                 .slice = "try health.record",
-                .message = "a wait that cannot be kept is a hint, not a failure: record it and carry on",
+                .message = message,
             },
             .{
                 .rule_id = "hint_is_not_a_failure",
                 .severity = .@"error",
                 .slice = "try waiting.?.recordFailure",
-                .message = "a wait that cannot be kept is a hint, not a failure: record it and carry on",
+                .message = message,
             },
         },
     );

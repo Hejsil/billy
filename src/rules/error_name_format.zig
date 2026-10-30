@@ -56,7 +56,7 @@ fn run(
                 .severity = config.severity,
                 .start = .startOfToken(tree, span.first),
                 .end = .endOfToken(tree, span.last),
-                .message = if (std.mem.eql(u8, name, "@errorName")) error_message else tag_message,
+                .message = try arena.dupe(u8, if (std.mem.eql(u8, name, "@errorName")) error_message else tag_message),
             });
         }
         i = last;

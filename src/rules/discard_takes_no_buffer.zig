@@ -44,7 +44,7 @@ fn run(
             .severity = config.severity,
             .start = .startOfToken(tree, open + 1),
             .end = .endOfToken(tree, close - 1),
-            .message = message,
+            .message = try arena.dupe(u8, message),
         });
     }
 

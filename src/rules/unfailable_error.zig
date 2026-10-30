@@ -13,6 +13,8 @@ pub fn buildRule(options: zlinter.rules.RuleOptions) zlinter.rules.LintRule {
     return .{ .rule_id = "unfailable_error", .run = &run };
 }
 
+const message = "nothing in this function can fail, so the `!` is a `try` every caller cannot fail";
+
 fn run(
     rule: zlinter.rules.LintRule,
     session: *zlinter.session.LintSession,
@@ -22,6 +24,7 @@ fn run(
     const config = options.getConfig(Config);
     if (config.severity == .off) return null;
 
+    const arena = session.runtime.sessionArena();
     const tree = doc.tree(session);
     const tags = tree.tokens.items(.tag);
     // The problems come from the session's arena, which frees them itself.
@@ -32,17 +35,17 @@ fn run(
     while (i < tags.len) : (i += 1) {
         if (tags[i] != .keyword_fn) continue;
         const bang = unproducible(tags, i) orelse continue;
-        try problems.append(session.runtime.sessionArena(), .{
+        try problems.append(arena, .{
             .rule_id = rule.rule_id,
             .severity = config.severity,
             .start = .startOfToken(tree, bang),
             .end = .endOfToken(tree, bang),
-            .message = "nothing in this function can fail, so the `!` is a `try` every caller cannot fail",
+            .message = try arena.dupe(u8, message),
         });
     }
 
     if (problems.items.len == 0) return null;
-    return try zlinter.results.LintResult.init(doc.file_id, try problems.toOwnedSlice(session.runtime.sessionArena()));
+    return try zlinter.results.LintResult.init(doc.file_id, try problems.toOwnedSlice(arena));
 }
 
 /// The `!` of the function's return type, when the body cannot produce an error.
@@ -134,13 +137,13 @@ test "an error a function cannot produce is reported, and one it can is not" {
                 .rule_id = "unfailable_error",
                 .severity = .@"error",
                 .slice = "!",
-                .message = "nothing in this function can fail, so the `!` is a `try` every caller cannot fail",
+                .message = message,
             },
             .{
                 .rule_id = "unfailable_error",
                 .severity = .@"error",
                 .slice = "!",
-                .message = "nothing in this function can fail, so the `!` is a `try` every caller cannot fail",
+                .message = message,
             },
         },
     );

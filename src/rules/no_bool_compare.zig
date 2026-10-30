@@ -10,6 +10,8 @@ pub fn buildRule(options: zlinter.rules.RuleOptions) zlinter.rules.LintRule {
     return .{ .rule_id = "no_bool_compare", .run = &run };
 }
 
+const message = "a comparison with a constant says the same as `x` or `!x`";
+
 fn run(
     rule: zlinter.rules.LintRule,
     session: *zlinter.session.LintSession,
@@ -40,7 +42,7 @@ fn run(
             .severity = config.severity,
             .start = .startOfToken(tree, literal),
             .end = .endOfToken(tree, literal),
-            .message = "a comparison with a constant says the same as `x` or `!x`",
+            .message = try arena.dupe(u8, message),
         });
     }
 
@@ -78,13 +80,13 @@ test "a comparison with a constant is reported, and one between two values is no
                 .rule_id = "no_bool_compare",
                 .severity = .@"error",
                 .slice = "false",
-                .message = "a comparison with a constant says the same as `x` or `!x`",
+                .message = message,
             },
             .{
                 .rule_id = "no_bool_compare",
                 .severity = .@"error",
                 .slice = "false",
-                .message = "a comparison with a constant says the same as `x` or `!x`",
+                .message = message,
             },
         },
     );

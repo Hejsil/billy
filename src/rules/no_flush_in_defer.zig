@@ -9,6 +9,8 @@ pub fn buildRule(options: zlinter.rules.RuleOptions) zlinter.rules.LintRule {
     return .{ .rule_id = "no_flush_in_defer", .run = &run };
 }
 
+const message = "a flush here has nowhere to report a failure: flush where the work ends";
+
 fn run(
     rule: zlinter.rules.LintRule,
     session: *zlinter.session.LintSession,
@@ -42,7 +44,7 @@ fn run(
                 .severity = config.severity,
                 .start = .startOfToken(tree, i),
                 .end = .endOfToken(tree, j),
-                .message = "a flush here has nowhere to report a failure: flush where the work ends",
+                .message = try arena.dupe(u8, message),
             });
             i = j;
             break;
@@ -106,19 +108,19 @@ test "a flush in a defer is reported, and one where the work ends is not" {
                 .rule_id = "no_flush_in_defer",
                 .severity = .@"error",
                 .slice = "defer out.flush",
-                .message = "a flush here has nowhere to report a failure: flush where the work ends",
+                .message = message,
             },
             .{
                 .rule_id = "no_flush_in_defer",
                 .severity = .@"error",
                 .slice = "defer {\n        out.writeAll(\"y\") catch {};\n        out.flush",
-                .message = "a flush here has nowhere to report a failure: flush where the work ends",
+                .message = message,
             },
             .{
                 .rule_id = "no_flush_in_defer",
                 .severity = .@"error",
                 .slice = "errdefer out.flush",
-                .message = "a flush here has nowhere to report a failure: flush where the work ends",
+                .message = message,
             },
         },
     );

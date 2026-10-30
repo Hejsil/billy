@@ -4,6 +4,7 @@ test {
     _ = @import("comment_budget.zig");
     _ = @import("discard_takes_no_buffer.zig");
     _ = @import("error_name_format.zig");
+    _ = @import("hint_is_not_a_failure.zig");
     _ = @import("method_by_receiver.zig");
     _ = @import("no_bool_compare.zig");
     _ = @import("no_flush_in_defer.zig");

@@ -9,6 +9,8 @@ pub fn buildRule(options: zlinter.rules.RuleOptions) zlinter.rules.LintRule {
     return .{ .rule_id = "report_failure_once", .run = &run };
 }
 
+const message = "logged and returned: the failure is reported twice, so return `report.Reported`";
+
 fn run(
     rule: zlinter.rules.LintRule,
     session: *zlinter.session.LintSession,
@@ -45,7 +47,7 @@ fn run(
             .severity = config.severity,
             .start = .startOfToken(tree, reported.first),
             .end = .endOfToken(tree, reported.last),
-            .message = "logged and returned: the failure is reported twice, so return `report.Reported`",
+            .message = try arena.dupe(u8, message),
         });
         i = reported.last;
     }
@@ -121,13 +123,13 @@ test "a failure that is logged and handed back is reported, and one that is only
                 .rule_id = "report_failure_once",
                 .severity = .@"error",
                 .slice = "err",
-                .message = "logged and returned: the failure is reported twice, so return `report.Reported`",
+                .message = message,
             },
             .{
                 .rule_id = "report_failure_once",
                 .severity = .@"error",
                 .slice = "error.Unreadable",
-                .message = "logged and returned: the failure is reported twice, so return `report.Reported`",
+                .message = message,
             },
         },
     );

@@ -11,6 +11,8 @@ pub fn buildRule(options: zlinter.rules.RuleOptions) zlinter.rules.LintRule {
     return .{ .rule_id = "streamed_write", .run = &run };
 }
 
+const message = "built in memory and then written: stream it onto the file's own writer";
+
 fn run(
     rule: zlinter.rules.LintRule,
     session: *zlinter.session.LintSession,
@@ -49,7 +51,7 @@ fn run(
                     .severity = config.severity,
                     .start = .startOfToken(tree, token),
                     .end = .endOfToken(tree, token),
-                    .message = "built in memory and then written: stream it onto the file's own writer",
+                    .message = try arena.dupe(u8, message),
                 });
             }
         }
@@ -194,7 +196,7 @@ test "a file written out of a buffer is reported, and one streamed onto its writ
             .rule_id = "streamed_write",
             .severity = .@"error",
             .slice = "Allocating",
-            .message = "built in memory and then written: stream it onto the file's own writer",
+            .message = message,
         }},
     );
 }
