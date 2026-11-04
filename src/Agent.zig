@@ -194,46 +194,6 @@ fn sameDir(io: std.Io, a: std.Io.Dir, b: std.Io.Dir) bool {
     return one.inode == two.inode;
 }
 
-/// The line shown above the input prompt: the session id, the model, the working directory, and how
-/// much of the context window the conversation fills.
-pub const SessionHeader = struct {
-    id: []const u8,
-    model: []const u8,
-    cwd: []const u8,
-    home: ?[]const u8 = null,
-    context_tokens: usize = 0,
-    context_window: ?usize = null,
-
-    /// The header for `session`: what it holds -- its id, directory and size -- with the model it
-    /// goes to and the window of that model, and the `home` a path is shortened against, which the
-    /// session keeps none of.
-    pub fn of(session: *const Session, model: Model, home: ?[]const u8) SessionHeader {
-        return .{
-            .id = session.id(),
-            .model = model.choice,
-            .cwd = session.cwd(),
-            .home = home,
-            .context_tokens = session.context_tokens,
-            .context_window = if (model.info) |info| info.context_window else null,
-        };
-    }
-
-    pub fn format(self: SessionHeader, out: *std.Io.Writer) std.Io.Writer.Error!void {
-        try out.print("billy · {s} · {s} · ", .{ self.id, self.model });
-        var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        try out.writeAll(displayPath(&path_buffer, self.cwd, self.home));
-        if (self.context_window) |window| {
-            try out.writeAll(" · ");
-            try formatTokens(out, self.context_tokens);
-            try out.writeAll("/");
-            try formatTokens(out, window);
-            try out.writeAll(" (");
-            try formatPercent(out, self.context_tokens, window);
-            try out.writeAll(")");
-        }
-    }
-};
-
 pub fn formatTokens(out: *std.Io.Writer, count: usize) !void {
     if (count < 1000) return try out.print("{d}", .{count});
     if (count < 999_500) return try formatScaled(out, count, 1000, 'k');
@@ -996,31 +956,11 @@ test "a model that cannot be resolved is a notice, and asks nothing" {
     try std.testing.expectEqual(@as(usize, 0), session.messages.items.len);
 }
 
-const test_session_id = "01HF7YAT000000000000000000";
-
-fn testHeader(model: []const u8, cwd: []const u8) SessionHeader {
-    return .{ .id = test_session_id, .model = model, .cwd = cwd };
-}
-
-fn expectHeader(expected: []const u8, header: SessionHeader) !void {
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-    try out.writer.print("{f}", .{header});
-    try std.testing.expectEqualStrings(expected, out.written());
-}
-
 fn expectTokens(expected: []const u8, count: usize) !void {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try formatTokens(&out.writer, count);
     try std.testing.expectEqualStrings(expected, out.written());
-}
-
-test "header names the session, the model and the working directory" {
-    try expectHeader(
-        "billy · 01HF7YAT000000000000000000 · deepseek-flash · /work",
-        testHeader("deepseek-flash", "/work"),
-    );
 }
 
 test "a header names the model the session goes to, not the one billy is pointed at" {
@@ -1045,33 +985,6 @@ test "a header names the model the session goes to, not the one billy is pointed
     try std.testing.expectEqual(@as(usize, 1_000_000), configured.info.?.context_window);
 }
 
-test "header shortens a path inside the home directory" {
-    var header = testHeader("m", "/home/user/repo/billy");
-    header.home = "/home/user";
-    try expectHeader("billy · 01HF7YAT000000000000000000 · m · ~/repo/billy", header);
-
-    header.cwd = "/home/user";
-    try expectHeader("billy · 01HF7YAT000000000000000000 · m · ~", header);
-
-    header.cwd = "/home/user2";
-    try expectHeader("billy · 01HF7YAT000000000000000000 · m · /home/user2", header);
-}
-
-test "header shows how full the context window is" {
-    var header = testHeader("m", "/work");
-    header.context_window = 128_000;
-
-    try expectHeader("billy · 01HF7YAT000000000000000000 · m · /work · 0/128k (0%)", header);
-    header.context_tokens = 500;
-    try expectHeader("billy · 01HF7YAT000000000000000000 · m · /work · 500/128k (<1%)", header);
-    header.context_tokens = 16_000;
-    try expectHeader("billy · 01HF7YAT000000000000000000 · m · /work · 16k/128k (12%)", header);
-    header.context_tokens = 128_000;
-    try expectHeader("billy · 01HF7YAT000000000000000000 · m · /work · 128k/128k (100%)", header);
-    header.context_tokens = 12_500;
-    try expectHeader("billy · 01HF7YAT000000000000000000 · m · /work · 13k/128k (9%)", header);
-}
-
 test "token counts are whole" {
     try expectTokens("0", 0);
     try expectTokens("999", 999);
@@ -1082,39 +995,6 @@ test "token counts are whole" {
     try expectTokens("999k", 999_499);
     try expectTokens("1M", 999_500);
     try expectTokens("1M", 999_999);
-}
-
-test "header leaves out the gauge for an unknown model" {
-    var header = testHeader("who-knows", "/work");
-    header.context_tokens = 5000;
-    try expectHeader("billy · 01HF7YAT000000000000000000 · who-knows · /work", header);
-}
-
-test "a header is built from a session" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
-    defer session.deinit();
-    session.context_tokens = 100;
-    try session.setModel("deepseek/deepseek-flash");
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    const model: Model = .{
-        .choice = "deepseek/deepseek-flash",
-        .info = .{ .context_window = 128_000 },
-    };
-    try out.writer.print("{f}", .{SessionHeader.of(&session, model, null)});
-
-    var expected: std.Io.Writer.Allocating = .init(gpa);
-    defer expected.deinit();
-    try expected.writer.print(
-        "billy · {s} · deepseek/deepseek-flash · /work · 100/128k (<1%)",
-        .{session.id()},
-    );
-    try std.testing.expectEqualStrings(expected.written(), out.written());
 }
 
 fn expectInstructions(expected: []const u8, read: anytype, dir: std.Io.Dir) !void {
