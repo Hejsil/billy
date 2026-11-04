@@ -323,36 +323,6 @@ pub fn prepare(agent: *Agent, session: *Session) !void {
     try session.ensureTools(agent.tool_set.definitions());
 }
 
-/// Where a request is sent: the address of the model's completions endpoint, the key stored for the
-/// provider that serves it, and the model to ask for.
-pub const Target = struct {
-    url: []const u8,
-    api_key: []const u8,
-    model: []const u8,
-};
-
-pub fn targetFor(
-    config: *const Config,
-    credentials: *const Credentials,
-    catalog: *const models.Catalog,
-    arena: std.mem.Allocator,
-    choice: []const u8,
-) !Target {
-    const halves = models.Choice{ .text = choice };
-    const provider = halves.provider();
-    const base_url = baseUrlOf(config.stored.providers, catalog, choice) orelse
-        return error.UnknownProvider;
-
-    return .{
-        .url = try completionsUrl(arena, base_url),
-        .api_key = credentials.get(provider) orelse return error.MissingApiKey,
-        // The model is copied out rather than sliced from `choice`: the choice a session passes is
-        // a slice of its own string pool, and a pointer into that pool survives no write to it, so
-        // the next intern would leave the target naming freed bytes.
-        .model = try arena.dupe(u8, halves.model()),
-    };
-}
-
 /// A model as a header shows it: the choice as it was written, and what is known of its window.
 pub const Model = struct {
     choice: []const u8,
@@ -373,11 +343,10 @@ fn completionsUrl(arena: std.mem.Allocator, base_url: []const u8) ![]u8 {
     });
 }
 
-fn baseUrlOf(providers: Config.Providers, catalog: *const models.Catalog, choice: []const u8) ?[]const u8 {
-    const name = (models.Choice{ .text = choice }).provider();
-    if (providers.get(name)) |base_url| return base_url;
-    const provider = catalog.find(name) orelse return null;
-    return provider.base_url;
+fn baseUrlOf(providers: Config.Providers, catalog: *const models.Catalog, provider: []const u8) ?[]const u8 {
+    if (providers.get(provider)) |base_url| return base_url;
+    const result = catalog.find(provider) orelse return null;
+    return result.base_url;
 }
 
 pub fn unreachableModel(buffer: []u8, err: anyerror, choice: []const u8) []const u8 {
@@ -397,18 +366,27 @@ pub fn unreachableModel(buffer: []u8, err: anyerror, choice: []const u8) []const
     };
 }
 
+/// The client a request in `session` is sent with: the address of its model's completions endpoint,
+/// the key stored for the provider that serves it, and the model to ask for.
 fn clientFor(agent: *Agent, session: *Session) !llm.Client {
     const choice = session.modelChoice(agent.config.stored.model);
     if (session.model() == null)
         try session.setModel(choice);
 
-    const target = try targetFor(agent.config, agent.credentials, agent.catalog, agent.target_state.allocator(), choice);
+    const halves = models.Choice{ .text = choice };
+    const base_url = baseUrlOf(agent.config.stored.providers, agent.catalog, halves.provider()) orelse
+        return error.UnknownProvider;
+    const arena = agent.target_state.allocator();
+
     return .{
         .gpa = agent.gpa,
         .io = agent.io,
-        .api_key = target.api_key,
-        .url = target.url,
-        .model = target.model,
+        .api_key = agent.credentials.get(halves.provider()) orelse return error.MissingApiKey,
+        .url = try completionsUrl(arena, base_url),
+        // The model is copied out rather than sliced from `choice`: the choice a session passes is
+        // a slice of its own string pool, and a pointer into that pool survives no write to it, so
+        // the next intern would leave the client naming freed bytes.
+        .model = try arena.dupe(u8, halves.model()),
         .http = agent.http,
     };
 }
@@ -2613,45 +2591,62 @@ test "a session is sent where the choice it recorded points, not the configurati
     try std.testing.expect(std.mem.find(u8, chosen.bodies.items[0], "\"model\":\"kimi-k2.7-code\"") != null);
 }
 
-test "a target carries the address, the key and the model of the choice it names" {
+test "a client carries the address, the key and the model of the choice it names" {
     const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const io = std.testing.io;
 
-    var config = Config.init(gpa);
-    defer config.deinit();
-    var credentials: Credentials = .{};
-    try credentials.put(arena, "deepseek", "k");
-    try credentials.put(arena, "opencode-go", "k");
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
 
-    const flash = try targetFor(&config, &credentials, &models.test_catalog, arena, "deepseek/deepseek-flash");
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
+    // The addresses the catalog knows, so the ones the providers really have.
+    setup.config.stored.providers = .{};
+    try setup.credentials.put(setup.arena.allocator(), "deepseek", "k");
+    try setup.credentials.put(setup.arena.allocator(), "opencode-go", "k");
+    var agent = try testAgent(io, gpa, setup, &http_client);
+    defer agent.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+
+    try session.setModel("deepseek/deepseek-flash");
+    const flash = try agent.clientFor(&session);
     try std.testing.expectEqualStrings("https://api.deepseek.com/chat/completions", flash.url);
     try std.testing.expectEqualStrings("k", flash.api_key);
     try std.testing.expectEqualStrings("deepseek-flash", flash.model);
 
-    const kimi = try targetFor(&config, &credentials, &models.test_catalog, arena, "opencode-go/kimi-k2.7-code");
+    try session.setModel("opencode-go/kimi-k2.7-code");
+    const kimi = try agent.clientFor(&session);
     try std.testing.expectEqualStrings("https://opencode.ai/zen/go/v1/chat/completions", kimi.url);
     try std.testing.expectEqualStrings("kimi-k2.7-code", kimi.model);
 }
 
-test "a target is resolved through a provider the configuration defines itself" {
+test "a client is made for a provider the configuration defines itself" {
     const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const io = std.testing.io;
 
-    var config = Config.init(gpa);
-    defer config.deinit();
-    config.stored.providers = .{ .entries = &.{
-        .{ .name = "mine", .base_url = "http://localhost:8080/v1" },
-    } };
-    var credentials: Credentials = .{};
-    try credentials.put(arena, "mine", "k");
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
 
-    const target = try targetFor(&config, &credentials, &models.test_catalog, arena, "mine/qwen3-coder:30b");
-    try std.testing.expectEqualStrings("http://localhost:8080/v1/chat/completions", target.url);
-    try std.testing.expectEqualStrings("qwen3-coder:30b", target.model);
+    // `test` is a provider the catalog does not have, so its address is the one the file gives it.
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
+    setup.pointAt("test", "http://localhost:8080/v1");
+    var agent = try testAgent(io, gpa, setup, &http_client);
+    defer agent.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+
+    try session.setModel("test/qwen3-coder:30b");
+    const client = try agent.clientFor(&session);
+    try std.testing.expectEqualStrings("http://localhost:8080/v1/chat/completions", client.url);
+    try std.testing.expectEqualStrings("qwen3-coder:30b", client.model);
 }
 
 test "a model as a header shows it carries the choice and the window of its model" {
@@ -2666,29 +2661,29 @@ test "a model as a header shows it carries the choice and the window of its mode
     try std.testing.expect(modelOf("test/m", &models.test_catalog).info == null);
 }
 
-test "the endpoint comes from the provider the choice names" {
+test "the endpoint comes from the provider the file or the catalog names" {
     const none: Config.Providers = .{};
 
     try std.testing.expectEqualStrings(
         "https://api.deepseek.com",
-        baseUrlOf(none, &models.test_catalog, "deepseek/deepseek-flash").?,
+        baseUrlOf(none, &models.test_catalog, "deepseek").?,
     );
     try std.testing.expectEqualStrings(
         "https://opencode.ai/zen/go/v1",
-        baseUrlOf(none, &models.test_catalog, "opencode-go/glm-5.3-flash").?,
+        baseUrlOf(none, &models.test_catalog, "opencode-go").?,
     );
 
     const defined: Config.Providers = .{ .entries = &.{
         .{ .name = "mock", .base_url = "http://127.0.0.1:8901/v1" },
     } };
-    try std.testing.expectEqualStrings("http://127.0.0.1:8901/v1", baseUrlOf(defined, &models.test_catalog, "mock/m").?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8901/v1", baseUrlOf(defined, &models.test_catalog, "mock").?);
 
     const overriding: Config.Providers = .{ .entries = &.{
         .{ .name = "deepseek", .base_url = "http://127.0.0.1:9/v1" },
     } };
     try std.testing.expectEqualStrings(
         "http://127.0.0.1:9/v1",
-        baseUrlOf(overriding, &models.test_catalog, "deepseek/deepseek-flash").?,
+        baseUrlOf(overriding, &models.test_catalog, "deepseek").?,
     );
 }
 
@@ -2696,14 +2691,14 @@ test "a provider the configuration does not name is refused, not defaulted" {
     const none: Config.Providers = .{};
     // A typo would otherwise send the conversation to whichever endpoint billy fell back on, which
     // is worse than failing: the request would go somewhere the user did not name.
-    try std.testing.expect(baseUrlOf(none, &models.test_catalog, "who-knows/m") == null);
-    try std.testing.expect(baseUrlOf(none, &models.test_catalog, "m") == null);
-    try std.testing.expect(baseUrlOf(none, &models.test_catalog, "/m") == null);
+    try std.testing.expect(baseUrlOf(none, &models.test_catalog, "who-knows") == null);
+    // A choice with no provider part names no provider, which is no address either.
+    try std.testing.expect(baseUrlOf(none, &models.test_catalog, "") == null);
 
     const defined: Config.Providers = .{ .entries = &.{
         .{ .name = "who-knows", .base_url = "http://127.0.0.1:8901/v1" },
     } };
-    try std.testing.expectEqualStrings("http://127.0.0.1:8901/v1", baseUrlOf(defined, &models.test_catalog, "who-knows/m").?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8901/v1", baseUrlOf(defined, &models.test_catalog, "who-knows").?);
 }
 
 test "the completions path is appended once, whatever the base carries" {
@@ -2746,38 +2741,35 @@ test "what is wrong with a model is said with what to do about it" {
     try std.testing.expect(std.mem.startsWith(u8, unreachableModel(&small, error.MissingApiKey, "a/b"), "the model cannot be reached"));
 }
 
-test "a target names bytes of its own, not a slice of the session's pool" {
+test "a client names bytes of its own, not a slice of the session's pool" {
     const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
+    setup.config.stored.providers = .{};
+    try setup.credentials.put(setup.arena.allocator(), "opencode-go", "k");
+    var agent = try testAgent(io, gpa, setup, &http_client);
+    defer agent.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = Config.file_name,
-        .data = "{\"model\":\"opencode-go/glm-5.3-flash\"}",
-    });
-    var config = try Config.open(std.testing.io, tmp.dir, gpa);
-    defer config.deinit();
-    var credentials: Credentials = .{};
-    try credentials.put(arena, "opencode-go", "k");
-
-    var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
     defer session.deinit();
+    try session.setModel("opencode-go/glm-5.3-flash");
 
-    const choice = session.modelChoice(config.stored.model);
-    try std.testing.expectEqualStrings("opencode-go/glm-5.3-flash", choice);
-    const target = try targetFor(&config, &credentials, &models.test_catalog, arena, choice);
+    const client = try agent.clientFor(&session);
     // The model the session recorded is interned in its string pool, and a pointer into that pool
     // survives no write to it.
-    try std.testing.expectEqualStrings("glm-5.3-flash", target.model);
+    try std.testing.expectEqualStrings("glm-5.3-flash", client.model);
     for (0..40) |i| {
         var buffer: [64]u8 = undefined;
         const filler = try std.mem.print(&buffer, "filler {d} padding padding padding padding", .{i});
         try session.append(.{ .role = .user, .content = filler });
     }
-    try std.testing.expectEqualStrings("glm-5.3-flash", target.model);
-    try std.testing.expectEqualStrings("https://opencode.ai/zen/go/v1/chat/completions", target.url);
+    try std.testing.expectEqualStrings("glm-5.3-flash", client.model);
+    try std.testing.expectEqualStrings("https://opencode.ai/zen/go/v1/chat/completions", client.url);
 }
