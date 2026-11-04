@@ -1,8 +1,8 @@
 //! Interactive line editor for the user prompt.
 
+const builtin = @import("builtin");
 const std = @import("std");
 
-const settings = @import("Terminal/settings.zig");
 const terminal_width = @import("Terminal/width.zig");
 
 const LineEditor = @This();
@@ -257,7 +257,7 @@ fn readKeys(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u
 }
 
 fn restore(ed: *LineEditor, saved: std.posix.termios) !void {
-    const settings_err = settings.set(std.posix.STDIN_FILENO, saved);
+    const settings_err = set(std.posix.STDIN_FILENO, saved);
 
     // Bracketed paste is a property of the terminal rather than of this process, so it is turned
     // back off when the line is done; left on, it would wrap pastes in whatever the user runs next.
@@ -549,10 +549,25 @@ fn nextByte(ed: *LineEditor) !?u8 {
     return ed.in_buf[ed.in_pos];
 }
 
+/// The settings `fd` is on now: the ones that deliver a line at a time, which raw mode turns off.
+fn get(fd: std.posix.fd_t) !std.posix.termios {
+    if (builtin.os.tag != .linux) return std.posix.tcgetattr(fd);
+    var term: std.posix.termios = undefined;
+    if (std.os.linux.tcgetattr(fd, &term) != 0) return error.NotATerminal;
+    return term;
+}
+
+/// Replaces the settings of `fd` with `term`, at once rather than when the output has been written,
+/// so that input is read a keystroke at a time.
+fn set(fd: std.posix.fd_t, term: std.posix.termios) !void {
+    if (builtin.os.tag != .linux) return std.posix.tcsetattr(fd, .NOW, term);
+    if (std.os.linux.tcsetattr(fd, .NOW, &term) != 0) return error.NotATerminal;
+}
+
 fn enterRaw(ed: *LineEditor) !std.posix.termios {
     _ = ed;
     const fd = std.posix.STDIN_FILENO;
-    const saved = try settings.get(fd);
+    const saved = try get(fd);
     var raw = saved;
     raw.lflag.ECHO = false;
     raw.lflag.ICANON = false;
@@ -562,7 +577,7 @@ fn enterRaw(ed: *LineEditor) !std.posix.termios {
     raw.iflag.IXON = false;
     raw.cc[@backingInt(std.posix.V.MIN)] = 0;
     raw.cc[@backingInt(std.posix.V.TIME)] = 1;
-    try settings.set(fd, raw);
+    try set(fd, raw);
     return saved;
 }
 
