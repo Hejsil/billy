@@ -20,6 +20,7 @@ const Terminal = @This();
 io: std.Io,
 writer: Writer,
 scratch: std.mem.Allocator,
+home: ?[]const u8 = null,
 answer: ?Answer = null,
 reasoning: bool = false,
 reasoning_at_line_start: bool = true,
@@ -253,7 +254,7 @@ pub fn run(
         try header.writer.print("{f}", .{SessionHeader.of(
             session,
             agent.modelChoice(session),
-            options.home,
+            self.home,
         )});
         const line = (try editor.readLine(header.written(), input_prompt)) orelse break;
         if (line.len == 0) continue;

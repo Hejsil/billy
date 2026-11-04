@@ -64,7 +64,6 @@ fn options(server: *const Server) Agent.Options {
         .catalog = server.catalog,
         .behaviour = Agent.Behaviour.fromConfig(server.config),
         .tools = setup.toolSettings(server.config, server.backends, server.health),
-        .home = server.environ.get("HOME"),
         .instructions = server.config_dir,
     };
 }

@@ -195,11 +195,15 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resuming: ?Resume) !void {
             try setup.Backends.build(arena, &billy.config, &billy.credentials),
             &billy.health,
         ),
-        .home = billy.environ.get("HOME"),
         .instructions = billy.dirs.config,
     };
 
-    var terminal = Terminal{ .writer = out, .io = billy.io, .scratch = billy.gpa };
+    var terminal = Terminal{
+        .writer = out,
+        .io = billy.io,
+        .scratch = billy.gpa,
+        .home = billy.environ.get("HOME"),
+    };
     defer terminal.deinit();
 
     if (resume_id != null) {

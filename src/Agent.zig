@@ -41,15 +41,13 @@ const Command = union(enum) {
 };
 
 /// What a run is given, in one value: what each turn's target is resolved from, how its agent
-/// behaves on it, what its tools run with, and the home directory and instructions the run reads
-/// outside the session.
+/// behaves on it, what its tools run with, and the instructions the run reads outside the session.
 pub const Options = struct {
     config: *const Config,
     credentials: *const Credentials,
     catalog: *const models.Catalog,
     behaviour: Behaviour,
     tools: Tools.Settings,
-    home: ?[]const u8 = null,
     instructions: ?std.Io.Dir = null,
 };
 
@@ -811,7 +809,6 @@ const TestSetup = struct {
     behaviour: Behaviour = .{ .max_turns = 10 },
     tools: Tools.Settings = .{ .bash_timeout_s = 120 },
     catalog: *const models.Catalog = &models.test_catalog,
-    home: ?[]const u8 = null,
     instructions: ?std.Io.Dir = null,
 
     fn init(gpa: std.mem.Allocator, model: []const u8) !TestSetup {
@@ -862,7 +859,6 @@ const TestSetup = struct {
             .catalog = setup.catalog,
             .behaviour = setup.behaviour,
             .tools = setup.tools,
-            .home = setup.home,
             .instructions = setup.instructions,
         };
     }
