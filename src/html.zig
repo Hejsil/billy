@@ -5,6 +5,7 @@ const std = @import("std");
 const Agent = @import("Agent.zig");
 const diff = @import("diff.zig");
 const favicons = @import("web/favicons.zig");
+const fmt = @import("fmt.zig");
 const md = @import("md.zig");
 const models = @import("models.zig");
 const Session = @import("Session.zig");
@@ -1170,16 +1171,16 @@ pub fn header(h: Header, out: *std.Io.Writer) !void {
     try part("model", h.model, out);
     try out.writeAll("<span class=\"sep\">·</span><span class=\"cwd\">");
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    try escape(Agent.displayPath(&path_buffer, h.cwd, h.home), out);
+    try escape(fmt.displayPath(&path_buffer, h.cwd, h.home), out);
     try out.writeAll("</span>");
 
     if (h.model_info) |info| {
         try out.writeAll("<span class=\"sep\">·</span><span class=\"gauge\">");
-        try Agent.formatTokens(out, h.context_tokens);
+        try fmt.printTokens(out, h.context_tokens);
         try out.writeAll("/");
-        try Agent.formatTokens(out, info.context_window);
+        try fmt.printTokens(out, info.context_window);
         try out.writeAll(" (");
-        try Agent.formatPercent(out, h.context_tokens, info.context_window);
+        try fmt.printPercent(out, h.context_tokens, info.context_window);
         try out.writeAll(")</span>");
     }
     try out.writeAll("</div>\n");

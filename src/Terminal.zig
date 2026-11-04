@@ -3,6 +3,7 @@
 const std = @import("std");
 
 const Agent = @import("Agent.zig");
+const fmt = @import("fmt.zig");
 const LineEditor = @import("LineEditor.zig");
 const llm = @import("llm.zig");
 const Session = @import("Session.zig");
@@ -210,14 +211,14 @@ pub const SessionHeader = struct {
     pub fn format(self: SessionHeader, out: *std.Io.Writer) std.Io.Writer.Error!void {
         try out.print("billy · {s} · {s} · ", .{ self.id, self.model });
         var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        try out.writeAll(Agent.displayPath(&path_buffer, self.cwd, self.home));
+        try out.writeAll(fmt.displayPath(&path_buffer, self.cwd, self.home));
         if (self.context_window) |window| {
             try out.writeAll(" · ");
-            try Agent.formatTokens(out, self.context_tokens);
+            try fmt.printTokens(out, self.context_tokens);
             try out.writeAll("/");
-            try Agent.formatTokens(out, window);
+            try fmt.printTokens(out, window);
             try out.writeAll(" (");
-            try Agent.formatPercent(out, self.context_tokens, window);
+            try fmt.printPercent(out, self.context_tokens, window);
             try out.writeAll(")");
         }
     }
