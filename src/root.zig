@@ -6,7 +6,6 @@ pub const Config = @import("Config.zig");
 pub const Credentials = @import("Credentials.zig");
 pub const diff = @import("diff.zig");
 pub const Dirs = @import("Dirs.zig");
-pub const endpoint = @import("endpoint.zig");
 pub const Health = @import("Health.zig");
 pub const html = @import("html.zig");
 pub const http = @import("http.zig");

@@ -1,15 +1,12 @@
 //! What a run is given, resolved from the configuration and the credentials: the backends its web
-//! tools ask, how its agent behaves, what its tools run with, and the model a header names.
+//! tools ask, how its agent behaves, and what its tools run with.
 
 const std = @import("std");
 
 const Config = @import("Config.zig");
 const Credentials = @import("Credentials.zig");
-const endpoint = @import("endpoint.zig");
 const Health = @import("Health.zig");
-const models = @import("models.zig");
 const report = @import("report.zig");
-const Session = @import("Session.zig");
 const Tools = @import("Tools.zig");
 
 pub const Backends = struct {
@@ -237,40 +234,4 @@ test "a fetch backend is asked for its key, and raw for none" {
 
     none.stored.tools.web_fetch.providers = &.{};
     try std.testing.expect((try fetchConfig(arena, &credentials, &none)) == .none);
-}
-
-test "a target names bytes of its own, not a slice of the session's pool" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = Config.file_name,
-        .data = "{\"model\":\"opencode-go/glm-5.3-flash\"}",
-    });
-    var config = try Config.open(std.testing.io, tmp.dir, gpa);
-    defer config.deinit();
-    var credentials: Credentials = .{};
-    try credentials.put(arena, "opencode-go", "k");
-
-    var session = try Session.open(std.testing.io, tmp.dir, gpa, null, "/work");
-    defer session.deinit();
-
-    const choice = session.modelChoice(config.stored.model);
-    try std.testing.expectEqualStrings("opencode-go/glm-5.3-flash", choice);
-    const target = try endpoint.targetFor(&config, &credentials, &models.test_catalog, arena, choice);
-    // The model the session recorded is interned in its string pool, and a pointer into that pool
-    // survives no write to it.
-    try std.testing.expectEqualStrings("glm-5.3-flash", target.model);
-    for (0..40) |i| {
-        var buffer: [64]u8 = undefined;
-        const filler = try std.mem.print(&buffer, "filler {d} padding padding padding padding", .{i});
-        try session.append(.{ .role = .user, .content = filler });
-    }
-    try std.testing.expectEqualStrings("glm-5.3-flash", target.model);
-    try std.testing.expectEqualStrings("https://opencode.ai/zen/go/v1/chat/completions", target.url);
 }
