@@ -3,6 +3,7 @@
 const std = @import("std");
 
 const Bash = @import("Tools/Bash.zig");
+const Credentials = @import("Credentials.zig");
 const Edit = @import("Tools/Edit.zig");
 const Health = @import("Health.zig");
 const llm = @import("llm.zig");
@@ -43,9 +44,10 @@ settings: Settings,
 /// under and the backends it asks.
 pub const Settings = struct {
     bash_timeout_s: usize,
-    search: ?web.Search.Config = null,
-    fetch: ?web.Fetch.Config = null,
+    search: web.SearchSettings = .{},
+    fetch: web.FetchSettings = .{},
     health: ?*Health = null,
+    keys: *const Credentials,
 };
 
 pub fn init(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, http: *std.http.Client, settings: Settings) Tools {
@@ -53,7 +55,7 @@ pub fn init(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, http: *std.http
 }
 
 pub fn hasWeb(tools: *const Tools) bool {
-    return tools.settings.search != null or tools.settings.fetch != null;
+    return tools.settings.search.providers.len > 0 or tools.settings.fetch.providers.len > 0;
 }
 
 pub fn definitions(tools: *const Tools) []const Session.Definition {
@@ -165,28 +167,8 @@ pub fn writeFile(io: std.Io, dir: std.Io.Dir, path: []const u8, bytes: []const u
 
 fn dispatch(tools: *Tools, call: Call, out: *std.Io.Writer) !void {
     switch (call) {
-        .edit => |edit| try edit.run(tools.gpa, tools.io, tools.dir, out),
-        .read => |read| try read.run(tools.gpa, tools.io, tools.dir, out),
-        .write => |write| try write.run(tools.io, tools.dir, out),
-        .bash => |bash| {
-            const timeout_s = std.math.cast(i64, tools.settings.bash_timeout_s) orelse std.math.maxInt(i64);
-            const timeout = std.Io.Duration.fromSeconds(timeout_s);
-            try bash.run(tools.gpa, tools.io, tools.dir, timeout, out);
-        },
-        .web_search => |search| try search.run(
-            tools.gpa,
-            tools.http,
-            tools.settings.search,
-            tools.settings.health,
-            out,
-        ),
-        .web_fetch => |fetch| try fetch.run(
-            tools.gpa,
-            tools.http,
-            tools.settings.fetch,
-            tools.settings.health,
-            out,
-        ),
+        // Every tool is run the same way: what it was parsed with, and the run it belongs to.
+        inline .read, .write, .edit, .bash, .web_search, .web_fetch => |tool| try tool.run(tools.*, out),
         .unknown => |name| try fail(out, "unknown tool '{s}'", .{name}),
         .malformed => |bad| try fail(
             out,
@@ -479,7 +461,7 @@ test "a bash command that outlives the timeout is killed and reported" {
 
     // A one-second limit kills a command that would otherwise run far longer, and the model is told
     // so rather than left waiting for it to finish.
-    var tool_set = Tools.init(io, std.Io.Dir.cwd(), gpa, &http_client, .{ .bash_timeout_s = 1 });
+    var tool_set = Tools.init(io, std.Io.Dir.cwd(), gpa, &http_client, .{ .bash_timeout_s = 1, .keys = &Credentials.empty });
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"sleep 30\"}",
@@ -540,10 +522,9 @@ fn testTools(with_search: bool) Tools {
     // the ones that refuse before any request, so this is never reached.
     return Tools.init(std.testing.io, .cwd(), std.testing.allocator, undefined, .{
         .bash_timeout_s = 120,
-        .search = if (with_search) .{
-            .backends = &.{.{ .provider = .tavily, .api_key = "key" }},
-            .max_results = 3,
-        } else null,
+        .search = if (with_search) .{ .providers = &.{.tavily}, .max_results = 3 } else .{},
+        .fetch = .{ .providers = &.{} },
+        .keys = &Credentials.empty,
     });
 }
 
@@ -637,7 +618,7 @@ test "the tools work in the directory they are given, wherever billy runs" {
     defer log.deinit();
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var tool_set = Tools.init(io, work, gpa, &http_client, .{ .bash_timeout_s = 120 });
+    var tool_set = Tools.init(io, work, gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
 
     var sink: std.Io.Writer.Discarding = .init("");
     _ = try runCall(arena, &tool_set, .{ .id = "1", .function = .{
@@ -670,7 +651,7 @@ test "a file a tool replaces keeps the permissions it had" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var tool_set = Tools.init(io, tmp.dir, gpa, &http_client, .{ .bash_timeout_s = 120 });
+    var tool_set = Tools.init(io, tmp.dir, gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
 
     // A file of the user's with a mode of its own, which is what a script is.
     try tmp.dir.writeFile(io, .{ .sub_path = "run.sh", .data = "#!/bin/sh\necho one\n" });
@@ -775,7 +756,7 @@ test "a result longer than the cap is cut and says what it lost" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var tool_set = Tools.init(io, tmp.dir, gpa, &http_client, .{ .bash_timeout_s = 120 });
+    var tool_set = Tools.init(io, tmp.dir, gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
 
     var result: std.Io.Writer.Allocating = .init(gpa);
     defer result.deinit();

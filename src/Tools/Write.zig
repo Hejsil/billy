@@ -7,13 +7,13 @@ const Write = @This();
 path: []const u8,
 content: []const u8,
 
-pub fn run(write: Write, io: std.Io, dir: std.Io.Dir, out: *std.Io.Writer) !void {
+pub fn run(write: Write, tools: Tools, out: *std.Io.Writer) !void {
     if (std.Io.Dir.path.dirname(write.path)) |parent| {
-        dir.createDirPath(io, parent) catch |err|
+        tools.dir.createDirPath(tools.io, parent) catch |err|
             return Tools.fail(out, "cannot create {s}: {t}", .{ parent, err });
     }
 
-    Tools.writeFile(io, dir, write.path, write.content) catch |err|
+    Tools.writeFile(tools.io, tools.dir, write.path, write.content) catch |err|
         return Tools.fail(out, "cannot write {s}: {t}", .{ write.path, err });
     try out.print("wrote {d} bytes to {s}", .{ write.content.len, write.path });
 }

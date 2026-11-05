@@ -12,22 +12,8 @@ pub const file_name = "config.json";
 
 pub const ToolSettings = struct {
     bash: Bash = .{},
-    web_search: WebSearch = .{},
-    web_fetch: WebFetch = .{},
-};
-
-pub const WebFetch = struct {
-    providers: []const Tools.web.Provider = &.{.raw},
-};
-
-pub const WebSearch = struct {
-    providers: []const Tools.web.Provider = &.{},
-    max_results: usize = 5,
-    searxng: Searxng = .{},
-
-    pub const Searxng = struct {
-        url: ?[]const u8 = null,
-    };
+    web_search: Tools.web.SearchSettings = .{},
+    web_fetch: Tools.web.FetchSettings = .{},
 };
 
 pub const Bash = struct {

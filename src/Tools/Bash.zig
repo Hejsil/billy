@@ -7,21 +7,17 @@ const Bash = @This();
 command: []const u8,
 description: ?[]const u8 = null,
 
-pub fn run(
-    bash: Bash,
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    dir: std.Io.Dir,
-    timeout: std.Io.Duration,
-    out: *std.Io.Writer,
-) !void {
+pub fn run(bash: Bash, tools: Tools, out: *std.Io.Writer) !void {
+    const timeout_s = std.math.cast(i64, tools.settings.bash_timeout_s) orelse std.math.maxInt(i64);
+    const timeout = std.Io.Duration.fromSeconds(timeout_s);
+
     const max_command_output = 1 << 20;
 
-    const result = std.process.run(gpa, io, .{
+    const result = std.process.run(tools.gpa, tools.io, .{
         .argv = &.{ "bash", "-c", bash.command },
         // The command runs where the session's tools do, which is the session's own directory
         // rather than the one billy was started in.
-        .cwd = .{ .dir = dir },
+        .cwd = .{ .dir = tools.dir },
         .stdout_limit = .limited(max_command_output),
         .stderr_limit = .limited(max_command_output),
         // A command that outlives the configured limit is killed, so a runaway command cannot hang
@@ -40,8 +36,8 @@ pub fn run(
         ),
         else => return Tools.fail(out, "cannot run command: {t}", .{err}),
     };
-    defer gpa.free(result.stdout);
-    defer gpa.free(result.stderr);
+    defer tools.gpa.free(result.stdout);
+    defer tools.gpa.free(result.stderr);
 
     try out.print("exit code: {d}\n", .{exitCode(result.term)});
 

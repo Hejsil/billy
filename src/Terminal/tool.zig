@@ -2,6 +2,7 @@
 //! and the result under it.
 const std = @import("std");
 
+const Credentials = @import("../Credentials.zig");
 const diff = @import("../diff.zig");
 const llm = @import("../llm.zig");
 const Tools = @import("../Tools.zig");
@@ -266,7 +267,7 @@ test "a bash block shows only the streams the command filled" {
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    var tool_set = Tools.init(io, std.Io.Dir.cwd(), gpa, &http_client, .{ .bash_timeout_s = 120 });
+    var tool_set = Tools.init(io, std.Io.Dir.cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
     const cases = [_]struct { command: []const u8, expected: []const u8 }{
         .{ .command = "true", .expected = "❯ bash true\ntrue\n✓ exit 0\n\n" },
         .{ .command = "echo hi", .expected = "❯ bash echo hi\necho hi\n✓ exit 0\n▾ stdout\nhi\n\n" },
@@ -423,7 +424,7 @@ test "run logs exactly what describe prints" {
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    var tool_set = Tools.init(io, std.Io.Dir.cwd(), gpa, &http_client, .{ .bash_timeout_s = 120 });
+    var tool_set = Tools.init(io, std.Io.Dir.cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"true\"}",

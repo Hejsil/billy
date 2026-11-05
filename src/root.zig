@@ -16,7 +16,6 @@ pub const models = @import("models.zig");
 pub const report = @import("report.zig");
 pub const Server = @import("Server.zig");
 pub const Session = @import("Session.zig");
-pub const setup = @import("setup.zig");
 pub const Terminal = @import("Terminal.zig");
 pub const Tools = @import("Tools.zig");
 pub const ulid = @import("ulid.zig");

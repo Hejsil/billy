@@ -10,7 +10,6 @@ const html = @import("html.zig");
 const models = @import("models.zig");
 const report = @import("report.zig");
 const Session = @import("Session.zig");
-const setup = @import("setup.zig");
 
 const Server = @This();
 
@@ -734,11 +733,12 @@ const TestServer = struct {
                     .credentials = &self.credentials,
                     .catalog = &models.test_catalog,
                     .behaviour = Agent.Behaviour.fromConfig(&self.config),
-                    .tools = setup.toolSettings(
-                        &self.config,
-                        .{ .search = null, .fetch = null },
-                        &self.health,
-                    ),
+                    // No web backend named, so a test that reaches for one fails rather than asks.
+                    .tools = .{
+                        .bash_timeout_s = self.config.stored.tools.bash.timeout_s,
+                        .health = &self.health,
+                        .keys = &self.credentials,
+                    },
                     .instructions = self.tmp.dir,
                 },
             },

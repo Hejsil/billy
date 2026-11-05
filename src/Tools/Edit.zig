@@ -9,16 +9,16 @@ old_string: []const u8,
 new_string: []const u8,
 replace_all: bool = false,
 
-pub fn run(edit: Edit, gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, out: *std.Io.Writer) !void {
+pub fn run(edit: Edit, tools: Tools, out: *std.Io.Writer) !void {
     if (edit.old_string.len == 0)
         return Tools.fail(out, "old_string must not be empty", .{});
 
-    const contents = dir.readFileAlloc(io, edit.path, gpa, .unlimited) catch |err|
+    const contents = tools.dir.readFileAlloc(tools.io, edit.path, tools.gpa, .unlimited) catch |err|
         return Tools.fail(out, "cannot read {s}: {t}", .{ edit.path, err });
-    defer gpa.free(contents);
+    defer tools.gpa.free(contents);
 
     const amount: Amount = if (edit.replace_all) .all else .one;
-    var change = try replace(gpa, contents, edit.old_string, edit.new_string, amount);
+    var change = try replace(tools.gpa, contents, edit.old_string, edit.new_string, amount);
 
     switch (change) {
         .not_found => return Tools.fail(out, "old_string not found in {s}", .{edit.path}),
@@ -28,8 +28,8 @@ pub fn run(edit: Edit, gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, out:
             .{ count, edit.path },
         ),
         .applied => |*applied| {
-            defer applied.text.deinit(gpa);
-            Tools.writeFile(io, dir, edit.path, applied.text.items) catch |err|
+            defer applied.text.deinit(tools.gpa);
+            Tools.writeFile(tools.io, tools.dir, edit.path, applied.text.items) catch |err|
                 return Tools.fail(out, "cannot write {s}: {t}", .{ edit.path, err });
 
             try out.print("replaced {d} occurrence(s) in {s}", .{ applied.count, edit.path });

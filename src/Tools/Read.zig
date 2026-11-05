@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const Credentials = @import("../Credentials.zig");
 const Tools = @import("../Tools.zig");
 
 const Read = @This();
@@ -8,14 +9,14 @@ path: []const u8,
 offset: usize = 1,
 limit: usize = 2000,
 
-pub fn run(read: Read, gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, out: *std.Io.Writer) !void {
-    const contents = dir.readFileAlloc(
-        io,
+pub fn run(read: Read, tools: Tools, out: *std.Io.Writer) !void {
+    const contents = tools.dir.readFileAlloc(
+        tools.io,
         read.path,
-        gpa,
+        tools.gpa,
         .limited(16 << 20),
     ) catch |err| return Tools.fail(out, "cannot read {s}: {t}", .{ read.path, err });
-    defer gpa.free(contents);
+    defer tools.gpa.free(contents);
 
     // A trailing newline would otherwise read as a final empty line.
     const text = std.mem.trimEnd(u8, contents, "\n");
@@ -56,7 +57,8 @@ fn expectRead(contents: []const u8, read: Read, expected: []const u8) !void {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try read.run(gpa, io, tmp.dir, &out.writer);
+    const tool_set = Tools.init(io, tmp.dir, gpa, undefined, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
+    try read.run(tool_set, &out.writer);
     try std.testing.expectEqualStrings(expected, out.written());
 }
 
@@ -139,7 +141,9 @@ test "a file that cannot be read is the call's failure, not the run's" {
     // Nothing is returned: a read that could not open its file is written as the call's result,
     // beginning with the mark both readers branch on, so the terminal shows it as a failure and the
     // page draws it as one rather than either reading it as the contents of a file.
-    try (Read{ .path = "missing.txt" }).run(gpa, io, tmp.dir, &out.writer);
+    const tool_set = Tools.init(io, tmp.dir, gpa, undefined, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
+    const read: Read = .{ .path = "missing.txt" };
+    try read.run(tool_set, &out.writer);
     try std.testing.expect(std.mem.startsWith(u8, out.written(), "error: cannot read missing.txt: "));
     try std.testing.expect(std.mem.find(u8, out.written(), "FileNotFound") != null);
 }

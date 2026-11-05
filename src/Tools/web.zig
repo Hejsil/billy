@@ -41,6 +41,22 @@ pub const Provider = enum {
     }
 };
 
+/// What the configuration says about searching: the backends to try, and the results to ask for.
+pub const SearchSettings = struct {
+    providers: []const Provider = &.{},
+    max_results: usize = 5,
+    searxng: Searxng = .{},
+
+    pub const Searxng = struct {
+        url: ?[]const u8 = null,
+    };
+};
+
+/// What the configuration says about fetching: the backends to try, in order.
+pub const FetchSettings = struct {
+    providers: []const Provider = &.{.raw},
+};
+
 /// How a provider is asked: the address billy knows it by, the header its key goes in, and what the
 /// two web tools ask it.
 pub const Descriptor = struct {

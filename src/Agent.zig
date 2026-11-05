@@ -807,7 +807,6 @@ const TestSetup = struct {
     credentials: *Credentials,
     entries: []Config.Providers.Entry,
     behaviour: Behaviour = .{ .max_turns = 10 },
-    tools: Tools.Settings = .{ .bash_timeout_s = 120 },
     catalog: *const models.Catalog = &models.test_catalog,
     instructions: ?std.Io.Dir = null,
 
@@ -858,7 +857,7 @@ const TestSetup = struct {
             .credentials = setup.credentials,
             .catalog = setup.catalog,
             .behaviour = setup.behaviour,
-            .tools = setup.tools,
+            .tools = .{ .bash_timeout_s = 120, .keys = setup.credentials },
             .instructions = setup.instructions,
         };
     }
@@ -1711,7 +1710,7 @@ test "the terminal shows a tool call the way a replay does" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var tool_set = Tools.init(io, std.Io.Dir.cwd(), gpa, &http_client, .{ .bash_timeout_s = 120 });
+    var tool_set = Tools.init(io, std.Io.Dir.cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
 
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",

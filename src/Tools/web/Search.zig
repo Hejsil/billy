@@ -2,6 +2,7 @@
 
 const std = @import("std");
 
+const Credentials = @import("../../Credentials.zig");
 const Health = @import("../../Health.zig");
 const Mock = @import("../../Mock.zig");
 const Tools = @import("../../Tools.zig");
@@ -19,29 +20,78 @@ pub const Backend = struct {
     endpoint: ?[]const u8 = null,
 };
 
-/// What the configuration says about searching, with the keys already resolved: the backends to
-/// try, in order, and how many results to ask for.
-pub const Config = struct {
-    backends: []const Backend,
-    max_results: usize,
-};
+/// The most backends one call asks, which is as many providers as billy knows.
+const max_backends = @typeInfo(web.Provider).@"enum".field_names.len;
 
 query: []const u8,
 
 /// Runs one web search and writes its results as text.
-pub fn run(search: Search, gpa: std.mem.Allocator, http_client: *std.http.Client, config: ?Config, health: ?*Health, out: *std.Io.Writer) !void {
-    const search_config = config orelse return Tools.fail(
+pub fn run(search: Search, tools: Tools, out: *std.Io.Writer) !void {
+    const settings = tools.settings.search;
+    if (settings.providers.len == 0) return Tools.fail(
         out,
-        "web search is not configured",
+        "no search backend is configured; add one to tools.web_search.providers",
         .{},
     );
 
-    const now_ms = std.Io.Clock.real.now(http_client.io).toMilliseconds();
+    // The keys are read as the call is made, so one stored while billy runs is the one the next
+    // search asks with, and a run that never searches asks for none of them.
+    var backends: [max_backends]Backend = undefined;
+    var usable: usize = 0;
+    var unusable: ?anyerror = null;
+    for (settings.providers) |provider| {
+        if (usable == max_backends) {
+            std.log.warn("search: {d} backends named, which is more than billy knows", .{settings.providers.len});
+            break;
+        }
+        backends[usable] = backendFor(settings, tools.settings.keys, provider) catch |err| {
+            std.log.warn("search: {t} cannot be asked: {t}, trying the next", .{ provider, err });
+            unusable = err;
+            continue;
+        };
+        usable += 1;
+    }
+    if (usable == 0) return switch (unusable.?) {
+        error.MissingApiKey => Tools.fail(
+            out,
+            "no key is stored for a search backend; run `billy login` to store one",
+            .{},
+        ),
+        error.MissingSearchUrl => Tools.fail(
+            out,
+            "the searxng backend has no address; set tools.web_search.searxng.url",
+            .{},
+        ),
+        else => |err| Tools.fail(out, "search failed: {t}", .{err}),
+    };
+
+    return search.ask(tools, backends[0..usable], out);
+}
+
+/// The backend `provider` is asked as, or the reason it cannot be asked: a key billy does not have,
+/// or a self-hosted backend with no address.
+fn backendFor(settings: web.SearchSettings, keys: *const Credentials, provider: web.Provider) !Backend {
+    return .{
+        .provider = provider,
+        .api_key = if (provider.service()) |service|
+            keys.get(service) orelse return error.MissingApiKey
+        else blk: {
+            const url = settings.searxng.url orelse return error.MissingSearchUrl;
+            if (url.len == 0) return error.MissingSearchUrl;
+            break :blk "";
+        },
+        .endpoint = if (provider.service() == null) settings.searxng.url else null,
+    };
+}
+
+/// Asks each backend in turn until one answers.
+fn ask(search: Search, tools: Tools, backends: []const Backend, out: *std.Io.Writer) !void {
+    const now_ms = std.Io.Clock.real.now(tools.http.io).toMilliseconds();
     var failed: ?anyerror = null;
-    for (search_config.backends) |backend| {
-        if (Health.isSetAside(health, @tagName(backend.provider), now_ms)) continue;
-        const value = searchBackend(gpa, http_client, backend, search.query, search_config.max_results) catch |err| {
-            Health.recordFailure(health, @tagName(backend.provider), null, now_ms);
+    for (backends) |backend| {
+        if (Health.isSetAside(tools.settings.health, @tagName(backend.provider), now_ms)) continue;
+        const value = searchBackend(tools, backend, search.query, tools.settings.search.max_results) catch |err| {
+            Health.recordFailure(tools.settings.health, @tagName(backend.provider), null, now_ms);
             std.log.warn("search: {t} failed: {t}, trying the next", .{
                 backend.provider, err,
             });
@@ -50,12 +100,12 @@ pub fn run(search: Search, gpa: std.mem.Allocator, http_client: *std.http.Client
         };
         switch (value) {
             .text => |text| {
-                defer gpa.free(text);
-                Health.recordAnswer(health, @tagName(backend.provider));
+                defer tools.gpa.free(text);
+                Health.recordAnswer(tools.settings.health, @tagName(backend.provider));
                 return out.writeAll(text);
             },
             .retry_after_ms => |ms| {
-                Health.recordFailure(health, @tagName(backend.provider), ms, now_ms);
+                Health.recordFailure(tools.settings.health, @tagName(backend.provider), ms, now_ms);
                 std.log.warn("search: {t} is set aside for {d}ms, trying the next", .{
                     backend.provider, ms,
                 });
@@ -63,11 +113,6 @@ pub fn run(search: Search, gpa: std.mem.Allocator, http_client: *std.http.Client
         }
     }
     if (failed) |err| return Tools.fail(out, "search failed: {t}", .{err});
-    if (search_config.backends.len == 0) return Tools.fail(
-        out,
-        "no search backend is configured; add one to tools.web_search.providers",
-        .{},
-    );
     return Tools.fail(
         out,
         "every search backend is set aside after failing; add another to tools.web_search.providers, or wait",
@@ -75,45 +120,39 @@ pub fn run(search: Search, gpa: std.mem.Allocator, http_client: *std.http.Client
     );
 }
 
-fn searchBackend(
-    gpa: std.mem.Allocator,
-    http_client: *std.http.Client,
-    backend: Backend,
-    query: []const u8,
-    max_results: usize,
-) !web.Answer {
+fn searchBackend(tools: Tools, backend: Backend, query: []const u8, max_results: usize) !web.Answer {
     const asked = @min(max_results, Result.result_limit);
 
     const descriptor = backend.provider.descriptor();
     const spec = descriptor.search orelse return error.NotASearchProvider;
     const base = backend.endpoint orelse descriptor.search_endpoint orelse return error.MissingSearchUrl;
-    const location = try web.address(gpa, base, if (descriptor.search_endpoint == null) spec.configured_path else "");
-    defer gpa.free(location);
+    const location = try web.address(tools.gpa, base, if (descriptor.search_endpoint == null) spec.configured_path else "");
+    defer tools.gpa.free(location);
 
     var payload: ?[]const u8 = null;
-    defer if (payload) |body| gpa.free(body);
+    defer if (payload) |body| tools.gpa.free(body);
     var asked_url: ?[]const u8 = null;
-    defer if (asked_url) |url| gpa.free(url);
+    defer if (asked_url) |url| tools.gpa.free(url);
     var target = location;
 
     const method: std.http.Method = switch (spec.request) {
         .get => |tail| get: {
             asked_url = switch (tail) {
-                .count => try web.queryUrl(gpa, location, query, "&count={d}", .{asked}),
-                .format_json => try web.queryUrl(gpa, location, query, "&format=json", .{}),
+                .count => try web.queryUrl(tools.gpa, location, query, "&count={d}", .{asked}),
+                .format_json => try web.queryUrl(tools.gpa, location, query, "&format=json", .{}),
             };
             target = asked_url.?;
             break :get .GET;
         },
         .post => |build| post: {
-            payload = try build(gpa, query, asked);
+            payload = try build(tools.gpa, query, asked);
             break :post .POST;
         },
     };
 
     const answer = try web.providerRequest(
-        gpa,
-        http_client,
+        tools.gpa,
+        tools.http,
         "search",
         descriptor,
         backend.api_key,
@@ -123,8 +162,8 @@ fn searchBackend(
     );
     return switch (answer) {
         .text => |text| text: {
-            defer gpa.free(text);
-            break :text .{ .text = try spec.render(gpa, text, asked) };
+            defer tools.gpa.free(text);
+            break :text .{ .text = try spec.render(tools.gpa, text, asked) };
         },
         .retry_after_ms => |ms| .{ .retry_after_ms = ms },
     };
@@ -148,17 +187,16 @@ test "the backends are tried in order until one answers" {
 
     // Two backends, both standing in for the same server, so what is tested is the order rather
     // than which backend it is.
-    const config: Config = .{
-        .backends = &.{
-            .{ .provider = .tavily, .api_key = "a", .endpoint = mock.url },
-            .{ .provider = .tavily, .api_key = "b", .endpoint = mock.url },
-        },
-        .max_results = 3,
+    const search: Search = .{ .query = "zig lang" };
+    const backends: []const Backend = &.{
+        .{ .provider = .tavily, .api_key = "a", .endpoint = mock.url },
+        .{ .provider = .tavily, .api_key = "b", .endpoint = mock.url },
     };
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try run(.{ .query = "zig lang" }, gpa, &http_client, config, null, &out.writer);
+    const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty, .search = .{ .max_results = 3 } });
+    try search.ask(tool_set, backends, &out.writer);
     try mock.await();
 
     try std.testing.expectEqual(@as(usize, 2), mock.served);
@@ -180,17 +218,16 @@ test "a search fails only when every backend has failed" {
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    const config: Config = .{
-        .backends = &.{
-            .{ .provider = .tavily, .api_key = "a", .endpoint = mock.url },
-            .{ .provider = .brave, .api_key = "b", .endpoint = mock.url },
-        },
-        .max_results = 3,
+    const search: Search = .{ .query = "zig lang" };
+    const backends: []const Backend = &.{
+        .{ .provider = .tavily, .api_key = "a", .endpoint = mock.url },
+        .{ .provider = .brave, .api_key = "b", .endpoint = mock.url },
     };
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try run(.{ .query = "zig lang" }, gpa, &http_client, config, null, &out.writer);
+    const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty, .search = .{ .max_results = 3 } });
+    try search.ask(tool_set, backends, &out.writer);
     try mock.await();
 
     try std.testing.expectEqual(@as(usize, 2), mock.served);
@@ -221,24 +258,28 @@ test "a backend that failed is set aside, so the next search skips it" {
     var health = try Health.load(io, gpa, tmp.dir);
     defer health.deinit();
 
-    const config: Config = .{
-        .backends = &.{
-            .{ .provider = .tavily, .api_key = "a", .endpoint = mock.url },
-            .{ .provider = .brave, .api_key = "b", .endpoint = mock.url },
-        },
-        .max_results = 3,
+    const search: Search = .{ .query = "zig lang" };
+    const backends: []const Backend = &.{
+        .{ .provider = .tavily, .api_key = "a", .endpoint = mock.url },
+        .{ .provider = .brave, .api_key = "b", .endpoint = mock.url },
     };
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    try run(.{ .query = "zig lang" }, gpa, &http_client, config, &health, &out.writer);
+    const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{
+        .bash_timeout_s = 120,
+        .keys = &Credentials.empty,
+        .search = .{ .max_results = 3 },
+        .health = &health,
+    });
+    try search.ask(tool_set, backends, &out.writer);
     try std.testing.expectEqualStrings("1. Zig\n   https://ziglang.org\n   A language.\n", out.written());
     try std.testing.expect(health.skips("tavily", std.Io.Clock.real.now(io).toMilliseconds()));
     try std.testing.expect(!health.skips("brave", std.Io.Clock.real.now(io).toMilliseconds()));
 
     out.clearRetainingCapacity();
-    try run(.{ .query = "zig lang" }, gpa, &http_client, config, &health, &out.writer);
+    try search.ask(tool_set, backends, &out.writer);
     try mock.await();
 
     try std.testing.expectEqual(@as(usize, 3), mock.served);
@@ -257,13 +298,12 @@ test "brave is asked for no more results than billy allows any backend" {
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    const config: Config = .{
-        .backends = &.{.{ .provider = .brave, .api_key = "b", .endpoint = mock.url }},
-        .max_results = 1000,
-    };
+    const search: Search = .{ .query = "zig" };
+    const backends: []const Backend = &.{.{ .provider = .brave, .api_key = "b", .endpoint = mock.url }};
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try run(.{ .query = "zig" }, gpa, &http_client, config, null, &out.writer);
+    const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty, .search = .{ .max_results = 1000 } });
+    try search.ask(tool_set, backends, &out.writer);
     try mock.await();
 
     try std.testing.expectEqualStrings("/search?q=zig&count=20", mock.targets.items[0]);
@@ -284,10 +324,9 @@ test "each provider is asked the way its table says" {
 
         var out: std.Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
-        try run(.{ .query = "zig lang" }, gpa, &http_client, .{
-            .backends = &.{.{ .provider = .tavily, .api_key = "secret", .endpoint = mock.url }},
-            .max_results = 3,
-        }, null, &out.writer);
+        const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty, .search = .{ .max_results = 3 } });
+        const search: Search = .{ .query = "zig lang" };
+        try search.ask(tool_set, &.{.{ .provider = .tavily, .api_key = "secret", .endpoint = mock.url }}, &out.writer);
         try mock.await();
 
         try std.testing.expectEqualStrings(
@@ -304,10 +343,9 @@ test "each provider is asked the way its table says" {
 
         var out: std.Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
-        try run(.{ .query = "zig lang" }, gpa, &http_client, .{
-            .backends = &.{.{ .provider = .exa, .api_key = "secret", .endpoint = mock.url }},
-            .max_results = 3,
-        }, null, &out.writer);
+        const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty, .search = .{ .max_results = 3 } });
+        const search: Search = .{ .query = "zig lang" };
+        try search.ask(tool_set, &.{.{ .provider = .exa, .api_key = "secret", .endpoint = mock.url }}, &out.writer);
         try mock.await();
 
         try std.testing.expectEqualStrings(
@@ -325,10 +363,9 @@ test "each provider is asked the way its table says" {
 
         var out: std.Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
-        try run(.{ .query = "zig lang" }, gpa, &http_client, .{
-            .backends = &.{.{ .provider = .searxng, .endpoint = mock.url }},
-            .max_results = 3,
-        }, null, &out.writer);
+        const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty, .search = .{ .max_results = 3 } });
+        const search: Search = .{ .query = "zig lang" };
+        try search.ask(tool_set, &.{.{ .provider = .searxng, .endpoint = mock.url }}, &out.writer);
         try mock.await();
 
         try std.testing.expectEqualStrings("/search?q=zig%20lang&format=json", mock.targets.items[0]);
@@ -355,16 +392,50 @@ test "searxng results are capped at the most billy allows any backend" {
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    const config: Config = .{
-        .backends = &.{.{ .provider = .searxng, .endpoint = mock.url }},
-        .max_results = 1000,
-    };
+    const search: Search = .{ .query = "zig lang" };
+    const backends: []const Backend = &.{.{ .provider = .searxng, .endpoint = mock.url }};
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try run(.{ .query = "zig" }, gpa, &http_client, config, null, &out.writer);
+    const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty, .search = .{ .max_results = 1000 } });
+    try search.ask(tool_set, backends, &out.writer);
     try mock.await();
 
     try std.testing.expectEqual(@as(usize, 20), std.mem.count(u8, out.written(), "   u\n"));
+}
+
+test "a backend with no key stored, or no address, is not asked" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // A backend billy knows is asked for its key rather than the search going out without one.
+    const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{
+        .bash_timeout_s = 120,
+        .keys = &Credentials.empty,
+        .search = .{ .providers = &.{.tavily} },
+    });
+    try run(.{ .query = "zig" }, tool_set, &out.writer);
+    try std.testing.expectEqualStrings(
+        "error: no key is stored for a search backend; run `billy login` to store one",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+
+    // SearXNG is the user's own instance, so what it needs is an address.
+    const searxng_set = Tools.init(io, .cwd(), gpa, &http_client, .{
+        .bash_timeout_s = 120,
+        .keys = &Credentials.empty,
+        .search = .{ .providers = &.{.searxng} },
+    });
+    try run(.{ .query = "zig" }, searxng_set, &out.writer);
+    try std.testing.expectEqualStrings(
+        "error: the searxng backend has no address; set tools.web_search.searxng.url",
+        out.written(),
+    );
 }
 
 test "a search with no backend named says one is not configured" {
@@ -378,7 +449,8 @@ test "a search with no backend named says one is not configured" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try run(.{ .query = "zig lang" }, gpa, &http_client, .{ .backends = &.{}, .max_results = 3 }, null, &out.writer);
+    const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
+    try run(.{ .query = "zig lang" }, tool_set, &out.writer);
     try std.testing.expectEqualStrings(
         "error: no search backend is configured; add one to tools.web_search.providers",
         out.written(),
@@ -405,17 +477,21 @@ test "a search with every backend set aside says so, without asking any" {
     health.record("tavily", null, now);
     health.record("brave", null, now);
 
-    const config: Config = .{
-        .backends = &.{
-            .{ .provider = .tavily, .api_key = "a", .endpoint = mock.url },
-            .{ .provider = .brave, .api_key = "b", .endpoint = mock.url },
-        },
-        .max_results = 3,
+    const search: Search = .{ .query = "zig lang" };
+    const backends: []const Backend = &.{
+        .{ .provider = .tavily, .api_key = "a", .endpoint = mock.url },
+        .{ .provider = .brave, .api_key = "b", .endpoint = mock.url },
     };
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try run(.{ .query = "zig lang" }, gpa, &http_client, config, &health, &out.writer);
+    const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{
+        .bash_timeout_s = 120,
+        .keys = &Credentials.empty,
+        .search = .{ .max_results = 3 },
+        .health = &health,
+    });
+    try search.ask(tool_set, backends, &out.writer);
 
     try std.testing.expectEqual(@as(usize, 0), mock.served);
     try std.testing.expectEqualStrings(

@@ -13,7 +13,6 @@ const models = @import("models.zig");
 const report = @import("report.zig");
 const Server = @import("Server.zig");
 const Session = @import("Session.zig");
-const setup = @import("setup.zig");
 const Terminal = @import("Terminal.zig");
 const xdg = @import("xdg.zig");
 
@@ -151,17 +150,20 @@ pub fn configSet(billy: *Billy, out: Terminal.Writer, path: []const u8, value: [
 }
 
 /// What a run is given, made once here so the terminal's run and the server's turns read the same.
-fn options(billy: *Billy, arena: std.mem.Allocator) !Agent.Options {
+fn options(billy: *Billy) Agent.Options {
+    const stored = &billy.config.stored;
     return .{
         .config = &billy.config,
         .credentials = &billy.credentials,
         .catalog = &billy.catalog,
         .behaviour = Agent.Behaviour.fromConfig(&billy.config),
-        .tools = setup.toolSettings(
-            &billy.config,
-            try setup.Backends.build(arena, &billy.config, &billy.credentials),
-            &billy.health,
-        ),
+        .tools = .{
+            .bash_timeout_s = stored.tools.bash.timeout_s,
+            .search = stored.tools.web_search,
+            .fetch = stored.tools.web_fetch,
+            .health = &billy.health,
+            .keys = &billy.credentials,
+        },
         .instructions = billy.dirs.config,
     };
 }
@@ -197,11 +199,7 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resuming: ?Resume) !void {
     };
     defer session.deinit();
 
-    var run_state = std.heap.ArenaAllocator.init(billy.gpa);
-    defer run_state.deinit();
-    const arena = run_state.allocator();
-
-    const run_options = try billy.options(arena);
+    const run_options = billy.options();
 
     var terminal = Terminal{
         .writer = out,
@@ -285,13 +283,6 @@ fn printSessions(out: Terminal.Writer, listed: []const Session.Named) !void {
 
 pub fn serve(billy: *Billy, host: []const u8, port: u16) !void {
     billy.ensureCatalog();
-    // What a request is sent to, and the backends it asks, are resolved before anything is served,
-    // since a server that cannot send a request has nothing to do: a key that is missing is
-    // reported here rather than on the first thing asked of it.
-    var server_state = std.heap.ArenaAllocator.init(billy.gpa);
-    defer server_state.deinit();
-    const arena = server_state.allocator();
-
     const server = Server{
         .io = billy.io,
         .gpa = billy.gpa,
@@ -299,9 +290,9 @@ pub fn serve(billy: *Billy, host: []const u8, port: u16) !void {
         .http_client = &billy.http_client,
         .cwd = billy.cwd,
         .home = billy.environ.get("HOME"),
-        .options = try billy.options(arena),
+        .options = billy.options(),
     };
-    return server.serve(host, port);
+    return try server.serve(host, port);
 }
 
 test "the listing writes each session's id and title on one line" {

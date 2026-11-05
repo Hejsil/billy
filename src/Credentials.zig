@@ -35,6 +35,9 @@ pub fn purposeOf(name: []const u8) ?[]const u8 {
 
 keys: std.array_hash_map.String([]const u8) = .empty,
 
+/// A table with no key stored in it, which a run that stores none is given.
+pub const empty: Credentials = .{};
+
 pub fn get(credentials: *const Credentials, name: []const u8) ?[]const u8 {
     return credentials.keys.get(name);
 }
