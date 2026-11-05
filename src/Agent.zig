@@ -40,35 +40,14 @@ const Command = union(enum) {
     }
 };
 
-/// What a run is given, in one value: what each turn's target is resolved from, how its agent
-/// behaves on it, what its tools run with, and the instructions the run reads outside the session.
+/// What a run is given, in one value: what each turn's target is resolved from, what its tools run
+/// with, and the directory outside the session its instructions are read from.
 pub const Options = struct {
     config: *const Config,
     credentials: *const Credentials,
     catalog: *const models.Catalog,
-    behaviour: Behaviour,
     tools: Tools.Settings,
     instructions: ?std.Io.Dir = null,
-};
-
-/// How the agent behaves on a session: how many turns it gives the model before giving up, how full
-/// the window may get before the conversation is compacted into a summary, and whether it asks the
-/// model for a name for the session.
-pub const Behaviour = struct {
-    max_turns: usize,
-    compact_at: usize = 80,
-    title: bool = true,
-
-    /// How a run's agent behaves: the turns it gives the model, the share of the window it fills
-    /// before the conversation is compacted into a summary, and whether it names the session.
-    pub fn fromConfig(config: *const Config) Behaviour {
-        const stored = &config.stored;
-        return .{
-            .max_turns = stored.max_turns,
-            .compact_at = stored.compact_at,
-            .title = stored.title,
-        };
-    }
 };
 
 /// One unit of what a run shows: the pieces a conversation is made of, in the order they happened.
@@ -194,7 +173,6 @@ fn sameDir(io: std.Io, a: std.Io.Dir, b: std.Io.Dir) bool {
 
 io: std.Io,
 gpa: std.mem.Allocator,
-behaviour: Behaviour,
 config: *const Config,
 catalog: *const models.Catalog,
 credentials: *const Credentials,
@@ -222,7 +200,6 @@ pub fn init(
     return .{
         .io = io,
         .gpa = gpa,
-        .behaviour = options.behaviour,
         .config = options.config,
         .credentials = options.credentials,
         .catalog = options.catalog,
@@ -470,7 +447,7 @@ pub fn ask(agent: *Agent, emitter: *Emitter, session: *Session, text: []const u8
         return emitter.show(.{ .notice = failureNotice(&notice, err, emitter.shown > shown_before) });
     };
 
-    if (first_turn and agent.behaviour.title) {
+    if (first_turn and agent.config.stored.title) {
         agent.titleSession(session, &client) catch |err|
             std.log.warn("could not title the session: {t}", .{err});
     }
@@ -590,7 +567,7 @@ fn turn(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client
     // The second bound on the loop: how many replies in a row may say nothing before the turn stops
     // asking.
     var retries: usize = max_retries;
-    var remaining: usize = agent.behaviour.max_turns;
+    var remaining: usize = agent.config.stored.max_turns;
     while (remaining > 0 and retries > 0) : (remaining -= 1) {
         if (agent.shouldCompact(session)) {
             agent.summarize(emitter, session, client) catch |err| {
@@ -644,7 +621,7 @@ fn turn(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client
     const stopped = std.mem.print(
         &buffer,
         "stopped after {d} turns without a final answer",
-        .{agent.behaviour.max_turns},
+        .{agent.config.stored.max_turns},
     ) catch "stopped without a final answer";
     try emitter.show(.{ .notice = stopped });
 }
@@ -750,9 +727,9 @@ const compact_prompt =
 ;
 
 fn compactThreshold(agent: *const Agent, session: *const Session) usize {
-    if (agent.behaviour.compact_at == 0) return 0;
+    if (agent.config.stored.compact_at == 0) return 0;
     const info = agent.modelChoice(session).info orelse return 0;
-    return info.context_window * agent.behaviour.compact_at / 100;
+    return info.context_window * agent.config.stored.compact_at / 100;
 }
 
 fn shouldCompact(agent: *const Agent, session: *const Session) bool {
@@ -806,7 +783,6 @@ const TestSetup = struct {
     config: *Config,
     credentials: *Credentials,
     entries: []Config.Providers.Entry,
-    behaviour: Behaviour = .{ .max_turns = 10 },
     catalog: *const models.Catalog = &models.test_catalog,
     instructions: ?std.Io.Dir = null,
 
@@ -856,7 +832,6 @@ const TestSetup = struct {
             .config = setup.config,
             .credentials = setup.credentials,
             .catalog = setup.catalog,
-            .behaviour = setup.behaviour,
             .tools = .{ .bash_timeout_s = 120, .keys = setup.credentials },
             .instructions = setup.instructions,
         };
@@ -1199,12 +1174,12 @@ test "the compaction threshold is the configured share of the window, or off" {
 
     try std.testing.expectEqual(800_000, agent.compactThreshold(&session));
 
-    agent.behaviour.compact_at = 0;
+    setup.config.stored.compact_at = 0;
     try std.testing.expectEqual(0, agent.compactThreshold(&session));
 
-    agent.behaviour.compact_at = 50;
+    setup.config.stored.compact_at = 50;
     try std.testing.expectEqual(500_000, agent.compactThreshold(&session));
-    agent.behaviour.compact_at = 33;
+    setup.config.stored.compact_at = 33;
     try std.testing.expectEqual(330_000, agent.compactThreshold(&session));
 }
 
@@ -1228,7 +1203,7 @@ test "a conversation that has filled the window is summarized in place of itself
 
     var setup = try TestSetup.init(gpa, "deepseek-flash");
     defer setup.deinit();
-    setup.behaviour.compact_at = 80;
+    setup.config.stored.compact_at = 80;
     session.context_tokens = 900_000;
 
     var mock = try Mock.start("/chat/completions", 1, Mock.completion("the summary"));
@@ -1294,11 +1269,11 @@ test "compaction is due only once the conversation is over the threshold" {
     session.context_tokens = 800_000;
     try std.testing.expect(agent.shouldCompact(&session));
 
-    agent.behaviour.compact_at = 0;
+    setup.config.stored.compact_at = 0;
     try std.testing.expect(!agent.shouldCompact(&session));
 
     // A model the catalog says nothing about has no window, so no line to cross.
-    agent.behaviour.compact_at = 80;
+    setup.config.stored.compact_at = 80;
     try session.setModel("test/m");
     try std.testing.expect(!agent.shouldCompact(&session));
 }
@@ -1319,7 +1294,7 @@ test "a summary is written into the conversation and announced" {
     var setup = try TestSetup.init(gpa, "m");
     defer setup.deinit();
     // Summarizing asks nothing of how full the conversation is: whoever asks for it decides that.
-    setup.behaviour.compact_at = 0;
+    setup.config.stored.compact_at = 0;
 
     var mock = try Mock.start("/chat/completions", 1, Mock.completion("the summary"));
     defer mock.deinit();
@@ -2084,7 +2059,7 @@ test "a provider that keeps saying nothing ends the turn" {
 
     // Every reply says nothing, which is a provider that is not answering rather than a model that
     // thought and stopped: the next ask gets the same nothing.
-    var mock = try Mock.start("/chat/completions", setup.behaviour.max_turns, Mock.eventStream(
+    var mock = try Mock.start("/chat/completions", setup.config.stored.max_turns, Mock.eventStream(
         "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking it over\"}}]}\n\n" ++
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
             "data: [DONE]\n\n",
@@ -2233,7 +2208,7 @@ test "a turn that runs out of turns says so" {
     setup.pointAt("test", mock.url);
     var agent = try testAgent(io, gpa, setup, &http_client);
     defer agent.deinit();
-    agent.behaviour.max_turns = 2;
+    setup.config.stored.max_turns = 2;
 
     var recorder = Recorder{ .gpa = arena_state.allocator() };
     var client = try agent.clientFor(&session);
@@ -2287,7 +2262,7 @@ test "the first turn names the session, and the naming is not part of it" {
 
     var setup = try TestSetup.init(gpa, "m");
     defer setup.deinit();
-    setup.behaviour.title = true;
+    setup.config.stored.title = true;
     setup.pointAt("test", mock.url);
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
@@ -2344,7 +2319,7 @@ test "a turn is sent to the model the session records when it begins" {
 
     var setup = try TestSetup.init(gpa, "m");
     defer setup.deinit();
-    setup.behaviour.title = false;
+    setup.config.stored.title = false;
     setup.pointAt("test", deepseek.url);
     setup.pointAt("other", opencode.url);
 
@@ -2392,7 +2367,7 @@ test "a session is sent where the choice it recorded points, not the configurati
     defer setup.deinit();
     // Only the provider the session records is pointed at a server; the one the configuration names
     // is left at a closed port, so a turn that went there would fail rather than answer.
-    setup.behaviour.title = false;
+    setup.config.stored.title = false;
     setup.pointAt("other", chosen.url);
     var agent = try testAgent(io, gpa, setup, &http_client);
     defer agent.deinit();

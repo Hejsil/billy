@@ -20,6 +20,7 @@ const Terminal = @This();
 io: std.Io,
 writer: Writer,
 scratch: std.mem.Allocator,
+/// What a path in the header is shortened against, or null when no home is known and none is.
 home: ?[]const u8 = null,
 answer: ?Answer = null,
 reasoning: bool = false,

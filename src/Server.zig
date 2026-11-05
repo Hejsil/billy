@@ -732,7 +732,6 @@ const TestServer = struct {
                     .config = &self.config,
                     .credentials = &self.credentials,
                     .catalog = &models.test_catalog,
-                    .behaviour = Agent.Behaviour.fromConfig(&self.config),
                     // No web backend named, so a test that reaches for one fails rather than asks.
                     .tools = .{
                         .bash_timeout_s = self.config.stored.tools.bash.timeout_s,

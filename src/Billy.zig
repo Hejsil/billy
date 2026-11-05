@@ -156,7 +156,6 @@ fn options(billy: *Billy) Agent.Options {
         .config = &billy.config,
         .credentials = &billy.credentials,
         .catalog = &billy.catalog,
-        .behaviour = Agent.Behaviour.fromConfig(&billy.config),
         .tools = .{
             .bash_timeout_s = stored.tools.bash.timeout_s,
             .search = stored.tools.web_search,
