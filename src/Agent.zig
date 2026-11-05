@@ -179,7 +179,6 @@ credentials: *const Credentials,
 http: *std.http.Client,
 target_state: std.heap.ArenaAllocator,
 instructions: ?std.Io.Dir = null,
-work_dir: std.Io.Dir,
 tool_set: Tools,
 
 pub fn init(
@@ -189,7 +188,7 @@ pub fn init(
     cwd: []const u8,
     http_client: *std.http.Client,
 ) !Agent {
-    var work_dir = std.Io.Dir.openDirAbsolute(io, cwd, .{}) catch |err| {
+    const work_dir = std.Io.Dir.openDirAbsolute(io, cwd, .{}) catch |err| {
         std.log.err("cannot work in {s}: {t}", .{ cwd, err });
         return report.Reported;
     };
@@ -206,19 +205,18 @@ pub fn init(
         .http = http_client,
         .target_state = std.heap.ArenaAllocator.init(gpa),
         .instructions = options.instructions,
-        .work_dir = work_dir,
         .tool_set = tool_set,
     };
 }
 
 pub fn deinit(agent: *Agent) void {
     agent.target_state.deinit();
-    agent.work_dir.close(agent.io);
+    agent.tool_set.dir.close(agent.io);
 }
 
 pub fn prepare(agent: *Agent, session: *Session) !void {
     if (session.messages.items.len == 0 and session.systemPrompt() == null) {
-        const prompt_text = try leadPrompt(agent.io, agent.gpa, agent.work_dir, agent.instructions);
+        const prompt_text = try leadPrompt(agent.io, agent.gpa, agent.tool_set.dir, agent.instructions);
         defer agent.gpa.free(prompt_text);
         try session.setSystemPrompt(prompt_text);
     }
@@ -389,7 +387,7 @@ fn changeCwd(agent: *Agent, emitter: *Emitter, session: *Session, asked: ?[]cons
     // Read from the directory the session works in now, so `/cwd ..` is the parent of where it was
     // moved to rather than of where billy was started, and recorded as the filesystem names it, so
     // the header, a resume and `pwd` agree.
-    const path = agent.work_dir.realPathFileAlloc(agent.io, wanted, agent.gpa) catch |err|
+    const path = agent.tool_set.dir.realPathFileAlloc(agent.io, wanted, agent.gpa) catch |err|
         return cwdNotice(emitter, &notice, wanted, err);
     defer agent.gpa.free(path);
 
@@ -398,8 +396,7 @@ fn changeCwd(agent: *Agent, emitter: *Emitter, session: *Session, asked: ?[]cons
     const moved = std.Io.Dir.openDirAbsolute(agent.io, path, .{}) catch |err|
         return cwdNotice(emitter, &notice, wanted, err);
 
-    agent.work_dir.close(agent.io);
-    agent.work_dir = moved;
+    agent.tool_set.dir.close(agent.io);
     agent.tool_set.dir = moved;
     try session.setCwd(path);
 
