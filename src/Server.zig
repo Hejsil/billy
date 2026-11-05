@@ -695,71 +695,65 @@ const Stream = struct {
 const TestServer = struct {
     server: Server,
     tmp: std.testing.TmpDir,
-    config: *Config,
-    health: *Health,
+    config: Config,
+    credentials: Credentials,
+    health: Health,
     registry: Registry,
-    http: *std.http.Client,
+    http: std.http.Client,
 
-    fn init() !TestServer {
+    fn init() !*TestServer {
         const gpa = std.testing.allocator;
+        const self = try gpa.create(TestServer);
+        errdefer gpa.destroy(self);
+
         var tmp = std.testing.tmpDir(.{});
         errdefer tmp.cleanup();
 
         const sessions = try tmp.dir.createDirPathOpen(std.testing.io, "sessions", .{});
         errdefer sessions.close(std.testing.io);
-        const config = try gpa.create(Config);
-        errdefer gpa.destroy(config);
-        config.* = Config.init(gpa);
-        errdefer config.deinit();
-        const health = try gpa.create(Health);
-        errdefer gpa.destroy(health);
-        health.* = try Health.load(std.testing.io, gpa, tmp.dir);
-        errdefer health.deinit();
-        const credentials = try gpa.create(Credentials);
-        errdefer gpa.destroy(credentials);
-        credentials.* = .{};
-        const http = try gpa.create(std.http.Client);
-        errdefer gpa.destroy(http);
-        http.* = .{ .allocator = gpa, .io = std.testing.io };
-        errdefer http.deinit();
 
-        return .{
+        var health = try Health.load(std.testing.io, gpa, tmp.dir);
+        errdefer health.deinit();
+
+        self.* = .{
             .tmp = tmp,
-            .config = config,
+            .config = .init(gpa),
+            .credentials = .{},
             .health = health,
             .registry = .{ .io = std.testing.io, .gpa = gpa },
-            .http = http,
+            .http = .{ .allocator = gpa, .io = std.testing.io },
             .server = .{
                 .io = std.testing.io,
                 .gpa = gpa,
                 .session_dir = sessions,
-                .http_client = http,
+                .http_client = &self.http,
                 .cwd = ".",
                 .home = "/home/tester",
                 .options = .{
-                    .config = config,
-                    .credentials = credentials,
+                    .config = &self.config,
+                    .credentials = &self.credentials,
                     .catalog = &models.test_catalog,
-                    .behaviour = Agent.Behaviour.fromConfig(config),
-                    // No web tools at all, so a test that reaches for one fails rather than asks.
-                    .tools = setup.toolSettings(config, .{ .search = null, .fetch = null }, health),
-                    .instructions = tmp.dir,
+                    .behaviour = Agent.Behaviour.fromConfig(&self.config),
+                    .tools = setup.toolSettings(
+                        &self.config,
+                        .{ .search = null, .fetch = null },
+                        &self.health,
+                    ),
+                    .instructions = self.tmp.dir,
                 },
             },
         };
+        return self;
     }
 
     fn deinit(server: *TestServer) void {
         server.http.deinit();
-        std.testing.allocator.destroy(server.http);
         server.registry.deinit();
-        server.server.session_dir.close(std.testing.io);
         server.health.deinit();
-        std.testing.allocator.destroy(server.health);
-        std.testing.allocator.destroy(server.server.options.credentials);
         server.config.deinit();
-        std.testing.allocator.destroy(server.config);
+        server.server.session_dir.close(std.testing.io);
         server.tmp.cleanup();
+        std.testing.allocator.destroy(server);
     }
 
     fn exchange(server: *TestServer, method: std.http.Method, path: []const u8, body: ?[]const u8) !Exchange {
@@ -840,7 +834,7 @@ const Exchange = struct {
 };
 
 test "a route answers a request it does not know with a 404" {
-    var server = try TestServer.init();
+    const server = try TestServer.init();
     defer server.deinit();
 
     var exchange = try server.exchange(.GET, "/nope", null);
@@ -851,7 +845,7 @@ test "a route answers a request it does not know with a 404" {
 }
 
 test "the page is served at the root, byte for byte" {
-    var server = try TestServer.init();
+    const server = try TestServer.init();
     defer server.deinit();
 
     var exchange = try server.exchange(.GET, "/", null);
@@ -862,7 +856,7 @@ test "the page is served at the root, byte for byte" {
 }
 
 test "the session list is read from disk, newest first" {
-    var server = try TestServer.init();
+    const server = try TestServer.init();
     defer server.deinit();
 
     var empty = try server.exchange(.GET, "/api/sessions", null);
@@ -881,7 +875,7 @@ test "the session list is read from disk, newest first" {
 }
 
 test "one session is opened as the page the frontend reads" {
-    var server = try TestServer.init();
+    const server = try TestServer.init();
     defer server.deinit();
 
     const id = try server.session(null);
@@ -899,7 +893,7 @@ test "one session is opened as the page the frontend reads" {
 }
 
 test "an id with no session is a 404, and one that is not an id is a 400" {
-    var server = try TestServer.init();
+    const server = try TestServer.init();
     defer server.deinit();
 
     var missing = try server.exchange(.GET, "/api/sessions/01M3AAAAAAAAAAAAAAAAAAAAAA", null);
@@ -912,7 +906,7 @@ test "an id with no session is a 404, and one that is not an id is a 400" {
 }
 
 test "a session is renamed, and the name is on disk" {
-    var server = try TestServer.init();
+    const server = try TestServer.init();
     defer server.deinit();
 
     const id = try server.session(null);
@@ -931,7 +925,7 @@ test "a session is renamed, and the name is on disk" {
 }
 
 test "a rename that says nothing usable is refused" {
-    var server = try TestServer.init();
+    const server = try TestServer.init();
     defer server.deinit();
 
     const id = try server.session(null);
@@ -956,7 +950,7 @@ test "a rename that says nothing usable is refused" {
 }
 
 test "a session is deleted, and deleting it again is a 404" {
-    var server = try TestServer.init();
+    const server = try TestServer.init();
     defer server.deinit();
 
     const id = try server.session(null);
@@ -982,7 +976,7 @@ test "a session is deleted, and deleting it again is a 404" {
 }
 
 test "a prompt is refused while the session is busy, and one that asks nothing" {
-    var server = try TestServer.init();
+    const server = try TestServer.init();
     defer server.deinit();
 
     const id = try server.session(null);
