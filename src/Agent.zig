@@ -1636,9 +1636,8 @@ test "the cwd command writes no session that has not been asked anything" {
     try std.testing.expect(moved == .ran);
     try std.testing.expectEqualStrings(sub, session.cwd());
 
-    var name_buf: [64]u8 = undefined;
-    const name = try std.mem.print(&name_buf, "{s}.json", .{session.id()});
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, name, .{}));
+    // The session is named by its id alone, so a file under that name is one that was written.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, session.id(), .{}));
 }
 
 test "the model command can move a session off a model that cannot be reached" {

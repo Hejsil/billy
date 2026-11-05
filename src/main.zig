@@ -46,19 +46,11 @@ const sessions_about =
     \\session that has not been named yet is listed by its id alone.
 ;
 
-const convert_about =
-    \\Write the sessions an older billy kept as JSON, which this one does not read,
-    \\out again in the format it does, one file to a session; each file of the old
-    \\kind is removed once the session it holds is written. A session already
-    \\written out is left alone, so running it twice does nothing the second time.
-;
-
 const billy_commands =
     \\  resume [<session>]        continue a session, or the latest one here
     \\  login [<service>]         store an API key, or list the services
     \\  config <setting> <value>  set a configuration setting by its path
     \\  sessions                  list the sessions, newest first
-    \\  convert                   write sessions of the old format out again
     \\  models [--refresh]        show the model catalog, or fetch it again
     \\  serve                     run the web frontend
 ;
@@ -104,7 +96,6 @@ const Options = struct {
         config: Config,
         serve: Serve,
         sessions: Sessions,
-        convert: Convert,
         models: Models,
     };
 
@@ -141,10 +132,6 @@ const Options = struct {
     };
 
     const Sessions = struct {
-        help: bool = false,
-    };
-
-    const Convert = struct {
         help: bool = false,
     };
 };
@@ -204,7 +191,6 @@ fn answer(init: std.process.Init, out: Terminal.Writer, options: Options) !u8 {
         .config => |config| try billy.configSet(out, config.path.?, config.value.?),
         .login => |login| try billy.login(out, login.service),
         .sessions => try billy.listSessions(out),
-        .convert => try billy.convertSessions(out),
         .models => |models| try billy.showModels(out, models.refresh),
     }
     return 0;
@@ -255,12 +241,6 @@ fn printAskedHelp(options: Options, out: Terminal.Writer) !bool {
                 return true;
             }
         },
-        .convert => |convert| {
-            if (convert.help) {
-                try printHelp(out, "billy convert", convert_about, null, command_options);
-                return true;
-            }
-        },
         .models => |models| {
             if (models.help) {
                 try printHelp(out, "billy models [--refresh]", models_about, null, models_options);
@@ -300,8 +280,6 @@ fn parseCommand(args: *spaghet.Args, command: []const u8) ParseError!Options.Com
         return .{ .serve = try parseServe(args) };
     if (std.mem.eql(u8, command, "sessions"))
         return .{ .sessions = try parseSessions(args) };
-    if (std.mem.eql(u8, command, "convert"))
-        return .{ .convert = try parseConvert(args) };
     if (std.mem.eql(u8, command, "models"))
         return .{ .models = try parseModels(args) };
     return error.InvalidArgument;
@@ -388,17 +366,6 @@ fn parseSessions(args: *spaghet.Args) ParseError!Options.Sessions {
             return error.InvalidArgument;
     }
     return sessions;
-}
-
-fn parseConvert(args: *spaghet.Args) ParseError!Options.Convert {
-    var convert: Options.Convert = .{};
-    while (args.next()) {
-        if (args.flag(&.{ "-h", "--help" }))
-            convert.help = true;
-        if (args.positional()) |_|
-            return error.InvalidArgument;
-    }
-    return convert;
 }
 
 test "parseArgs" {
@@ -522,16 +489,6 @@ test "parseArgs reads the sessions subcommand on its own" {
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "sessions", "--nope", "x" }));
 }
 
-test "parseArgs reads the convert subcommand on its own" {
-    try expectOptions(.{ .command = .{ .convert = .{} } }, try parseArgsSlice(&.{"convert"}));
-
-    try expectOptions(.{ .command = .{ .convert = .{ .help = true } } }, try parseArgsSlice(&.{ "convert", "-h" }));
-    try expectOptions(.{ .command = .{ .convert = .{ .help = true } } }, try parseArgsSlice(&.{ "convert", "--help" }));
-
-    try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "convert", "extra" }));
-    try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "convert", "--nope", "x" }));
-}
-
 fn expectOptions(expected: Options, actual: Options) !void {
     try std.testing.expectEqual(expected.help, actual.help);
 
@@ -576,7 +533,6 @@ fn expectOptions(expected: Options, actual: Options) !void {
             }
         },
         .sessions => |sessions| try std.testing.expectEqual(sessions.help, actual.command.sessions.help),
-        .convert => |convert| try std.testing.expectEqual(convert.help, actual.command.convert.help),
         .models => |models| {
             const actual_models = actual.command.models;
             try std.testing.expectEqual(models.refresh, actual_models.refresh);
@@ -618,12 +574,6 @@ const help_messages = [_]struct {
     .{
         .invocation = "billy sessions",
         .description = sessions_about,
-        .commands = null,
-        .options = command_options,
-    },
-    .{
-        .invocation = "billy convert",
-        .description = convert_about,
         .commands = null,
         .options = command_options,
     },

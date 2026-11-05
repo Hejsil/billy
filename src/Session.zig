@@ -8,38 +8,9 @@ const ulid = @import("ulid.zig");
 
 const Session = @This();
 
-/// The extension the text format wrote: a name with this on it is one thing only, a file for
-/// `billy convert` to read and then remove.
-const old_extension = ".json";
-
 const max_id_len = 64;
 
 const interrupted_result = "Error: the tool call was interrupted before it produced a result.";
-
-const StoredTool = struct {
-    type: []const u8 = "function",
-    function: Function,
-
-    const Function = struct {
-        name: []const u8 = "",
-        description: []const u8 = "",
-        parameters: std.json.Value = .null,
-    };
-};
-
-const Stored = struct {
-    version: u32 = 3,
-    title: ?[]const u8 = null,
-    system_prompt: ?[]const u8 = null,
-    model: ?[]const u8 = null,
-    messages: []const llm.Message = &.{},
-    compactions: []const u32 = &.{},
-    tools: []const StoredTool = &.{},
-    context_tokens: usize = 0,
-    cwd: ?[]const u8 = null,
-
-    const default = Stored{};
-};
 
 const StringIndex = Pool.Index;
 
@@ -147,96 +118,6 @@ pub fn open(
 
 pub fn create(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: []const u8, start_cwd: []const u8) !Session {
     return try named(io, dir, gpa, named_id, start_cwd);
-}
-
-/// Opens the session a file of the old text format holds, which only `billy convert` writes out again.
-pub fn openOld(
-    io: std.Io,
-    dir: std.Io.Dir,
-    gpa: std.mem.Allocator,
-    session_id: []const u8,
-    start_cwd: []const u8,
-) !Session {
-    var session = try named(io, dir, gpa, session_id, start_cwd);
-    errdefer session.deinit();
-    try session.loadJson();
-    return session;
-}
-
-/// What a run of `billy convert` found and did.
-pub const Converted = struct {
-    converted: usize = 0,
-    skipped: usize = 0,
-    unreadable: usize = 0,
-};
-
-/// Writes out every session in `dir` an older billy kept as text, and removes each file it came
-/// from. One that cannot be read is counted and left alone.
-pub fn convert(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, start_cwd: []const u8) !Converted {
-    var iter_dir = try dir.openDir(io, ".", .{ .iterate = true });
-    defer iter_dir.close(io);
-
-    // The names are read before anything is written, so the walk cannot see the files it makes.
-    var ids: std.ArrayList([]u8) = .empty;
-    defer {
-        for (ids.items) |id_text| gpa.free(id_text);
-        ids.deinit(gpa);
-    }
-    var entries = iter_dir.iterate();
-    while (try entries.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        const stem = oldIdInName(entry.name) orelse continue;
-        try ids.append(gpa, try gpa.dupe(u8, stem));
-    }
-
-    var counted: Converted = .{};
-    for (ids.items) |session_id| {
-        switch (try convertOne(io, dir, gpa, session_id, start_cwd)) {
-            .converted => counted.converted += 1,
-            .skipped => counted.skipped += 1,
-            .unreadable => |err| {
-                std.log.warn("cannot convert the session '{s}': {t}", .{ session_id, err });
-                counted.unreadable += 1;
-            },
-        }
-    }
-    return counted;
-}
-
-const Outcome = union(enum) {
-    converted,
-    skipped,
-    unreadable: anyerror,
-};
-
-fn convertOne(
-    io: std.Io,
-    dir: std.Io.Dir,
-    gpa: std.mem.Allocator,
-    session_id: []const u8,
-    start_cwd: []const u8,
-) !Outcome {
-    var binary_buf: [max_id_len]u8 = undefined;
-    const binary = fileName(session_id, &binary_buf) orelse return error.InvalidSessionId;
-    // A session billy has already written keeps what it has: the text is the older of the two.
-    if (exists(io, dir, binary)) return .skipped;
-
-    var old_buf: [max_id_len + old_extension.len]u8 = undefined;
-    const old_name = oldFileName(session_id, &old_buf) orelse return error.InvalidSessionId;
-
-    var session = openOld(io, dir, gpa, session_id, start_cwd) catch |err| switch (err) {
-        error.OutOfMemory, error.InvalidSessionId => return err,
-        else => return .{ .unreadable = err },
-    };
-    defer session.deinit();
-    const stored = try dir.statFile(io, old_name, .{});
-
-    // The session is written before the text it came from goes, so a run that stops part way leaves it.
-    try session.save();
-    // It keeps the time it was last written at, so a conversion does not reorder the store.
-    try dir.setTimestamps(io, binary, .{ .modify_timestamp = .{ .new = stored.mtime } });
-    try dir.deleteFile(io, old_name);
-    return .converted;
 }
 
 fn named(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: ?[]const u8, start_cwd: []const u8) !Session {
@@ -520,7 +401,7 @@ pub fn save(session: *const Session) !void {
 
 const magic = "BILLYSSN";
 
-/// This version of the format, which is the layout below: the text one is only ever converted.
+/// This version of the format, which is the layout below: a file of another one is not read.
 const format_version: u32 = 1;
 
 /// What a file says of itself before the blocks it counts: how long each of them is, where the
@@ -623,7 +504,7 @@ fn load(session: *Session) !void {
     var name_buf: [max_id_len]u8 = undefined;
     const file_name = fileName(session.id(), &name_buf) orelse return error.InvalidSessionId;
     var file = session.dir.openFile(session.io, file_name, .{}) catch |err| switch (err) {
-        error.FileNotFound => return session.noFile(),
+        error.FileNotFound => return error.SessionNotFound,
         else => return err,
     };
     defer file.close(session.io);
@@ -661,14 +542,6 @@ fn load(session: *Session) !void {
     try session.checkIndices();
     session.dropCompactionsPastTheEnd();
     try session.repairTail();
-}
-
-/// What a missing file means: a session billy never wrote, or one an older billy kept as text.
-fn noFile(session: *const Session) !void {
-    var name_buf: [max_id_len + old_extension.len]u8 = undefined;
-    const old_name = oldFileName(session.id(), &name_buf) orelse return error.SessionNotFound;
-    if (!exists(session.io, session.dir, old_name)) return error.SessionNotFound;
-    return error.SessionInOldFormat;
 }
 
 fn readHeader(reader: *std.Io.Reader, file_len: u64) !Header {
@@ -747,101 +620,6 @@ fn dropCompactionsPastTheEnd(session: *Session) void {
     session.compactions.shrinkRetainingCapacity(kept);
 }
 
-/// Reads the session a file of the old text format holds.
-fn loadJson(session: *Session) !void {
-    var name_buf: [max_id_len + old_extension.len]u8 = undefined;
-    var arena_allocator = std.heap.ArenaAllocator.init(session.gpa);
-    defer arena_allocator.deinit();
-    const arena = arena_allocator.allocator();
-
-    const text = session.dir.readFileAlloc(
-        session.io,
-        oldFileName(session.id(), &name_buf) orelse return error.InvalidSessionId,
-        arena,
-        .unlimited,
-    ) catch |err| switch (err) {
-        error.FileNotFound => return error.SessionNotFound,
-        else => return err,
-    };
-
-    const stored = std.json.parseFromSliceLeaky(Stored, arena, text, .{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_if_needed,
-    }) catch return error.CorruptSession;
-
-    if (stored.version > Stored.default.version)
-        return error.UnsupportedSessionVersion;
-
-    const lead = try session.loadPromptAndMessages(stored.system_prompt, stored.messages);
-    try session.loadCompactions(stored.compactions, lead);
-    try session.loadTools(stored.tools);
-    try session.repairTail();
-
-    if (stored.title) |stored_title|
-        try session.setTitle(stored_title);
-
-    if (stored.model) |stored_model| {
-        // An empty field is a file written without one, so it is left unset and read as the fallback.
-        if (stored_model.len > 0) try session.setModel(stored_model);
-    }
-    session.context_tokens = stored.context_tokens;
-    if (stored.cwd) |stored_cwd|
-        session.interned.cwd = try session.pool.intern(session.gpa, stored_cwd);
-}
-
-fn loadPromptAndMessages(
-    session: *Session,
-    system_prompt: ?[]const u8,
-    messages: []const llm.Message,
-) !usize {
-    var lead: usize = 0;
-    if (system_prompt) |prompt| {
-        try session.setSystemPrompt(prompt);
-    } else {
-        while (lead < messages.len and messages[lead].role == .system) lead += 1;
-        if (lead > 0)
-            try session.setSystemPrompt(messages[0].content orelse "");
-    }
-    for (messages[lead..]) |message| {
-        try session.appendMessage(message);
-    }
-
-    return lead;
-}
-
-fn loadCompactions(session: *Session, stored: []const u32, lead: usize) !void {
-    if (session.messages.items.len == 0) return;
-
-    const last: u32 = @intCast(session.messages.items.len - 1);
-    try session.compactions.ensureTotalCapacity(session.gpa, stored.len);
-    for (stored) |stored_index| {
-        const index = std.math.sub(u32, stored_index, @intCast(lead)) catch 0;
-        // An index past the end names no message to stand in for.
-        if (index > last) continue;
-        session.compactions.appendAssumeCapacity(index);
-    }
-    std.mem.sort(u32, session.compactions.items, {}, std.sort.asc(u32));
-
-    var kept: usize = 0;
-    for (session.compactions.items) |index| {
-        if (kept > 0 and session.compactions.items[kept - 1] == index) continue;
-        session.compactions.items[kept] = index;
-        kept += 1;
-    }
-    session.compactions.shrinkRetainingCapacity(kept);
-}
-
-fn loadTools(session: *Session, stored: []const StoredTool) !void {
-    try session.tools.ensureUnusedCapacity(session.gpa, stored.len);
-    for (stored) |stored_tool| {
-        session.tools.appendAssumeCapacity(.{
-            .name = try session.pool.intern(session.gpa, stored_tool.function.name),
-            .description = try session.pool.intern(session.gpa, stored_tool.function.description),
-            .parameters = try session.internParameters(stored_tool.function.parameters),
-        });
-    }
-}
-
 fn repairTail(session: *Session) !void {
     const hole = session.unanswered() orelse return;
     const tail = hole.tail;
@@ -893,17 +671,6 @@ fn lastCall(session: *const Session) ?usize {
             return i;
     }
     return null;
-}
-
-fn internParameters(session: *Session, value: std.json.Value) !StringIndex {
-    switch (value) {
-        .string => |text| return session.pool.intern(session.gpa, text),
-        else => {
-            const text = try std.json.Stringify.valueAlloc(session.gpa, value, .{});
-            defer session.gpa.free(text);
-            return session.pool.intern(session.gpa, text);
-        },
-    }
 }
 
 /// The tools as JSON: each definition with its arguments schema as the text it is held as.
@@ -1103,35 +870,9 @@ pub fn delete(io: std.Io, dir: std.Io.Dir, session_id: []const u8) !void {
     };
 }
 
-/// Whether `dir` holds a file by that name.
-fn exists(io: std.Io, dir: std.Io.Dir, name: []const u8) bool {
-    _ = dir.statFile(io, name, .{}) catch return false;
-    return true;
-}
-
-/// The name of the file an older billy wrote the session `session_id` as.
-fn oldFileName(session_id: []const u8, buffer: []u8) ?[]const u8 {
-    if (!usableName(session_id)) return null;
-    if (session_id.len + old_extension.len > buffer.len) return null;
-    @memcpy(buffer[0..session_id.len], session_id);
-    @memcpy(buffer[session_id.len..][0..old_extension.len], old_extension);
-    return buffer[0 .. session_id.len + old_extension.len];
-}
-
-/// The id of the session an old text file is named by, or null for a file of any other kind.
-fn oldIdInName(file_name: []const u8) ?[]const u8 {
-    if (!std.mem.endsWith(u8, file_name, old_extension)) return null;
-    const stem = file_name[0 .. file_name.len - old_extension.len];
-    if (!usableName(stem)) return null;
-    return stem;
-}
-
 fn idInName(file_name: []const u8) ?[]const u8 {
-    // A name carrying the old extension is a file to convert rather than a session to show.
-    if (std.mem.endsWith(u8, file_name, old_extension)) return null;
-    const stem = file_name;
-    if (!usableName(stem)) return null;
-    return stem;
+    if (!usableName(file_name)) return null;
+    return file_name;
 }
 
 fn newTestSession(tmp: *std.testing.TmpDir) !Session {
@@ -2418,147 +2159,6 @@ test "a resumed session frees everything it read back" {
     try std.testing.expectEqual(200, resumed.messages.items.len);
     try std.testing.expectEqualStrings("a line of the conversation", resumed.contentOf(resumed.messages.items[199]).?);
     try std.testing.expectEqualStrings("/work", resumed.cwd());
-}
-
-/// A session as the old text format wrote one, holding everything a session can.
-const old_file =
-    \\{"version":3,"title":"An old session","cwd":"/old","system_prompt":"be terse",
-    \\ "model":"deepseek/deepseek-flash",
-    \\ "messages":[{"role":"user","content":"hello"},
-    \\             {"role":"assistant","content":"hi"}],
-    \\ "compactions":[1],
-    \\ "tools":[{"type":"function","function":{"name":"read","description":"Read a file.",
-    \\          "parameters":{"type":"object"}}}],
-    \\ "context_tokens":42}
-;
-
-fn writeOldFile(tmp: *std.testing.TmpDir, session_id: []const u8, data: []const u8) !void {
-    var name_buf: [max_id_len + old_extension.len]u8 = undefined;
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = oldFileName(session_id, &name_buf).?,
-        .data = data,
-    });
-}
-
-test "a session kept as a file of the old format says so rather than nothing" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try writeOldFile(&tmp, "old", old_file);
-
-    // This billy reads no text, so a resume says what to do rather than that there is no session.
-    try std.testing.expectError(error.SessionInOldFormat, reopenTestSession(&tmp, "old"));
-    try std.testing.expectError(error.SessionNotFound, reopenTestSession(&tmp, "nobody"));
-
-    const listed = try Session.list(std.testing.io, tmp.dir, gpa);
-    defer freeList(listed, gpa);
-    try std.testing.expectEqual(0, listed.len);
-}
-
-test "a session of the old format is converted, and the file it came from removed" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try writeOldFile(&tmp, "old", old_file);
-    const counted = try Session.convert(std.testing.io, tmp.dir, gpa, "/work");
-    try std.testing.expectEqual(1, counted.converted);
-    try std.testing.expectEqual(0, counted.skipped);
-    try std.testing.expectEqual(0, counted.unreadable);
-
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "old.json", .{}));
-
-    // What was text is a session now, holding the conversation, the prompt, the model, the tools and
-    // the directory it was started in, none of which billy could read before.
-    var session = try reopenTestSession(&tmp, "old");
-    defer session.deinit();
-    try std.testing.expectEqualStrings("An old session", session.title().?);
-    try std.testing.expectEqualStrings("/old", session.cwd());
-    try std.testing.expectEqualStrings("be terse", session.systemPrompt().?);
-    try std.testing.expectEqualStrings("deepseek/deepseek-flash", session.model().?);
-    try std.testing.expectEqual(@as(usize, 42), session.context_tokens);
-    try std.testing.expectEqual(2, session.messages.items.len);
-    try session.expectSessionConvo(&.{
-        .{ .role = .system, .content = "be terse" },
-        .{ .role = .user, .content = "hello" },
-        .{ .role = .assistant, .content = "hi" },
-    });
-    try std.testing.expectEqual(1, session.compactions.items.len);
-    try std.testing.expectEqual(1, session.tools.items.len);
-    try std.testing.expectEqualStrings(
-        "{\"type\":\"object\"}",
-        session.pool.get(session.tools.items[0].parameters).?,
-    );
-}
-
-test "a converted session keeps the time it was last written at" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try writeOldFile(&tmp, "old", old_file);
-    try tmp.dir.setTimestamps(std.testing.io, "old.json", .{
-        .modify_timestamp = .{ .new = std.Io.Timestamp.fromNanoseconds(1_000 * std.time.ns_per_ms) },
-    });
-
-    _ = try Session.convert(std.testing.io, tmp.dir, gpa, "/work");
-
-    // The session goes on sitting where it did in the store rather than reading as one just written.
-    const stat = try tmp.dir.statFile(std.testing.io, "old", .{});
-    try std.testing.expectEqual(@as(i64, 1_000), stat.mtime.toMilliseconds());
-}
-
-test "a conversion leaves a session billy has already written as it is" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var session = try Session.create(std.testing.io, tmp.dir, gpa, "old", "/work");
-    defer session.deinit();
-    try session.append(.{ .role = .user, .content = "the conversation since" });
-    try writeOldFile(&tmp, "old", old_file);
-
-    // The text is the older of the two, so writing it over the top would take the session back.
-    const counted = try Session.convert(std.testing.io, tmp.dir, gpa, "/work");
-    try std.testing.expectEqual(0, counted.converted);
-    try std.testing.expectEqual(1, counted.skipped);
-    try std.testing.expectEqual(0, counted.unreadable);
-
-    var kept = try reopenTestSession(&tmp, "old");
-    defer kept.deinit();
-    try kept.expectSessionConvo(&.{.{ .role = .user, .content = "the conversation since" }});
-}
-
-test "a file that cannot be converted is counted, and the rest still are" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try writeOldFile(&tmp, "cut-short", "{\"version\":3,\"messages\":[");
-    try writeOldFile(&tmp, "from-the-future", "{\"version\":99,\"messages\":[]}");
-    try writeOldFile(&tmp, "old", old_file);
-
-    const counted = try Session.convert(std.testing.io, tmp.dir, gpa, "/work");
-    try std.testing.expectEqual(1, counted.converted);
-    try std.testing.expectEqual(0, counted.skipped);
-    try std.testing.expectEqual(2, counted.unreadable);
-
-    // A file that could not be read is left where it is, and nothing is written in its name.
-    _ = try tmp.dir.statFile(std.testing.io, "from-the-future.json", .{});
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "from-the-future", .{}));
-}
-
-test "converting a directory of sessions that are all in this format does nothing" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try writeSessionAt(&tmp, std.testing.allocator, "dev", 1_000);
-
-    const counted = try Session.convert(std.testing.io, tmp.dir, std.testing.allocator, "/work");
-    try std.testing.expectEqual(0, counted.converted);
-    try std.testing.expectEqual(0, counted.skipped);
-    try std.testing.expectEqual(0, counted.unreadable);
 }
 
 test "the id a session was opened by is the one it reads back" {

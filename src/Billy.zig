@@ -194,13 +194,6 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resuming: ?Resume) !void {
             std.log.err("'{s}' cannot be used as a session name", .{resume_id.?});
             return report.Reported;
         },
-        error.SessionInOldFormat => {
-            std.log.err(
-                "the session '{s}' is kept in the old format; `billy convert` writes it out",
-                .{resume_id.?},
-            );
-            return report.Reported;
-        },
         else => |other| return other,
     };
     defer session.deinit();
@@ -285,22 +278,6 @@ fn printSessions(out: Terminal.Writer, listed: []const Session.Named) !void {
         const space = if (named.title.len != 0) " " else "";
         try out.print("{s}{s}{s}\n", .{ named.id, space, named.title });
     }
-}
-
-pub fn convertSessions(billy: *Billy, out: Terminal.Writer) !void {
-    const counted = Session.convert(billy.io, billy.dirs.sessions, billy.gpa, billy.cwd) catch |err| {
-        std.log.err("cannot convert the sessions: {t}", .{err});
-        return report.Reported;
-    };
-    if (counted.converted == 0 and counted.skipped == 0 and counted.unreadable == 0) {
-        try out.out.writeAll("no session of the old format to convert\n");
-        return;
-    }
-    try out.print("{d} converted, {d} skipped, {d} unreadable\n", .{
-        counted.converted,
-        counted.skipped,
-        counted.unreadable,
-    });
 }
 
 pub fn serve(billy: *Billy, host: []const u8, port: u16) !void {
