@@ -298,7 +298,7 @@ pub fn serve(billy: *Billy, host: []const u8, port: u16) !void {
         .session_dir = billy.dirs.sessions,
         .http_client = &billy.http_client,
         .cwd = billy.cwd,
-        .environ = billy.environ,
+        .home = billy.environ.get("HOME"),
         .options = try billy.options(arena),
     };
     return server.serve(host, port);

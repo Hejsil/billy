@@ -49,7 +49,7 @@ gpa: std.mem.Allocator,
 session_dir: std.Io.Dir,
 http_client: *std.http.Client,
 cwd: []const u8,
-environ: *const std.process.Environ.Map,
+home: ?[]const u8,
 options: Agent.Options,
 
 pub fn serve(server: *const Server, host: []const u8, port: u16) !void {
@@ -622,7 +622,7 @@ fn writeHeader(server: *const Server, session: *const Session, out: *std.Io.Writ
         .id = session.id(),
         .model = shown.choice,
         .cwd = session.cwd(),
-        .home = server.environ.get("HOME"),
+        .home = server.home,
         .context_tokens = session.context_tokens,
         .model_info = shown.info,
     }, out);
@@ -696,7 +696,6 @@ const TestServer = struct {
     server: Server,
     tmp: std.testing.TmpDir,
     config: *Config,
-    environ: *std.process.Environ.Map,
     health: *Health,
     registry: Registry,
     http: *std.http.Client,
@@ -712,11 +711,6 @@ const TestServer = struct {
         errdefer gpa.destroy(config);
         config.* = Config.init(gpa);
         errdefer config.deinit();
-        const environ = try gpa.create(std.process.Environ.Map);
-        errdefer gpa.destroy(environ);
-        environ.* = .init(gpa);
-        errdefer environ.deinit();
-        try environ.put("HOME", "/home/tester");
         const health = try gpa.create(Health);
         errdefer gpa.destroy(health);
         health.* = try Health.load(std.testing.io, gpa, tmp.dir);
@@ -732,7 +726,6 @@ const TestServer = struct {
         return .{
             .tmp = tmp,
             .config = config,
-            .environ = environ,
             .health = health,
             .registry = .{ .io = std.testing.io, .gpa = gpa },
             .http = http,
@@ -742,7 +735,7 @@ const TestServer = struct {
                 .session_dir = sessions,
                 .http_client = http,
                 .cwd = ".",
-                .environ = environ,
+                .home = "/home/tester",
                 .options = .{
                     .config = config,
                     .credentials = credentials,
@@ -766,8 +759,6 @@ const TestServer = struct {
         std.testing.allocator.destroy(server.server.options.credentials);
         server.config.deinit();
         std.testing.allocator.destroy(server.config);
-        server.environ.deinit();
-        std.testing.allocator.destroy(server.environ);
         server.tmp.cleanup();
     }
 
