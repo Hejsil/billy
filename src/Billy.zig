@@ -150,6 +150,22 @@ pub fn configSet(billy: *Billy, out: Terminal.Writer, path: []const u8, value: [
     try out.print("set {s} to {s}\n", .{ path, value });
 }
 
+/// What a run is given, made once here so the terminal's run and the server's turns read the same.
+fn options(billy: *Billy, arena: std.mem.Allocator) !Agent.Options {
+    return .{
+        .config = &billy.config,
+        .credentials = &billy.credentials,
+        .catalog = &billy.catalog,
+        .behaviour = Agent.Behaviour.fromConfig(&billy.config),
+        .tools = setup.toolSettings(
+            &billy.config,
+            try setup.Backends.build(arena, &billy.config, &billy.credentials),
+            &billy.health,
+        ),
+        .instructions = billy.dirs.config,
+    };
+}
+
 pub const Resume = union(enum) {
     id: []const u8,
     latest,
@@ -185,18 +201,7 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resuming: ?Resume) !void {
     defer run_state.deinit();
     const arena = run_state.allocator();
 
-    const options = Agent.Options{
-        .config = &billy.config,
-        .credentials = &billy.credentials,
-        .catalog = &billy.catalog,
-        .behaviour = Agent.Behaviour.fromConfig(&billy.config),
-        .tools = setup.toolSettings(
-            &billy.config,
-            try setup.Backends.build(arena, &billy.config, &billy.credentials),
-            &billy.health,
-        ),
-        .instructions = billy.dirs.config,
-    };
+    const run_options = try billy.options(arena);
 
     var terminal = Terminal{
         .writer = out,
@@ -209,7 +214,7 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resuming: ?Resume) !void {
     if (resume_id != null) {
         try terminal.printTranscript(&session, billy.config.stored.resume_blocks);
     }
-    try terminal.run(options, &session, &billy.http_client);
+    try terminal.run(run_options, &session, &billy.http_client);
 }
 
 fn resumeId(billy: *Billy, resuming: ?Resume) !?[]const u8 {
@@ -291,15 +296,10 @@ pub fn serve(billy: *Billy, host: []const u8, port: u16) !void {
         .io = billy.io,
         .gpa = billy.gpa,
         .session_dir = billy.dirs.sessions,
-        .config_dir = billy.dirs.config,
-        .config = &billy.config,
-        .catalog = &billy.catalog,
-        .credentials = billy.credentials,
-        .health = &billy.health,
         .http_client = &billy.http_client,
         .cwd = billy.cwd,
         .environ = billy.environ,
-        .backends = try setup.Backends.build(arena, &billy.config, &billy.credentials),
+        .options = try billy.options(arena),
     };
     return server.serve(host, port);
 }

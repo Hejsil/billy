@@ -47,26 +47,10 @@ const max_connections = 64;
 io: std.Io,
 gpa: std.mem.Allocator,
 session_dir: std.Io.Dir,
-config_dir: std.Io.Dir,
-config: *const Config,
-catalog: *const models.Catalog,
-credentials: Credentials,
-health: *Health,
 http_client: *std.http.Client,
 cwd: []const u8,
 environ: *const std.process.Environ.Map,
-backends: setup.Backends,
-
-fn options(server: *const Server) Agent.Options {
-    return .{
-        .config = server.config,
-        .credentials = &server.credentials,
-        .catalog = server.catalog,
-        .behaviour = Agent.Behaviour.fromConfig(server.config),
-        .tools = setup.toolSettings(server.config, server.backends, server.health),
-        .instructions = server.config_dir,
-    };
-}
+options: Agent.Options,
 
 pub fn serve(server: *const Server, host: []const u8, port: u16) !void {
     const address = listenAddress(host, port) catch |err| {
@@ -389,7 +373,7 @@ fn writeSession(
 
     var blocks: std.Io.Writer.Allocating = .init(gpa);
     defer blocks.deinit();
-    try html.conversation(gpa, &session, server.config.stored.web_blocks, &blocks.writer);
+    try html.conversation(gpa, &session, server.options.config.stored.web_blocks, &blocks.writer);
 
     try writeOpened(out, header.written(), blocks.written());
     return true;
@@ -562,7 +546,7 @@ fn createSession(r: *Request, registry: *Registry) !void {
     if (parsed.value.text.len == 0)
         return r.reply(.text, "the prompt is empty\n", .bad_request);
 
-    try serveTurn(r, &session, r.server.options(), parsed.value.text, .announce);
+    try serveTurn(r, &session, r.server.options, parsed.value.text, .announce);
 }
 
 fn askSession(r: *Request, registry: *Registry, id: []const u8) !void {
@@ -577,7 +561,7 @@ fn askSession(r: *Request, registry: *Registry, id: []const u8) !void {
     var session = (try r.open(id)) orelse return;
     defer session.deinit();
 
-    try serveTurn(r, &session, r.server.options(), parsed.value.text, .quiet);
+    try serveTurn(r, &session, r.server.options, parsed.value.text, .quiet);
 }
 
 const Announce = enum { announce, quiet };
@@ -633,7 +617,7 @@ fn serveTurn(
 }
 
 fn writeHeader(server: *const Server, session: *const Session, out: *std.Io.Writer) !void {
-    const shown = Agent.sessionModelChoice(server.catalog, session, server.config.stored.model);
+    const shown = Agent.sessionModelChoice(server.options.catalog, session, server.options.config.stored.model);
     try html.header(.{
         .id = session.id(),
         .model = shown.choice,
@@ -737,6 +721,9 @@ const TestServer = struct {
         errdefer gpa.destroy(health);
         health.* = try Health.load(std.testing.io, gpa, tmp.dir);
         errdefer health.deinit();
+        const credentials = try gpa.create(Credentials);
+        errdefer gpa.destroy(credentials);
+        credentials.* = .{};
         const http = try gpa.create(std.http.Client);
         errdefer gpa.destroy(http);
         http.* = .{ .allocator = gpa, .io = std.testing.io };
@@ -753,15 +740,18 @@ const TestServer = struct {
                 .io = std.testing.io,
                 .gpa = gpa,
                 .session_dir = sessions,
-                .config_dir = tmp.dir,
-                .config = config,
-                .catalog = &models.test_catalog,
-                .credentials = .{},
-                .health = health,
                 .http_client = http,
                 .cwd = ".",
                 .environ = environ,
-                .backends = .{ .search = null, .fetch = null },
+                .options = .{
+                    .config = config,
+                    .credentials = credentials,
+                    .catalog = &models.test_catalog,
+                    .behaviour = Agent.Behaviour.fromConfig(config),
+                    // No web tools at all, so a test that reaches for one fails rather than asks.
+                    .tools = setup.toolSettings(config, .{ .search = null, .fetch = null }, health),
+                    .instructions = tmp.dir,
+                },
             },
         };
     }
@@ -773,6 +763,7 @@ const TestServer = struct {
         server.server.session_dir.close(std.testing.io);
         server.health.deinit();
         std.testing.allocator.destroy(server.health);
+        std.testing.allocator.destroy(server.server.options.credentials);
         server.config.deinit();
         std.testing.allocator.destroy(server.config);
         server.environ.deinit();
