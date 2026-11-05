@@ -6,7 +6,8 @@ const Health = @import("Health.zig");
 const http = @import("http.zig");
 const Mock = @import("Mock.zig");
 
-pub const Role = enum {
+/// The part a message plays, held as a u32 because a stored message is read back as its own bytes.
+pub const Role = enum(u32) {
     system,
     user,
     assistant,

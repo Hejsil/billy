@@ -1,5 +1,4 @@
-//! Sessions: the conversation persisted under the XDG data directory so that a later run can pick
-//! up where the previous one stopped.
+//! Sessions: the conversation kept under the XDG data directory for a later run to pick up.
 
 const std = @import("std");
 
@@ -9,7 +8,9 @@ const ulid = @import("ulid.zig");
 
 const Session = @This();
 
-const extension = ".json";
+/// The extension the text format wrote: a name with this on it is one thing only, a file for
+/// `billy convert` to read and then remove.
+const old_extension = ".json";
 
 const max_id_len = 64;
 
@@ -44,14 +45,13 @@ const StringIndex = Pool.Index;
 
 const Interned = struct {
     id: StringIndex = .none,
-    name: StringIndex = .none,
     cwd: StringIndex = .none,
     system_prompt: StringIndex = .none,
     title: StringIndex = .none,
     model: StringIndex = .none,
 };
 
-const ToolCallIndex = struct {
+const ToolCallIndex = extern struct {
     start: u32,
     len: u32,
 
@@ -62,12 +62,12 @@ const ToolCallIndex = struct {
     }
 };
 
-const ToolCall = struct {
+const ToolCall = extern struct {
     id: StringIndex,
     type: StringIndex,
     function: Function,
 
-    const Function = struct {
+    const Function = extern struct {
         name: StringIndex,
         arguments: StringIndex,
     };
@@ -84,7 +84,7 @@ const ToolCall = struct {
     }
 };
 
-pub const Message = struct {
+pub const Message = extern struct {
     role: llm.Role,
     content: StringIndex = .none,
     tool_call_id: StringIndex = .none,
@@ -109,7 +109,7 @@ pub const Message = struct {
     }
 };
 
-pub const Tool = struct {
+pub const Tool = extern struct {
     name: StringIndex,
     description: StringIndex,
     parameters: StringIndex,
@@ -130,7 +130,7 @@ tool_calls: std.ArrayList(ToolCall) = .empty,
 messages: std.ArrayList(Message) = .empty,
 compactions: std.ArrayList(u32) = .empty,
 tools: std.ArrayList(Tool) = .empty,
-context_tokens: usize = 0,
+context_tokens: u64 = 0,
 
 pub fn open(
     io: std.Io,
@@ -149,6 +149,96 @@ pub fn create(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: []c
     return try named(io, dir, gpa, named_id, start_cwd);
 }
 
+/// Opens the session a file of the old text format holds, which only `billy convert` writes out again.
+pub fn openOld(
+    io: std.Io,
+    dir: std.Io.Dir,
+    gpa: std.mem.Allocator,
+    session_id: []const u8,
+    start_cwd: []const u8,
+) !Session {
+    var session = try named(io, dir, gpa, session_id, start_cwd);
+    errdefer session.deinit();
+    try session.loadJson();
+    return session;
+}
+
+/// What a run of `billy convert` found and did.
+pub const Converted = struct {
+    converted: usize = 0,
+    skipped: usize = 0,
+    unreadable: usize = 0,
+};
+
+/// Writes out every session in `dir` an older billy kept as text, and removes each file it came
+/// from. One that cannot be read is counted and left alone.
+pub fn convert(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, start_cwd: []const u8) !Converted {
+    var iter_dir = try dir.openDir(io, ".", .{ .iterate = true });
+    defer iter_dir.close(io);
+
+    // The names are read before anything is written, so the walk cannot see the files it makes.
+    var ids: std.ArrayList([]u8) = .empty;
+    defer {
+        for (ids.items) |id_text| gpa.free(id_text);
+        ids.deinit(gpa);
+    }
+    var entries = iter_dir.iterate();
+    while (try entries.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const stem = oldIdInName(entry.name) orelse continue;
+        try ids.append(gpa, try gpa.dupe(u8, stem));
+    }
+
+    var counted: Converted = .{};
+    for (ids.items) |session_id| {
+        switch (try convertOne(io, dir, gpa, session_id, start_cwd)) {
+            .converted => counted.converted += 1,
+            .skipped => counted.skipped += 1,
+            .unreadable => |err| {
+                std.log.warn("cannot convert the session '{s}': {t}", .{ session_id, err });
+                counted.unreadable += 1;
+            },
+        }
+    }
+    return counted;
+}
+
+const Outcome = union(enum) {
+    converted,
+    skipped,
+    unreadable: anyerror,
+};
+
+fn convertOne(
+    io: std.Io,
+    dir: std.Io.Dir,
+    gpa: std.mem.Allocator,
+    session_id: []const u8,
+    start_cwd: []const u8,
+) !Outcome {
+    var binary_buf: [max_id_len]u8 = undefined;
+    const binary = fileName(session_id, &binary_buf) orelse return error.InvalidSessionId;
+    // A session billy has already written keeps what it has: the text is the older of the two.
+    if (exists(io, dir, binary)) return .skipped;
+
+    var old_buf: [max_id_len + old_extension.len]u8 = undefined;
+    const old_name = oldFileName(session_id, &old_buf) orelse return error.InvalidSessionId;
+
+    var session = openOld(io, dir, gpa, session_id, start_cwd) catch |err| switch (err) {
+        error.OutOfMemory, error.InvalidSessionId => return err,
+        else => return .{ .unreadable = err },
+    };
+    defer session.deinit();
+    const stored = try dir.statFile(io, old_name, .{});
+
+    // The session is written before the text it came from goes, so a run that stops part way leaves it.
+    try session.save();
+    // It keeps the time it was last written at, so a conversion does not reorder the store.
+    try dir.setTimestamps(io, binary, .{ .modify_timestamp = .{ .new = stored.mtime } });
+    try dir.deleteFile(io, old_name);
+    return .converted;
+}
+
 fn named(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: ?[]const u8, start_cwd: []const u8) !Session {
     var session: Session = .{ .io = io, .dir = dir, .gpa = gpa };
     errdefer session.deinit();
@@ -160,14 +250,10 @@ fn named(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, named_id: ?[]const
         ulid.generate(io, id_buf[0..ulid.length]);
         break :made id_buf[0..ulid.length];
     };
+    // The id goes in first, so it is the pool's first string: the one place a file need not name.
     session.interned.id = try session.pool.intern(gpa, id_text);
 
-    var name_buf: [max_id_len + extension.len]u8 = undefined;
-    const file_name = try std.mem.print(&name_buf, "{s}{s}", .{ id_text, extension });
-    session.interned.name = try session.pool.intern(gpa, file_name);
-
-    // The session owns its directory rather than pointing into the caller's memory, which it may
-    // outlive.
+    // The session owns its directory rather than pointing into memory it may outlive.
     session.interned.cwd = try session.pool.intern(gpa, start_cwd);
     return session;
 }
@@ -184,16 +270,11 @@ pub fn id(session: *const Session) []const u8 {
     return session.pool.get(session.interned.id) orelse "";
 }
 
-pub fn name(session: *const Session) []const u8 {
-    return session.pool.get(session.interned.name) orelse "";
-}
-
 pub fn cwd(session: *const Session) []const u8 {
     return session.pool.get(session.interned.cwd) orelse "";
 }
 
-/// The conversation as a completion request carries it: the `messages` array of a request body,
-/// written straight out of the pool.
+/// The conversation as a request carries it: its `messages`, written straight out of the pool.
 pub const Conversation = struct {
     session: *const Session,
     extra: []const llm.Message = &.{},
@@ -253,8 +334,7 @@ pub fn conversation(session: *const Session, extra: []const llm.Message) Convers
     return .{ .session = session, .extra = extra };
 }
 
-/// The first message a compaction leaves out of a request: the summary the last compaction
-/// produced, or zero for a conversation that has never been compacted.
+/// Where a request starts: the summary the last compaction produced, or zero if there was none.
 pub fn sentFrom(session: *const Session) usize {
     if (session.compactions.items.len == 0) return 0;
     return session.compactions.items[session.compactions.items.len - 1];
@@ -312,8 +392,7 @@ pub fn toolResult(session: *const Session, from: usize, call: []const u8) []cons
     return "";
 }
 
-/// The conversation as plain API messages, every string resolved out of the pool: the system
-/// prompt, when there is one, and then the whole conversation.
+/// The conversation as plain API messages, resolved out of the pool, the system prompt first.
 pub fn resolvedMessages(session: *const Session, allocator: std.mem.Allocator) ![]const llm.Message {
     const lead: usize = if (session.systemPrompt() != null) 1 else 0;
     const messages = try allocator.alloc(llm.Message, lead + session.messages.items.len);
@@ -329,16 +408,11 @@ pub fn resolvedMessages(session: *const Session, allocator: std.mem.Allocator) !
     return messages;
 }
 
-/// Adds a message to the conversation, and writes the session out once it is a
-/// conversation again: a request can be built from what is on disk, which is what
-/// makes the file worth having.
+/// Adds a message, and writes the session out once a request could be built from what is on disk.
 pub fn append(session: *Session, message: llm.Message) !void {
     try session.appendMessage(message);
-    // A turn adds the assistant message with the calls it asks for, and then a
-    // result for each: between the two the conversation asks for what it has no
-    // answer to, which no request can be built from. Writing that state out would
-    // leave a file that is only good for `repairTail`, so the file is written
-    // where the conversation is whole instead.
+    // A turn adds the calls, then a result for each: between the two no request can be built, so
+    // the file waits for where the conversation is whole.
     if (session.unanswered() == null) try session.save();
 }
 
@@ -378,8 +452,7 @@ fn appendMessage(session: *Session, message: llm.Message) !void {
     });
 }
 
-/// Records `system_prompt` as what every request opens with, replacing any prompt the session
-/// already had.
+/// Records `system_prompt` as what every request opens with, in place of any prompt it had.
 pub fn setSystemPrompt(session: *Session, system_prompt: []const u8) !void {
     session.interned.system_prompt = try session.pool.intern(session.gpa, system_prompt);
 }
@@ -396,8 +469,7 @@ pub fn model(session: *const Session) ?[]const u8 {
     return session.pool.get(session.interned.model);
 }
 
-/// The choice to send the session to: its own model, or `fallback` for a session saved before one
-/// was recorded -- the choice billy is configured with, which is where it was being sent anyway.
+/// The choice to send the session to: its own model, or `fallback` for one saved without it.
 pub fn modelChoice(session: *const Session, fallback: []const u8) []const u8 {
     return session.model() orelse fallback;
 }
@@ -425,14 +497,13 @@ pub fn ensureTools(session: *Session, definitions: []const Definition) !void {
     try session.setTools(definitions);
 }
 
-/// Remembers how full the context window is: the size of the conversation the last request was
-/// sent.
+/// Remembers how full the context window is: the size of the conversation last sent.
 pub fn recordUsage(session: *Session, usage: llm.Usage) void {
     session.context_tokens = usage.total_tokens;
 }
 
 pub fn save(session: *const Session) !void {
-    var atomic = try session.dir.createFileAtomic(session.io, session.name(), .{
+    var atomic = try session.dir.createFileAtomic(session.io, session.id(), .{
         .replace = true,
     });
     defer atomic.deinit(session.io);
@@ -445,65 +516,247 @@ pub fn save(session: *const Session) !void {
     try atomic.replace(session.io);
 }
 
-pub fn write(session: *const Session, writer: *std.Io.Writer) !void {
-    var json: std.json.Stringify = .{
-        .writer = writer,
-        .options = .{ .emit_null_optional_fields = false },
-    };
+// ---------------------------------------------------------------- the file itself
 
-    try json.beginObject();
+const magic = "BILLYSSN";
 
-    try json.objectField("version");
-    try json.write(Stored.default.version);
+/// This version of the format, which is the layout below: the text one is only ever converted.
+const format_version: u32 = 1;
 
-    if (session.title()) |stored_title| {
-        try json.objectField("title");
-        try json.write(stored_title);
+/// What a file says of itself before the blocks it counts: how long each of them is, where the
+/// strings a listing shows sit, and how long it is.
+const Header = extern struct {
+    magic: [magic.len]u8 = magic.*,
+    version: u32 = format_version,
+    header_len: u32 = @sizeOf(Header),
+    context_tokens: u64 = 0,
+    strings_len: u64 = 0,
+    tools_len: u64 = 0,
+    messages_len: u64 = 0,
+    tool_calls_len: u64 = 0,
+    compactions_len: u64 = 0,
+    file_len: u64 = 0,
+    title: StringIndex = .none,
+    system_prompt: StringIndex = .none,
+    model: StringIndex = .none,
+    cwd: StringIndex = .none,
+    /// Held at nothing: a header with a gap would write the gap, which is a stack's bytes, not ours.
+    reserved: u64 = 0,
+
+    fn bodyLen(header: Header) u64 {
+        return header.strings_len +
+            header.tools_len * @sizeOf(Tool) +
+            header.messages_len * @sizeOf(Message) +
+            header.tool_calls_len * @sizeOf(ToolCall) +
+            header.compactions_len * @sizeOf(u32);
     }
+};
 
-    // The directory the session was started in is written here, with the title, because it is the
-    // other field something asks a session file for without reading it: `latest` walks the files
-    // looking for the one started in this directory, and a field at the end costs every
-    // conversation in the store to answer a question about one of them.
-    try json.objectField("cwd");
-    try json.write(session.cwd());
+const header_len = @sizeOf(Header);
 
-    if (session.systemPrompt()) |prompt| {
-        try json.objectField("system_prompt");
-        try json.write(prompt);
-    }
+/// What a session file is read through: room for any field, and a page of a file at a time.
+const read_buffer = 8 * 1024;
 
-    if (session.model()) |recorded| {
-        try json.objectField("model");
-        try json.write(recorded);
-    }
-
-    try json.objectField("messages");
-    try json.beginArray();
-    for (session.messages.items) |message|
-        try session.writeMessage(&json, message);
-    try json.endArray();
-
-    try json.objectField("compactions");
-    try json.write(session.compactions.items);
-
-    try json.objectField("tools");
-    try json.write(session.toolSet());
-
-    try json.objectField("context_tokens");
-    try json.write(session.context_tokens);
-
-    try json.endObject();
+// A file is the structs a session is held as: what fails here is what says to bump `format_version`.
+comptime {
+    fixedSize(Header, 96);
+    fixedSize(Tool, 12);
+    fixedSize(Message, 24);
+    fixedSize(ToolCall, 16);
+    fixedPacking(Header);
+    fixedPacking(Tool);
+    fixedPacking(Message);
+    fixedPacking(ToolCall);
+    fixedOffset(Header, "context_tokens", 16);
+    fixedOffset(Header, "strings_len", 24);
+    fixedOffset(Header, "file_len", 64);
+    fixedOffset(Header, "title", 72);
+    fixedOffset(Header, "cwd", 84);
+    fixedOffset(Header, "reserved", 88);
+    fixedOffset(Message, "role", 0);
+    fixedOffset(Message, "tool_calls", 16);
 }
 
+fn fixedPacking(T: type) void {
+    var held: usize = 0;
+    inline for (@typeInfo(T).@"struct".field_types) |Field| held += @sizeOf(Field);
+    if (held != @sizeOf(T)) @compileError("format_version: " ++ @typeName(T) ++ " has a gap the file cannot hold");
+}
+
+fn fixedSize(T: type, comptime len: usize) void {
+    if (@sizeOf(T) != len) @compileError("format_version: " ++ @typeName(T) ++ " is no longer the size it was written at");
+}
+
+fn fixedOffset(T: type, comptime field: []const u8, comptime at: usize) void {
+    if (@offsetOf(T, field) != at) @compileError("format_version: " ++ @typeName(T) ++ "." ++ field ++ " no longer sits where it was written");
+}
+
+/// Writes the session as the header and the blocks it counts, each the bytes it is held as.
+pub fn write(session: *const Session, writer: *std.Io.Writer) !void {
+    var header: Header = .{
+        .context_tokens = session.context_tokens,
+        .strings_len = session.pool.strings.items.len,
+        .tools_len = session.tools.items.len,
+        .messages_len = session.messages.items.len,
+        .tool_calls_len = session.tool_calls.items.len,
+        .compactions_len = session.compactions.items.len,
+        .title = session.interned.title,
+        .system_prompt = session.interned.system_prompt,
+        .model = session.interned.model,
+        .cwd = session.interned.cwd,
+    };
+    header.file_len = header_len + Header.bodyLen(header);
+
+    var blocks = [_][]const u8{
+        std.mem.asBytes(&header),
+        session.pool.strings.items,
+        std.mem.sliceAsBytes(session.tools.items),
+        std.mem.sliceAsBytes(session.messages.items),
+        std.mem.sliceAsBytes(session.tool_calls.items),
+        std.mem.sliceAsBytes(session.compactions.items),
+    };
+    try writer.writeVecAll(&blocks);
+}
+
+/// Reads the session a file holds, block by block, into where the session keeps it.
 fn load(session: *Session) !void {
+    var name_buf: [max_id_len]u8 = undefined;
+    const file_name = fileName(session.id(), &name_buf) orelse return error.InvalidSessionId;
+    var file = session.dir.openFile(session.io, file_name, .{}) catch |err| switch (err) {
+        error.FileNotFound => return session.noFile(),
+        else => return err,
+    };
+    defer file.close(session.io);
+
+    var read_buf: [read_buffer]u8 = undefined;
+    var file_reader = file.reader(session.io, &read_buf);
+    const reader = &file_reader.interface;
+
+    const header = try readHeader(reader, try file_reader.getSize());
+    try session.pool.strings.resize(session.gpa, @intCast(header.strings_len));
+    try session.tools.resize(session.gpa, @intCast(header.tools_len));
+    try session.messages.resize(session.gpa, @intCast(header.messages_len));
+    try session.tool_calls.resize(session.gpa, @intCast(header.tool_calls_len));
+    try session.compactions.resize(session.gpa, @intCast(header.compactions_len));
+
+    var blocks = [_][]u8{
+        session.pool.strings.items,
+        std.mem.sliceAsBytes(session.tools.items),
+        std.mem.sliceAsBytes(session.messages.items),
+        std.mem.sliceAsBytes(session.tool_calls.items),
+        std.mem.sliceAsBytes(session.compactions.items),
+    };
+    reader.readVecAll(&blocks) catch |err| switch (err) {
+        // The header counted this file's length already, so a short block is a file that changed.
+        error.EndOfStream => return error.CorruptSession,
+        else => |other| return other,
+    };
+
+    session.interned.title = header.title;
+    session.interned.system_prompt = header.system_prompt;
+    session.interned.model = header.model;
+    session.interned.cwd = header.cwd;
+    session.context_tokens = header.context_tokens;
+
+    try session.checkIndices();
+    session.dropCompactionsPastTheEnd();
+    try session.repairTail();
+}
+
+/// What a missing file means: a session billy never wrote, or one an older billy kept as text.
+fn noFile(session: *const Session) !void {
+    var name_buf: [max_id_len + old_extension.len]u8 = undefined;
+    const old_name = oldFileName(session.id(), &name_buf) orelse return error.SessionNotFound;
+    if (!exists(session.io, session.dir, old_name)) return error.SessionNotFound;
+    return error.SessionInOldFormat;
+}
+
+fn readHeader(reader: *std.Io.Reader, file_len: u64) !Header {
+    const bytes = reader.take(header_len) catch return error.CorruptSession;
+    return readHeaderBytes(bytes, file_len);
+}
+
+/// The header a file opens with, refused when it is of another kind or of a later version.
+fn readHeaderBytes(bytes: []const u8, file_len: u64) !Header {
+    if (bytes.len < header_len) return error.CorruptSession;
+
+    var header: Header = undefined;
+    @memcpy(std.mem.asBytes(&header), bytes[0..header_len]);
+    if (!std.mem.eql(u8, &header.magic, magic)) return error.CorruptSession;
+    if (header.header_len != header_len) return error.CorruptSession;
+    if (header.version > format_version) return error.UnsupportedSessionVersion;
+    // A file says how long it is, so one cut short, or whose counts do not add up, is refused first.
+    if (header.file_len != file_len) return error.CorruptSession;
+    if (header_len + Header.bodyLen(header) != file_len) return error.CorruptSession;
+    return header;
+}
+
+/// Whether every message holds a role the API names, read through its backing integer.
+fn checkRoles(messages: []const Message) !void {
+    for (messages) |*message| {
+        const stored: *const u32 = @ptrCast(&message.role);
+        if (std.enums.fromInt(llm.Role, stored.*) == null) return error.CorruptSession;
+    }
+}
+
+/// Whether every index a session holds names a string and every range names tool calls.
+fn checkIndices(session: *Session) !void {
+    // A string is found by the NUL that ends it, so a pool not ending in one could run off its end.
+    const strings = session.pool.strings.items;
+    if (strings.len > 0 and strings[strings.len - 1] != 0) return error.CorruptSession;
+
+    try session.checkStrings(Interned, session.interned);
+    for (session.tools.items) |tool| try session.checkStrings(Tool, tool);
+    for (session.messages.items) |message| {
+        try session.checkStrings(Message, message);
+        const calls = message.tool_calls;
+        if (@as(u64, calls.start) + calls.len > session.tool_calls.items.len) return error.CorruptSession;
+    }
+    for (session.tool_calls.items) |call| try session.checkStrings(ToolCall, call);
+    try checkRoles(session.messages.items);
+}
+
+/// Checks every string index `value` holds, at whatever depth it sits.
+fn checkStrings(session: *Session, T: type, value: T) !void {
+    if (T == StringIndex) return session.checkString(value);
+    switch (@typeInfo(T)) {
+        .@"struct" => |info| inline for (info.field_names, info.field_types) |name, Field| {
+            try session.checkStrings(Field, @field(value, name));
+        },
+        else => {},
+    }
+}
+
+/// Whether `index` names a string: one past the pool, or inside another, names none.
+fn checkString(session: *Session, index: Pool.Index) !void {
+    if (index == .none) return;
+    const strings = session.pool.strings.items;
+    const start = @backingInt(index);
+    if (start >= strings.len) return error.CorruptSession;
+    if (start != 0 and strings[start - 1] != 0) return error.CorruptSession;
+}
+
+/// A compaction names the message it summed up, and one past the last message names none.
+fn dropCompactionsPastTheEnd(session: *Session) void {
+    var kept: usize = 0;
+    for (session.compactions.items) |index| {
+        if (index >= session.messages.items.len) continue;
+        session.compactions.items[kept] = index;
+        kept += 1;
+    }
+    session.compactions.shrinkRetainingCapacity(kept);
+}
+
+/// Reads the session a file of the old text format holds.
+fn loadJson(session: *Session) !void {
+    var name_buf: [max_id_len + old_extension.len]u8 = undefined;
     var arena_allocator = std.heap.ArenaAllocator.init(session.gpa);
     defer arena_allocator.deinit();
     const arena = arena_allocator.allocator();
 
     const text = session.dir.readFileAlloc(
         session.io,
-        session.name(),
+        oldFileName(session.id(), &name_buf) orelse return error.InvalidSessionId,
         arena,
         .unlimited,
     ) catch |err| switch (err) {
@@ -528,8 +781,7 @@ fn load(session: *Session) !void {
         try session.setTitle(stored_title);
 
     if (stored.model) |stored_model| {
-        // An empty field is a file written without one rather than a session sent to no model, so
-        // it is left unset and read as the fallback.
+        // An empty field is a file written without one, so it is left unset and read as the fallback.
         if (stored_model.len > 0) try session.setModel(stored_model);
     }
     session.context_tokens = stored.context_tokens;
@@ -596,8 +848,7 @@ fn repairTail(session: *Session) !void {
     const calls = hole.calls;
     const answered = hole.answered;
 
-    // The calls with no result are answered right after the results the file holds, in the order
-    // the calls were made, so the assistant message is followed by one result per call.
+    // The calls with no result are answered after the results the file holds, in the order made.
     const at = tail + 1 + answered;
     const missing = calls - answered;
     var k: usize = answered;
@@ -611,16 +862,13 @@ fn repairTail(session: *Session) !void {
         try session.messages.insert(session.gpa, at + (k - answered), result);
     }
 
-    // A compaction records where its summary sits by index, and the answers push every message from
-    // `at` on along, so a summary at or past `at` moves with them.
+    // A summary is held by index, and the answers push every message from `at` on, so it moves too.
     for (session.compactions.items) |*index| {
         if (index.* >= at) index.* += @intCast(missing);
     }
 }
 
-/// The calls of the last assistant message that have no result yet, and where
-/// that message is: null when every call it made has been answered, which is the
-/// one state a request can be built from.
+/// The calls of the last assistant message left without a result, and where it is: null if none.
 fn unanswered(session: *const Session) ?Hole {
     const tail = session.lastCall() orelse return null;
     const calls = session.messages.items[tail].tool_calls.len;
@@ -658,8 +906,7 @@ fn internParameters(session: *Session, value: std.json.Value) !StringIndex {
     }
 }
 
-/// The tools as JSON: the definitions written out, each with its arguments schema as the JSON text
-/// it is held as.
+/// The tools as JSON: each definition with its arguments schema as the text it is held as.
 pub const ToolSet = struct {
     session: *const Session,
 
@@ -705,8 +952,7 @@ fn usableName(text: []const u8) bool {
     return !std.mem.allEqual(u8, text, '.');
 }
 
-/// The ids of the sessions in the directory `dir`, the one most recently written to first, each
-/// with its title.
+/// The sessions in `dir`, the one most recently written to first, each with its title.
 pub fn list(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator) ![]Named {
     var iter_dir = try dir.openDir(io, ".", .{ .iterate = true });
     defer iter_dir.close(io);
@@ -714,22 +960,21 @@ pub fn list(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator) ![]Named {
     return listIn(iter_dir, io, gpa);
 }
 
-/// The id of the session in `dir` that was last written to from `start_cwd`, or null when no
-/// session was started there.
+/// The id of the session last written to from `start_cwd`, or null if none was started there.
 pub fn latest(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, start_cwd: []const u8) !?[]const u8 {
     const listed = try list(io, dir, gpa);
     defer freeList(listed, gpa);
 
     for (listed) |listed_session| {
-        var name_buf: [max_id_len + extension.len]u8 = undefined;
+        var name_buf: [max_id_len]u8 = undefined;
         const file_name = fileName(listed_session.id, &name_buf) orelse continue;
         var file = dir.openFile(io, file_name, .{}) catch continue;
         defer file.close(io);
 
-        const stored = cwdFrom(io, gpa, file) catch |err| switch (err) {
+        const stat = file.stat(io) catch continue;
+        const stored = cwdFrom(io, gpa, file, stat.size) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            // A file that cannot be read through is not the session to continue here, and is still
-            // one to resume by its id.
+            // A file that cannot be read through is not the session to continue here.
             else => continue,
         };
         defer if (stored) |text| gpa.free(text);
@@ -740,8 +985,7 @@ pub fn latest(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, start_cwd: []
     return null;
 }
 
-/// One session as a listing shows it: the id that names it, and its title, which is "" for a
-/// session that has not been named.
+/// One session as a listing shows it: the id that names it and its title, "" until it is named.
 pub const Named = struct {
     id: []const u8,
     title: []const u8,
@@ -776,10 +1020,7 @@ fn listIn(dir: std.Io.Dir, io: std.Io, gpa: std.mem.Allocator) ![]Named {
         defer file.close(io);
         const stat = file.stat(io) catch continue;
 
-        const stored_title = readTitle(io, gpa, file) catch |err| switch (err) {
-            error.SyntaxError => continue,
-            else => return err,
-        };
+        const stored_title = readTitle(io, gpa, file, stat.size) catch continue;
         errdefer gpa.free(stored_title);
 
         const owned_id = try gpa.dupe(u8, stem);
@@ -796,72 +1037,38 @@ fn listIn(dir: std.Io.Dir, io: std.Io, gpa: std.mem.Allocator) ![]Named {
     return names.toOwnedSlice(gpa);
 }
 
-const title_read_buffer_len = 1024;
-
-fn cwdFrom(io: std.Io, gpa: std.mem.Allocator, file: std.Io.File) !?[]const u8 {
-    var reader_buf: [std.heap.page_size_min]u8 = undefined;
-    var reader = file.reader(io, &reader_buf);
-
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var j_reader = std.json.Reader.init(gpa, &reader.interface);
-    defer j_reader.deinit();
-
-    if (try j_reader.next() != .object_begin) return null;
-    while (true) {
-        const key = try j_reader.nextAlloc(arena, .alloc_if_needed);
-        const field = switch (key) {
-            .object_end => return null,
-            .string => |text| text,
-            .allocated_string => |text| text,
-            else => return null,
-        };
-        if (std.mem.eql(u8, field, "cwd")) {
-            return switch (try j_reader.nextAlloc(gpa, .alloc_always)) {
-                // `alloc_always` puts the text in memory of the caller's, which the reader's buffer
-                // cannot move under it.
-                .allocated_string => |text| text,
-                else => null,
-            };
-        }
-        try j_reader.skipValue();
-    }
+/// The header of a file, read without what follows it, so a listing costs one small read a file.
+fn readHeaderOf(io: std.Io, file: std.Io.File, file_len: u64) !Header {
+    var bytes: [header_len]u8 = undefined;
+    const read = try file.readPositionalAll(io, &bytes, 0);
+    if (read < header_len) return error.CorruptSession;
+    return readHeaderBytes(&bytes, file_len);
 }
 
-fn readTitle(io: std.Io, gpa: std.mem.Allocator, file: std.Io.File) ![]const u8 {
-    var reader_buf: [std.heap.page_size_min]u8 = undefined;
-    var reader = file.reader(io, &reader_buf);
-    return (try titleFrom(&reader.interface, gpa)) orelse "";
+/// The string `index` names, read from the file without reading the rest of the pool.
+fn readFieldAt(io: std.Io, gpa: std.mem.Allocator, file: std.Io.File, header: Header, index: Pool.Index) !?[]u8 {
+    if (index == .none) return null;
+    const start = @backingInt(index);
+    if (start >= header.strings_len) return error.CorruptSession;
+
+    // A field comes out of a window the size of a buffer: one longer than that is no title or path.
+    var read_buf: [read_buffer]u8 = undefined;
+    var file_reader = file.reader(io, &read_buf);
+    try file_reader.seekTo(header_len + start);
+    const text = file_reader.interface.takeSentinel(0) catch return error.CorruptSession;
+    return try gpa.dupe(u8, text);
 }
 
-fn titleFrom(reader: *std.Io.Reader, gpa: std.mem.Allocator) !?[]u8 {
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+/// The title of the session in `file`, or "" for one that has not been named.
+fn readTitle(io: std.Io, gpa: std.mem.Allocator, file: std.Io.File, file_len: u64) ![]const u8 {
+    const header = try readHeaderOf(io, file, file_len);
+    return (try readFieldAt(io, gpa, file, header, header.title)) orelse try gpa.dupe(u8, "");
+}
 
-    var j_reader = std.json.Reader.init(gpa, reader);
-    defer j_reader.deinit();
-
-    const object_begin = try j_reader.next();
-    if (object_begin != .object_begin) return null;
-
-    const version_key = try j_reader.nextAlloc(arena, .alloc_always);
-    if (version_key != .allocated_string) return null;
-    if (!std.mem.eql(u8, version_key.allocated_string, "version")) return null;
-
-    const version_value = try j_reader.nextAlloc(arena, .alloc_always);
-    if (version_value != .allocated_number) return null;
-
-    const title_key = try j_reader.nextAlloc(arena, .alloc_always);
-    if (title_key != .allocated_string) return null;
-    if (!std.mem.eql(u8, title_key.allocated_string, "title")) return null;
-
-    const title_value = try j_reader.nextAlloc(arena, .alloc_always);
-    if (title_value != .allocated_string) return null;
-
-    return try gpa.dupe(u8, title_value.allocated_string);
+/// The directory the session in `file` was started in, or null when it does not say.
+fn cwdFrom(io: std.Io, gpa: std.mem.Allocator, file: std.Io.File, file_len: u64) !?[]u8 {
+    const header = try readHeaderOf(io, file, file_len);
+    return readFieldAt(io, gpa, file, header, header.cwd);
 }
 
 const Ordering = struct {
@@ -881,12 +1088,14 @@ const Ordering = struct {
 
 fn fileName(session_id: []const u8, buffer: []u8) ?[]const u8 {
     if (!usableName(session_id)) return null;
-    return std.mem.print(buffer, "{s}{s}", .{ session_id, extension }) catch null;
+    if (session_id.len > buffer.len) return null;
+    @memcpy(buffer[0..session_id.len], session_id);
+    return buffer[0..session_id.len];
 }
 
 /// Deletes the session `id` from `dir`, so it is gone for good: billy keeps no trash.
 pub fn delete(io: std.Io, dir: std.Io.Dir, session_id: []const u8) !void {
-    var buffer: [max_id_len + extension.len]u8 = undefined;
+    var buffer: [max_id_len]u8 = undefined;
     const file = fileName(session_id, &buffer) orelse return error.InvalidSessionId;
     dir.deleteFile(io, file) catch |err| switch (err) {
         error.FileNotFound => return error.SessionNotFound,
@@ -894,9 +1103,33 @@ pub fn delete(io: std.Io, dir: std.Io.Dir, session_id: []const u8) !void {
     };
 }
 
+/// Whether `dir` holds a file by that name.
+fn exists(io: std.Io, dir: std.Io.Dir, name: []const u8) bool {
+    _ = dir.statFile(io, name, .{}) catch return false;
+    return true;
+}
+
+/// The name of the file an older billy wrote the session `session_id` as.
+fn oldFileName(session_id: []const u8, buffer: []u8) ?[]const u8 {
+    if (!usableName(session_id)) return null;
+    if (session_id.len + old_extension.len > buffer.len) return null;
+    @memcpy(buffer[0..session_id.len], session_id);
+    @memcpy(buffer[session_id.len..][0..old_extension.len], old_extension);
+    return buffer[0 .. session_id.len + old_extension.len];
+}
+
+/// The id of the session an old text file is named by, or null for a file of any other kind.
+fn oldIdInName(file_name: []const u8) ?[]const u8 {
+    if (!std.mem.endsWith(u8, file_name, old_extension)) return null;
+    const stem = file_name[0 .. file_name.len - old_extension.len];
+    if (!usableName(stem)) return null;
+    return stem;
+}
+
 fn idInName(file_name: []const u8) ?[]const u8 {
-    if (!std.mem.endsWith(u8, file_name, extension)) return null;
-    const stem = file_name[0 .. file_name.len - extension.len];
+    // A name carrying the old extension is a file to convert rather than a session to show.
+    if (std.mem.endsWith(u8, file_name, old_extension)) return null;
+    const stem = file_name;
     if (!usableName(stem)) return null;
     return stem;
 }
@@ -972,7 +1205,7 @@ test "a new session is given a ULID, and nothing is written yet" {
     defer session.deinit();
 
     try std.testing.expect(ulid.isId(session.id()));
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, session.name(), .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, session.id(), .{}));
 }
 
 test "a session can be started for an id that has no file yet" {
@@ -983,7 +1216,7 @@ test "a session can be started for an id that has no file yet" {
     var session = try Session.create(std.testing.io, tmp.dir, gpa, "made-by-hand", "/work");
     defer session.deinit();
     try std.testing.expectEqualStrings("made-by-hand", session.id());
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, session.name(), .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, session.id(), .{}));
 
     try session.append(.{ .role = .user, .content = "hello" });
     var resumed = try reopenTestSession(&tmp, "made-by-hand");
@@ -1041,7 +1274,7 @@ test "a new session is written out by its first message" {
 
     try session.setSystemPrompt("be terse");
     try session.ensureTools(&tools);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, session.name(), .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, session.id(), .{}));
 
     try session.append(.{ .role = .user, .content = "hello" });
 
@@ -1055,6 +1288,96 @@ test "a new session is written out by its first message" {
     try std.testing.expectEqualStrings("hello", resumed.contentOf(resumed.messages.items[0]).?);
 }
 
+test "a session written, read and written again is the same bytes" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try newTestSession(&tmp);
+    defer session.deinit();
+    try session.setTitle("stable");
+    try session.setSystemPrompt("be terse");
+    try session.setModel("deepseek/deepseek-flash");
+    try session.ensureTools(&.{.{ .name = "read", .description = "Read a file.", .parameters = "{}" }});
+    session.recordUsage(.{ .total_tokens = 7 });
+    try session.append(.{ .role = .user, .content = "hello" });
+    try session.append(.{ .role = .assistant, .tool_calls = &.{.{
+        .id = "call_1",
+        .function = .{ .name = "read", .arguments = "{}" },
+    }} });
+    try session.append(.{ .role = .tool, .tool_call_id = "call_1", .content = "the result" });
+    try session.appendCompaction("summarise", "the summary");
+
+    const first = try tmp.dir.readFileAlloc(std.testing.io, session.id(), gpa, .unlimited);
+    defer gpa.free(first);
+
+    // A file is what a session is held as, so reading one and writing it back is no change at all.
+    var resumed = try reopenTestSession(&tmp, session.id());
+    defer resumed.deinit();
+    try resumed.save();
+
+    const second = try tmp.dir.readFileAlloc(std.testing.io, session.id(), gpa, .unlimited);
+    defer gpa.free(second);
+    try std.testing.expectEqualStrings(first, second);
+}
+
+test "a session longer than the buffer it is read through is read back whole" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try newTestSession(&tmp);
+    defer session.deinit();
+    // Written in one go, so both blocks are larger than the buffer the file is read through.
+    for (0..4000) |_| try session.appendMessage(.{ .role = .user, .content = "a line of the conversation" });
+    try session.save();
+
+    var resumed = try reopenTestSession(&tmp, session.id());
+    defer resumed.deinit();
+    try std.testing.expectEqual(4000, resumed.messages.items.len);
+    try std.testing.expectEqualStrings("a line of the conversation", resumed.contentOf(resumed.messages.items[3999]).?);
+}
+
+test "a session is written as its own bytes, and its header counts them" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try newTestSession(&tmp);
+    defer session.deinit();
+    try session.setTitle("a written session");
+    try session.setSystemPrompt("be terse");
+    try session.setModel("deepseek/deepseek-flash");
+    try session.ensureTools(&.{.{ .name = "read", .description = "Read a file.", .parameters = "{}" }});
+    try session.append(.{ .role = .user, .content = "hello" });
+    try session.append(.{ .role = .assistant, .tool_calls = &.{.{
+        .id = "call_1",
+        .function = .{ .name = "read", .arguments = "{\"path\":\"a.zig\"}" },
+    }} });
+    try session.append(.{ .role = .tool, .tool_call_id = "call_1", .content = "the result" });
+
+    const written = try tmp.dir.readFileAlloc(std.testing.io, session.id(), gpa, .unlimited);
+    defer gpa.free(written);
+
+    // A file says what it is, what version it is and how long it is, so another kind, or a cut
+    // short one, is refused before anything is taken out of it.
+    const header = try readHeaderBytes(written[0..header_len], written.len);
+    try std.testing.expectEqual(format_version, header.version);
+    try std.testing.expectEqual(@as(u32, header_len), header.header_len);
+    try std.testing.expectEqual(@as(u64, written.len), header.file_len);
+    try std.testing.expectEqual(@as(u64, 1), header.tools_len);
+    try std.testing.expectEqual(@as(u64, 3), header.messages_len);
+    try std.testing.expectEqual(@as(u64, 1), header.tool_calls_len);
+    try std.testing.expectEqual(@as(u64, 0), header.compactions_len);
+
+    // The strings follow the header and the four blocks follow them, each the bytes it is held as.
+    const strings = session.pool.strings.items;
+    try std.testing.expectEqual(@as(u64, strings.len), header.strings_len);
+    try std.testing.expectEqualStrings(strings, written[header_len..][0..strings.len]);
+    const messages_at = header_len + strings.len + session.tools.items.len * @sizeOf(Tool);
+    const messages = std.mem.sliceAsBytes(session.messages.items);
+    try std.testing.expectEqualStrings(messages, written[messages_at..][0..messages.len]);
+}
+
 test "the file only takes a conversation a request can be built from" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1064,8 +1387,8 @@ test "the file only takes a conversation a request can be built from" {
 
     try session.append(.{ .role = .user, .content = "one" });
 
-    // A call with no result is a conversation no request can be built from, so what
-    // is on disk stays at the last whole state rather than taking it.
+    // A call with no result is a conversation no request can be built from, so the file stays
+    // at the last whole state rather than taking it.
     try session.append(.{ .role = .assistant, .tool_calls = &.{.{
         .id = "call_1",
         .function = .{ .name = "read", .arguments = "{}" },
@@ -1100,20 +1423,37 @@ test "ids made one after another differ" {
 }
 
 fn writeSessionAt(tmp: *std.testing.TmpDir, gpa: std.mem.Allocator, session_id: []const u8, written_ms: i64) !void {
-    try writeFileAt(tmp, gpa, session_id, "{}", written_ms);
+    try writeSessionIn(tmp, gpa, session_id, "/work", written_ms);
 }
 
-fn writeFileAt(
+fn writeSessionIn(
+    tmp: *std.testing.TmpDir,
+    gpa: std.mem.Allocator,
+    session_id: []const u8,
+    session_cwd: []const u8,
+    written_ms: i64,
+) !void {
+    var session = try Session.create(std.testing.io, tmp.dir, gpa, session_id, session_cwd);
+    defer session.deinit();
+    try session.append(.{ .role = .user, .content = "hi" });
+    try session.save();
+    try tmp.dir.setTimestamps(std.testing.io, session_id, .{
+        .modify_timestamp = .{ .new = std.Io.Timestamp.fromNanoseconds(
+            @as(i96, written_ms) * std.time.ns_per_ms,
+        ) },
+    });
+}
+
+fn writeRawAt(
     tmp: *std.testing.TmpDir,
     gpa: std.mem.Allocator,
     session_id: []const u8,
     data: []const u8,
     written_ms: i64,
 ) !void {
-    const file_name = try gpa.print("{s}{s}", .{ session_id, extension });
-    defer gpa.free(file_name);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = data });
-    try tmp.dir.setTimestamps(std.testing.io, file_name, .{
+    _ = gpa;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = session_id, .data = data });
+    try tmp.dir.setTimestamps(std.testing.io, session_id, .{
         .modify_timestamp = .{ .new = std.Io.Timestamp.fromNanoseconds(
             @as(i96, written_ms) * std.time.ns_per_ms,
         ) },
@@ -1141,8 +1481,8 @@ test "the sessions in a directory are listed by when they were written" {
     for (files) |file| try writeSessionAt(&tmp, gpa, file.id, file.written_ms);
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "notes.txt", .data = "x" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad name" ++ extension, .data = "x" });
-    try tmp.dir.createDirPath(std.testing.io, "a-directory" ++ extension);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad name", .data = "x" });
+    try tmp.dir.createDirPath(std.testing.io, "a-directory");
 
     const ids = try listIn(tmp.dir, std.testing.io, std.testing.allocator);
     defer freeList(ids, std.testing.allocator);
@@ -1161,10 +1501,14 @@ test "the directory a session was started in is written at the front" {
     try session.setTitle("a name");
     try session.append(.{ .role = .user, .content = "hi" });
 
-    const text = try tmp.dir.readFileAlloc(std.testing.io, session.name(), std.testing.allocator, .unlimited);
+    const text = try tmp.dir.readFileAlloc(std.testing.io, session.id(), std.testing.allocator, .unlimited);
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.startsWith(u8, text, "{\"version\":3,\"title\":\"a name\",\"cwd\":\"/work\","));
+    // The header says where the directory sits in the pool, and the directory itself follows it.
+    const header = try readHeaderBytes(text[0..header_len], text.len);
+    const stored = try readFieldAt(std.testing.io, std.testing.allocator, try tmp.dir.openFile(std.testing.io, session.id(), .{}), header, header.cwd);
+    defer if (stored) |dir| std.testing.allocator.free(dir);
+    try std.testing.expectEqualStrings("/work", stored.?);
 }
 
 test "the latest session for a directory is the one last written there" {
@@ -1172,22 +1516,18 @@ test "the latest session for a directory is the one last written there" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    const here =
-        \\{"version":3,"messages":[{"role":"user","content":"hello \"there\""}],"cwd":"/work"}
-    ;
-    const elsewhere =
-        \\{"version":3,"messages":[],"cwd":"/other"}
-    ;
-    try writeFileAt(&tmp, gpa, "first", here, 1_000);
-    try writeFileAt(&tmp, gpa, "other", elsewhere, 2_000);
-    try writeFileAt(&tmp, gpa, "second", here, 3_000);
+    try writeSessionIn(&tmp, gpa, "first", "/work", 1_000);
+    try writeSessionIn(&tmp, gpa, "other", "/other", 2_000);
+    try writeSessionIn(&tmp, gpa, "second", "/work", 3_000);
 
     const found = (try latest(std.testing.io, tmp.dir, gpa, "/work")).?;
     defer gpa.free(found);
     try std.testing.expectEqualStrings("second", found);
 
     try std.testing.expect(try latest(std.testing.io, tmp.dir, gpa, "/nowhere") == null);
-    try writeFileAt(&tmp, gpa, "old", "{\"version\":1}", 4_000);
+    var truncated: [header_len - 1]u8 = @splat(0);
+    try writeRawAt(&tmp, gpa, "old", &truncated, 4_000);
+    _ = &truncated;
     const unchanged = (try latest(std.testing.io, tmp.dir, gpa, "/work")).?;
     defer gpa.free(unchanged);
     try std.testing.expectEqualStrings("second", unchanged);
@@ -1198,9 +1538,8 @@ test "the ordering keeps each id with the time it was written at" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    // Six sessions whose id order and write order run opposite ways, so the sort has to move the
-    // times along with the ids rather than reorder one list on its own: the id that was made first
-    // is the one written last, and so is the one that comes first in the listing.
+    // Six sessions whose id order and write order run opposite ways, so the sort has to carry the
+    // times along with the ids rather than reorder one list on its own.
     const count = 6;
     var buffers: [count][max_id_len]u8 = undefined;
     for (0..count) |i| {
@@ -1244,11 +1583,10 @@ test "a file that is not a session is left out without disturbing the order" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    // The unreadable file is written between the others, so wherever the directory yields it, some
-    // session follows it.
+    // The unreadable file is written between the others, so a session follows it wherever it comes.
     try writeSessionAt(&tmp, gpa, "a", 1_000);
     try writeSessionAt(&tmp, gpa, "b", 2_000);
-    try writeFileAt(&tmp, gpa, "broken", "not json at all", 3_000);
+    try writeRawAt(&tmp, gpa, "broken", "not a session at all", 3_000);
     try writeSessionAt(&tmp, gpa, "c", 4_000);
     try writeSessionAt(&tmp, gpa, "d", 5_000);
 
@@ -1273,8 +1611,7 @@ test "a listing carries each session's title" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    const long_title: [title_read_buffer_len + 1]u8 = @splat('y');
-    try std.testing.expect(long_title.len > title_read_buffer_len);
+    const long_title: [4096]u8 = @splat('y');
     var long = try newTestSession(&tmp);
     defer long.deinit();
     try long.setTitle(&long_title);
@@ -1323,34 +1660,70 @@ test "a title is trimmed when it is set, and kept whole however long" {
     try std.testing.expectEqualStrings(&many_euros, session.title().?);
 }
 
-test "the title is read from the front of a session file, unescaped" {
+test "a title is read from the header of the file, and is not the whole of it" {
     const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    // The title sits right after the version, and the reader stops there rather than reading the
-    // rest of the file.
-    try expectTitle(gpa, "Fix it", "{\"version\":3,\"title\":\"Fix it\",\"system_prompt\":\"x\"}");
-    try expectTitle(gpa, "a \"quoted\" \\ title", "{\"version\":3,\"title\":\"a \\\"quoted\\\" \\\\ title\"}");
-    try expectTitle(gpa, "ends with a backslash \\", "{\"version\":3,\"title\":\"ends with a backslash \\\\\",\"messages\":[]}");
-    try expectTitle(gpa, "\"", "{\"version\":3,\"title\":\"\\\"\"}");
-    try expectTitle(gpa, "", "{\"version\":3,\"title\":\"\",\"messages\":[]}");
+    var unnamed = try newTestSession(&tmp);
+    defer unnamed.deinit();
+    try unnamed.append(.{ .role = .user, .content = "hi" });
+    // A session that has not been named has no title in its file at all.
+    try std.testing.expect((try titleOfFile(&tmp, gpa, unnamed.id())) == null);
 
-    try std.testing.expect((try titleOf(gpa, "{\"version\":3,\"system_prompt\":\"be terse\",\"messages\":[]}")) == null);
-    try std.testing.expect((try titleOf(gpa, "{\"version\":3,\"messages\":[]}")) == null);
-    try std.testing.expectError(error.SyntaxError, titleOf(gpa, "not json at all"));
+    var titled = try newTestSession(&tmp);
+    defer titled.deinit();
+    try titled.setTitle("a \"quoted\" \\ title");
+    try titled.append(.{ .role = .user, .content = "hi" });
+    const read = (try titleOfFile(&tmp, gpa, titled.id())).?;
+    defer gpa.free(read);
+    try std.testing.expectEqualStrings("a \"quoted\" \\ title", read);
 
-    const long_title: [4096]u8 = @splat('y');
-    try expectTitle(gpa, &long_title, "{\"version\":3,\"title\":\"" ++ &long_title ++ "\"}");
+    // A file that is not a session is not read as one.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "not-a-session", .data = "not a session at all" });
+    try std.testing.expectError(error.CorruptSession, titleOfFile(&tmp, gpa, "not-a-session"));
 }
 
-fn titleOf(gpa: std.mem.Allocator, front: []const u8) !?[]u8 {
-    var reader: std.Io.Reader = .fixed(front);
-    return try titleFrom(&reader, gpa);
+fn titleOfFile(tmp: *std.testing.TmpDir, gpa: std.mem.Allocator, session_id: []const u8) !?[]u8 {
+    var file = try tmp.dir.openFile(std.testing.io, session_id, .{});
+    defer file.close(std.testing.io);
+    const stat = try file.stat(std.testing.io);
+    const header = try readHeaderOf(std.testing.io, file, stat.size);
+    return try readFieldAt(std.testing.io, gpa, file, header, header.title);
 }
 
-fn expectTitle(gpa: std.mem.Allocator, expected: []const u8, front: []const u8) !void {
-    const got = (try titleOf(gpa, front)).?;
-    defer gpa.free(got);
-    try std.testing.expectEqualStrings(expected, got);
+test "a listing and the latest session are read from the header alone" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.create(std.testing.io, tmp.dir, gpa, "listed", "/work");
+    defer session.deinit();
+    try session.setTitle("a listed session");
+    try session.append(.{ .role = .user, .content = "hello" });
+    try session.save();
+
+    // A role no request could carry: opening refuses the file, so a listing that still shows its
+    // title has read nothing past the header.
+    const written = try tmp.dir.readFileAlloc(std.testing.io, "listed", gpa, .unlimited);
+    defer gpa.free(written);
+    var patched = try gpa.dupe(u8, written);
+    defer gpa.free(patched);
+    const messages_at = header_len + session.pool.strings.items.len + session.tools.items.len * @sizeOf(Tool);
+    std.mem.writeInt(u32, patched[messages_at..][0..4], 99, .little);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "listed", .data = patched });
+
+    const listed = try Session.list(std.testing.io, tmp.dir, gpa);
+    defer freeList(listed, gpa);
+    try std.testing.expectEqual(1, listed.len);
+    try std.testing.expectEqualStrings("listed", listed[0].id);
+    try std.testing.expectEqualStrings("a listed session", listed[0].title);
+
+    const resumed_here = (try Session.latest(std.testing.io, tmp.dir, gpa, "/work")).?;
+    defer gpa.free(resumed_here);
+    try std.testing.expectEqualStrings("listed", resumed_here);
+
+    try std.testing.expectError(error.CorruptSession, reopenTestSession(&tmp, "listed"));
 }
 
 test "setCheckedId rejects names that could escape the session directory" {
@@ -1491,9 +1864,8 @@ test "a repair moves a compaction that sits behind the turn it completes" {
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
 
-    // user, the assistant message, its answer, then the prompt and the summary: the summary the
-    // file recorded at index 3 moves to 4 with the message it names, so a request still starts at
-    // the summary rather than at the prompt.
+    // The summary the file recorded at index 3 moves to 4 with the message it names, so a request
+    // still starts at the summary rather than at the prompt that asked for it.
     try std.testing.expectEqual(@as(usize, 5), resumed.messages.items.len);
     try std.testing.expectEqual(@as(usize, 4), resumed.sentFrom());
     try std.testing.expect(resumed.isCompaction(resumed.sentFrom()));
@@ -1528,9 +1900,8 @@ test "a conversation writes the messages a request would have carried" {
         "{\"role\":\"tool\",\"content\":\"1\\tconst x = 1;\\n\",\"tool_call_id\":\"call_1\"}]";
     try session.expectRequestJson(&.{}, expected);
 
-    // Writing the stored conversation has to give the bytes the resolved one does, field for field
-    // and in the same order, or a resumed session would send a request that misses its prompt
-    // cache.
+    // The stored conversation has to write the bytes the resolved one does, or a resumed session
+    // would send a request that misses its prompt cache.
     const resolved = try session.resolvedMessages(gpa);
     defer freeResolved(gpa, resolved);
     const via_messages = try std.json.Stringify.valueAlloc(gpa, resolved, .{ .emit_null_optional_fields = false });
@@ -1568,34 +1939,8 @@ test "a string that is not valid UTF-8 is repaired on the way into the pool" {
 
     try session.expectRequestJson(&.{}, "[{\"role\":\"tool\",\"content\":\"a\u{FFFD}b\u{FFFD}c\",\"tool_call_id\":\"call_1\"}]");
 
-    // The repaired text is what the session keeps, so a resume reads it back the same rather than
-    // the bytes that could not be sent.
+    // The repaired text is what the session keeps, so a resume reads back what could be sent.
     try std.testing.expectEqualStrings("a\u{FFFD}b\u{FFFD}c", session.contentOf(session.messages.items[0]).?);
-}
-
-test "a message a session read back with bytes that are not UTF-8 is repaired" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "bytes.json",
-        .data = "{\"version\":2,\"messages\":[{\"role\":\"tool\"," ++
-            "\"content\":[97,255,98],\"tool_call_id\":\"call_1\"}]}",
-    });
-
-    var session = try reopenTestSession(&tmp, "bytes");
-    defer session.deinit();
-
-    try std.testing.expectEqualStrings("a\u{FFFD}b", session.contentOf(session.messages.items[0]).?);
-
-    // Saving it back writes the content as a string, so the bytes are gone for good and the file is
-    // one a later resume reads as text.
-    try session.save();
-    const text = try tmp.dir.readFileAlloc(std.testing.io, "bytes.json", gpa, .unlimited);
-    defer gpa.free(text);
-    try std.testing.expect(std.mem.find(u8, text, "[97,255,98]") == null);
-    try std.testing.expect(std.mem.find(u8, text, "\"content\":\"a\u{FFFD}b\"") != null);
 }
 
 test "a stored message reads back as its parts" {
@@ -1694,7 +2039,7 @@ test "every string is kept as it was written, and reads back as its own" {
 
     var expected: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer expected.deinit();
-    try expected.writer.print("{s}\x00{s}\x00/work\x00", .{ session.id(), session.name() });
+    try expected.writer.print("{s}\x00/work\x00", .{session.id()});
     try expected.writer.writeAll(
         "hello\x00hello\x00call_1\x00function\x00read\x00{}\x00" ++
             "call_1\x00function\x00read\x00[]\x00",
@@ -1705,29 +2050,6 @@ test "every string is kept as it was written, and reads back as its own" {
     const calls = session.messages.items[2].tool_calls.resolve(&session);
     try std.testing.expectEqualStrings("{}", session.pool.get(calls[0].function.arguments).?);
     try std.testing.expectEqualStrings("[]", session.pool.get(calls[1].function.arguments).?);
-}
-
-test "a version 2 file's system prompt is lifted into its own field" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "one.json",
-        .data = "{\"version\":2,\"messages\":[" ++
-            "{\"role\":\"system\",\"content\":\"old prompt\"}," ++
-            "{\"role\":\"user\",\"content\":\"hi\"}]}",
-    });
-
-    var resumed = try reopenTestSession(&tmp, "one");
-    defer resumed.deinit();
-
-    try std.testing.expectEqualStrings("old prompt", resumed.systemPrompt().?);
-    try std.testing.expectEqual(1, resumed.messages.items.len);
-    try std.testing.expectEqualStrings("user", resumed.messages.items[0].role.name());
-    try std.testing.expectEqualStrings("hi", resumed.contentOf(resumed.messages.items[0]).?);
-
-    try resumed.ensureSystemPrompt("new prompt");
-    try std.testing.expectEqualStrings("old prompt", resumed.systemPrompt().?);
 }
 
 test "a compaction is appended and a request starts at its summary" {
@@ -1780,46 +2102,29 @@ test "a compaction survives a save and resume" {
     try std.testing.expectEqualStrings("next", resumed.pool.get(resumed.messages.items[3].content).?);
 }
 
-test "the compaction list is sorted, deduplicated and dropped where it names nothing" {
+test "a compaction that names no message is dropped when the file is read" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "odd.json",
-        .data = "{\"version\":2,\"messages\":[" ++
-            "{\"role\":\"system\",\"content\":\"s\"}," ++
-            "{\"role\":\"user\",\"content\":\"one\"}," ++
-            "{\"role\":\"user\",\"content\":\"summary\"}," ++
-            "{\"role\":\"user\",\"content\":\"two\"}]," ++
-            "\"compactions\":[2,0,2,99]}",
-    });
-
-    var session = try reopenTestSession(&tmp, "odd");
+    var session = try newTestSession(&tmp);
     defer session.deinit();
+    try session.append(.{ .role = .user, .content = "one" });
+    try session.setSystemPrompt("s");
+    try session.appendCompaction("ask", "the summary");
+    try std.testing.expectEqual(1, session.compactions.items.len);
 
-    try std.testing.expectEqualStrings("s", session.systemPrompt().?);
-    // 99 is past the end and dropped, not moved onto the last message, where it would have read as
-    // a summary of "two"; the two 2s name one compaction.
-    try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, session.compactions.items);
-    try std.testing.expectEqual(1, session.sentFrom());
-    try std.testing.expect(session.isCompaction(1));
-    try std.testing.expect(!session.isCompaction(2));
-}
+    // The last four bytes are the compaction's index: 99 names no message, so it is dropped.
+    const written = try tmp.dir.readFileAlloc(std.testing.io, session.id(), std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(written);
+    var patched = try std.testing.allocator.dupe(u8, written);
+    defer std.testing.allocator.free(patched);
+    std.mem.writeInt(u32, patched[patched.len - 4 ..][0..4], 99, .little);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "far-off", .data = patched });
 
-test "compactions in a file with no messages are dropped" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "empty.json",
-        .data = "{\"version\":3,\"messages\":[],\"compactions\":[0,5]}",
-    });
-
-    var session = try reopenTestSession(&tmp, "empty");
-    defer session.deinit();
-    try std.testing.expectEqual(0, session.messages.items.len);
-    try std.testing.expectEqual(0, session.compactions.items.len);
-    try std.testing.expectEqual(0, session.sentFrom());
+    var resumed = try reopenTestSession(&tmp, "far-off");
+    defer resumed.deinit();
+    try std.testing.expectEqual(0, resumed.compactions.items.len);
+    try std.testing.expectEqual(0, resumed.sentFrom());
 }
 
 fn openOnce(gpa: std.mem.Allocator, dir: std.Io.Dir) !void {
@@ -1831,13 +2136,14 @@ test "a session that fails part way through reading its tools frees what it took
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "tools.json",
-        .data = "{\"version\":3,\"tools\":[" ++
-            "{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"d\",\"parameters\":{\"type\":\"object\"}}}," ++
-            "{\"type\":\"function\",\"function\":{\"name\":\"write\",\"description\":\"d\",\"parameters\":{\"type\":\"object\"}}}]," ++
-            "\"messages\":[]}",
+    var session = try Session.create(std.testing.io, tmp.dir, std.testing.allocator, "tools", "/work");
+    defer session.deinit();
+    try session.setTools(&.{
+        .{ .name = "read", .description = "d", .parameters = "{\"type\":\"object\"}" },
+        .{ .name = "write", .description = "d", .parameters = "{\"type\":\"object\"}" },
     });
+    try session.append(.{ .role = .user, .content = "hi" });
+    try session.save();
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, openOnce, .{tmp.dir});
 }
@@ -1927,7 +2233,7 @@ test "ensureTools stores the tools and only sets them once" {
 
     try std.testing.expectError(
         error.FileNotFound,
-        tmp.dir.statFile(std.testing.io, session.name(), .{}),
+        tmp.dir.statFile(std.testing.io, session.id(), .{}),
     );
     try session.append(.{ .role = .user, .content = "hi" });
 
@@ -1953,14 +2259,14 @@ test "a session saved without tools loads with none" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "legacy.json",
-        .data = "{\"version\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
-    });
-
-    var session = try reopenTestSession(&tmp, "legacy");
+    var session = try newTestSession(&tmp);
     defer session.deinit();
-    try std.testing.expectEqual(0, session.tools.items.len);
+    try session.append(.{ .role = .user, .content = "hi" });
+    try session.save();
+
+    var resumed = try reopenTestSession(&tmp, session.id());
+    defer resumed.deinit();
+    try std.testing.expectEqual(0, resumed.tools.items.len);
 }
 
 test "the context size survives a save and resume" {
@@ -1995,9 +2301,8 @@ test "the provider and model a session was started on are saved and resumed" {
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
 
-    // The resumed session keeps the provider and model it was started on rather than following
-    // whatever the configuration now says, since the conversation belongs to the model that
-    // produced it.
+    // The resumed session keeps the model it was started on, since the conversation belongs to
+    // the model that produced it rather than to whatever the configuration says now.
     try std.testing.expect(resumed.model() != null);
     try std.testing.expectEqualStrings("opencode-go/glm-5.3-flash", resumed.modelChoice("deepseek/deepseek-flash"));
 }
@@ -2011,30 +2316,9 @@ test "a session with no recorded model is read as the configured one" {
     try std.testing.expectEqualStrings("deepseek/deepseek-flash", session.modelChoice("deepseek/deepseek-flash"));
 
     try session.append(.{ .role = .user, .content = "hi" });
-    const file = try tmp.dir.readFileAlloc(std.testing.io, session.name(), std.testing.allocator, .unlimited);
+    const file = try tmp.dir.readFileAlloc(std.testing.io, session.id(), std.testing.allocator, .unlimited);
     defer std.testing.allocator.free(file);
     try std.testing.expect(std.mem.find(u8, file, "\"model\"") == null);
-}
-
-test "a session file written with an empty model reads as the configured one" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const session_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = session_id ++ ".json",
-        .data = "{\"version\":3,\"title\":null,\"system_prompt\":null,\"mode\":\"general\"," ++
-            "\"model\":\"\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]," ++
-            "\"compactions\":[],\"tools\":[],\"context_tokens\":0,\"cwd\":\"/work\"}",
-    });
-
-    var resumed = try reopenTestSession(&tmp, session_id);
-    defer resumed.deinit();
-    try std.testing.expect(resumed.model() == null);
-    try std.testing.expectEqualStrings(
-        "opencode-go/glm-5.3-flash",
-        resumed.modelChoice("opencode-go/glm-5.3-flash"),
-    );
 }
 
 test "opening an unknown or damaged session is reported" {
@@ -2043,19 +2327,42 @@ test "opening an unknown or damaged session is reported" {
 
     try std.testing.expectError(
         error.SessionNotFound,
-        reopenTestSession(&tmp, "nope"),
+        Session.open(std.testing.io, tmp.dir, std.testing.allocator, "nobody", "/work"),
     );
 
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad.json", .data = "{" });
+    var damaged = try newTestSession(&tmp);
+    defer damaged.deinit();
+    try damaged.append(.{ .role = .user, .content = "hi" });
+    try damaged.save();
+
+    // A file cut short, and a file of a version this billy does not know.
+    const written = try tmp.dir.readFileAlloc(std.testing.io, damaged.id(), std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(written);
+
+    var short_id: [max_id_len]u8 = undefined;
+    @memcpy(short_id[0..].ptr[0..damaged.id().len], damaged.id());
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "cut-short",
+        .data = written[0 .. written.len - 1],
+    });
     try std.testing.expectError(
         error.CorruptSession,
-        reopenTestSession(&tmp, "bad"),
+        Session.open(std.testing.io, tmp.dir, std.testing.allocator, "cut-short", "/work"),
     );
 
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "future.json", .data = "{\"version\":99}" });
+    var future = try std.testing.allocator.dupe(u8, written);
+    defer std.testing.allocator.free(future);
+    std.mem.writeInt(u32, future[@offsetOf(Header, "version")..][0..4], format_version + 1, .little);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "future", .data = future });
     try std.testing.expectError(
         error.UnsupportedSessionVersion,
-        reopenTestSession(&tmp, "future"),
+        Session.open(std.testing.io, tmp.dir, std.testing.allocator, "future", "/work"),
+    );
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "nothing-like-a-session", .data = "not a session" });
+    try std.testing.expectError(
+        error.CorruptSession,
+        Session.open(std.testing.io, tmp.dir, std.testing.allocator, "nothing-like-a-session", "/work"),
     );
 }
 
@@ -2094,65 +2401,183 @@ test "the working directory is stored and restored on resume" {
     try std.testing.expectEqualStrings("/home/user/project", resumed.cwd());
 }
 
-test "a session saved before the directory was recorded uses the run's own" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "old" ++ extension,
-        .data = "{\"version\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
-    });
-
-    var resumed = try Session.open(std.testing.io, tmp.dir, gpa, "old", "/now/here");
-    defer resumed.deinit();
-    try std.testing.expectEqualStrings("/now/here", resumed.cwd());
-}
-
 test "a resumed session frees everything it read back" {
-    const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A file big enough that holding its bytes for the run would show: writing and resuming it here
-    // runs under the testing gpa, which reports any allocation left behind, so this passing means
-    // the file it read and the parse of it were both freed by `deinit`.
-    var big: std.ArrayList(u8) = .empty;
-    defer big.deinit(gpa);
-    try big.appendSlice(gpa, "{\"version\":1,\"cwd\":\"/work\",\"messages\":[");
-    for (0..2000) |i| {
-        if (i > 0) try big.append(gpa, ',');
-        try big.appendSlice(gpa, "{\"role\":\"user\",\"content\":\"a line of the conversation\"}");
-    }
-    try big.appendSlice(gpa, "]}");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big" ++ extension, .data = big.items });
+    // Writing and resuming here runs under the testing gpa, which reports any allocation left
+    // behind, so this passing means the bytes read and the session built were both freed.
+    var session = try newTestSession(&tmp);
+    var id_buf: [max_id_len]u8 = undefined;
+    const written_id = try setCheckedId(&id_buf, session.id());
+    for (0..200) |_| try session.append(.{ .role = .user, .content = "a line of the conversation" });
+    session.deinit();
 
-    var resumed = try reopenTestSession(&tmp, "big");
+    var resumed = try reopenTestSession(&tmp, written_id);
     defer resumed.deinit();
-    try std.testing.expectEqual(2000, resumed.messages.items.len);
+    try std.testing.expectEqual(200, resumed.messages.items.len);
+    try std.testing.expectEqualStrings("a line of the conversation", resumed.contentOf(resumed.messages.items[199]).?);
     try std.testing.expectEqualStrings("/work", resumed.cwd());
 }
 
-test "the id and file name read back from their fixed buffers" {
+/// A session as the old text format wrote one, holding everything a session can.
+const old_file =
+    \\{"version":3,"title":"An old session","cwd":"/old","system_prompt":"be terse",
+    \\ "model":"deepseek/deepseek-flash",
+    \\ "messages":[{"role":"user","content":"hello"},
+    \\             {"role":"assistant","content":"hi"}],
+    \\ "compactions":[1],
+    \\ "tools":[{"type":"function","function":{"name":"read","description":"Read a file.",
+    \\          "parameters":{"type":"object"}}}],
+    \\ "context_tokens":42}
+;
+
+fn writeOldFile(tmp: *std.testing.TmpDir, session_id: []const u8, data: []const u8) !void {
+    var name_buf: [max_id_len + old_extension.len]u8 = undefined;
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = oldFileName(session_id, &name_buf).?,
+        .data = data,
+    });
+}
+
+test "a session kept as a file of the old format says so rather than nothing" {
+    const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "dev" ++ extension,
-        .data = "{\"version\":1,\"messages\":[]}",
+    try writeOldFile(&tmp, "old", old_file);
+
+    // This billy reads no text, so a resume says what to do rather than that there is no session.
+    try std.testing.expectError(error.SessionInOldFormat, reopenTestSession(&tmp, "old"));
+    try std.testing.expectError(error.SessionNotFound, reopenTestSession(&tmp, "nobody"));
+
+    const listed = try Session.list(std.testing.io, tmp.dir, gpa);
+    defer freeList(listed, gpa);
+    try std.testing.expectEqual(0, listed.len);
+}
+
+test "a session of the old format is converted, and the file it came from removed" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeOldFile(&tmp, "old", old_file);
+    const counted = try Session.convert(std.testing.io, tmp.dir, gpa, "/work");
+    try std.testing.expectEqual(1, counted.converted);
+    try std.testing.expectEqual(0, counted.skipped);
+    try std.testing.expectEqual(0, counted.unreadable);
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "old.json", .{}));
+
+    // What was text is a session now, holding the conversation, the prompt, the model, the tools and
+    // the directory it was started in, none of which billy could read before.
+    var session = try reopenTestSession(&tmp, "old");
+    defer session.deinit();
+    try std.testing.expectEqualStrings("An old session", session.title().?);
+    try std.testing.expectEqualStrings("/old", session.cwd());
+    try std.testing.expectEqualStrings("be terse", session.systemPrompt().?);
+    try std.testing.expectEqualStrings("deepseek/deepseek-flash", session.model().?);
+    try std.testing.expectEqual(@as(usize, 42), session.context_tokens);
+    try std.testing.expectEqual(2, session.messages.items.len);
+    try session.expectSessionConvo(&.{
+        .{ .role = .system, .content = "be terse" },
+        .{ .role = .user, .content = "hello" },
+        .{ .role = .assistant, .content = "hi" },
     });
+    try std.testing.expectEqual(1, session.compactions.items.len);
+    try std.testing.expectEqual(1, session.tools.items.len);
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"object\"}",
+        session.pool.get(session.tools.items[0].parameters).?,
+    );
+}
+
+test "a converted session keeps the time it was last written at" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeOldFile(&tmp, "old", old_file);
+    try tmp.dir.setTimestamps(std.testing.io, "old.json", .{
+        .modify_timestamp = .{ .new = std.Io.Timestamp.fromNanoseconds(1_000 * std.time.ns_per_ms) },
+    });
+
+    _ = try Session.convert(std.testing.io, tmp.dir, gpa, "/work");
+
+    // The session goes on sitting where it did in the store rather than reading as one just written.
+    const stat = try tmp.dir.statFile(std.testing.io, "old", .{});
+    try std.testing.expectEqual(@as(i64, 1_000), stat.mtime.toMilliseconds());
+}
+
+test "a conversion leaves a session billy has already written as it is" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.create(std.testing.io, tmp.dir, gpa, "old", "/work");
+    defer session.deinit();
+    try session.append(.{ .role = .user, .content = "the conversation since" });
+    try writeOldFile(&tmp, "old", old_file);
+
+    // The text is the older of the two, so writing it over the top would take the session back.
+    const counted = try Session.convert(std.testing.io, tmp.dir, gpa, "/work");
+    try std.testing.expectEqual(0, counted.converted);
+    try std.testing.expectEqual(1, counted.skipped);
+    try std.testing.expectEqual(0, counted.unreadable);
+
+    var kept = try reopenTestSession(&tmp, "old");
+    defer kept.deinit();
+    try kept.expectSessionConvo(&.{.{ .role = .user, .content = "the conversation since" }});
+}
+
+test "a file that cannot be converted is counted, and the rest still are" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeOldFile(&tmp, "cut-short", "{\"version\":3,\"messages\":[");
+    try writeOldFile(&tmp, "from-the-future", "{\"version\":99,\"messages\":[]}");
+    try writeOldFile(&tmp, "old", old_file);
+
+    const counted = try Session.convert(std.testing.io, tmp.dir, gpa, "/work");
+    try std.testing.expectEqual(1, counted.converted);
+    try std.testing.expectEqual(0, counted.skipped);
+    try std.testing.expectEqual(2, counted.unreadable);
+
+    // A file that could not be read is left where it is, and nothing is written in its name.
+    _ = try tmp.dir.statFile(std.testing.io, "from-the-future.json", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "from-the-future", .{}));
+}
+
+test "converting a directory of sessions that are all in this format does nothing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeSessionAt(&tmp, std.testing.allocator, "dev", 1_000);
+
+    const counted = try Session.convert(std.testing.io, tmp.dir, std.testing.allocator, "/work");
+    try std.testing.expectEqual(0, counted.converted);
+    try std.testing.expectEqual(0, counted.skipped);
+    try std.testing.expectEqual(0, counted.unreadable);
+}
+
+test "the id a session was opened by is the one it reads back" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.create(std.testing.io, tmp.dir, gpa, "dev", "/work");
+    defer session.deinit();
+    try session.append(.{ .role = .user, .content = "hello" });
+
+    // The id names the file, so a session reads back the one it was opened by, not another.
     var resumed = try reopenTestSession(&tmp, "dev");
     defer resumed.deinit();
     try std.testing.expectEqualStrings("dev", resumed.id());
-    try std.testing.expectEqualStrings("dev" ++ extension, resumed.name());
+    try std.testing.expectEqual(1, resumed.messages.items.len);
 
     var fresh = try newTestSession(&tmp);
     defer fresh.deinit();
     try std.testing.expectEqual(ulid.length, fresh.id().len);
     try std.testing.expect(ulid.isId(fresh.id()));
-    try std.testing.expect(std.mem.endsWith(u8, fresh.name(), extension));
-    try std.testing.expectEqualStrings(
-        fresh.id(),
-        fresh.name()[0 .. fresh.name().len - extension.len],
-    );
 }
