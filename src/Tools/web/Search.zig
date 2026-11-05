@@ -12,14 +12,6 @@ pub const Result = @import("Search/Result.zig");
 
 const Search = @This();
 
-/// One backend to search with, and what it is asked with: the key `billy login` stored for it, and
-/// the instance for a backend that is the user's own.
-pub const Backend = struct {
-    provider: web.Provider,
-    api_key: []const u8 = "",
-    endpoint: ?[]const u8 = null,
-};
-
 /// The most backends one call asks, which is as many providers as billy knows.
 const max_backends = @typeInfo(web.Provider).@"enum".field_names.len;
 
@@ -36,7 +28,7 @@ pub fn run(search: Search, tools: Tools, out: *std.Io.Writer) !void {
 
     // The keys are read as the call is made, so one stored while billy runs is the one the next
     // search asks with, and a run that never searches asks for none of them.
-    var backends: [max_backends]Backend = undefined;
+    var backends: [max_backends]web.Backend = undefined;
     var usable: usize = 0;
     var unusable: ?anyerror = null;
     for (settings.providers) |provider| {
@@ -70,7 +62,7 @@ pub fn run(search: Search, tools: Tools, out: *std.Io.Writer) !void {
 
 /// The backend `provider` is asked as, or the reason it cannot be asked: a key billy does not have,
 /// or a self-hosted backend with no address.
-fn backendFor(settings: web.SearchSettings, keys: *const Credentials, provider: web.Provider) !Backend {
+fn backendFor(settings: web.SearchSettings, keys: *const Credentials, provider: web.Provider) !web.Backend {
     return .{
         .provider = provider,
         .api_key = if (provider.service()) |service|
@@ -85,7 +77,7 @@ fn backendFor(settings: web.SearchSettings, keys: *const Credentials, provider: 
 }
 
 /// Asks each backend in turn until one answers.
-fn ask(search: Search, tools: Tools, backends: []const Backend, out: *std.Io.Writer) !void {
+fn ask(search: Search, tools: Tools, backends: []const web.Backend, out: *std.Io.Writer) !void {
     const now_ms = std.Io.Clock.real.now(tools.http.io).toMilliseconds();
     var failed: ?anyerror = null;
     for (backends) |backend| {
@@ -120,7 +112,7 @@ fn ask(search: Search, tools: Tools, backends: []const Backend, out: *std.Io.Wri
     );
 }
 
-fn searchBackend(tools: Tools, backend: Backend, query: []const u8, max_results: usize) !web.Answer {
+fn searchBackend(tools: Tools, backend: web.Backend, query: []const u8, max_results: usize) !web.Answer {
     const asked = @min(max_results, Result.result_limit);
 
     const descriptor = backend.provider.descriptor();
@@ -188,7 +180,7 @@ test "the backends are tried in order until one answers" {
     // Two backends, both standing in for the same server, so what is tested is the order rather
     // than which backend it is.
     const search: Search = .{ .query = "zig lang" };
-    const backends: []const Backend = &.{
+    const backends: []const web.Backend = &.{
         .{ .provider = .tavily, .api_key = "a", .endpoint = mock.url },
         .{ .provider = .tavily, .api_key = "b", .endpoint = mock.url },
     };
@@ -219,7 +211,7 @@ test "a search fails only when every backend has failed" {
     defer http_client.deinit();
 
     const search: Search = .{ .query = "zig lang" };
-    const backends: []const Backend = &.{
+    const backends: []const web.Backend = &.{
         .{ .provider = .tavily, .api_key = "a", .endpoint = mock.url },
         .{ .provider = .brave, .api_key = "b", .endpoint = mock.url },
     };
@@ -259,7 +251,7 @@ test "a backend that failed is set aside, so the next search skips it" {
     defer health.deinit();
 
     const search: Search = .{ .query = "zig lang" };
-    const backends: []const Backend = &.{
+    const backends: []const web.Backend = &.{
         .{ .provider = .tavily, .api_key = "a", .endpoint = mock.url },
         .{ .provider = .brave, .api_key = "b", .endpoint = mock.url },
     };
@@ -299,7 +291,7 @@ test "brave is asked for no more results than billy allows any backend" {
     defer http_client.deinit();
 
     const search: Search = .{ .query = "zig" };
-    const backends: []const Backend = &.{.{ .provider = .brave, .api_key = "b", .endpoint = mock.url }};
+    const backends: []const web.Backend = &.{.{ .provider = .brave, .api_key = "b", .endpoint = mock.url }};
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty, .search = .{ .max_results = 1000 } });
@@ -393,7 +385,7 @@ test "searxng results are capped at the most billy allows any backend" {
     defer http_client.deinit();
 
     const search: Search = .{ .query = "zig lang" };
-    const backends: []const Backend = &.{.{ .provider = .searxng, .endpoint = mock.url }};
+    const backends: []const web.Backend = &.{.{ .provider = .searxng, .endpoint = mock.url }};
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty, .search = .{ .max_results = 1000 } });
@@ -478,7 +470,7 @@ test "a search with every backend set aside says so, without asking any" {
     health.record("brave", null, now);
 
     const search: Search = .{ .query = "zig lang" };
-    const backends: []const Backend = &.{
+    const backends: []const web.Backend = &.{
         .{ .provider = .tavily, .api_key = "a", .endpoint = mock.url },
         .{ .provider = .brave, .api_key = "b", .endpoint = mock.url },
     };

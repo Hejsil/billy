@@ -41,6 +41,12 @@ pub const Provider = enum {
     }
 };
 
+pub const Backend = struct {
+    provider: Provider,
+    api_key: []const u8 = "",
+    endpoint: ?[]const u8 = null,
+};
+
 /// What the configuration says about searching: the backends to try, and the results to ask for.
 pub const SearchSettings = struct {
     providers: []const Provider = &.{},

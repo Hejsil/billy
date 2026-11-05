@@ -10,13 +10,6 @@ const web = @import("../web.zig");
 
 const Fetch = @This();
 
-/// One backend to fetch with, and what it is asked with: the key `billy login` stored for it.
-pub const Backend = struct {
-    provider: web.Provider,
-    api_key: []const u8 = "",
-    endpoint: ?[]const u8 = null,
-};
-
 url: []const u8,
 raw: bool = false,
 
@@ -35,7 +28,7 @@ pub fn run(fetch: Fetch, tools: Tools, out: *std.Io.Writer) !void {
 
     // The key is read as the call is made, so one stored while billy runs is the one the next fetch
     // asks with, and a run that never fetches asks for none of them.
-    var backends: [max_backends]Backend = undefined;
+    var backends: [max_backends]web.Backend = undefined;
     var usable: usize = 0;
     for (settings.providers) |provider| {
         if (usable == max_backends) {
@@ -60,7 +53,7 @@ pub fn run(fetch: Fetch, tools: Tools, out: *std.Io.Writer) !void {
 const max_backends = @typeInfo(web.Provider).@"enum".field_names.len;
 
 /// The backend `provider` is asked as, or the reason it cannot be asked.
-fn backendFor(keys: *const Credentials, provider: web.Provider) !Backend {
+fn backendFor(keys: *const Credentials, provider: web.Provider) !web.Backend {
     return .{
         .provider = provider,
         .api_key = if (provider.service()) |service|
@@ -71,7 +64,7 @@ fn backendFor(keys: *const Credentials, provider: web.Provider) !Backend {
 }
 
 /// Asks each backend in turn until one reads the url.
-fn ask(fetch: Fetch, tools: Tools, backends: []const Backend, out: *std.Io.Writer) !void {
+fn ask(fetch: Fetch, tools: Tools, backends: []const web.Backend, out: *std.Io.Writer) !void {
     const now_ms = std.Io.Clock.real.now(tools.http.io).toMilliseconds();
 
     var failed: ?anyerror = null;
@@ -132,7 +125,7 @@ fn readDirectly(tools: Tools, url: []const u8, out: *std.Io.Writer) !void {
     }
 }
 
-fn fetchBackend(tools: Tools, backend: Backend, url: []const u8) !web.Answer {
+fn fetchBackend(tools: Tools, backend: web.Backend, url: []const u8) !web.Answer {
     const descriptor = backend.provider.descriptor();
     const spec = descriptor.fetch orelse return error.NotAFetchProvider;
 
@@ -248,7 +241,7 @@ test "a url no backend could read does not set the backend aside" {
     var health = try Health.load(io, gpa, tmp.dir);
     defer health.deinit();
 
-    const backends: []const Backend = &.{.{ .provider = .tavily, .api_key = "secret", .endpoint = mock.url }};
+    const backends: []const web.Backend = &.{.{ .provider = .tavily, .api_key = "secret", .endpoint = mock.url }};
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -413,7 +406,7 @@ test "a url neither a backend nor a direct read could reach is a failed call" {
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    const backends: []const Backend = &.{.{
+    const backends: []const web.Backend = &.{.{
         .provider = .tavily,
         .api_key = "secret",
         .endpoint = mock.url,
