@@ -4,6 +4,7 @@ const std = @import("std");
 
 const llm = @import("llm.zig");
 const Pool = @import("Pool.zig");
+const store = @import("store.zig");
 const ulid = @import("ulid.zig");
 
 const Session = @This();
@@ -12,14 +13,12 @@ const max_id_len = 64;
 
 const interrupted_result = "Error: the tool call was interrupted before it produced a result.";
 
-const StringIndex = Pool.Index;
-
 const Interned = struct {
-    id: StringIndex = .none,
-    cwd: StringIndex = .none,
-    system_prompt: StringIndex = .none,
-    title: StringIndex = .none,
-    model: StringIndex = .none,
+    id: Pool.Index = .none,
+    cwd: Pool.Index = .none,
+    system_prompt: Pool.Index = .none,
+    title: Pool.Index = .none,
+    model: Pool.Index = .none,
 };
 
 const ToolCallIndex = extern struct {
@@ -34,13 +33,13 @@ const ToolCallIndex = extern struct {
 };
 
 const ToolCall = extern struct {
-    id: StringIndex,
-    type: StringIndex,
+    id: Pool.Index,
+    type: Pool.Index,
     function: Function,
 
     const Function = extern struct {
-        name: StringIndex,
-        arguments: StringIndex,
+        name: Pool.Index,
+        arguments: Pool.Index,
     };
 
     fn resolve(tool_call: ToolCall, session: *const Session) llm.ToolCall {
@@ -57,9 +56,9 @@ const ToolCall = extern struct {
 
 pub const Message = extern struct {
     role: llm.Role,
-    content: StringIndex = .none,
-    tool_call_id: StringIndex = .none,
-    reasoning: StringIndex = .none,
+    content: Pool.Index = .none,
+    tool_call_id: Pool.Index = .none,
+    reasoning: Pool.Index = .none,
     tool_calls: ToolCallIndex = .empty,
 
     pub fn resolve(message: Message, session: *const Session, allocator: std.mem.Allocator) !llm.Message {
@@ -81,9 +80,9 @@ pub const Message = extern struct {
 };
 
 pub const Tool = extern struct {
-    name: StringIndex,
-    description: StringIndex,
-    parameters: StringIndex,
+    name: Pool.Index,
+    description: Pool.Index,
+    parameters: Pool.Index,
 };
 
 pub const Definition = struct {
@@ -417,10 +416,10 @@ const Header = extern struct {
     tool_calls_len: u64 = 0,
     compactions_len: u64 = 0,
     file_len: u64 = 0,
-    title: StringIndex = .none,
-    system_prompt: StringIndex = .none,
-    model: StringIndex = .none,
-    cwd: StringIndex = .none,
+    title: Pool.Index = .none,
+    system_prompt: Pool.Index = .none,
+    model: Pool.Index = .none,
+    cwd: Pool.Index = .none,
     /// Held at nothing: a header with a gap would write the gap, which is a stack's bytes, not ours.
     reserved: u64 = 0,
 
@@ -435,41 +434,24 @@ const Header = extern struct {
 
 const header_len = @sizeOf(Header);
 
-/// What a session file is read through: room for any field, and a page of a file at a time.
-const read_buffer = 8 * 1024;
-
 // A file is the structs a session is held as: what fails here is what says to bump `format_version`.
 comptime {
-    fixedSize(Header, 96);
-    fixedSize(Tool, 12);
-    fixedSize(Message, 24);
-    fixedSize(ToolCall, 16);
-    fixedPacking(Header);
-    fixedPacking(Tool);
-    fixedPacking(Message);
-    fixedPacking(ToolCall);
-    fixedOffset(Header, "context_tokens", 16);
-    fixedOffset(Header, "strings_len", 24);
-    fixedOffset(Header, "file_len", 64);
-    fixedOffset(Header, "title", 72);
-    fixedOffset(Header, "cwd", 84);
-    fixedOffset(Header, "reserved", 88);
-    fixedOffset(Message, "role", 0);
-    fixedOffset(Message, "tool_calls", 16);
-}
-
-fn fixedPacking(T: type) void {
-    var held: usize = 0;
-    inline for (@typeInfo(T).@"struct".field_types) |Field| held += @sizeOf(Field);
-    if (held != @sizeOf(T)) @compileError("format_version: " ++ @typeName(T) ++ " has a gap the file cannot hold");
-}
-
-fn fixedSize(T: type, comptime len: usize) void {
-    if (@sizeOf(T) != len) @compileError("format_version: " ++ @typeName(T) ++ " is no longer the size it was written at");
-}
-
-fn fixedOffset(T: type, comptime field: []const u8, comptime at: usize) void {
-    if (@offsetOf(T, field) != at) @compileError("format_version: " ++ @typeName(T) ++ "." ++ field ++ " no longer sits where it was written");
+    store.fixedSize(Header, 96);
+    store.fixedSize(Tool, 12);
+    store.fixedSize(Message, 24);
+    store.fixedSize(ToolCall, 16);
+    store.fixedPacking(Header);
+    store.fixedPacking(Tool);
+    store.fixedPacking(Message);
+    store.fixedPacking(ToolCall);
+    store.fixedOffset(Header, "context_tokens", 16);
+    store.fixedOffset(Header, "strings_len", 24);
+    store.fixedOffset(Header, "file_len", 64);
+    store.fixedOffset(Header, "title", 72);
+    store.fixedOffset(Header, "cwd", 84);
+    store.fixedOffset(Header, "reserved", 88);
+    store.fixedOffset(Message, "role", 0);
+    store.fixedOffset(Message, "tool_calls", 16);
 }
 
 /// Writes the session as the header and the blocks it counts, each the bytes it is held as.
@@ -509,7 +491,7 @@ fn load(session: *Session) !void {
     };
     defer file.close(session.io);
 
-    var read_buf: [read_buffer]u8 = undefined;
+    var read_buf: [store.read_buffer]u8 = undefined;
     var file_reader = file.reader(session.io, &read_buf);
     const reader = &file_reader.interface;
 
@@ -574,39 +556,17 @@ fn checkRoles(messages: []const Message) !void {
 
 /// Whether every index a session holds names a string and every range names tool calls.
 fn checkIndices(session: *Session) !void {
-    // A string is found by the NUL that ends it, so a pool not ending in one could run off its end.
-    const strings = session.pool.strings.items;
-    if (strings.len > 0 and strings[strings.len - 1] != 0) return error.CorruptSession;
-
-    try session.checkStrings(Interned, session.interned);
-    for (session.tools.items) |tool| try session.checkStrings(Tool, tool);
+    const pool = &session.pool;
+    var sound = pool.validateIndicesInStruct(Interned, session.interned);
+    for (session.tools.items) |tool| sound = sound and pool.validateIndicesInStruct(Tool, tool);
     for (session.messages.items) |message| {
-        try session.checkStrings(Message, message);
+        sound = sound and pool.validateIndicesInStruct(Message, message);
         const calls = message.tool_calls;
-        if (@as(u64, calls.start) + calls.len > session.tool_calls.items.len) return error.CorruptSession;
+        sound = sound and @as(u64, calls.start) + calls.len <= session.tool_calls.items.len;
     }
-    for (session.tool_calls.items) |call| try session.checkStrings(ToolCall, call);
+    for (session.tool_calls.items) |call| sound = sound and pool.validateIndicesInStruct(ToolCall, call);
+    if (!sound) return error.CorruptSession;
     try checkRoles(session.messages.items);
-}
-
-/// Checks every string index `value` holds, at whatever depth it sits.
-fn checkStrings(session: *Session, T: type, value: T) !void {
-    if (T == StringIndex) return session.checkString(value);
-    switch (@typeInfo(T)) {
-        .@"struct" => |info| inline for (info.field_names, info.field_types) |name, Field| {
-            try session.checkStrings(Field, @field(value, name));
-        },
-        else => {},
-    }
-}
-
-/// Whether `index` names a string: one past the pool, or inside another, names none.
-fn checkString(session: *Session, index: Pool.Index) !void {
-    if (index == .none) return;
-    const strings = session.pool.strings.items;
-    const start = @backingInt(index);
-    if (start >= strings.len) return error.CorruptSession;
-    if (start != 0 and strings[start - 1] != 0) return error.CorruptSession;
 }
 
 /// A compaction names the message it summed up, and one past the last message names none.
@@ -819,7 +779,7 @@ fn readFieldAt(io: std.Io, gpa: std.mem.Allocator, file: std.Io.File, header: He
     if (start >= header.strings_len) return error.CorruptSession;
 
     // A field comes out of a window the size of a buffer: one longer than that is no title or path.
-    var read_buf: [read_buffer]u8 = undefined;
+    var read_buf: [store.read_buffer]u8 = undefined;
     var file_reader = file.reader(io, &read_buf);
     try file_reader.seekTo(header_len + start);
     const text = file_reader.interface.takeSentinel(0) catch return error.CorruptSession;

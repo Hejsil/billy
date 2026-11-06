@@ -40,13 +40,38 @@ pub fn ptr(pool: *const Pool, index: Index) ?[*:0]const u8 {
     if (index == .none) return null;
     const start = @backingInt(index);
     std.debug.assert(start < pool.strings.items.len);
-    std.debug.assert(start == 0 or pool.strings.items[start - 1] == 0);
     return @ptrCast(pool.strings.items.ptr + start);
 }
 
 /// The string `index` names, or null for `.none`.
 pub fn get(pool: *const Pool, index: Index) ?[]const u8 {
     return std.mem.span(pool.ptr(index) orelse return null);
+}
+
+/// Whether `index` names a string in the pool, which is what a pool read from a file is held to.
+pub fn validateIndex(pool: *const Pool, index: Index) bool {
+    const strings = pool.strings.items;
+    const start = @backingInt(index);
+
+    const pool_is_valid = strings.len == 0 or strings[strings.len - 1] == 0;
+    const index_is_valid = index == .none or start < strings.len;
+    return pool_is_valid and index_is_valid;
+}
+
+/// Whether every index `value` holds, at whatever depth, names a string in the pool.
+pub fn validateIndicesInStruct(pool: *const Pool, T: type, value: T) bool {
+    if (T == Index)
+        return pool.validateIndex(value);
+
+    switch (@typeInfo(T)) {
+        .@"struct" => |info| inline for (info.field_names, info.field_types) |name, Field| {
+            if (!pool.validateIndicesInStruct(Field, @field(value, name)))
+                return false;
+        },
+        else => {},
+    }
+
+    return true;
 }
 
 test "each string is kept where it was written, and reads back from there" {
@@ -57,8 +82,7 @@ test "each string is kept where it was written, and reads back from there" {
 
     const first = try pool.intern(gpa, "hello");
     const second = try pool.intern(gpa, "world");
-    // A string already held is added again rather than looked for: the pool keeps text, it does not
-    // remember which text it has.
+    // A string already held is added again rather than looked for: the pool keeps text, not names.
     const again = try pool.intern(gpa, "hello");
 
     try std.testing.expect(again != first);
@@ -124,6 +148,29 @@ test "a string read back is the whole string, not the rest of the pool" {
     const empty = try pool.intern(gpa, "");
     try std.testing.expect(empty != .none);
     try std.testing.expectEqualStrings("", pool.get(empty).?);
+}
+
+test "an index is validated where a pool is read, and trusted after that" {
+    const gpa = std.testing.allocator;
+
+    var pool: Pool = .{};
+    defer pool.deinit(gpa);
+
+    const first = try pool.intern(gpa, "one");
+    const second = try pool.intern(gpa, "two");
+
+    try std.testing.expect(pool.validateIndex(.none));
+    try std.testing.expect(pool.validateIndex(first));
+    try std.testing.expect(pool.validateIndex(second));
+    try std.testing.expect(!pool.validateIndex(@fromBackingInt(99)));
+
+    const Held = struct { a: Pool.Index, b: Pool.Index = .none };
+    try std.testing.expect(pool.validateIndicesInStruct(Held, .{ .a = second }));
+    try std.testing.expect(!pool.validateIndicesInStruct(Held, .{ .a = second, .b = @fromBackingInt(99) }));
+
+    // A block that no longer ends where a string does makes every index in it unreadable.
+    try pool.strings.append(gpa, 'x');
+    try std.testing.expect(!pool.validateIndex(first));
 }
 
 test "a pointer into the pool reads the string it names" {

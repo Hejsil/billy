@@ -71,6 +71,7 @@ pub fn open(init: std.process.Init) !Billy {
 }
 
 pub fn deinit(billy: *Billy) void {
+    billy.catalog.deinit(billy.gpa);
     billy.http_client.deinit();
     billy.health.deinit();
     billy.config.deinit();
@@ -232,8 +233,8 @@ fn resumeId(billy: *Billy, resuming: ?Resume) !?[]const u8 {
 }
 
 fn ensureCatalog(billy: *Billy) void {
-    if (billy.catalog.providers.len > 0) return;
-    billy.catalog = models.ensure(billy.io, billy.arena, billy.gpa, billy.dirs.cache);
+    if (billy.catalog.providers.items.len > 0) return;
+    billy.catalog = models.ensure(billy.io, billy.gpa, billy.dirs.cache);
 }
 
 pub fn showModels(billy: *Billy, out: Terminal.Writer, refresh: bool) !void {
@@ -242,7 +243,8 @@ pub fn showModels(billy: *Billy, out: Terminal.Writer, refresh: bool) !void {
             std.log.err("cannot refresh the model catalog: {t}", .{err});
             return report.Reported;
         };
-        billy.catalog = models.load(billy.io, billy.arena, billy.dirs.cache) catch |err| {
+        billy.catalog.deinit(billy.gpa);
+        billy.catalog = models.load(billy.io, billy.gpa, billy.dirs.cache) catch |err| {
             std.log.err("the model catalog was fetched but cannot be read: {t}", .{err});
             return report.Reported;
         };
@@ -252,7 +254,7 @@ pub fn showModels(billy: *Billy, out: Terminal.Writer, refresh: bool) !void {
 
     billy.ensureCatalog();
     try out.print("{d} providers, {d} models\n", .{
-        billy.catalog.providers.len,
+        billy.catalog.providers.items.len,
         models.Catalog.modelCount(&billy.catalog),
     });
 }

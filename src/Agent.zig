@@ -246,7 +246,7 @@ fn completionsUrl(arena: std.mem.Allocator, base_url: []const u8) ![]u8 {
 fn baseUrlOf(providers: Config.Providers, catalog: *const models.Catalog, provider: []const u8) ?[]const u8 {
     if (providers.get(provider)) |base_url| return base_url;
     const result = catalog.find(provider) orelse return null;
-    return result.base_url;
+    return catalog.baseUrl(result);
 }
 
 pub fn unreachableModel(buffer: []u8, err: anyerror, choice: []const u8) []const u8 {
