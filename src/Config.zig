@@ -84,10 +84,6 @@ pub const Providers = struct {
         return null;
     }
 
-    pub fn has(providers: Providers, name: []const u8) bool {
-        return providers.get(name) != null;
-    }
-
     /// The object is read as a value and walked, since the names are the user's and no set of
     /// fields could hold them.
     pub fn jsonParse(
