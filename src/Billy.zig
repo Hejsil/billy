@@ -287,13 +287,15 @@ pub fn serve(billy: *Billy, host: []const u8, port: u16) !void {
     const server = Server{
         .io = billy.io,
         .gpa = billy.gpa,
+        .host = host,
+        .port = port,
         .session_dir = billy.dirs.sessions,
         .http_client = &billy.http_client,
         .cwd = billy.cwd,
         .home = billy.environ.get("HOME"),
         .options = billy.options(),
     };
-    return try server.serve(host, port);
+    return try server.serve();
 }
 
 test "the listing writes each session's id and title on one line" {

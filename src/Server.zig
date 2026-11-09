@@ -45,17 +45,20 @@ const max_connections = 64;
 
 io: std.Io,
 gpa: std.mem.Allocator,
+/// The name and port this server listens on, which is the name a request has to carry.
+host: []const u8 = default_host,
+port: u16 = default_port,
 session_dir: std.Io.Dir,
 http_client: *std.http.Client,
 cwd: []const u8,
 home: ?[]const u8,
 options: Agent.Options,
 
-pub fn serve(server: *const Server, host: []const u8, port: u16) !void {
-    const address = listenAddress(host, port) catch |err| {
+pub fn serve(server: *const Server) !void {
+    const address = listenAddress(server.host, server.port) catch |err| {
         std.log.err(
             "cannot listen on '{s}': {t}; give an address such as 127.0.0.1, 0.0.0.0 or 192.168.1.5",
-            .{ host, err },
+            .{ server.host, err },
         );
         return report.Reported;
     };
@@ -66,9 +69,13 @@ pub fn serve(server: *const Server, host: []const u8, port: u16) !void {
     defer registry.deinit();
 
     std.log.info("billy serve is listening on http://{s}:{d}/", .{
-        host,
+        server.host,
         listener.socket.address.getPort(),
     });
+    // A wildcard bind cannot know the machine's own names, so it cannot tell a site's name from the
+    // user's: say so where it is bound.
+    if (!loopback(server.host) and !wildcard(server.host))
+        std.log.warn("billy serve answers to '{s}': a site that points its own name here can reach it", .{server.host});
 
     // One task per connection, gathered so that they are all cancelled when the loop ends, as they
     // all share the listener's lifetime.
@@ -217,9 +224,93 @@ const Request = struct {
     fn replyNotAllowed(r: *Request) !void {
         return try r.reply(.text, "method not allowed\n", .method_not_allowed);
     }
+
+    fn header(r: *const Request, name: []const u8) ?[]const u8 {
+        var headers = r.request.iterateHeaders();
+        while (headers.next()) |sent| {
+            if (std.ascii.eqlIgnoreCase(sent.name, name)) return sent.value;
+        }
+        return null;
+    }
+
+    /// Answers a request that did not come from the page this server serves, and answers whether it
+    /// did: one that did not would run commands as the user.
+    fn refuseOtherSites(r: *Request) !bool {
+        const host = hostName(r.header("host") orelse "");
+
+        // A name this server does not answer to is one another site made resolve here, so its page
+        // would read this server as if it were its own.
+        if (!r.server.answersTo(host)) {
+            try r.reply(.text, "this server answers to its own name only\n", .forbidden);
+            return true;
+        }
+
+        // A browser sends a body of one of three types without asking this server first, and JSON
+        // is not one of them: a write has to be JSON, which the page's own writes always are.
+        switch (r.request.head.method) {
+            .POST, .PATCH => if (!isJson(r.header("content-type") orelse "")) {
+                try r.reply(.text, "a write is a JSON body\n", .unsupported_media_type);
+                return true;
+            },
+            else => {},
+        }
+
+        // A page that is not this one names itself here, and the page a session runs from is the
+        // only client billy has.
+        if (r.header("origin")) |origin| {
+            const scheme = "http://";
+            const named = if (std.mem.startsWith(u8, origin, scheme)) origin[scheme.len..] else "";
+            if (!std.ascii.eqlIgnoreCase(named, r.header("host") orelse "")) {
+                try r.reply(.text, "this server answers its own page only\n", .forbidden);
+                return true;
+            }
+        }
+
+        return false;
+    }
 };
 
+/// Whether `host` is a name this server answers to: its own, or a loopback name.
+fn answersTo(server: *const Server, host: []const u8) bool {
+    if (!loopback(server.host) and wildcard(server.host)) return true;
+    if (std.ascii.eqlIgnoreCase(host, server.host)) return true;
+    for ([_][]const u8{ "127.0.0.1", "localhost", "[::1]", "::1" }) |own| {
+        if (std.ascii.eqlIgnoreCase(host, own)) return true;
+    }
+    return false;
+}
+
+fn loopback(host: []const u8) bool {
+    return std.mem.eql(u8, host, "localhost") or
+        std.mem.eql(u8, host, "::1") or
+        std.mem.eql(u8, host, "[::1]") or
+        std.mem.startsWith(u8, host, "127.");
+}
+
+fn wildcard(host: []const u8) bool {
+    return std.mem.eql(u8, host, "0.0.0.0") or std.mem.eql(u8, host, "::") or host.len == 0;
+}
+
+/// The name a `Host` header carries, without the port that follows it, and with the brackets an
+/// IPv6 name keeps.
+fn hostName(host: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, host, "[")) {
+        const end = std.mem.findScalar(u8, host, ']') orelse return host;
+        return host[0 .. end + 1];
+    }
+    const colon = std.mem.findScalar(u8, host, ':') orelse return host;
+    return host[0..colon];
+}
+
+/// Whether `value` is a JSON body's type, with or without the charset a browser may add.
+fn isJson(value: []const u8) bool {
+    const kind = std.mem.trim(u8, value[0 .. std.mem.findScalar(u8, value, ';') orelse value.len], " \t");
+    return std.ascii.eqlIgnoreCase(kind, "application/json");
+}
+
 fn route(r: *Request, registry: *Registry) !void {
+    if (try r.refuseOtherSites()) return;
+
     const target = r.request.head.target;
     const path = target[0 .. std.mem.findScalar(u8, target, '?') orelse target.len];
 
@@ -776,6 +867,9 @@ fn sessionPath(id: []const u8, suffix: []const u8) ![]const u8 {
     return try std.testing.allocator.print("/api/sessions/{s}{s}", .{ id, suffix });
 }
 
+/// The headers the page sends, which is what a request from the page itself looks like.
+const request_headers = "host: 127.0.0.1:8787\r\ncontent-type: application/json\r\n";
+
 const Exchange = struct {
     written: std.Io.Writer.Allocating,
     answered: bool = false,
@@ -787,15 +881,32 @@ const Exchange = struct {
         path: []const u8,
         body: ?[]const u8,
     ) !Exchange {
+        return try Exchange.runWith(server, registry, method, path, request_headers, body);
+    }
+
+    /// The same, with the headers a test writes itself, so a request from another site can be written.
+    fn runWith(
+        server: *const Server,
+        registry: *Registry,
+        method: std.http.Method,
+        path: []const u8,
+        headers: []const u8,
+        body: ?[]const u8,
+    ) !Exchange {
         const gpa = std.testing.allocator;
         var exchange: Exchange = .{ .written = .init(gpa) };
         errdefer exchange.written.deinit();
 
         const request_text = if (body) |payload|
-            try gpa.print("{t} {s} HTTP/1.1\r\nhost: billy\r\ncontent-type: application/json\r\n" ++
-                "content-length: {d}\r\n\r\n{s}", .{ method, path, payload.len, payload })
+            try gpa.print("{t} {s} HTTP/1.1\r\n{s}content-length: {d}\r\n\r\n{s}", .{
+                method,
+                path,
+                headers,
+                payload.len,
+                payload,
+            })
         else
-            try gpa.print("{t} {s} HTTP/1.1\r\nhost: billy\r\n\r\n", .{ method, path });
+            try gpa.print("{t} {s} HTTP/1.1\r\n{s}\r\n", .{ method, path, headers });
         defer gpa.free(request_text);
 
         var in_buffer: [4096]u8 = undefined;
@@ -831,6 +942,62 @@ const Exchange = struct {
         return std.mem.find(u8, exchange.written.written(), needle) != null;
     }
 };
+
+test "a write that did not come from this page is refused" {
+    const server = try TestServer.init();
+    defer server.deinit();
+
+    // A body of a type a browser sends without asking first could come from any site the user has open.
+    var plain = try Exchange.runWith(
+        &server.server,
+        &server.registry,
+        .POST,
+        "/api/sessions",
+        "host: 127.0.0.1:8787\r\ncontent-type: text/plain\r\n",
+        "{\"text\":\"hello\"}",
+    );
+    defer plain.deinit();
+    try std.testing.expectEqualStrings("HTTP/1.1 415 Unsupported Media Type", plain.statusLine());
+}
+
+test "a request that names another host or origin is refused" {
+    const server = try TestServer.init();
+    defer server.deinit();
+
+    // A name that is not this server's is one another site made resolve here.
+    var rebound = try Exchange.runWith(
+        &server.server,
+        &server.registry,
+        .GET,
+        "/api/sessions",
+        "host: evil.example\r\n",
+        null,
+    );
+    defer rebound.deinit();
+    try std.testing.expectEqualStrings("HTTP/1.1 403 Forbidden", rebound.statusLine());
+
+    var foreign = try Exchange.runWith(
+        &server.server,
+        &server.registry,
+        .POST,
+        "/api/sessions",
+        "host: 127.0.0.1:8787\r\ncontent-type: application/json\r\norigin: https://evil.example\r\n",
+        "{\"text\":\"hello\"}",
+    );
+    defer foreign.deinit();
+    try std.testing.expectEqualStrings("HTTP/1.1 403 Forbidden", foreign.statusLine());
+
+    var own = try Exchange.runWith(
+        &server.server,
+        &server.registry,
+        .GET,
+        "/api/sessions",
+        "host: 127.0.0.1:8787\r\norigin: http://127.0.0.1:8787\r\n",
+        null,
+    );
+    defer own.deinit();
+    try std.testing.expectEqualStrings("HTTP/1.1 200 OK", own.statusLine());
+}
 
 test "a route answers a request it does not know with a 404" {
     const server = try TestServer.init();
