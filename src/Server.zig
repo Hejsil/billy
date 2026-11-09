@@ -72,10 +72,10 @@ pub fn serve(server: *const Server) !void {
         server.host,
         listener.socket.address.getPort(),
     });
-    // A wildcard bind cannot know the machine's own names, so it cannot tell a site's name from the
-    // user's: say so where it is bound.
-    if (!loopback(server.host) and !wildcard(server.host))
-        std.log.warn("billy serve answers to '{s}': a site that points its own name here can reach it", .{server.host});
+    // A bind on every address cannot know the machine's own names, so it answers to whatever a
+    // request carries: a site that points its own name here is let in.
+    if (wildcard(server.host))
+        std.log.warn("billy serve listens on every address, so it answers any name that reaches it", .{});
 
     // One task per connection, gathered so that they are all cancelled when the loop ends, as they
     // all share the listener's lifetime.
@@ -233,8 +233,7 @@ const Request = struct {
         return null;
     }
 
-    /// Answers a request that did not come from the page this server serves, and answers whether it
-    /// did: one that did not would run commands as the user.
+    /// Answers a request that did not come from the page this server serves, and says whether it did.
     fn refuseOtherSites(r: *Request) !bool {
         const host = hostName(r.header("host") orelse "");
 
@@ -272,19 +271,13 @@ const Request = struct {
 
 /// Whether `host` is a name this server answers to: its own, or a loopback name.
 fn answersTo(server: *const Server, host: []const u8) bool {
-    if (!loopback(server.host) and wildcard(server.host)) return true;
+    // Every address is bound and their names are not known here, so any name is answered.
+    if (wildcard(server.host)) return true;
     if (std.ascii.eqlIgnoreCase(host, server.host)) return true;
     for ([_][]const u8{ "127.0.0.1", "localhost", "[::1]", "::1" }) |own| {
         if (std.ascii.eqlIgnoreCase(host, own)) return true;
     }
     return false;
-}
-
-fn loopback(host: []const u8) bool {
-    return std.mem.eql(u8, host, "localhost") or
-        std.mem.eql(u8, host, "::1") or
-        std.mem.eql(u8, host, "[::1]") or
-        std.mem.startsWith(u8, host, "127.");
 }
 
 fn wildcard(host: []const u8) bool {
