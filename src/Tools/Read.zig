@@ -14,7 +14,7 @@ pub fn run(read: Read, tools: Tools, out: *std.Io.Writer) !void {
         tools.io,
         read.path,
         tools.gpa,
-        .limited(16 << 20),
+        .limited(Tools.max_file_bytes),
     ) catch |err| return Tools.fail(out, "cannot read {s}: {t}", .{ read.path, err });
     defer tools.gpa.free(contents);
 

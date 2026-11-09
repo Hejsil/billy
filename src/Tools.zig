@@ -18,6 +18,10 @@ const Tools = @This();
 
 const max_result_len = 30_000;
 
+/// The most of a file the tools hold at once: a path comes from the model, so a log, a device or a
+/// file that grows while it is read is refused rather than read until the heap runs out.
+pub const max_file_bytes = 16 << 20;
+
 pub const Call = union(enum) {
     read: Read,
     write: Write,

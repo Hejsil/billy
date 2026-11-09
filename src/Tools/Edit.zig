@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const Credentials = @import("../Credentials.zig");
 const Tools = @import("../Tools.zig");
 
 const Edit = @This();
@@ -13,8 +14,12 @@ pub fn run(edit: Edit, tools: Tools, out: *std.Io.Writer) !void {
     if (edit.old_string.len == 0)
         return Tools.fail(out, "old_string must not be empty", .{});
 
-    const contents = tools.dir.readFileAlloc(tools.io, edit.path, tools.gpa, .unlimited) catch |err|
-        return Tools.fail(out, "cannot read {s}: {t}", .{ edit.path, err });
+    const contents = tools.dir.readFileAlloc(
+        tools.io,
+        edit.path,
+        tools.gpa,
+        .limited(Tools.max_file_bytes),
+    ) catch |err| return Tools.fail(out, "cannot read {s}: {t}", .{ edit.path, err });
     defer tools.gpa.free(contents);
 
     const amount: Amount = if (edit.replace_all) .all else .one;
@@ -262,6 +267,29 @@ fn expectReplaceOne(expected: []const u8, contents: []const u8, old_string: []co
 
 fn expectReplaceAll(expected: []const u8, contents: []const u8, old_string: []const u8, new_string: []const u8) !void {
     return try expectReplace(expected, contents, old_string, new_string, .all);
+}
+
+test "an edit refuses a file too large to hold, as a read does" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const too_large = try gpa.alloc(u8, Tools.max_file_bytes + 1);
+    defer gpa.free(too_large);
+    @memset(too_large, 'a');
+    try tmp.dir.writeFile(io, .{ .sub_path = "big.txt", .data = too_large });
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // A path comes from the model, so one that is a log, a device or a file still being written is
+    // refused at the same limit a read holds it to, rather than read until the heap runs out.
+    const tool_set = Tools.init(io, tmp.dir, gpa, undefined, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
+    const edit: Edit = .{ .path = "big.txt", .old_string = "a", .new_string = "b" };
+    try edit.run(tool_set, &out.writer);
+    try std.testing.expect(std.mem.startsWith(u8, out.written(), "error: cannot read big.txt: "));
 }
 
 test "an exact match is changed where it is" {
