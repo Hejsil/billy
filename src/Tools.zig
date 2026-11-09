@@ -54,12 +54,10 @@ pub fn init(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, http: *std.http
     return .{ .io = io, .dir = dir, .gpa = gpa, .http = http, .settings = settings };
 }
 
-pub fn hasWeb(tools: *const Tools) bool {
-    return tools.settings.search.providers.len > 0 or tools.settings.fetch.providers.len > 0;
-}
-
 pub fn definitions(tools: *const Tools) []const Session.Definition {
-    return if (tools.hasWeb()) &specs_with_web else &specs;
+    const has_web = tools.settings.search.providers.len > 0 or
+        tools.settings.fetch.providers.len > 0;
+    return if (has_web) &specs_with_web else &specs;
 }
 
 pub fn callName(call: Call) []const u8 {
