@@ -95,14 +95,14 @@ pub const Catalog = struct {
 
     /// What is known about `model` at `provider`, or among all providers when it is not named.
     pub fn metadata(catalog: *const Catalog, provider: ?[]const u8, model: []const u8) ?Metadata {
-        if (provider) |name| {
-            if (catalog.find(name)) |known| {
-                const entry = catalog.modelOf(known, model) orelse return null;
-                return .{ .context_window = entry.context };
-            }
+        // A provider the catalog does not list names nothing to look at, so the rest are looked at.
+        const named = if (provider) |name| catalog.find(name) else null;
+        if (named) |known| {
+            const entry = catalog.modelOf(known, model) orelse return null;
+            return .{ .context_window = entry.context };
         }
-        for (catalog.providers.items) |*known| {
-            const entry = catalog.modelOf(known, model) orelse continue;
+        for (catalog.providers.items) |*offered_by| {
+            const entry = catalog.modelOf(offered_by, model) orelse continue;
             return .{ .context_window = entry.context };
         }
         return null;
