@@ -97,8 +97,9 @@ pub fn print(diff: []const Line, writer: Terminal.Writer) !void {
 }
 
 fn markedLine(kind: Kind, text: []const u8, hue: Terminal.Writer.Color, writer: Terminal.Writer) !void {
-    try writer.print("{s}{c}{s}", .{ writer.color(hue), kind.mark(), writer.reset() });
+    try writer.print("{s}{c}", .{ writer.color(hue), kind.mark() });
     try writer.writeText(text);
+    try writer.write(writer.reset());
 }
 
 fn splitLines(gpa: std.mem.Allocator, text: []const u8) ![]const []const u8 {
@@ -114,6 +115,20 @@ fn splitLines(gpa: std.mem.Allocator, text: []const u8) ![]const []const u8 {
         if (last.len > 0) try list.append(gpa, last);
     }
     return list.toOwnedSlice(gpa);
+}
+
+test "a diff line is written in the colour of what it is" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    const changed = try lines(arena_state.allocator(), "old\n", "new\n");
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // The colour wraps the line and its mark, which is what makes a change readable at a glance.
+    try print(changed, .{ .style = .ansi, .out = &out.writer });
+    try std.testing.expectEqualStrings("\x1b[31m-old\x1b[0m\n\x1b[32m+new\x1b[0m\n", out.written());
 }
 
 test "a change in the middle keeps the lines around it" {
