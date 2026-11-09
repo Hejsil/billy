@@ -67,7 +67,8 @@ pub fn load(io: std.Io, dir: std.Io.Dir, arena: std.mem.Allocator) !Credentials 
     };
     if (object.get("version")) |reported| {
         const version: u32 = switch (reported) {
-            .integer => |value| @intCast(value),
+            // A version that is not a version at all is one billy did not write.
+            .integer => |value| std.math.cast(u32, value) orelse return error.CorruptCredentials,
             else => return error.CorruptCredentials,
         };
         if (version > format_version) return error.UnsupportedCredentialsVersion;
@@ -511,4 +512,14 @@ test "load refuses a damaged or future credentials file" {
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{\"version\":99}" });
     try std.testing.expectError(error.UnsupportedCredentialsVersion, load(std.testing.io, tmp.dir, allocator));
+
+    // A version that is not a version is refused rather than cast, which would trap in a safe build.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{\"version\":-1}" });
+    try std.testing.expectError(error.CorruptCredentials, load(std.testing.io, tmp.dir, allocator));
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = file_name,
+        .data = "{\"version\":4294967296}",
+    });
+    try std.testing.expectError(error.CorruptCredentials, load(std.testing.io, tmp.dir, allocator));
 }
