@@ -14,11 +14,11 @@ pub fn dir(
     variable: []const u8,
     fallback: []const []const u8,
 ) ![]const u8 {
-    if (environ.get(variable)) |xdg| {
-        if (xdg.len > 0 and std.Io.Dir.path.isAbsolute(xdg)) {
-            return std.Io.Dir.path.join(gpa, &.{ xdg, app_dir });
-        }
-    }
+    // The specification says a variable that is empty or relative names no directory, so the
+    // fallback is used.
+    const xdg = environ.get(variable) orelse "";
+    const usable = xdg.len > 0 and std.Io.Dir.path.isAbsolute(xdg);
+    if (usable) return std.Io.Dir.path.join(gpa, &.{ xdg, app_dir });
 
     const home = environ.get("HOME") orelse return error.HomeNotSet;
     const fallback_join = std.Io.Dir.path.fmtJoin(fallback);
