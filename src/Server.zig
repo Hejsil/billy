@@ -936,6 +936,22 @@ const Exchange = struct {
     }
 };
 
+test "a server answers a name it holds, and no other" {
+    const server = try TestServer.init();
+    defer server.deinit();
+
+    try std.testing.expect(server.server.answersTo("127.0.0.1"));
+    try std.testing.expect(server.server.answersTo("localhost"));
+    try std.testing.expect(server.server.answersTo("[::1]"));
+    try std.testing.expect(!server.server.answersTo("evil.example"));
+    try std.testing.expect(!server.server.answersTo(""));
+
+    // Bound to every address, the machine's own names are not known here, so any is the server's.
+    server.server.host = "0.0.0.0";
+    try std.testing.expect(server.server.answersTo("evil.example"));
+    try std.testing.expect(server.server.answersTo("192.168.1.5"));
+}
+
 test "a write that did not come from this page is refused" {
     const server = try TestServer.init();
     defer server.deinit();
