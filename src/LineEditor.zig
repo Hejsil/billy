@@ -410,16 +410,19 @@ fn recall(
     const history = ed.history.items;
     if (history.len == 0) return false;
 
+    // The first recall lands on the line typed before it: the newest history line going forward, or
+    // the draft itself going back, since there is no line after the draft to go back from.
     const landing: ?usize = land: {
-        if (recalled.*) |here| {
-            if (direction < 0) {
-                if (here == 0) return false;
-                break :land here - 1;
-            }
-            break :land if (here + 1 < history.len) here + 1 else null;
+        const here = recalled.* orelse {
+            if (direction > 0) return false;
+            break :land history.len - 1;
+        };
+
+        if (direction < 0) {
+            if (here == 0) return false;
+            break :land here - 1;
         }
-        if (direction > 0) return false;
-        break :land history.len - 1;
+        break :land if (here + 1 < history.len) here + 1 else null;
     };
 
     if (recalled.* == null) {
