@@ -26,7 +26,7 @@ pub fn printHead(scratch: std.mem.Allocator, call: Tools.Call, writer: Writer) !
     switch (call) {
         .edit => |args| try printDiff(scratch, args.old_string, args.new_string, writer),
         .bash => |args| {
-            try writer.write(std.mem.trimEnd(u8, args.command, "\n"));
+            try writer.writeText(std.mem.trimEnd(u8, args.command, "\n"));
             try writer.write("\n");
         },
         else => {},
@@ -56,10 +56,14 @@ fn printLabel(name: []const u8, writer: Writer) !void {
 
 fn printInk(text: []const u8, ink: Ink, writer: Writer) !void {
     switch (ink) {
-        .plain => try writer.write(text),
-        .dim => try writer.print("{s}{s}{s}", .{ writer.dim(), text, writer.reset() }),
-        .hue => |hue| try writer.print("{s}{s}{s}", .{ writer.color(hue), text, writer.reset() }),
+        .plain => {},
+        .dim => try writer.write(writer.dim()),
+        .hue => |hue| try writer.write(writer.color(hue)),
     }
+    // What a call produced is text: a control in it would be an instruction to the terminal, so it
+    // is written through the filter rather than as it came.
+    try writer.writeText(text);
+    if (ink != .plain) try writer.write(writer.reset());
 }
 
 /// Prints what a call produced under the `output` label.
@@ -126,6 +130,18 @@ fn printTruncated(text: []const u8, ink: Ink, writer: Writer) !void {
     if (total > shown) {
         try writer.print("{s}… {d} more lines{s}\n", .{ writer.dim(), total - shown, writer.reset() });
     }
+}
+
+test "what a call printed is text, so the terminal runs none of it" {
+    // A command that cats a file, or a program that draws with escapes, can put a control in the
+    // output: the terminal would obey it as if billy had meant it.
+    try expectDescribe(
+        "❯ bash cat note.txt\ncat note.txt\n▾ output\nhello]0;gone\n\n",
+        "bash",
+        "{\"command\":\"cat note.txt\"}",
+        "hello\x1b]0;gone\x07\n",
+        .plain,
+    );
 }
 
 test "describe frames a call and its output" {

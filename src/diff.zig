@@ -82,7 +82,12 @@ fn appendHunk(gpa: std.mem.Allocator, out: *std.ArrayList(Line), kind: Kind, lin
 pub fn print(diff: []const Line, writer: Terminal.Writer) !void {
     for (diff) |line| {
         switch (line.kind) {
-            .context => try writer.print("{s} {s}{s}", .{ writer.dim(), line.text, writer.reset() }),
+            .context => {
+                try writer.write(writer.dim());
+                try writer.write(" ");
+                try writer.writeText(line.text);
+                try writer.write(writer.reset());
+            },
             .removed => try markedLine(line.kind, line.text, .red, writer),
             .added => try markedLine(line.kind, line.text, .green, writer),
             .elided => try writer.print("{s} … {d} more lines{s}", .{ writer.dim(), line.hidden, writer.reset() }),
@@ -92,7 +97,8 @@ pub fn print(diff: []const Line, writer: Terminal.Writer) !void {
 }
 
 fn markedLine(kind: Kind, text: []const u8, hue: Terminal.Writer.Color, writer: Terminal.Writer) !void {
-    try writer.print("{s}{c}{s}{s}", .{ writer.color(hue), kind.mark(), text, writer.reset() });
+    try writer.print("{s}{c}{s}", .{ writer.color(hue), kind.mark(), writer.reset() });
+    try writer.writeText(text);
 }
 
 fn splitLines(gpa: std.mem.Allocator, text: []const u8) ![]const []const u8 {

@@ -6,8 +6,7 @@ const terminal_width = @import("width.zig");
 
 const Writer = @This();
 
-/// What a terminal takes of the decoration billy writes: nothing, or the escape codes every
-/// terminal understands.
+/// What a terminal takes of the decoration billy writes: nothing, or the codes every one knows.
 pub const Style = enum {
     plain,
     ansi,
@@ -132,7 +131,19 @@ fn hueCode(writer: Writer, hue: Color, comptime weight: Weight) []const u8 {
     };
 }
 
-fn writeText(writer: Writer, bytes: []const u8) !void {
+/// Writes text a model or a tool produced: a control in it is an instruction, so it is dropped.
+pub fn writeText(writer: Writer, bytes: []const u8) !void {
+    try writer.writeFiltered(bytes, .body);
+}
+
+/// Writes one line the terminal lays out itself, so every control is dropped.
+fn writeLine(writer: Writer, bytes: []const u8) !void {
+    try writer.writeFiltered(bytes, .line);
+}
+
+const Keeping = enum { body, line };
+
+fn writeFiltered(writer: Writer, bytes: []const u8, comptime keeping: Keeping) !void {
     var at: usize = 0;
     while (at < bytes.len) {
         const len: usize = std.unicode.utf8ByteSequenceLength(bytes[at]) catch {
@@ -146,7 +157,7 @@ fn writeText(writer: Writer, bytes: []const u8) !void {
             continue;
         };
         at += len;
-        if (control(codepoint)) continue;
+        if (control(codepoint) and !(keeping == .body and (codepoint == '\n' or codepoint == '\t'))) continue;
         try writer.write(bytes[at - len .. at]);
     }
 }
@@ -155,8 +166,7 @@ fn control(codepoint: u21) bool {
     return codepoint < 0x20 or (codepoint >= 0x7f and codepoint <= 0x9f);
 }
 
-/// The mark a block header opens with: a glyph and the colour it is shown in, so a block is
-/// recognisable from its first character.
+/// The mark a block header opens with: a glyph and a colour, so a block reads from its first byte.
 pub const Mark = struct {
     glyph: []const u8,
     hue: Color,
@@ -165,12 +175,12 @@ pub const Mark = struct {
         try writer.print("{s}{s}{s} {s}", .{
             writer.color(mark.hue), mark.glyph, writer.reset(), writer.bold(),
         });
-        try writer.writeText(name);
+        try writer.writeLine(name);
         try writer.write(writer.reset());
         if (target.len > 0) {
             try writer.write(" ");
             try writer.write(writer.dim());
-            try writer.writeText(target);
+            try writer.writeLine(target);
             try writer.write(writer.reset());
         }
         try writer.write("\n");
@@ -220,6 +230,18 @@ test "a block header is the same text in either style" {
         "\x1b[34m▸\x1b[0m \x1b[1mread\x1b[0m \x1b[2ma.zig\x1b[0m\n",
         ansi_out.written(),
     );
+}
+
+test "body text keeps its lines and drops every other control" {
+    const gpa = std.testing.allocator;
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    const writer: Writer = .{ .style = .plain, .out = &out.writer };
+    // A reply that names a title or a clipboard would otherwise be carried out by the terminal.
+    try writer.writeText("a\x1b]0;title\x07b\x1b]52;c;c2VjcmV0\x07c\n\td\x9b");
+    try std.testing.expectEqualStrings("a]0;titleb]52;c;c2VjcmV0c\n\td", out.written());
 }
 
 test "a header writes what a model named as text, so none of it is an instruction" {

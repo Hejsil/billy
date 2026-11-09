@@ -130,6 +130,16 @@ fn deinit(self: *Markdown) void {
     self.freeTable();
 }
 
+/// Writes text a reply produced, so that nothing in it is an instruction to the terminal.
+fn body(self: *Markdown, bytes: []const u8) bool {
+    if (self.err != null) return false;
+    self.writer.writeText(bytes) catch |err| {
+        self.err = err;
+        return false;
+    };
+    return true;
+}
+
 fn raw(self: *Markdown, bytes: []const u8) bool {
     if (self.err != null) return false;
     self.writer.out.writeAll(bytes) catch |err| {
@@ -186,7 +196,7 @@ fn put(self: *Markdown, text: []const u8) bool {
         if (line.len > 0) {
             if (!self.flush()) return false;
             if (!self.writeIndent()) return false;
-            if (!self.raw(line)) return false;
+            if (!self.body(line)) return false;
         }
         if (cut) |i| {
             self.newline();
@@ -630,6 +640,12 @@ fn expectPlain(expected: []const u8, text: []const u8) !void {
 
 fn expectAnsi(expected: []const u8, text: []const u8) !void {
     try expectRendered(expected, text, .ansi);
+}
+
+test "a reply cannot give the terminal an instruction" {
+    // What a model writes is shown as text: a control in it would be carried out by the terminal in
+    // the middle of the answer, which is a title, a clipboard or a hidden line the user never saw.
+    try expectPlain("a[31mred[0m", "a\x1b[31mred\x1b[0m\n");
 }
 
 test "a paragraph is written as it stands" {
