@@ -67,7 +67,9 @@ fn streamReasoning(self: *Terminal, text: []const u8) !void {
         self.reasoning = true;
         self.reasoning_at_line_start = true;
     }
-    try self.writer.write(text);
+    // A model's reasoning is text like its answer, and a control in it would be an instruction to
+    // the terminal just the same.
+    try self.writer.writeText(text);
     self.reasoning_at_line_start = text[text.len - 1] == '\n';
     try self.writer.flush();
 }
@@ -348,6 +350,23 @@ test "streamed reasoning is shown before the answer" {
         "◇ reasoning\nI should check.\n\n◆ answer\nhello\n\n",
         out.written(),
     );
+}
+
+test "reasoning is text like the answer, so the terminal runs none of it" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var terminal = Terminal{
+        .writer = .{ .style = .plain, .out = &out.writer },
+        .io = undefined,
+        .scratch = gpa,
+    };
+    defer terminal.deinit();
+    const emit = terminal.emitter();
+
+    try emit.showDelta(.{ .reasoning = "think\x1b]0;gone\x07\n" });
+    try std.testing.expectEqualStrings("◇ reasoning\nthink]0;gone\n", out.written());
 }
 
 test "reasoning is dim and the answer is not" {
