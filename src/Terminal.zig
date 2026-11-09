@@ -42,11 +42,11 @@ pub fn deinit(self: *Terminal) void {
 fn showDelta(e: *Agent.Emitter, delta: Agent.Delta) anyerror!void {
     const self = selfOf(e);
 
-    if (delta.reasoning) |text| {
-        // Reasoning that arrives after the answer has begun would split the answer block, so it is
-        // left out; providers send it first.
-        if (self.answer == null and text.len > 0) try self.streamReasoning(text);
-    }
+    // Reasoning that arrives after the answer has begun would split the answer block, so it is left
+    // out; providers send it first.
+    const reasoning = delta.reasoning orelse "";
+    const before_answer = self.answer == null and reasoning.len > 0;
+    if (before_answer) try self.streamReasoning(reasoning);
 
     const text = delta.content orelse return;
     if (text.len == 0) return;
