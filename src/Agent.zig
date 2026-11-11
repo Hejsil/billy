@@ -11,6 +11,8 @@ const Session = @import("Session.zig");
 const Terminal = @import("Terminal.zig");
 const Tools = @import("Tools.zig");
 
+const banlist = @import("banlist.zig");
+
 const Agent = @This();
 
 const Command = union(enum) {
@@ -557,6 +559,65 @@ fn showDeltaText(emitter: *Emitter, delta: llm.Delta) !void {
 
 const max_retries: usize = 3;
 
+/// What a banned answer is asked for: the same answer, written without the words it used.
+const rephrase_asked =
+    \\The answer above used these words and phrases, which billy does not write: {s}
+    \\Write the answer again without them, changing nothing else: the same
+    \\findings, the same order, and about the same length. Reply with the answer
+    \\alone.
+;
+
+/// Stores the answer `message` carries and shows it, asking for it once more without the banned
+/// words it used; a rewrite that still uses one is kept, since the list is advice rather than a
+/// gate. What is kept is what the user is shown: one answer, not a draft and a version of it.
+fn answer(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client, message: llm.Message) !void {
+    const draft = message.content orelse "";
+    const used = try banlist.used(agent.gpa, draft, agent.config.stored.banned) orelse {
+        try session.append(message);
+        return emitter.show(.{ .answer = draft });
+    };
+    defer agent.gpa.free(used);
+
+    // A rewrite that cannot be made is the draft: a banned word is not worth losing the answer
+    // over, and the draft has been streamed to the user already.
+    const rewritten = agent.rephrase(session, client, draft, used) catch |err| {
+        std.log.warn("could not write the answer again: {t}", .{err});
+        try session.append(message);
+        return emitter.show(.{ .answer = draft });
+    };
+    defer agent.gpa.free(rewritten);
+
+    try session.append(.{
+        .role = .assistant,
+        .content = rewritten,
+        .reasoning_content = message.reasoning_content,
+    });
+    return emitter.show(.{ .answer = rewritten });
+}
+
+/// The answer `draft` written without `used`, from the model that wrote it.
+fn rephrase(agent: *Agent, session: *Session, client: *llm.Client, draft: []const u8, used: []const u8) ![]u8 {
+    const asked = try agent.gpa.print(rephrase_asked, .{used});
+    defer agent.gpa.free(asked);
+
+    // The draft is not in the session, since it is the answer this run is replacing; the request
+    // carries it as the message the model is being asked about.
+    const extra = [_]llm.Message{
+        .{ .role = .assistant, .content = draft },
+        .{ .role = .user, .content = asked },
+    };
+    var stream = try client.complete(
+        agent.gpa,
+        session.id(),
+        session.conversation(&extra),
+        session.toolSet(),
+    );
+    defer stream.deinit();
+
+    while (try stream.next()) |_| {}
+    return agent.gpa.dupe(u8, (try stream.message()).content orelse return error.NoAnswer);
+}
+
 fn turn(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client) !void {
     var scratch_state = std.heap.ArenaAllocator.init(agent.tool_set.gpa);
     defer scratch_state.deinit();
@@ -599,10 +660,10 @@ fn turn(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client
         retries = max_retries;
 
         session.recordUsage(stream.usage());
+
+        if (calls.len == 0) return agent.answer(emitter, session, client, message);
+
         try session.append(message);
-
-        if (calls.len == 0) return emitter.show(.{ .answer = message.content orelse "" });
-
         try runCalls(&agent.tool_set, emitter, &scratch_state, session, calls);
     }
     var buffer: [96]u8 = undefined;
@@ -2038,6 +2099,66 @@ test "a reply with nothing is not kept, and the turn is asked again" {
     try std.testing.expectEqual(@as(usize, 2), session.messages.items.len);
     try std.testing.expectEqualStrings("assistant", session.messages.items[1].role.name());
     try std.testing.expectEqualStrings("all done", session.contentOf(session.messages.items[1]).?);
+}
+
+test "an answer that used a banned word is asked again without it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    try session.setSystemPrompt("be terse");
+    try session.append(.{ .role = .user, .content = "first" });
+
+    // The first reply writes an em dash, which the banlist names, so the run asks for the same
+    // answer again and keeps the second one.
+    const answering = struct {
+        fn answer(number: usize, _: []const u8) Mock.Answer {
+            if (number == 1)
+                return .{
+                    .body = "data: {\"choices\":[{\"delta\":{\"content\":\"It is \u{2014} done\"}}]}\n\ndata: [DONE]\n\n",
+                    .content_type = "text/event-stream",
+                };
+            return .{
+                .body = "data: {\"choices\":[{\"delta\":{\"content\":\"It is done\"}}]}\n\ndata: [DONE]\n\n",
+                .content_type = "text/event-stream",
+            };
+        }
+    }.answer;
+    var mock = try Mock.start("/chat/completions", 2, answering);
+    defer mock.deinit();
+    try mock.serve();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    var setup = try TestSetup.init(gpa, "m");
+    defer setup.deinit();
+    setup.pointAt("test", mock.url);
+    var agent = try testAgent(io, gpa, setup, &http_client);
+    defer agent.deinit();
+
+    var recorder = Recorder{ .gpa = arena_state.allocator() };
+    var client = try agent.clientFor(&session);
+    try agent.turn(recorder.emitter(), &session, &client);
+    try mock.await();
+
+    // The second request is the draft itself, so the model is asked about the answer it wrote.
+    try std.testing.expectEqual(@as(usize, 2), mock.bodies.items.len);
+    try std.testing.expect(std.mem.find(u8, mock.bodies.items[1], "It is \u{2014} done") != null);
+
+    // What is shown and what is kept is the rewrite. The draft did reach the deltas, since it was
+    // streamed before it could be checked.
+    try std.testing.expectEqual(@as(usize, 1), recorder.seen.items.len);
+    try std.testing.expectEqualStrings("It is done", recorder.seen.items[0].answer);
+    try std.testing.expectEqual(@as(usize, 2), session.messages.items.len);
+    try std.testing.expectEqualStrings("It is done", session.contentOf(session.messages.items[1]).?);
 }
 
 test "a provider that keeps saying nothing ends the turn" {

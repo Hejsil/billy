@@ -3,6 +3,7 @@
 
 const std = @import("std");
 
+const banlist = @import("banlist.zig");
 const models = @import("models.zig");
 const Tools = @import("Tools.zig");
 
@@ -29,6 +30,9 @@ const Stored = struct {
     web_blocks: usize = 200,
     compact_at: usize = 80,
     title: bool = true,
+    /// The words and phrases an answer is held to: billy's own by default, and the user's when the
+    /// file names its own.
+    banned: []const []const u8 = &banlist.default,
     tools: ToolSettings = .{},
 
     const default = Stored{};
@@ -429,6 +433,16 @@ test "the file is indented, so it can be read and edited by hand" {
         \\  "web_blocks": 200,
         \\  "compact_at": 80,
         \\  "title": true,
+        \\  "banned": [
+        \\    "—",
+        \\    "here's what",
+        \\    "here's where",
+        \\    "honest",
+        \\    "load-bearing",
+        \\    "the shape of",
+        \\    "worth a look",
+        \\    "worth noting"
+        \\  ],
         \\  "tools": {
         \\    "bash": {
         \\      "timeout_s": 120
