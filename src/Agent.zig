@@ -653,6 +653,11 @@ const base_prompt =
     \\Use the tools when they help with the task: read or change files, run a
     \\command, or search the web. Inspect the code before you change it, and
     \\reply in plain text when the work is done.
+    \\
+    \\Use no em dashes, and do not open with "here is what I found": say what
+    \\you found. Do not say a thing is worth the reader's attention, or call
+    \\your own statement honest. Avoid "load-bearing" and "the shape of" for
+    \\how code works.
 ;
 
 fn leadPrompt(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir, user_dir: ?std.Io.Dir) ![]u8 {
