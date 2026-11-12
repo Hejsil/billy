@@ -630,21 +630,54 @@ fn runCalls(
     session: *Session,
     calls: []const llm.ToolCall,
 ) !void {
-    for (calls) |call| {
-        _ = scratch_state.reset(.retain_capacity);
-        const parsed = Tools.parse(scratch_state.allocator(), call);
-        try emitter.show(.{ .tool_begin = parsed });
+    const Run = struct {
+        parsed: Tools.Call,
+        result: std.Io.Writer.Allocating,
+        failure: anyerror!void = {},
 
-        var result: std.Io.Writer.Allocating = .init(tool_set.gpa);
-        defer result.deinit();
-        try tool_set.run(parsed, &result.writer);
+        // A group's tasks answer nothing, so what one of them fails with is kept for the check
+        // after the group is awaited.
+        fn runTool(run: *@This(), set: *Tools) void {
+            run.failure = set.run(run.parsed, &run.result.writer);
+        }
+    };
 
+    // Every call is parsed before any of them runs, so the arena the arguments sit in lasts until
+    // the batch's results have been shown rather than being reset under a call still using it.
+    defer _ = scratch_state.reset(.retain_capacity);
+
+    const arena = scratch_state.allocator();
+    const runs = try arena.alloc(Run, calls.len);
+
+    for (calls, runs) |call, *run| {
+        run.* = .{
+            .parsed = Tools.parse(scratch_state.allocator(), call),
+            .result = .init(arena),
+        };
+    }
+
+    for (runs) |run|
+        try emitter.show(.{ .tool_begin = run.parsed });
+
+    var group: std.Io.Group = .init;
+    for (runs) |*run|
+        group.async(tool_set.io, Run.runTool, .{ run, tool_set });
+    try group.await(tool_set.io);
+
+    // The group is awaited before any result is shown, so no task is still running if appending a
+    // result or showing it fails and the turn returns.
+    for (runs) |run|
+        try run.failure;
+
+    // Appended in the order the model gave them, where the API expects them, even though the calls
+    // themselves ran together.
+    for (calls, runs) |call, *run| {
         try session.append(.{
             .role = .tool,
             .tool_call_id = call.id,
-            .content = result.written(),
+            .content = run.result.written(),
         });
-        try emitter.show(.{ .tool_end = .{ .call = parsed, .result = result.written() } });
+        try emitter.show(.{ .tool_end = .{ .call = run.parsed, .result = run.result.written() } });
     }
 }
 
@@ -1860,6 +1893,58 @@ test "a turn shows the tool it runs and then the answer" {
         "all done",
         session.contentOf(session.messages.items[session.messages.items.len - 1]).?,
     );
+}
+
+test "a batch of calls runs together and answers in the order it was asked" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The arena the calls are parsed in is reset when the batch ends, so the recorder keeps what
+    // it saw in one of its own.
+    var scratch_state = std.heap.ArenaAllocator.init(gpa);
+    defer scratch_state.deinit();
+    var recorder_state = std.heap.ArenaAllocator.init(gpa);
+    defer recorder_state.deinit();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+    var tool_set = Tools.init(io, tmp.dir, gpa, &http_client, .{
+        .bash_timeout_s = 30,
+        .keys = &Credentials.empty,
+    });
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+
+    // The first command waits for a file only the second command writes, so it finishes only if
+    // the two run together. One after the other, it waits out its loop and reports the failure.
+    const calls = [_]llm.ToolCall{
+        .{ .id = "call_1", .function = .{
+            .name = "bash",
+            .arguments = "{\"command\":\"for i in {1..300}; do [ -e second.done ] && break; sleep 0.01; done; test -e second.done && echo first\"}",
+        } },
+        .{ .id = "call_2", .function = .{
+            .name = "bash",
+            .arguments = "{\"command\":\"touch second.done; echo second\"}",
+        } },
+    };
+    try session.append(.{ .role = .assistant, .tool_calls = &calls });
+
+    var recorder = Recorder{ .gpa = recorder_state.allocator() };
+    try runCalls(&tool_set, recorder.emitter(), &scratch_state, &session, &calls);
+
+    try std.testing.expectEqual(@as(usize, 4), recorder.seen.items.len);
+    try std.testing.expectEqualStrings("bash", recorder.seen.items[0].tool_begin);
+    try std.testing.expectEqualStrings("bash", recorder.seen.items[1].tool_begin);
+    try std.testing.expectEqualStrings("exit code: 0\nfirst\n", recorder.seen.items[2].tool_end.result);
+    try std.testing.expectEqualStrings("exit code: 0\nsecond\n", recorder.seen.items[3].tool_end.result);
+
+    // Each result is kept against the call that asked for it, in the order the model gave them.
+    try std.testing.expectEqualStrings("exit code: 0\nfirst\n", session.toolResult(1, "call_1"));
+    try std.testing.expectEqualStrings("exit code: 0\nsecond\n", session.toolResult(1, "call_2"));
 }
 
 fn expectNotice(expected: []const u8, err: anyerror, shown: bool) !void {

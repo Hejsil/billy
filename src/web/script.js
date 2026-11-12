@@ -12,8 +12,10 @@ let working = false;
 // Whether the end of the conversation follows what comes in: true while the user
 // is at the bottom, false once they scroll away.
 let stick = true;
-// The `<details>` opened by `tool_begin`, which `tool_end` replaces.
-let openCall = null;
+// The `<details>` opened for each call still running, oldest first. A batch begins every call
+// before any of them finishes, and the results come back in the order the calls were made, so a
+// `tool_end` completes the first call still waiting rather than the one just begun.
+let openCalls = [];
 // Where the running turn's tool calls go; open until another block closes it.
 let fold = null;
 
@@ -105,7 +107,7 @@ async function open(id) {
   }
   // A turn that ended on a tool call has no later block to close its fold.
   if (fold) closeFold();
-  openCall = null;
+  openCalls = [];
   scrollToEnd(true);
   input.focus();
 }
@@ -174,7 +176,7 @@ async function send(text) {
     note('lost the connection: ' + err.message);
   } finally {
     working = false;
-    openCall = null;
+    openCalls = [];
     fold = null;
     form.classList.remove('working');
     input.disabled = false;
@@ -215,17 +217,17 @@ function handleFrame(frame) {
     show(payload.html);
     scrollToEnd();
   } else if (event === 'tool_begin') {
-    openCall = show(payload.html);
+    openCalls.push(show(payload.html));
     labelFold(false);
     scrollToEnd();
   } else if (event === 'tool_end') {
     // Replaces the begun call in place, keeping whether the user opened it.
     const finished = show(payload.html);
-    if (openCall) {
-      finished.open = openCall.open;
-      openCall.replaceWith(finished);
+    const begun = openCalls.shift();
+    if (begun) {
+      finished.open = begun.open;
+      begun.replaceWith(finished);
     }
-    openCall = null;
     labelFold(false);
     scrollToEnd();
   } else if (event === 'session') {
@@ -334,7 +336,7 @@ function grow() {
 function newDraft() {
   if (working) return;
   selected = null;
-  openCall = null;
+  openCalls = [];
   fold = null;
   headerBox.innerHTML = '';
   conversation.innerHTML = '';

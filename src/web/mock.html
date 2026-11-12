@@ -94,10 +94,12 @@ const turn = (text, creating, id) => [
   ...(creating ? [[0, 'session', { id }]] : []),
   [0, 'header', { html: header(id) }],
   [200, 'block', { html: prompt_(text) }],
+  // One batch of calls: both begin before either ends, and the ends arrive in the order the calls
+  // were made, as a concurrent turn now streams them.
   [600, 'tool_begin', { html: call('read', 'src/main.zig', '', '') }],
-  [900, 'tool_end', { html: call('read', 'src/main.zig', '', '<pre class="result">1\tconst x = 1;</pre>\n') }],
-  [300, 'tool_begin', { html: call('bash', 'make', running, '<pre class="command">make</pre>\n') }],
-  [1500, 'tool_end', { html: call('bash', 'make', ok, '<pre class="command">make</pre>\n<pre class="stdout">done</pre>\n') }],
+  [150, 'tool_begin', { html: call('bash', 'make', running, '<pre class="command">make</pre>\n') }],
+  [1200, 'tool_end', { html: call('read', 'src/main.zig', '', '<pre class="result">1\tconst x = 1;</pre>\n') }],
+  [900, 'tool_end', { html: call('bash', 'make', ok, '<pre class="command">make</pre>\n<pre class="stdout">done</pre>\n') }],
   [500, 'block', { html: answer('<p>You said: <code>' + esc(text) + '</code></p>\n') }],
   ...(creating ? [[0, 'title', { title: text.slice(0, 40) }]] : []),
 ];
