@@ -163,6 +163,7 @@ fn options(billy: *Billy) Agent.Options {
             .fetch = stored.tools.web_fetch,
             .health = &billy.health,
             .keys = &billy.credentials,
+            .sub_agents = true,
         },
         .instructions = billy.dirs.config,
     };
@@ -173,33 +174,38 @@ pub const Resume = union(enum) {
     latest,
 };
 
+/// The session a run works in: the one named, or a new one. A resumed session keeps the directory
+/// it was saved with, so it continues where it was left rather than where it is picked up.
+fn openSession(billy: *Billy, out: Terminal.Writer, id: ?[]const u8) !Session {
+    return Session.open(billy.io, billy.dirs.sessions, billy.gpa, id, billy.cwd) catch |err| switch (err) {
+        error.SessionNotFound => {
+            try say(out, "no session '{s}'", .{id.?});
+            return report.Reported;
+        },
+        error.InvalidSessionId => {
+            try say(out, "'{s}' cannot be used as a session name", .{id.?});
+            return report.Reported;
+        },
+        else => |other| return other,
+    };
+}
+
+fn agentFor(billy: *Billy, session: *Session, run_options: Agent.Options) !Agent {
+    return try Agent.init(billy.io, billy.gpa, run_options, session.cwd(), &billy.http_client);
+}
+
 /// Runs one session in the terminal, resuming what `resuming` asks for or starting a new one when
 /// it asks for nothing.
 pub fn run(billy: *Billy, out: Terminal.Writer, resuming: ?Resume) !void {
     const resume_id = try billy.resumeId(resuming);
     billy.ensureCatalog();
-    // A resumed session keeps the directory it was saved with, so a session continues where it was
-    // left rather than wherever it is picked up.
-    var session = Session.open(
-        billy.io,
-        billy.dirs.sessions,
-        billy.gpa,
-        resume_id,
-        billy.cwd,
-    ) catch |err| switch (err) {
-        error.SessionNotFound => {
-            std.log.err("no session '{s}'", .{resume_id.?});
-            return report.Reported;
-        },
-        error.InvalidSessionId => {
-            std.log.err("'{s}' cannot be used as a session name", .{resume_id.?});
-            return report.Reported;
-        },
-        else => |other| return other,
-    };
+    var session = try billy.openSession(out, resume_id);
     defer session.deinit();
 
-    const run_options = billy.options();
+    var agent = try billy.agentFor(&session, billy.options());
+    defer agent.deinit();
+    // A session picked up again has its prompt and tools refreshed for where it works now.
+    if (session.messages.items.len > 0) try agent.prepare(&session);
 
     var terminal = Terminal{
         .writer = out,
@@ -212,8 +218,71 @@ pub fn run(billy: *Billy, out: Terminal.Writer, resuming: ?Resume) !void {
     if (resume_id != null) {
         try terminal.printTranscript(&session, billy.config.stored.resume_blocks);
     }
-    try terminal.run(run_options, &session, &billy.http_client);
+    try terminal.run(&agent, &session);
 }
+
+pub const Ask = struct {
+    prompt: []const u8,
+    session: ?[]const u8 = null,
+    /// Whether this run may start sub agents of its own, which a sub agent's run may not.
+    agents: bool = true,
+};
+
+/// Asks one thing and prints the answer under its session: the terminal's turn, with nothing around it.
+pub fn ask(billy: *Billy, out: Terminal.Writer, asked: Ask) !void {
+    var session = try billy.openSession(out, asked.session);
+    defer session.deinit();
+
+    billy.ensureCatalog();
+    var run_options = billy.options();
+    // A sub agent is not given the tool that starts one, so a run starts one and no more.
+    if (!asked.agents) run_options.tools.sub_agents = false;
+
+    var agent = try billy.agentFor(&session, run_options);
+    defer agent.deinit();
+    try agent.prepare(&session);
+
+    var arena_state = std.heap.ArenaAllocator.init(billy.gpa);
+    defer arena_state.deinit();
+    var plain = Plain{ .arena = arena_state.allocator() };
+    agent.ask(plain.emitter(), &session, asked.prompt) catch |err| {
+        std.log.err("could not show the turn: {t}", .{err});
+        return say(out, "the turn stopped: {t}", .{err});
+    };
+    if (plain.notice) |text| return say(out, "{s}", .{text});
+
+    // Flushed here: a failed run answers with its exit code, so `main` never reaches its own flush.
+    try out.print("session: {s}\n\n{s}\n", .{ session.id(), plain.answer orelse "" });
+    try out.flush();
+}
+
+fn say(out: Terminal.Writer, comptime format: []const u8, args: anytype) !void {
+    try out.print("error: " ++ format ++ "\n", args);
+    try out.flush();
+    return report.Reported;
+}
+
+const Plain = struct {
+    arena: std.mem.Allocator,
+    answer: ?[]const u8 = null,
+    notice: ?[]const u8 = null,
+    interface: Agent.Emitter = .{ .vtable = &vtable },
+
+    const vtable: Agent.Emitter.VTable = .{ .block = show };
+
+    fn emitter(self: *Plain) *Agent.Emitter {
+        return &self.interface;
+    }
+
+    fn show(e: *Agent.Emitter, block: Agent.Block) anyerror!void {
+        const self: *Plain = @alignCast(@fieldParentPtr("interface", e));
+        switch (block) {
+            .answer => |text| self.answer = try self.arena.dupe(u8, text),
+            .notice => |text| self.notice = try self.arena.dupe(u8, text),
+            else => {},
+        }
+    }
+};
 
 fn resumeId(billy: *Billy, resuming: ?Resume) !?[]const u8 {
     const asked = resuming orelse return null;

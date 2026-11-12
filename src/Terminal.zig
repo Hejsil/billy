@@ -231,21 +231,11 @@ pub const SessionHeader = struct {
 const input_prompt = "> ";
 
 /// Runs a session here: reads the line the user types, gives it to the agent, and shows what comes
-/// back, until the input ends.
-pub fn run(
-    self: *Terminal,
-    options: Agent.Options,
-    session: *Session,
-    http_client: *std.http.Client,
-) !void {
+/// back, until the input ends. The agent is the caller's, so what it is given is made in one place.
+pub fn run(self: *Terminal, agent: *Agent, session: *Session) !void {
     const io = self.io;
     const gpa = self.scratch;
     const out = self.writer;
-
-    var agent = try Agent.init(io, gpa, options, session.cwd(), http_client);
-    defer agent.deinit();
-    const resumed = session.messages.items.len > 0;
-    if (resumed) try agent.prepare(session);
 
     var editor = LineEditor.init(io, out.out, gpa);
     defer editor.deinit();

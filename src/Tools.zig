@@ -9,6 +9,7 @@ const Health = @import("Health.zig");
 const llm = @import("llm.zig");
 const Read = @import("Tools/Read.zig");
 const Session = @import("Session.zig");
+const SubAgent = @import("Tools/SubAgent.zig");
 const Terminal = @import("Terminal.zig");
 const Write = @import("Tools/Write.zig");
 
@@ -29,6 +30,7 @@ pub const Call = union(enum) {
     bash: Bash,
     web_search: web.Search,
     web_fetch: web.Fetch,
+    agent: SubAgent,
     unknown: []const u8,
     malformed: Malformed,
 
@@ -43,6 +45,8 @@ dir: std.Io.Dir,
 gpa: std.mem.Allocator,
 http: *std.http.Client,
 settings: Settings,
+/// The tools the last call to `definitions` wrote, which `definitions` answers with.
+definitions_buffer: [table.len]Session.Definition = undefined,
 
 /// What a tool set runs with, beyond the plumbing of the run it belongs to: the limits it runs
 /// under and the backends it asks.
@@ -52,16 +56,33 @@ pub const Settings = struct {
     fetch: web.FetchSettings = .{},
     health: ?*Health = null,
     keys: *const Credentials,
+    /// Whether this run offers the agent tool. A sub agent's own run withholds it, since the billy
+    /// it starts would otherwise be able to start another, and another.
+    sub_agents: bool = false,
 };
 
 pub fn init(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, http: *std.http.Client, settings: Settings) Tools {
     return .{ .io = io, .dir = dir, .gpa = gpa, .http = http, .settings = settings };
 }
 
-pub fn definitions(tools: *const Tools) []const Session.Definition {
-    const has_web = tools.settings.search.providers.len > 0 or
+pub fn definitions(tools: *Tools) []const Session.Definition {
+    var count: usize = 0;
+    for (table) |tool| {
+        if (tool.web and !tools.hasWeb()) continue;
+        if (tool.sub_agent and !tools.settings.sub_agents) continue;
+        tools.definitions_buffer[count] = .{
+            .name = @tagName(tool.tag),
+            .description = tool.description,
+            .parameters = tool.parameters,
+        };
+        count += 1;
+    }
+    return tools.definitions_buffer[0..count];
+}
+
+fn hasWeb(tools: *const Tools) bool {
+    return tools.settings.search.providers.len > 0 or
         tools.settings.fetch.providers.len > 0;
-    return if (has_web) &specs_with_web else &specs;
 }
 
 pub fn callName(call: Call) []const u8 {
@@ -170,7 +191,7 @@ pub fn writeFile(io: std.Io, dir: std.Io.Dir, path: []const u8, bytes: []const u
 fn dispatch(tools: *Tools, call: Call, out: *std.Io.Writer) !void {
     switch (call) {
         // Every tool is run the same way: what it was parsed with, and the run it belongs to.
-        inline .read, .write, .edit, .bash, .web_search, .web_fetch => |tool| try tool.run(tools.*, out),
+        inline .read, .write, .edit, .bash, .web_search, .web_fetch, .agent => |tool| try tool.run(tools.*, out),
         .unknown => |name| try fail(out, "unknown tool '{s}'", .{name}),
         .malformed => |bad| try fail(
             out,
@@ -224,6 +245,7 @@ const marks = struct {
     const bash = Terminal.Writer.Mark{ .glyph = "❯", .hue = .cyan };
     const search = Terminal.Writer.Mark{ .glyph = "⌕", .hue = .magenta };
     const fetch = Terminal.Writer.Mark{ .glyph = "⇣", .hue = .magenta };
+    const agent = Terminal.Writer.Mark{ .glyph = "❖", .hue = .yellow };
     const unknown = Terminal.Writer.Mark{ .glyph = "?", .hue = .red };
 };
 
@@ -241,6 +263,7 @@ pub const Heading = struct {
             .bash => |args| .forTool(.bash, headerLine(args.description orelse args.command)),
             .web_search => |args| .forTool(.web_search, args.query),
             .web_fetch => |args| .forTool(.web_fetch, args.url),
+            .agent => |args| .forTool(.agent, headerLine(args.prompt)),
             .unknown => |name| .marked(marks.unknown, name, ""),
             .malformed => |bad| .marked(marks.unknown, bad.name, ""),
         };
@@ -311,6 +334,7 @@ const Tool = struct {
     parameters: []const u8,
     mark: Terminal.Writer.Mark,
     web: bool = false,
+    sub_agent: bool = false,
 };
 
 const table = [_]Tool{
@@ -373,6 +397,18 @@ const table = [_]Tool{
             "\"raw\":{\"type\":\"boolean\",\"description\":\"Read the url directly instead of extracting a page, for JSON or plain text, whose bytes would be changed by extraction. Defaults to false.\"}}," ++
             "\"required\":[\"url\"]}",
     },
+    .{
+        .tag = .agent,
+        .mark = marks.agent,
+        .sub_agent = true,
+        .description = "Ask a sub agent to do something: it runs its own billy in this session's " ++
+            "working directory, and answers with what it found, under the session it worked in. " ++
+            "Pass that session back to ask that agent more.",
+        .parameters = "{\"type\":\"object\",\"properties\":{" ++
+            "\"prompt\":{\"type\":\"string\",\"description\":\"What to ask the sub agent.\"}," ++
+            "\"session\":{\"type\":\"string\",\"description\":\"The session to continue, as an earlier call returned it. A new one is started without it.\"}}," ++
+            "\"required\":[\"prompt\"]}",
+    },
 };
 
 fn isNotATool(comptime name: []const u8) bool {
@@ -404,35 +440,6 @@ comptime {
             @compileError("the non-tool arm '" ++ @tagName(tool.tag) ++ "' has a table row");
     }
 }
-
-fn specList(comptime web_tools: Web) [specsCount(web_tools)]Session.Definition {
-    var list: [specsCount(web_tools)]Session.Definition = undefined;
-    var n: usize = 0;
-    for (table) |tool| {
-        if (web_tools == .without_web and tool.web) continue;
-        list[n] = .{
-            .name = @tagName(tool.tag),
-            .description = tool.description,
-            .parameters = tool.parameters,
-        };
-        n += 1;
-    }
-    return list;
-}
-
-const Web = enum { with_web, without_web };
-
-fn specsCount(comptime web_tools: Web) usize {
-    var n: usize = 0;
-    for (table) |tool| {
-        if (web_tools == .without_web and tool.web) continue;
-        n += 1;
-    }
-    return n;
-}
-
-const specs = specList(.without_web);
-const specs_with_web = specList(.with_web);
 
 test "a bash result splits into its status and its streams" {
     const failed = bashOutput("exit code: 2\nbuilt\nstderr:\nboom\n").?;
@@ -588,15 +595,15 @@ test "the definitions cover every tool the loop dispatches" {
 test "the web tools are offered only when a backend is configured" {
     var plain = testTools(false);
     const without = plain.definitions();
-    try std.testing.expectEqual(specs.len, without.len);
-    for (without) |definition| {
-        try std.testing.expect(!std.mem.eql(u8, definition.name, "web_search"));
-        try std.testing.expect(!std.mem.eql(u8, definition.name, "web_fetch"));
+    const expected = [_][]const u8{ "read", "write", "edit", "bash" };
+    try std.testing.expectEqual(expected.len, without.len);
+    for (without, expected) |definition, name| {
+        try std.testing.expectEqualStrings(name, definition.name);
     }
 
     var searched = testTools(true);
     const with = searched.definitions();
-    try std.testing.expectEqual(specs_with_web.len, with.len);
+    try std.testing.expectEqual(expected.len + 2, with.len);
     try std.testing.expectEqualStrings("web_search", with[with.len - 2].name);
     try std.testing.expectEqualStrings("web_fetch", with[with.len - 1].name);
 }

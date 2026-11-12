@@ -34,6 +34,15 @@ const models_about =
     \\a run needs it.
 ;
 
+const ask_about =
+    \\Ask one thing and print the answer, without the conversation the terminal
+    \\keeps around it: the one-shot run a sub agent is. The session it was asked
+    \\in leads the answer, so naming it again with --session asks that agent
+    \\more; a run that could not answer says why instead, beginning with
+    \\`error:`. A session named that does not exist is an error rather than a
+    \\new one.
+;
+
 const resume_about =
     \\Continue a session: the one named, or with none named the one written to
     \\most recently in this directory. `billy sessions` lists the sessions, with
@@ -47,12 +56,13 @@ const sessions_about =
 ;
 
 const billy_commands =
-    \\  resume [<session>]        continue a session, or the latest one here
-    \\  login [<service>]         store an API key, or list the services
-    \\  config <setting> <value>  set a configuration setting by its path
-    \\  sessions                  list the sessions, newest first
-    \\  models [--refresh]        show the model catalog, or fetch it again
-    \\  serve                     run the web frontend
+    \\  resume [<session>]             continue a session, or the latest one here
+    \\  ask <prompt> [--session <id>]  ask one thing and print the answer
+    \\  login [<service>]              store an API key, or list the services
+    \\  config <setting> <value>       set a configuration setting by its path
+    \\  sessions                       list the sessions, newest first
+    \\  models [--refresh]             show the model catalog, or fetch it again
+    \\  serve                          run the web frontend
 ;
 
 const models_options =
@@ -62,6 +72,12 @@ const models_options =
 
 const command_options =
     \\  -h, --help  print this message
+;
+
+const ask_options =
+    \\      --session <id>  continue the session with this id
+    \\      --no-agents     do not offer this run the agent tool
+    \\  -h, --help          print this message
 ;
 
 const serve_options =
@@ -92,6 +108,7 @@ const Options = struct {
     const Command = union(enum) {
         none,
         resume_session: Resume,
+        ask: Ask,
         login: Login,
         config: Config,
         serve: Serve,
@@ -107,6 +124,13 @@ const Options = struct {
             const id = asked.id orelse return .{ .latest = {} };
             return .{ .id = id };
         }
+    };
+
+    const Ask = struct {
+        prompt: ?[]const u8 = null,
+        session: ?[]const u8 = null,
+        no_agents: bool = false,
+        help: bool = false,
     };
 
     const Login = struct {
@@ -187,6 +211,11 @@ fn answer(init: std.process.Init, out: Terminal.Writer, options: Options) !u8 {
     switch (options.command) {
         .none => try billy.run(out, null),
         .resume_session => |asked| try billy.run(out, asked.wanted()),
+        .ask => |asked| try billy.ask(out, .{
+            .prompt = asked.prompt.?,
+            .session = asked.session,
+            .agents = !asked.no_agents,
+        }),
         .serve => |serve| try billy.serve(serve.host, serve.port),
         .config => |config| try billy.configSet(out, config.path.?, config.value.?),
         .login => |login| try billy.login(out, login.service),
@@ -214,6 +243,12 @@ fn printAskedHelp(options: Options, out: Terminal.Writer) !bool {
         .resume_session => |asked| {
             if (asked.help) {
                 try printHelp(out, "billy resume [<session>]", resume_about, null, command_options);
+                return true;
+            }
+        },
+        .ask => |asked| {
+            if (asked.help) {
+                try printHelp(out, "billy ask <prompt> [--session <id>]", ask_about, null, ask_options);
                 return true;
             }
         },
@@ -272,6 +307,8 @@ fn parseArgs(args: *spaghet.Args) ParseError!Options {
 fn parseCommand(args: *spaghet.Args, command: []const u8) ParseError!Options.Command {
     if (std.mem.eql(u8, command, "resume"))
         return .{ .resume_session = try parseResume(args) };
+    if (std.mem.eql(u8, command, "ask"))
+        return .{ .ask = try parseAsk(args) };
     if (std.mem.eql(u8, command, "login"))
         return .{ .login = try parseLogin(args) };
     if (std.mem.eql(u8, command, "config"))
@@ -295,6 +332,25 @@ fn parseResume(args: *spaghet.Args) ParseError!Options.Resume {
         if (args.positional()) |_|
             return error.InvalidArgument;
     }
+    return asked;
+}
+
+fn parseAsk(args: *spaghet.Args) ParseError!Options.Ask {
+    var asked: Options.Ask = .{};
+    while (args.next()) {
+        if (args.flag(&.{ "-h", "--help" }))
+            asked.help = true;
+        if (args.option(&.{"--session"})) |id|
+            asked.session = id;
+        if (args.flag(&.{"--no-agents"}))
+            asked.no_agents = true;
+        if (asked.prompt == null)
+            asked.prompt = args.positional();
+        if (args.positional()) |_|
+            return error.InvalidArgument;
+    }
+    if (!asked.help and asked.prompt == null)
+        return error.InvalidArgument;
     return asked;
 }
 
@@ -396,6 +452,32 @@ test "parseArgs reads the resume subcommand on its own" {
         try parseArgsSlice(&.{ "resume", "--help" }),
     );
     try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "resume", "dev", "extra" }));
+}
+
+test "parseArgs reads the ask subcommand on its own" {
+    try expectOptions(
+        .{ .command = .{ .ask = .{ .prompt = "do the thing" } } },
+        try parseArgsSlice(&.{ "ask", "do the thing" }),
+    );
+    try expectOptions(
+        .{ .command = .{ .ask = .{ .prompt = "do the thing", .session = "dev" } } },
+        try parseArgsSlice(&.{ "ask", "--session", "dev", "do the thing" }),
+    );
+    try expectOptions(
+        .{ .command = .{ .ask = .{ .prompt = "do the thing", .session = "dev" } } },
+        try parseArgsSlice(&.{ "ask", "--session=dev", "do the thing" }),
+    );
+    try expectOptions(
+        .{ .command = .{ .ask = .{ .prompt = "--session", .no_agents = true } } },
+        try parseArgsSlice(&.{ "ask", "--no-agents", "--", "--session" }),
+    );
+    try expectOptions(
+        .{ .command = .{ .ask = .{ .help = true } } },
+        try parseArgsSlice(&.{ "ask", "-h" }),
+    );
+
+    try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{"ask"}));
+    try std.testing.expectError(error.InvalidArgument, parseArgsSlice(&.{ "ask", "one", "two" }));
 }
 
 test "parseArgs reads the login subcommand on its own" {
@@ -503,6 +585,21 @@ fn expectOptions(expected: Options, actual: Options) !void {
                 try std.testing.expect(actual_resume.id == null);
             }
         },
+        .ask => |asked| {
+            const actual_ask = actual.command.ask;
+            try std.testing.expectEqual(asked.help, actual_ask.help);
+            try std.testing.expectEqual(asked.no_agents, actual_ask.no_agents);
+            if (asked.prompt) |prompt| {
+                try std.testing.expectEqualStrings(prompt, actual_ask.prompt.?);
+            } else {
+                try std.testing.expect(actual_ask.prompt == null);
+            }
+            if (asked.session) |session| {
+                try std.testing.expectEqualStrings(session, actual_ask.session.?);
+            } else {
+                try std.testing.expect(actual_ask.session == null);
+            }
+        },
         .login => |login| {
             const actual_login = actual.command.login;
             try std.testing.expectEqual(login.help, actual_login.help);
@@ -558,6 +655,12 @@ const help_messages = [_]struct {
         .description = resume_about,
         .commands = null,
         .options = command_options,
+    },
+    .{
+        .invocation = "billy ask <prompt> [--session <id>]",
+        .description = ask_about,
+        .commands = null,
+        .options = ask_options,
     },
     .{
         .invocation = "billy login [<service>]",
