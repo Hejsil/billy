@@ -711,14 +711,11 @@ const TestServer = struct {
         const sessions = try tmp.dir.createDirPathOpen(std.testing.io, "sessions", .{});
         errdefer sessions.close(std.testing.io);
 
-        var health = try Health.load(std.testing.io, gpa, tmp.dir);
-        errdefer health.deinit();
-
         self.* = .{
             .tmp = tmp,
             .config = .init(gpa),
             .credentials = .{},
-            .health = health,
+            .health = .{ .io = std.testing.io, .gpa = gpa },
             .registry = .{ .io = std.testing.io, .gpa = gpa },
             .http = .{ .allocator = gpa, .io = std.testing.io },
             .server = .{

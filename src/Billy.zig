@@ -65,7 +65,7 @@ pub fn open(init: std.process.Init) !Billy {
         .dirs = dirs,
         .credentials = credentials,
         .config = config,
-        .health = try Health.load(io, init.gpa, dirs.data),
+        .health = .{ .io = io, .gpa = init.gpa },
         .cwd = cwd,
     };
 }

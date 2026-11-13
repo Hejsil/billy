@@ -230,9 +230,6 @@ test "a backend that failed is set aside, so the next search skips it" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
     // Three requests: Tavily fails the first search, Brave answers it, and Brave answers the second
     // search, which never asks Tavily again.
     var mock = try Mock.start("/search", 3, struct {
@@ -247,7 +244,7 @@ test "a backend that failed is set aside, so the next search skips it" {
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    var health = try Health.load(io, gpa, tmp.dir);
+    var health = Health{ .io = io, .gpa = gpa };
     defer health.deinit();
 
     const search: Search = .{ .query = "zig lang" };
@@ -453,9 +450,6 @@ test "a search with every backend set aside says so, without asking any" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
     // A listener that never serves: no backend should be reached.
     var mock = try Mock.start("/search", 1, Mock.fixed("{}"));
     defer mock.deinit();
@@ -463,7 +457,7 @@ test "a search with every backend set aside says so, without asking any" {
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    var health = try Health.load(io, gpa, tmp.dir);
+    var health = Health{ .io = io, .gpa = gpa };
     defer health.deinit();
     const now = std.Io.Clock.real.now(io).toMilliseconds();
     health.record("tavily", null, now);

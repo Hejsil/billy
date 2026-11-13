@@ -221,9 +221,6 @@ test "a url no backend could read does not set the backend aside" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
     var mock = try Mock.start("/extract", 2, struct {
         fn answer(number: usize, _: []const u8) Mock.Answer {
             if (number == 1) return .{
@@ -238,7 +235,7 @@ test "a url no backend could read does not set the backend aside" {
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    var health = try Health.load(io, gpa, tmp.dir);
+    var health = Health{ .io = io, .gpa = gpa };
     defer health.deinit();
 
     const backends: []const web.Backend = &.{.{ .provider = .tavily, .api_key = "secret", .endpoint = mock.url }};
