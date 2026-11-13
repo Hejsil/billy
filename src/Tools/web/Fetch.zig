@@ -187,9 +187,9 @@ test "each fetch backend is asked the way its table says" {
 
         var out: std.Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
-        const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
+        const tools = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
         const fetch: Fetch = .{ .url = "https://ziglang.org" };
-        try fetch.ask(tool_set, &.{.{ .provider = .tavily, .api_key = "secret", .endpoint = mock.url }}, &out.writer);
+        try fetch.ask(tools, &.{.{ .provider = .tavily, .api_key = "secret", .endpoint = mock.url }}, &out.writer);
         try mock.await();
 
         try std.testing.expectEqualStrings("{\"urls\":[\"https://ziglang.org\"]}", mock.bodies.items[0]);
@@ -206,9 +206,9 @@ test "each fetch backend is asked the way its table says" {
 
         var out: std.Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
-        const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
+        const tools = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
         const fetch: Fetch = .{ .url = "https://ziglang.org" };
-        try fetch.ask(tool_set, &.{.{ .provider = .exa, .api_key = "secret", .endpoint = mock.url }}, &out.writer);
+        try fetch.ask(tools, &.{.{ .provider = .exa, .api_key = "secret", .endpoint = mock.url }}, &out.writer);
         try mock.await();
 
         try std.testing.expectEqualStrings("{\"urls\":[\"https://ziglang.org\"]}", mock.bodies.items[0]);
@@ -248,8 +248,8 @@ test "a url no backend could read does not set the backend aside" {
     // Tavily is the only configured backend and it could not read the url, so the url is read
     // directly instead -- from the same mock.
     const fetch: Fetch = .{ .url = mock.url };
-    const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .health = &health, .keys = &Credentials.empty });
-    try fetch.ask(tool_set, backends, &out.writer);
+    const tools = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .health = &health, .keys = &Credentials.empty });
+    try fetch.ask(tools, backends, &out.writer);
     try mock.await();
 
     try std.testing.expectEqualStrings("<html>a page</html>", out.written());
@@ -273,12 +273,12 @@ test "a raw fetch reads the url directly, without any backend" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{
+    const tools = Tools.init(io, .cwd(), gpa, &http_client, .{
         .bash_timeout_s = 120,
         .keys = &Credentials.empty,
         .fetch = .{},
     });
-    try run(.{ .url = mock.url, .raw = true }, tool_set, &out.writer);
+    try run(.{ .url = mock.url, .raw = true }, tools, &out.writer);
     try mock.await();
 
     try std.testing.expectEqualStrings(reply, out.written());
@@ -298,12 +298,12 @@ test "a raw fetch keeps a body of any size whole" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{
+    const tools = Tools.init(io, .cwd(), gpa, &http_client, .{
         .bash_timeout_s = 120,
         .keys = &Credentials.empty,
         .fetch = .{},
     });
-    try run(.{ .url = mock.url, .raw = true }, tool_set, &out.writer);
+    try run(.{ .url = mock.url, .raw = true }, tools, &out.writer);
     try mock.await();
 
     try std.testing.expectEqual(reply.len, out.written().len);
@@ -318,12 +318,12 @@ test "a backend whose key is not stored is not asked" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{
+    const tools = Tools.init(io, .cwd(), gpa, &http_client, .{
         .bash_timeout_s = 120,
         .keys = &Credentials.empty,
         .fetch = .{ .providers = &.{.tavily} },
     });
-    try run(.{ .url = "https://example.org" }, tool_set, &out.writer);
+    try run(.{ .url = "https://example.org" }, tools, &out.writer);
     try std.testing.expectEqualStrings(
         "error: no key is stored for a fetch backend; run `billy login` to store one",
         out.written(),
@@ -341,12 +341,12 @@ test "a fetch with no backend named says so rather than reading the url" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{
+    const tools = Tools.init(io, .cwd(), gpa, &http_client, .{
         .bash_timeout_s = 120,
         .keys = &Credentials.empty,
         .fetch = .{ .providers = &.{} },
     });
-    try run(.{ .url = "https://example.org" }, tool_set, &out.writer);
+    try run(.{ .url = "https://example.org" }, tools, &out.writer);
     try std.testing.expectEqualStrings(
         "error: no fetch backend is configured; add one to tools.web_fetch.providers, or pass raw",
         out.written(),
@@ -362,12 +362,12 @@ test "a fetch of an empty url is refused before any backend is asked" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{
+    const tools = Tools.init(io, .cwd(), gpa, &http_client, .{
         .bash_timeout_s = 120,
         .keys = &Credentials.empty,
         .fetch = .{},
     });
-    try run(.{ .url = "" }, tool_set, &out.writer);
+    try run(.{ .url = "" }, tools, &out.writer);
     try std.testing.expectEqualStrings("error: no url to fetch", out.written());
 }
 
@@ -384,12 +384,12 @@ test "a raw fetch of a url that cannot be read fails as the call, not the run" {
     defer out.deinit();
 
     // Nothing is returned.
-    const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{
+    const tools = Tools.init(io, .cwd(), gpa, &http_client, .{
         .bash_timeout_s = 120,
         .keys = &Credentials.empty,
         .fetch = .{},
     });
-    try run(.{ .url = closed_port_url, .raw = true }, tool_set, &out.writer);
+    try run(.{ .url = closed_port_url, .raw = true }, tools, &out.writer);
     try std.testing.expect(std.mem.startsWith(u8, out.written(), "error: cannot read " ++ closed_port_url ++ ": "));
 }
 
@@ -415,8 +415,8 @@ test "a url neither a backend nor a direct read could reach is a failed call" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     const fetch: Fetch = .{ .url = closed_port_url };
-    const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
-    try fetch.ask(tool_set, backends, &out.writer);
+    const tools = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
+    try fetch.ask(tools, backends, &out.writer);
     try mock.await();
 
     try std.testing.expect(std.mem.startsWith(u8, out.written(), "error: cannot read " ++ closed_port_url ++ ": "));
@@ -443,12 +443,12 @@ test "a url that asked to be waited is a failed call, and says how long for" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    const tool_set = Tools.init(io, .cwd(), gpa, &http_client, .{
+    const tools = Tools.init(io, .cwd(), gpa, &http_client, .{
         .bash_timeout_s = 120,
         .keys = &Credentials.empty,
         .fetch = .{},
     });
-    try run(.{ .url = mock.url, .raw = true }, tool_set, &out.writer);
+    try run(.{ .url = mock.url, .raw = true }, tools, &out.writer);
     try mock.await();
 
     const expected = try gpa.print("error: {s} asked to be waited 2000ms before it is read again", .{mock.url});

@@ -57,8 +57,8 @@ fn expectRead(contents: []const u8, read: Read, expected: []const u8) !void {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    const tool_set = Tools.init(io, tmp.dir, gpa, undefined, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
-    try read.run(tool_set, &out.writer);
+    const tools = Tools.init(io, tmp.dir, gpa, undefined, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
+    try read.run(tools, &out.writer);
     try std.testing.expectEqualStrings(expected, out.written());
 }
 
@@ -141,9 +141,9 @@ test "a file that cannot be read is the call's failure, not the run's" {
     // Nothing is returned: a read that could not open its file is written as the call's result,
     // beginning with the mark both readers branch on, so the terminal shows it as a failure and the
     // page draws it as one rather than either reading it as the contents of a file.
-    const tool_set = Tools.init(io, tmp.dir, gpa, undefined, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
+    const tools = Tools.init(io, tmp.dir, gpa, undefined, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
     const read: Read = .{ .path = "missing.txt" };
-    try read.run(tool_set, &out.writer);
+    try read.run(tools, &out.writer);
     try std.testing.expect(std.mem.startsWith(u8, out.written(), "error: cannot read missing.txt: "));
     try std.testing.expect(std.mem.find(u8, out.written(), "FileNotFound") != null);
 }

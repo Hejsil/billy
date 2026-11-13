@@ -286,9 +286,9 @@ test "an edit refuses a file too large to hold, as a read does" {
 
     // A path comes from the model, so one that is a log, a device or a file still being written is
     // refused at the same limit a read holds it to, rather than read until the heap runs out.
-    const tool_set = Tools.init(io, tmp.dir, gpa, undefined, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
+    const tools = Tools.init(io, tmp.dir, gpa, undefined, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
     const edit: Edit = .{ .path = "big.txt", .old_string = "a", .new_string = "b" };
-    try edit.run(tool_set, &out.writer);
+    try edit.run(tools, &out.writer);
     try std.testing.expect(std.mem.startsWith(u8, out.written(), "error: cannot read big.txt: "));
 }
 

@@ -463,7 +463,7 @@ test "a bash command that outlives the timeout is killed and reported" {
 
     // A one-second limit kills a command that would otherwise run far longer, and the model is told
     // so rather than left waiting for it to finish.
-    var tool_set = Tools.init(io, std.Io.Dir.cwd(), gpa, &http_client, .{ .bash_timeout_s = 1, .keys = &Credentials.empty });
+    var tools = Tools.init(io, std.Io.Dir.cwd(), gpa, &http_client, .{ .bash_timeout_s = 1, .keys = &Credentials.empty });
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"sleep 30\"}",
@@ -472,7 +472,7 @@ test "a bash command that outlives the timeout is killed and reported" {
     defer result.deinit();
     var parse_state = std.heap.ArenaAllocator.init(gpa);
     defer parse_state.deinit();
-    _ = try runCall(parse_state.allocator(), &tool_set, call, &result.writer);
+    _ = try runCall(parse_state.allocator(), &tools, call, &result.writer);
 
     try std.testing.expectEqualStrings(
         "error: command did not finish within 1s and was killed",
@@ -554,8 +554,8 @@ test "a fetch that fails reaches the reader as a failure" {
         .name = "web_fetch",
         .arguments = "{\"url\":\"\"}",
     } });
-    var tool_set = testTools(true);
-    try tool_set.run(call, &result.writer);
+    var tools = testTools(true);
+    try tools.run(call, &result.writer);
     try std.testing.expectEqualStrings("error: no url to fetch", result.written());
 
     // And the reader is told it failed, rather than reading the text as an answer the call gave.
@@ -568,11 +568,11 @@ test "a fetch that fails reaches the reader as a failure" {
 
 test "the definitions cover every tool the loop dispatches" {
     const gpa = std.testing.allocator;
-    var tool_set = testTools(false);
+    var tools = testTools(false);
 
     // The names are exactly the tools the loop can dispatch, in the order the model receives them,
     // so it is never offered one that does not run.
-    const offered = tool_set.definitions();
+    const offered = tools.definitions();
     const expected = [_][]const u8{ "read", "write", "edit", "bash" };
     try std.testing.expectEqual(expected.len, offered.len);
     for (offered, expected) |definition, name| {
@@ -620,10 +620,10 @@ test "the tools work in the directory they are given, wherever billy runs" {
     defer log.deinit();
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var tool_set = Tools.init(io, work, gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
+    var tools = Tools.init(io, work, gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
 
     var sink: std.Io.Writer.Discarding = .init("");
-    _ = try runCall(arena, &tool_set, .{ .id = "1", .function = .{
+    _ = try runCall(arena, &tools, .{ .id = "1", .function = .{
         .name = "write",
         .arguments = "{\"path\":\"note.txt\",\"content\":\"hi\"}",
     } }, &sink.writer);
@@ -633,7 +633,7 @@ test "the tools work in the directory they are given, wherever billy runs" {
     log.clearRetainingCapacity();
     var result: std.Io.Writer.Allocating = .init(gpa);
     defer result.deinit();
-    _ = try runCall(arena, &tool_set, .{ .id = "2", .function = .{
+    _ = try runCall(arena, &tools, .{ .id = "2", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"pwd\"}",
     } }, &result.writer);
@@ -653,7 +653,7 @@ test "a file a tool replaces keeps the permissions it had" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var tool_set = Tools.init(io, tmp.dir, gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
+    var tools = Tools.init(io, tmp.dir, gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
 
     // A file of the user's with a mode of its own, which is what a script is.
     try tmp.dir.writeFile(io, .{ .sub_path = "run.sh", .data = "#!/bin/sh\necho one\n" });
@@ -661,7 +661,7 @@ test "a file a tool replaces keeps the permissions it had" {
     try tmp.dir.setFilePermissions(io, "run.sh", user_only, .{});
 
     var sink: std.Io.Writer.Discarding = .init("");
-    _ = try runCall(arena, &tool_set, .{ .id = "1", .function = .{
+    _ = try runCall(arena, &tools, .{ .id = "1", .function = .{
         .name = "edit",
         .arguments = "{\"path\":\"run.sh\",\"old_string\":\"echo one\",\"new_string\":\"echo two\"}",
     } }, &sink.writer);
@@ -671,7 +671,7 @@ test "a file a tool replaces keeps the permissions it had" {
     var stat = try tmp.dir.statFile(io, "run.sh", .{});
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), stat.permissions.toMode() & 0o777);
 
-    _ = try runCall(arena, &tool_set, .{ .id = "2", .function = .{
+    _ = try runCall(arena, &tools, .{ .id = "2", .function = .{
         .name = "write",
         .arguments = "{\"path\":\"run.sh\",\"content\":\"#!/bin/sh\\necho three\\n\"}",
     } }, &sink.writer);
@@ -758,11 +758,11 @@ test "a result longer than the cap is cut and says what it lost" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var tool_set = Tools.init(io, tmp.dir, gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
+    var tools = Tools.init(io, tmp.dir, gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
 
     var result: std.Io.Writer.Allocating = .init(gpa);
     defer result.deinit();
-    _ = try runCall(arena, &tool_set, .{ .id = "1", .function = .{
+    _ = try runCall(arena, &tools, .{ .id = "1", .function = .{
         .name = "read",
         .arguments = "{\"path\":\"big.txt\"}",
     } }, &result.writer);

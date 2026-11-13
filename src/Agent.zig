@@ -179,7 +179,7 @@ credentials: *const Credentials,
 http: *std.http.Client,
 target_state: std.heap.ArenaAllocator,
 instructions: ?std.Io.Dir = null,
-tool_set: Tools,
+tools: Tools,
 
 pub fn init(
     io: std.Io,
@@ -194,7 +194,7 @@ pub fn init(
     };
     errdefer work_dir.close(io);
 
-    const tool_set = Tools.init(io, work_dir, gpa, http_client, options.tools);
+    const tools = Tools.init(io, work_dir, gpa, http_client, options.tools);
 
     return .{
         .io = io,
@@ -205,22 +205,22 @@ pub fn init(
         .http = http_client,
         .target_state = std.heap.ArenaAllocator.init(gpa),
         .instructions = options.instructions,
-        .tool_set = tool_set,
+        .tools = tools,
     };
 }
 
 pub fn deinit(agent: *Agent) void {
     agent.target_state.deinit();
-    agent.tool_set.dir.close(agent.io);
+    agent.tools.dir.close(agent.io);
 }
 
 pub fn prepare(agent: *Agent, session: *Session) !void {
     if (session.messages.items.len == 0 and session.systemPrompt() == null) {
-        const prompt_text = try leadPrompt(agent.io, agent.gpa, agent.tool_set.dir, agent.instructions);
+        const prompt_text = try leadPrompt(agent.io, agent.gpa, agent.tools.dir, agent.instructions);
         defer agent.gpa.free(prompt_text);
         try session.setSystemPrompt(prompt_text);
     }
-    try session.ensureTools(agent.tool_set.definitions());
+    try session.ensureTools(agent.tools.definitions());
 }
 
 /// A model as a header shows it: the choice as it was written, and what is known of its window.
@@ -387,7 +387,7 @@ fn changeCwd(agent: *Agent, emitter: *Emitter, session: *Session, asked: ?[]cons
     // Read from the directory the session works in now, so `/cwd ..` is the parent of where it was
     // moved to rather than of where billy was started, and recorded as the filesystem names it, so
     // the header, a resume and `pwd` agree.
-    const path = agent.tool_set.dir.realPathFileAlloc(agent.io, wanted, agent.gpa) catch |err|
+    const path = agent.tools.dir.realPathFileAlloc(agent.io, wanted, agent.gpa) catch |err|
         return cwdNotice(emitter, &notice, wanted, err);
     defer agent.gpa.free(path);
 
@@ -396,8 +396,8 @@ fn changeCwd(agent: *Agent, emitter: *Emitter, session: *Session, asked: ?[]cons
     const moved = std.Io.Dir.openDirAbsolute(agent.io, path, .{}) catch |err|
         return cwdNotice(emitter, &notice, wanted, err);
 
-    agent.tool_set.dir.close(agent.io);
-    agent.tool_set.dir = moved;
+    agent.tools.dir.close(agent.io);
+    agent.tools.dir = moved;
     try session.setCwd(path);
 
     // A session that has been asked something carries a prompt read from the directory it worked in
@@ -420,7 +420,7 @@ fn cwdNotice(emitter: *Emitter, buffer: []u8, path: []const u8, err: anyerror) !
 }
 
 fn refresh(agent: *Agent, session: *Session) void {
-    agent.refreshLead(agent.tool_set.definitions(), session) catch |err|
+    agent.refreshLead(agent.tools.definitions(), session) catch |err|
         std.log.warn("could not refresh the prompt and tools: {t}", .{err});
 }
 
@@ -558,7 +558,7 @@ fn showDeltaText(emitter: *Emitter, delta: llm.Delta) !void {
 const max_retries: usize = 3;
 
 fn turn(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client) !void {
-    var scratch_state = std.heap.ArenaAllocator.init(agent.tool_set.gpa);
+    var scratch_state = std.heap.ArenaAllocator.init(agent.tools.gpa);
     defer scratch_state.deinit();
 
     // The second bound on the loop: how many replies in a row may say nothing before the turn stops
@@ -603,7 +603,7 @@ fn turn(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client
 
         if (calls.len == 0) return emitter.show(.{ .answer = message.content orelse "" });
 
-        try runCalls(&agent.tool_set, emitter, &scratch_state, session, calls);
+        try runCalls(&agent.tools, emitter, &scratch_state, session, calls);
     }
     var buffer: [96]u8 = undefined;
     // Which bound stopped the loop says what went wrong.
@@ -624,7 +624,7 @@ fn turn(agent: *Agent, emitter: *Emitter, session: *Session, client: *llm.Client
 }
 
 fn runCalls(
-    tool_set: *Tools,
+    tools: *Tools,
     emitter: *Emitter,
     scratch_state: *std.heap.ArenaAllocator,
     session: *Session,
@@ -661,8 +661,8 @@ fn runCalls(
 
     var group: std.Io.Group = .init;
     for (runs) |*run|
-        group.async(tool_set.io, Run.runTool, .{ run, tool_set });
-    try group.await(tool_set.io);
+        group.async(tools.io, Run.runTool, .{ run, tools });
+    try group.await(tools.io);
 
     // The group is awaited before any result is shown, so no task is still running if appending a
     // result or showing it fails and the turn returns.
@@ -711,7 +711,7 @@ fn refreshLead(
     const prompt_text = try leadPrompt(
         agent.io,
         agent.gpa,
-        agent.tool_set.dir,
+        agent.tools.dir,
         agent.instructions,
     );
     defer agent.gpa.free(prompt_text);
@@ -1625,7 +1625,7 @@ test "the cwd command moves the session, its tools and its prompt" {
     defer arena_state.deinit();
     var written: std.Io.Writer.Allocating = .init(gpa);
     defer written.deinit();
-    try agent.tool_set.run(
+    try agent.tools.run(
         Tools.parseCallNamed(arena_state.allocator(), "write", "{\"path\":\"note.txt\",\"content\":\"hi\"}"),
         &written.writer,
     );
@@ -1719,7 +1719,7 @@ test "the terminal shows a tool call the way a replay does" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var tool_set = Tools.init(io, std.Io.Dir.cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
+    var tools = Tools.init(io, std.Io.Dir.cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
 
     const call: llm.ToolCall = .{ .id = "1", .function = .{
         .name = "bash",
@@ -1735,7 +1735,7 @@ test "the terminal shows a tool call the way a replay does" {
     try emitter.show(.{ .tool_begin = parsed });
     var result: std.Io.Writer.Allocating = .init(gpa);
     defer result.deinit();
-    try tool_set.run(parsed, &result.writer);
+    try tools.run(parsed, &result.writer);
     try emitter.show(.{ .tool_end = .{ .call = parsed, .result = result.written() } });
 
     var replayed: std.Io.Writer.Allocating = .init(gpa);
@@ -1911,7 +1911,7 @@ test "a batch of calls runs together and answers in the order it was asked" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var tool_set = Tools.init(io, tmp.dir, gpa, &http_client, .{
+    var tools = Tools.init(io, tmp.dir, gpa, &http_client, .{
         .bash_timeout_s = 30,
         .keys = &Credentials.empty,
     });
@@ -1934,7 +1934,7 @@ test "a batch of calls runs together and answers in the order it was asked" {
     try session.append(.{ .role = .assistant, .tool_calls = &calls });
 
     var recorder = Recorder{ .gpa = recorder_state.allocator() };
-    try runCalls(&tool_set, recorder.emitter(), &scratch_state, &session, &calls);
+    try runCalls(&tools, recorder.emitter(), &scratch_state, &session, &calls);
 
     try std.testing.expectEqual(@as(usize, 4), recorder.seen.items.len);
     try std.testing.expectEqualStrings("bash", recorder.seen.items[0].tool_begin);
