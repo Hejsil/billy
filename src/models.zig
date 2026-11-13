@@ -116,10 +116,6 @@ pub const Catalog = struct {
         return null;
     }
 
-    pub fn modelCount(catalog: *const Catalog) usize {
-        return catalog.models.items.len;
-    }
-
     /// Whether what the file said adds up: every index names a string, and every range has models.
     fn sound(catalog: *const Catalog) bool {
         const pool = &catalog.pool;
@@ -209,8 +205,7 @@ pub fn ensure(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir) Catalog {
             std.log.info("fetching the model catalog", .{});
             return fetchThenLoad(io, gpa, dir);
         },
-        // A file half written, of another version or edited by hand is fetched again rather than
-        // left to blind the run.
+        // A half-written or other-version file would blind the run, so it is fetched again.
         error.CorruptCatalog, error.UnsupportedCatalogVersion => {
             std.log.warn("the model catalog cannot be used ({t}); fetching it again", .{err});
             return fetchThenLoad(io, gpa, dir);

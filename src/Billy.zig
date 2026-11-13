@@ -239,7 +239,7 @@ fn ensureCatalog(billy: *Billy) void {
 
 pub fn showModels(billy: *Billy, out: Terminal.Writer, refresh: bool) !void {
     if (refresh) {
-        const counts = models.refresh(billy.io, billy.gpa, billy.dirs.cache) catch |err| {
+        _ = models.refresh(billy.io, billy.gpa, billy.dirs.cache) catch |err| {
             std.log.err("cannot refresh the model catalog: {t}", .{err});
             return report.Reported;
         };
@@ -248,15 +248,23 @@ pub fn showModels(billy: *Billy, out: Terminal.Writer, refresh: bool) !void {
             std.log.err("the model catalog was fetched but cannot be read: {t}", .{err});
             return report.Reported;
         };
-        try out.print("fetched {d} providers and {d} models\n", .{ counts.providers, counts.models });
-        return;
+    } else {
+        billy.ensureCatalog();
     }
 
-    billy.ensureCatalog();
-    try out.print("{d} providers, {d} models\n", .{
-        billy.catalog.providers.items.len,
-        models.Catalog.modelCount(&billy.catalog),
-    });
+    try printModels(out, &billy.catalog);
+}
+
+/// Writes every model the catalog holds as the choice that names it, `provider/model`, in the
+/// catalog's own order: providers by name, and each provider's models by id.
+fn printModels(out: Terminal.Writer, catalog: *const models.Catalog) !void {
+    for (catalog.providers.items) |provider| {
+        const name = catalog.pool.get(provider.name) orelse "";
+        const offered = catalog.models.items[provider.models_start..][0..provider.models_len];
+        for (offered) |model| {
+            try out.print("{s}/{s}\n", .{ name, catalog.pool.get(model.id) orelse "" });
+        }
+    }
 }
 
 pub fn listSessions(billy: *Billy, out: Terminal.Writer) !void {
@@ -311,6 +319,24 @@ test "the listing writes each session's id and title on one line" {
         "01M3AAAAAAAAAAAAAAAAAAAAAA Fix the flaky test\n" ++
             "01M3BBBBBBBBBBBBBBBBBBBBBB Two words\n" ++
             "legacy\n",
+        out.written(),
+    );
+}
+
+test "the model listing writes each provider and model as the choice that names it" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    try printModels(.{ .out = &out.writer }, &models.test_catalog);
+
+    try std.testing.expectEqualStrings(
+        "deepseek/deepseek-flash\n" ++
+            "deepseek/deepseek-v4-flash\n" ++
+            "deepseek/deepseek-v4-pro\n" ++
+            "opencode-go/deepseek-flash\n" ++
+            "opencode-go/kimi-k2.7-code\n" ++
+            "xai/grok-4\n",
         out.written(),
     );
 }

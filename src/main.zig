@@ -29,9 +29,9 @@ const serve_about =
 ;
 
 const models_about =
-    \\Show how many providers and models the cached catalog holds, or fetch it
-    \\again from models.dev. The catalog is fetched automatically the first time
-    \\a run needs it.
+    \\List every model the cached catalog holds, as `provider/model`, or fetch the
+    \\catalog again from models.dev. The catalog is fetched automatically the first
+    \\time a run needs it.
 ;
 
 const resume_about =
@@ -51,7 +51,7 @@ const billy_commands =
     \\  login [<service>]         store an API key, or list the services
     \\  config <setting> <value>  set a configuration setting by its path
     \\  sessions                  list the sessions, newest first
-    \\  models [--refresh]        show the model catalog, or fetch it again
+    \\  models [--refresh]        list the models, or fetch the catalog again
     \\  serve                     run the web frontend
 ;
 
