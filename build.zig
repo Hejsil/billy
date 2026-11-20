@@ -26,8 +26,7 @@ pub fn build(b: *std.Build) void {
     md4c_zig.addIncludePath(md4c.path("src"));
     md4c_zig.defineCMacro("MD4C_USE_UTF8", null);
 
-    // The lint rules are not imported by billy itself, so main.zig's test block reaches them through
-    // src/rules/test.zig, which needs the same zlinter the lint step uses.
+    // main.zig's tests reach the lint rules too, through src/rules/test.zig, which needs zlinter.
     const root = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -62,8 +61,7 @@ pub fn build(b: *std.Build) void {
     exe.link_gc_sections = true;
     b.installArtifact(exe);
 
-    // One test run for the whole program: main.zig's test block references every module, so the
-    // tests of each are collected here.
+    // One test run: main.zig's test block pulls in every module's tests.
     const tests = b.addTest(.{
         .root_module = root,
         .filters = filters,
