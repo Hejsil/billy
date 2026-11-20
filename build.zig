@@ -26,15 +26,21 @@ pub fn build(b: *std.Build) void {
     md4c_zig.addIncludePath(md4c.path("src"));
     md4c_zig.defineCMacro("MD4C_USE_UTF8", null);
 
-    const mod = b.addModule("billy", .{
-        .root_source_file = b.path("src/root.zig"),
+    // The lint rules are not imported by billy itself, so main.zig's test block reaches them through
+    // src/rules/test.zig, which needs the same zlinter the lint step uses.
+    const root = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .imports = &.{
+            .{ .name = "md4c", .module = md4c_zig.mod },
+            .{ .name = "spaghet", .module = spaghet.module("spaghet") },
+            .{ .name = "zlinter", .module = b.dependency("zlinter", .{}).module("zlinter") },
+        },
     });
-    mod.addImport("md4c", md4c_zig.mod);
-    mod.addIncludePath(md4c.path("src"));
-    mod.addCSourceFiles(.{
+    root.addIncludePath(md4c.path("src"));
+    root.addCSourceFiles(.{
         .root = md4c.path("src"),
         .files = &.{ "md4c.c", "entity.c" },
         // C99, because the library is written in it, so a compiler whose default is newer or older
@@ -47,15 +53,7 @@ pub fn build(b: *std.Build) void {
 
     const exe = b.addExecutable(.{
         .name = "billy",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "billy", .module = mod },
-                .{ .name = "spaghet", .module = spaghet.module("spaghet") },
-            },
-        }),
+        .root_module = root,
     });
     // Dropping unreachable sections keeps the markdown library's unused code out of the binary, and
     // it is also what lets a build that links libc work here at all: this system's `crt1.o` carries
@@ -64,37 +62,17 @@ pub fn build(b: *std.Build) void {
     exe.link_gc_sections = true;
     b.installArtifact(exe);
 
-    const mod_tests = b.addTest(.{
-        .root_module = mod,
+    // One test run for the whole program: main.zig's test block references every module, so the
+    // tests of each are collected here.
+    const tests = b.addTest(.{
+        .root_module = root,
         .filters = filters,
     });
-    mod_tests.link_gc_sections = true;
-    const run_mod_tests = b.addRunArtifact(mod_tests);
-
-    const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
-    });
-    exe_tests.link_gc_sections = true;
-    const run_exe_tests = b.addRunArtifact(exe_tests);
-
-    // The lint rules are billy's own source, but nothing imports them, so the module above never
-    // reaches them: they are built and tested from a root of their own, against the same zlinter
-    // the lint step uses.
-    const rules_module = b.createModule(.{
-        .root_source_file = b.path("src/rules/test.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "zlinter", .module = b.dependency("zlinter", .{}).module("zlinter") },
-        },
-    });
-    const rules_tests = b.addTest(.{ .root_module = rules_module });
-    const run_rules_tests = b.addRunArtifact(rules_tests);
+    tests.link_gc_sections = true;
+    const run_tests = b.addRunArtifact(tests);
 
     const test_step = b.step("test", "Run the tests");
-    test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
-    test_step.dependOn(&run_rules_tests.step);
+    test_step.dependOn(&run_tests.step);
 
     const fmt = b.addFmt(.{
         .paths = &.{ b.path("src"), b.path("build.zig"), b.path("build.zig.zon") },

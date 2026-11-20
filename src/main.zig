@@ -1,10 +1,10 @@
 const std = @import("std");
 
-const Billy = @import("billy").Billy;
-const report = @import("billy").report;
-const Server = @import("billy").Server;
+const Billy = @import("Billy.zig");
+const report = @import("report.zig");
+const Server = @import("Server.zig");
 const spaghet = @import("spaghet");
-const Terminal = @import("billy").Terminal;
+const Terminal = @import("Terminal.zig");
 
 const billy_about = "A small fast AI agent that works in your terminal.";
 
@@ -624,4 +624,43 @@ test "a failure a command has reported exits non-zero and is not said again" {
     // This passes only because nothing is logged: the test runner counts an error line against the
     // test that caused it, which is the property wanted here.
     try std.testing.expectEqual(@as(u8, 1), fail(report.Reported));
+}
+
+// Every module with tests is named here so that one `zig build test` run collects them all.
+test {
+    _ = @import("Agent.zig");
+    _ = @import("Billy.zig");
+    _ = @import("Config.zig");
+    _ = @import("Credentials.zig");
+    _ = @import("Health.zig");
+    _ = @import("LineEditor.zig");
+    _ = @import("Server.zig");
+    _ = @import("Session.zig");
+    _ = @import("Terminal.zig");
+    _ = @import("Terminal/Answer.zig");
+    _ = @import("Terminal/Markdown.zig");
+    _ = @import("Terminal/Writer.zig");
+    _ = @import("Terminal/tool.zig");
+    _ = @import("Terminal/width.zig");
+    _ = @import("Tools.zig");
+    _ = @import("Tools/Bash.zig");
+    _ = @import("Tools/Edit.zig");
+    _ = @import("Tools/Read.zig");
+    _ = @import("Tools/web.zig");
+    _ = @import("Tools/web/Fetch.zig");
+    _ = @import("Tools/web/Search.zig");
+    _ = @import("Tools/web/Search/Result.zig");
+    _ = @import("Tools/web/provider/brave.zig");
+    _ = @import("Tools/web/provider/exa.zig");
+    _ = @import("Tools/web/provider/searxng.zig");
+    _ = @import("Tools/web/provider/tavily.zig");
+    _ = @import("diff.zig");
+    _ = @import("fmt.zig");
+    _ = @import("html.zig");
+    _ = @import("llm.zig");
+    _ = @import("models.zig");
+    _ = @import("Pool.zig");
+    _ = @import("ulid.zig");
+    _ = @import("xdg.zig");
+    _ = @import("rules/test.zig");
 }
