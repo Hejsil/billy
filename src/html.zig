@@ -1162,10 +1162,7 @@ const Page = struct {
         const page: *Page = @alignCast(@fieldParentPtr("interface", e));
         // A tool call is written from its `tool_end`, which is the whole call -- head, body and
         // status.
-        switch (b) {
-            .tool_begin => return,
-            else => {},
-        }
+        if (b == .tool_begin) return;
         return try block(page.gpa, b, page.out);
     }
 };
