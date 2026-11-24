@@ -142,8 +142,10 @@ const Limited = struct {
     }
 };
 
+const failed_prefix = "error: ";
+
 pub fn fail(out: *std.Io.Writer, comptime format: []const u8, args: anytype) !void {
-    try out.print("error: " ++ format, args);
+    try out.print(failed_prefix ++ format, args);
 }
 
 /// Writes `bytes` to `path` under `dir`, replacing the file in one step: the new contents are put
@@ -304,6 +306,26 @@ pub fn bashOutput(result: []const u8) ?BashOutput {
         };
     }
     return .{ .exit = exit, .stdout = body, .stderr = "" };
+}
+
+/// What a tool call's result is, so each frontend can draw it its own way.
+pub const Outcome = union(enum) {
+    failed: []const u8,
+    write: []const u8,
+    edit,
+    bash: BashOutput,
+    bash_unparsed: []const u8,
+    text: []const u8,
+};
+
+pub fn outcome(call: Call, result: []const u8) Outcome {
+    if (std.mem.startsWith(u8, result, failed_prefix)) return .{ .failed = result };
+    return switch (call) {
+        .write => |args| .{ .write = args.content },
+        .edit => .edit,
+        .bash => if (bashOutput(result)) |parts| .{ .bash = parts } else .{ .bash_unparsed = result },
+        else => .{ .text = result },
+    };
 }
 
 const Tool = struct {

@@ -68,17 +68,15 @@ fn printInk(text: []const u8, ink: Ink, writer: Writer) !void {
 
 /// Prints what a call produced under the `output` label.
 pub fn printResult(call: Tools.Call, result: []const u8, writer: Writer) !void {
-    if (std.mem.startsWith(u8, result, "error: ")) {
-        try printOutput(result, .{ .hue = .red }, writer);
-        return;
-    }
-    switch (call) {
+    switch (Tools.outcome(call, result)) {
+        .failed => |text| try printOutput(text, .{ .hue = .red }, writer),
         // A write succeeds by putting the content in the file, so that content is what it produced.
-        .write => |args| try printOutput(args.content, .dim, writer),
+        .write => |content| try printOutput(content, .dim, writer),
         // An edit's result would only repeat the diff shown above it.
         .edit => {},
-        .bash => return printBash(result, writer),
-        else => try printOutput(result, .dim, writer),
+        .bash => |parts| try printBash(parts, writer),
+        .bash_unparsed => |text| try printOutput(text, .dim, writer),
+        .text => |text| try printOutput(text, .dim, writer),
     }
 }
 
@@ -88,8 +86,7 @@ fn printOutput(text: []const u8, ink: Ink, writer: Writer) !void {
     return printTruncated(text, ink, writer);
 }
 
-fn printBash(result: []const u8, writer: Writer) !void {
-    const parts = Tools.bashOutput(result) orelse return printOutput(result, .dim, writer);
+fn printBash(parts: Tools.BashOutput, writer: Writer) !void {
     try printExit(parts.exit, writer);
     if (parts.stdout.len > 0) {
         try printLabel("stdout", writer);

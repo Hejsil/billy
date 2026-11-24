@@ -721,24 +721,20 @@ fn toolBody(gpa: std.mem.Allocator, call: Tools.Call, result: []const u8, out: *
 
 fn toolResult(call: Tools.Call, result: []const u8, out: *std.Io.Writer) !void {
     if (result.len == 0) return;
-    const text = std.mem.trimEnd(u8, result, "\n");
-    if (std.mem.startsWith(u8, result, "error: ")) {
-        return element("pre", "error", text, out);
-    }
-    switch (call) {
-        .write => |args| try element("pre", "result", std.mem.trimEnd(u8, args.content, "\n"), out),
+    switch (Tools.outcome(call, result)) {
+        .failed => |text| return element("pre", "error", std.mem.trimEnd(u8, text, "\n"), out),
+        .write => |content| return element("pre", "result", std.mem.trimEnd(u8, content, "\n"), out),
         .edit => {},
-        .bash => {
-            const output = Tools.bashOutput(result) orelse
-                return element("pre", "result", text, out);
-            if (output.stdout.len > 0)
-                try element("pre", "stdout", std.mem.trimEnd(u8, output.stdout, "\n"), out);
-            if (output.stderr.len > 0)
-                try element("pre", "stderr", std.mem.trimEnd(u8, output.stderr, "\n"), out);
-            if (output.stdout.len == 0 and output.stderr.len == 0)
+        .bash => |parts| {
+            if (parts.stdout.len > 0)
+                try element("pre", "stdout", std.mem.trimEnd(u8, parts.stdout, "\n"), out);
+            if (parts.stderr.len > 0)
+                try element("pre", "stderr", std.mem.trimEnd(u8, parts.stderr, "\n"), out);
+            if (parts.stdout.len == 0 and parts.stderr.len == 0)
                 try element("pre", "result", "(no output)", out);
         },
-        else => try element("pre", "result", text, out),
+        .bash_unparsed => |text| return element("pre", "result", std.mem.trimEnd(u8, text, "\n"), out),
+        .text => |text| return element("pre", "result", std.mem.trimEnd(u8, text, "\n"), out),
     }
 }
 
