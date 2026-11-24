@@ -173,20 +173,13 @@ test "text that is not a list of results reads back as none" {
     try std.testing.expect(parsed.next() == null);
 }
 
-/// A backend's own results in the one shape `render` writes, where `snippet` names the field that
-/// backend puts its text in.
-pub fn mapped(gpa: std.mem.Allocator, backend_results: anytype, comptime snippet: []const u8) ![]const Result {
-    const mapped_results = try gpa.alloc(Result, backend_results.len);
-    for (backend_results, mapped_results) |result, *one| {
+/// A backend's results as the text the model reads, where `snippet` names the field that backend
+/// puts its text in, owned by `gpa`.
+pub fn renderMapped(gpa: std.mem.Allocator, backend_results: anytype, comptime snippet: []const u8) ![]const u8 {
+    const list = try gpa.alloc(Result, backend_results.len);
+    defer gpa.free(list);
+    for (backend_results, list) |result, *one| {
         one.* = .{ .title = result.title, .url = result.url, .snippet = @field(result, snippet) };
     }
-    return mapped_results;
-}
-
-/// `mapped` and `render` in one, for a provider: a backend's results as the text the model reads,
-/// owned by `gpa`.
-pub fn renderMapped(gpa: std.mem.Allocator, backend_results: anytype, comptime snippet: []const u8) ![]const u8 {
-    const list = try mapped(gpa, backend_results, snippet);
-    defer gpa.free(list);
     return renderAlloc(gpa, list);
 }
