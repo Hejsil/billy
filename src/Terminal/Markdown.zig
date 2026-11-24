@@ -335,7 +335,6 @@ pub fn leaveBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyo
             return self.finishBody();
         },
         md.c.MD_BLOCK_LI => self.container_depth -= 1,
-        md.c.MD_BLOCK_HR => return self.finishBody(),
         md.c.MD_BLOCK_H => {
             if (!self.raw(self.writer.reset())) return false;
             return self.finishBody();
@@ -345,7 +344,7 @@ pub fn leaveBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyo
             self.in_code = false;
             return self.finishBody();
         },
-        md.c.MD_BLOCK_P => return self.finishBody(),
+        md.c.MD_BLOCK_HR, md.c.MD_BLOCK_P => return self.finishBody(),
         md.c.MD_BLOCK_TABLE => return self.closeTable(),
         md.c.MD_BLOCK_THEAD, md.c.MD_BLOCK_TBODY => {},
         md.c.MD_BLOCK_TR => {
