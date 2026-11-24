@@ -384,7 +384,7 @@ pub fn recordUsage(session: *Session, usage: llm.Usage) void {
     session.context_tokens = usage.total_tokens;
 }
 
-pub fn save(session: *const Session) !void {
+pub fn save(session: *Session) !void {
     var atomic = try session.dir.createFileAtomic(session.io, session.id(), .{
         .replace = true,
     });
@@ -457,7 +457,7 @@ comptime {
 }
 
 /// Writes the session as the header and the blocks it counts, each the bytes it is held as.
-pub fn write(session: *const Session, writer: *std.Io.Writer) !void {
+pub fn write(session: *Session, writer: *std.Io.Writer) !void {
     var header: Header = .{
         .context_tokens = session.context_tokens,
         .strings_len = session.pool.strings.items.len,
@@ -472,15 +472,20 @@ pub fn write(session: *const Session, writer: *std.Io.Writer) !void {
     };
     header.file_len = header_len + Header.bodyLen(header);
 
-    var blocks = [_][]const u8{
-        std.mem.asBytes(&header),
+    var blocks = session.fileBlocks();
+    try writer.writeAll(std.mem.asBytes(&header));
+    for (&blocks) |block| try writer.writeAll(block);
+}
+
+/// The blocks a file holds after its header, in the order they are written and read.
+fn fileBlocks(session: *Session) [5][]u8 {
+    return .{
         session.pool.strings.items,
         std.mem.sliceAsBytes(session.tools.items),
         std.mem.sliceAsBytes(session.messages.items),
         std.mem.sliceAsBytes(session.tool_calls.items),
         std.mem.sliceAsBytes(session.compactions.items),
     };
-    try writer.writeVecAll(&blocks);
 }
 
 /// Reads the session a file holds, block by block, into where the session keeps it.
@@ -505,13 +510,7 @@ fn load(session: *Session) !void {
     try session.tool_calls.resize(session.gpa, @intCast(header.tool_calls_len));
     try session.compactions.resize(session.gpa, @intCast(header.compactions_len));
 
-    var blocks = [_][]u8{
-        session.pool.strings.items,
-        std.mem.sliceAsBytes(session.tools.items),
-        std.mem.sliceAsBytes(session.messages.items),
-        std.mem.sliceAsBytes(session.tool_calls.items),
-        std.mem.sliceAsBytes(session.compactions.items),
-    };
+    var blocks = session.fileBlocks();
     reader.readVecAll(&blocks) catch |err| switch (err) {
         // The header counted this file's length already, so a short block is a file that changed.
         error.EndOfStream => return error.CorruptSession,
