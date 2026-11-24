@@ -88,7 +88,7 @@ pub fn login(billy: *Billy, out: Terminal.Writer, service: ?[]const u8) !void {
         try provider_names.append(billy.arena, entry.name);
     }
 
-    const name = service orelse return billy.credentials.list(out.out, provider_names.items, &billy.catalog);
+    const name = service orelse return billy.credentials.list(billy.gpa, out.out, provider_names.items, &billy.catalog);
     if (!Credentials.acceptable(name, provider_names.items) and billy.catalog.find(name) == null) {
         std.log.err(
             "'{s}' is neither a service billy knows nor a provider the configuration names;" ++

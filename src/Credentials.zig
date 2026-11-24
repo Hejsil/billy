@@ -108,51 +108,51 @@ const dangling_purpose = "a service billy does not know";
 
 /// Prints every name a key can be stored for, and whether one is: the services billy ships, the
 /// providers the configuration names, and any other name a key is stored under.
+const Row = struct {
+    name: []const u8,
+    purpose: []const u8,
+    state: KeyState,
+};
+
 pub fn list(
     credentials: *const Credentials,
+    gpa: std.mem.Allocator,
     out: *std.Io.Writer,
     providers: []const []const u8,
     catalog: *const models.Catalog,
 ) !void {
-    // Every row that will be printed decides the columns, so a long name of the user's own widens
-    // them all rather than running past the end.
-    var name_width: usize = 0;
-    var purpose_width: usize = 0;
-    for (known) |service| {
-        name_width = @max(name_width, service.name.len);
-        purpose_width = @max(purpose_width, service.purpose.len);
-    }
-    for (providers) |name| {
-        name_width = @max(name_width, name.len);
-        purpose_width = @max(purpose_width, configured_purpose.len);
-    }
-    for (credentials.names()) |name| {
-        name_width = @max(name_width, name.len);
-        if (storedPurpose(name, providers, catalog)) |purpose|
-            purpose_width = @max(purpose_width, purpose.len);
-    }
+    var rows: std.ArrayList(Row) = .empty;
+    defer rows.deinit(gpa);
 
     for (known) |service| {
         const state: KeyState = if (credentials.get(service.name) != null) .stored else .not_set;
-        try printRow(out, service.name, service.purpose, name_width, purpose_width, state);
+        try rows.append(gpa, .{ .name = service.name, .purpose = service.purpose, .state = state });
     }
     for (providers) |name| {
         // One billy already knows was printed as the service it is, with what its key is for rather
         // than where it came from.
         if (purposeOf(name) != null) continue;
         const state: KeyState = if (credentials.get(name) != null) .stored else .not_set;
-        try printRow(out, name, configured_purpose, name_width, purpose_width, state);
+        try rows.append(gpa, .{ .name = name, .purpose = configured_purpose, .state = state });
     }
     for (credentials.names()) |name| {
-        const purpose = storedPurpose(name, providers, catalog) orelse continue;
-        try printRow(out, name, purpose, name_width, purpose_width, .stored);
+        if (purposeOf(name) != null or definedIn(name, providers)) continue;
+        const purpose = if (catalog.find(name) != null) catalog_purpose else dangling_purpose;
+        try rows.append(gpa, .{ .name = name, .purpose = purpose, .state = .stored });
+    }
+
+    // Every row that will be printed decides the columns, so a long name of the user's own widens
+    // them all rather than running past the end.
+    var name_width: usize = 0;
+    var purpose_width: usize = 0;
+    for (rows.items) |row| {
+        name_width = @max(name_width, row.name.len);
+        purpose_width = @max(purpose_width, row.purpose.len);
+    }
+    for (rows.items) |row| {
+        try printRow(out, row.name, row.purpose, name_width, purpose_width, row.state);
     }
     try out.writeAll("\n`billy login <service>` stores a key\n");
-}
-
-fn storedPurpose(name: []const u8, providers: []const []const u8, catalog: *const models.Catalog) ?[]const u8 {
-    if (purposeOf(name) != null or definedIn(name, providers)) return null;
-    return if (catalog.find(name) != null) catalog_purpose else dangling_purpose;
 }
 
 fn definedIn(name: []const u8, providers: []const []const u8) bool {
@@ -332,7 +332,7 @@ test "the listing shows each service billy knows and whether a key is stored" {
 
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try credentials.list(&sink.writer, &.{}, &models.test_catalog);
+    try credentials.list(gpa, &sink.writer, &.{}, &models.test_catalog);
 
     try std.testing.expectEqualStrings(
         \\deepseek     DeepSeek API key           stored
@@ -355,7 +355,7 @@ test "the listing names a service that has no key of any kind" {
     const credentials: Credentials = .{};
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try credentials.list(&sink.writer, &.{}, &models.test_catalog);
+    try credentials.list(gpa, &sink.writer, &.{}, &models.test_catalog);
 
     try std.testing.expectEqualStrings(
         \\deepseek     DeepSeek API key           not set
@@ -383,7 +383,7 @@ test "the listing shows a stored name billy does not know" {
 
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try credentials.list(&sink.writer, &.{}, &models.test_catalog);
+    try credentials.list(gpa, &sink.writer, &.{}, &models.test_catalog);
 
     try std.testing.expect(std.mem.find(
         u8,
@@ -415,7 +415,7 @@ test "the listing names a catalog provider whose key is stored" {
 
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try credentials.list(&sink.writer, &.{}, &models.test_catalog);
+    try credentials.list(gpa, &sink.writer, &.{}, &models.test_catalog);
 
     try std.testing.expect(std.mem.find(u8, sink.written(), "a provider in the model catalog") != null);
     try std.testing.expect(std.mem.find(u8, sink.written(), "a service billy does not know") == null);
@@ -443,7 +443,7 @@ test "the listing names the providers the configuration defines" {
     const credentials: Credentials = .{};
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try credentials.list(&sink.writer, &.{"mock"}, &models.test_catalog);
+    try credentials.list(gpa, &sink.writer, &.{"mock"}, &models.test_catalog);
 
     try std.testing.expect(std.mem.find(
         u8,
@@ -465,7 +465,7 @@ test "the listing shows a key under a name nothing names any more" {
 
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try credentials.list(&sink.writer, &.{"mock"}, &models.test_catalog);
+    try credentials.list(gpa, &sink.writer, &.{"mock"}, &models.test_catalog);
 
     try std.testing.expect(std.mem.find(u8, sink.written(), "gone") != null);
     try std.testing.expect(std.mem.find(u8, sink.written(), "a service billy does not know") != null);
