@@ -151,11 +151,7 @@ pub fn load(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir) !Catalog {
     try catalog.providers.resize(gpa, @intCast(header.providers_len));
     try catalog.models.resize(gpa, @intCast(header.models_len));
 
-    var blocks = [_][]u8{
-        catalog.pool.strings.items,
-        std.mem.sliceAsBytes(catalog.providers.items),
-        std.mem.sliceAsBytes(catalog.models.items),
-    };
+    var blocks = fileBlocks(&catalog);
     reader.readVecAll(&blocks) catch |err| switch (err) {
         // The header counted this file's length already, so a short block is a file that changed.
         error.EndOfStream => return error.CorruptCatalog,
@@ -181,7 +177,7 @@ fn readHeader(reader: *std.Io.Reader, file_len: u64) !Header {
 }
 
 /// Writes the catalog as the header and the blocks it counts, each the bytes it is held as.
-fn write(catalog: *const Catalog, writer: *std.Io.Writer) !void {
+fn write(catalog: *Catalog, writer: *std.Io.Writer) !void {
     var header: Header = .{
         .strings_len = catalog.pool.strings.items.len,
         .providers_len = catalog.providers.items.len,
@@ -189,13 +185,17 @@ fn write(catalog: *const Catalog, writer: *std.Io.Writer) !void {
     };
     header.file_len = header_len + Header.bodyLen(header);
 
-    var blocks = [_][]const u8{
-        std.mem.asBytes(&header),
+    var blocks = fileBlocks(catalog);
+    try writer.writeAll(std.mem.asBytes(&header));
+    for (&blocks) |block| try writer.writeAll(block);
+}
+
+fn fileBlocks(catalog: *Catalog) [3][]u8 {
+    return .{
         catalog.pool.strings.items,
         std.mem.sliceAsBytes(catalog.providers.items),
         std.mem.sliceAsBytes(catalog.models.items),
     };
-    try writer.writeVecAll(&blocks);
 }
 
 /// Reads the cached catalog, fetching one first when there is none or the one there cannot be used.
@@ -261,7 +261,7 @@ fn writeFrom(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir, body: []const 
         .allocate = .alloc_if_needed,
     }) catch return error.CorruptCatalog;
 
-    const catalog = try fromSource(build, source);
+    var catalog = try fromSource(build, source);
     if (catalog.providers.items.len == 0) return error.EmptyCatalog;
 
     var atomic = try dir.createFileAtomic(io, cache_file, .{ .replace = true });
