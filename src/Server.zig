@@ -580,21 +580,17 @@ fn serveTurn(
     // without a turn being run: a `/model` typed first must not put a session in the list that has
     // nothing in it.
     const waiting = try agent.take(emitter, session, text);
-    if (waiting == .ran) {
-        try r.server.sendHeader(gpa, session, &stream);
-        try stream.done();
-        return;
+    if (waiting != .ran) {
+        if (announce == .announce)
+            try stream.send("session", SessionEvent{ .id = session.id() });
+        if (waiting.prompt.title) |title|
+            try stream.send("title", TitleEvent{ .title = title });
+
+        agent.ask(emitter, session, text) catch |err| {
+            std.log.err("could not show the turn: {t}", .{err});
+            try stream.fail(@errorName(err));
+        };
     }
-
-    if (announce == .announce)
-        try stream.send("session", SessionEvent{ .id = session.id() });
-    if (waiting.prompt.title) |title|
-        try stream.send("title", TitleEvent{ .title = title });
-
-    agent.ask(emitter, session, text) catch |err| {
-        std.log.err("could not show the turn: {t}", .{err});
-        try stream.fail(@errorName(err));
-    };
 
     try r.server.sendHeader(gpa, session, &stream);
     try stream.done();
