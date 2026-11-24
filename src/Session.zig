@@ -687,9 +687,7 @@ pub fn latest(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, start_cwd: []
     defer freeList(listed, gpa);
 
     for (listed) |listed_session| {
-        var name_buf: [max_id_len]u8 = undefined;
-        const file_name = fileName(listed_session.id, &name_buf) orelse continue;
-        var file = dir.openFile(io, file_name, .{}) catch continue;
+        var file = dir.openFile(io, listed_session.id, .{}) catch continue;
         defer file.close(io);
 
         const stat = file.stat(io) catch continue;
