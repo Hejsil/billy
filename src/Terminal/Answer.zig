@@ -38,9 +38,13 @@ pub fn close(self: *Answer) !void {
     try self.frame(finish);
 }
 
+fn readDocument(self: *Answer) !markdown.Document {
+    return try markdown.read(self.gpa, self.text.items, self.writer, self.finished);
+}
+
 fn finish(self: *Answer, width: usize) !void {
     try self.undo(width);
-    var document = try markdown.read(self.gpa, self.text.items, self.writer, self.finished);
+    var document = try self.readDocument();
     defer document.deinit();
     for (document.blocks.items) |block| try self.writer.write(block.text);
     self.finished += document.blocks.items.len;
@@ -52,7 +56,7 @@ fn show(self: *Answer) !void {
 
 fn repaint(self: *Answer, width: usize) !void {
     try self.undo(width);
-    var document = try markdown.read(self.gpa, self.text.items, self.writer, self.finished);
+    var document = try self.readDocument();
     defer document.deinit();
     const blocks = document.blocks.items;
     if (blocks.len == 0) return;
