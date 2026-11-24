@@ -572,6 +572,7 @@ fn expectStream(comptime events: []const u8, expected: ExpectedStream) !void {
 
     const calls = message.tool_calls orelse &.{};
     try std.testing.expectEqual(expected.calls.len, calls.len);
+    if (expected.calls.len == 0) try std.testing.expect(message.tool_calls == null);
     for (expected.calls, calls) |want, got| {
         try std.testing.expectEqualStrings(want.id, got.id);
         try std.testing.expectEqualStrings(want.name, got.function.name);
