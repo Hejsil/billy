@@ -495,7 +495,8 @@ fn load(session: *Session) !void {
     var file_reader = file.reader(session.io, &read_buf);
     const reader = &file_reader.interface;
 
-    const header = try readHeader(reader, try file_reader.getSize());
+    const bytes = reader.take(header_len) catch return error.CorruptSession;
+    const header = try readHeaderBytes(bytes, try file_reader.getSize());
     try session.pool.strings.resize(session.gpa, @intCast(header.strings_len));
     try session.tools.resize(session.gpa, @intCast(header.tools_len));
     try session.messages.resize(session.gpa, @intCast(header.messages_len));
@@ -524,11 +525,6 @@ fn load(session: *Session) !void {
     try session.checkIndices();
     session.dropCompactionsPastTheEnd();
     try session.repairTail();
-}
-
-fn readHeader(reader: *std.Io.Reader, file_len: u64) !Header {
-    const bytes = reader.take(header_len) catch return error.CorruptSession;
-    return readHeaderBytes(bytes, file_len);
 }
 
 /// The header a file opens with, refused when it is of another kind or of a later version.
