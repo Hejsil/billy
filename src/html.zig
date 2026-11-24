@@ -91,8 +91,7 @@ const Markdown = struct {
             md.c.MD_BLOCK_TR => return self.put("<tr>\n"),
             md.c.MD_BLOCK_TH => return self.openCell("th", @ptrCast(@alignCast(detail.?))),
             md.c.MD_BLOCK_TD => return self.openCell("td", @ptrCast(@alignCast(detail.?))),
-            // Raw HTML never reaches here: `md.flags` turns it off, so it comes as text and is
-            // escaped.
+            // Raw HTML never reaches here: `md.flags` turns it off, so it is escaped text.
             else => {},
         }
         return true;
@@ -614,10 +613,7 @@ const Status = union(enum) {
 };
 
 fn showsStatus(call: Tools.Call) bool {
-    return switch (call) {
-        .bash => true,
-        else => false,
-    };
+    return call == .bash;
 }
 
 fn pill(status: Status, out: *std.Io.Writer) !void {
