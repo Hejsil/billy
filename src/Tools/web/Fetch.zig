@@ -246,7 +246,7 @@ test "a url no backend could read does not set the backend aside" {
 
     try std.testing.expectEqualStrings("<html>a page</html>", out.written());
     try std.testing.expect(!health.skips("tavily", std.Io.Clock.real.now(io).toMilliseconds()));
-    try std.testing.expectEqual(@as(usize, 0), health.entries.count());
+    try std.testing.expectEqual(@as(usize, 0), health.waits.count());
     try std.testing.expectEqual(@as(usize, 2), mock.served);
     try std.testing.expect(mock.header("authorization") == null);
 }

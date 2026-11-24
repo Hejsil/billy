@@ -12,37 +12,15 @@ const Wait = struct {
     failures: u32 = 0,
 };
 
-const Name = enum(u32) { _ };
-
-const Names = struct {
-    health: *const Health,
-
-    pub fn hash(names: Names, name: anytype) u32 {
-        return @truncate(std.hash.Wyhash.hash(0, names.text(name)));
-    }
-
-    pub fn eql(names: Names, a: anytype, b: Name, b_index: usize) bool {
-        _ = b_index;
-        return std.mem.eql(u8, names.text(a), names.text(b));
-    }
-
-    fn text(names: Names, name: anytype) []const u8 {
-        if (@TypeOf(name) == Name) return names.health.nameText(name);
-        return name;
-    }
-};
-
 io: std.Io,
 gpa: std.mem.Allocator,
 mutex: std.Io.Mutex = .init,
-strings: std.ArrayList(u8) = .empty,
-entries: std.array_hash_map.Custom(Name, Wait, Names, store_hash) = .empty,
-
-const store_hash = true;
+waits: std.StringHashMapUnmanaged(Wait) = .empty,
 
 pub fn deinit(self: *Health) void {
-    self.strings.deinit(self.gpa);
-    self.entries.deinit(self.gpa);
+    var names = self.waits.keyIterator();
+    while (names.next()) |name| self.gpa.free(name.*);
+    self.waits.deinit(self.gpa);
 }
 
 pub fn skips(self: *Health, name: []const u8, now_ms: i64) bool {
@@ -70,7 +48,6 @@ pub fn clear(self: *Health, name: []const u8) void {
     defer self.mutex.unlock(self.io);
 
     const wait = self.lookup(name) orelse return;
-    if (wait.failures == 0 and wait.until_ms == 0) return;
     wait.* = .{};
 }
 
@@ -87,30 +64,16 @@ pub fn recordAnswer(health: ?*Health, name: []const u8) void {
 }
 
 fn lookup(self: *Health, name: []const u8) ?*Wait {
-    return self.entries.getPtrAdapted(name, Names{ .health = self });
+    return self.waits.getPtr(name);
 }
 
 fn add(self: *Health, name: []const u8) !*Wait {
-    const names = Names{ .health = self };
-    if (self.entries.getPtrAdapted(name, names)) |wait| return wait;
+    if (self.waits.getPtr(name)) |wait| return wait;
 
-    try self.entries.ensureUnusedCapacityContext(self.gpa, 1, names);
-
-    const start: u32 = @intCast(self.strings.items.len);
-    try self.strings.appendSlice(self.gpa, name);
-    errdefer self.strings.shrinkRetainingCapacity(start);
-    try self.strings.append(self.gpa, 0);
-
-    const entry = self.entries.getOrPutAssumeCapacityAdapted(name, names);
-    std.debug.assert(!entry.found_existing);
-    entry.key_ptr.* = @fromBackingInt(@intCast(start));
-    entry.value_ptr.* = .{};
-    return entry.value_ptr;
-}
-
-fn nameText(self: *const Health, offset: Name) []const u8 {
-    const start = @backingInt(offset);
-    return std.mem.span(self.strings.items[start .. self.strings.items.len - 1 :0].ptr);
+    const owned = try self.gpa.dupe(u8, name);
+    errdefer self.gpa.free(owned);
+    try self.waits.putNoClobber(self.gpa, owned, .{});
+    return self.waits.getPtr(owned).?;
 }
 
 fn waitFor(failures: u32) i64 {
@@ -191,7 +154,7 @@ test "a backend is set aside for longer with each failure, up to the cap" {
     try std.testing.expectEqual(max_wait_ms, waitFor(100));
 }
 
-test "only a recorded name reaches the pool, and then only once" {
+test "only a recorded name is kept, and then only once" {
     const gpa = std.testing.allocator;
     var health = Health{ .io = std.testing.io, .gpa = gpa };
     defer health.deinit();
@@ -199,14 +162,12 @@ test "only a recorded name reaches the pool, and then only once" {
     try std.testing.expect(!health.skips("nope", 0));
     try std.testing.expect(!health.skips("nope", 0));
     health.clear("nope");
-    try std.testing.expectEqual(@as(usize, 0), health.strings.items.len);
-    try std.testing.expectEqual(@as(usize, 0), health.entries.count());
+    try std.testing.expectEqual(@as(usize, 0), health.waits.count());
 
     health.record("tavily", null, 0);
     health.record("brave", null, 0);
     health.record("tavily", null, 0);
-    try std.testing.expectEqual(@as(usize, "tavily\x00brave\x00".len), health.strings.items.len);
-    try std.testing.expectEqual(@as(usize, 2), health.entries.count());
+    try std.testing.expectEqual(@as(usize, 2), health.waits.count());
     try std.testing.expect(health.skips("tavily", 0));
     try std.testing.expect(!health.skips("tavilyx", 0));
     try std.testing.expect(!health.skips("tavil", 0));
