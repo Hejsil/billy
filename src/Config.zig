@@ -204,7 +204,8 @@ fn setPath(
     inline for (info.field_names, info.field_types) |name, Field| {
         // The version is the file's, not a setting, and a field nothing can be read into from the
         // command line is no setting either.
-        const settable = comptime !std.mem.eql(u8, name, "version") and isSettable(Field);
+        const settable = comptime !std.mem.eql(u8, name, "version") and
+            (@typeInfo(Field) == .@"struct" or isSettableValue(Field));
         if (settable and std.mem.eql(u8, name, segment.head)) {
             const is_section = comptime @typeInfo(Field) == .@"struct";
             if (segment.rest.len == 0) {
@@ -249,11 +250,6 @@ fn parseValue(T: type, arena: std.mem.Allocator, value: []const u8) error{ Inval
         },
         else => @compileError("cannot set a " ++ @typeName(T) ++ " from the command line"),
     }
-}
-
-fn isSettable(T: type) bool {
-    if (@typeInfo(T) == .@"struct") return true;
-    return isSettableValue(T);
 }
 
 fn isSettableValue(T: type) bool {
