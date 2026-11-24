@@ -99,8 +99,9 @@ fn breakAt(line: []const u8, width: usize) usize {
             continue;
         }
         const length = charLen(line[i..]);
-        if (seen + charWidth(line[i..]) > width) break;
-        seen += charWidth(line[i..]);
+        const width_here = charWidth(line[i..]);
+        if (seen + width_here > width) break;
+        seen += width_here;
         i += length;
         if (line[i - 1] == ' ' or line[i - 1] == '\t') space = i - 1;
     }

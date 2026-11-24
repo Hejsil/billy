@@ -272,18 +272,13 @@ fn deleteSession(r: *Request, registry: *Registry, id: []const u8) !void {
 const Rename = struct { title: []const u8 };
 
 fn renameSession(r: *Request, registry: *Registry, id: []const u8) !void {
-    const gpa = r.server.gpa;
-
-    var body_buffer: [4096]u8 = undefined;
-    const body_reader = r.request.readerExpectNone(&body_buffer);
-    const body = body_reader.allocRemaining(gpa, .limited(1 << 16)) catch
-        return r.reply(.text, "cannot read the title\n", .bad_request);
-    defer gpa.free(body);
-
-    const parsed = std.json.parseFromSlice(Rename, gpa, body, .{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_always,
-    }) catch return r.reply(.text, "the title is not JSON\n", .bad_request);
+    const parsed = (try readJson(
+        r,
+        Rename,
+        1 << 16,
+        "cannot read the title\n",
+        "the title is not JSON\n",
+    )) orelse return;
     defer parsed.deinit();
     // A title of nothing is refused rather than stored: a session with an empty name reads as one
     // that was never named.
@@ -429,7 +424,7 @@ test "a parsed prompt is copied, so the body it came from can be freed" {
     const json = "{\"text\":\"hello\"}";
     @memcpy(buffer[0..json.len], json);
 
-    const parsed = try parsePrompt(gpa, buffer[0..json.len]);
+    const parsed = try parseJson(Prompt, gpa, buffer[0..json.len]);
     defer parsed.deinit();
     @memset(buffer[0..json.len], 'x');
 
@@ -487,27 +482,39 @@ const Prompt = struct {
     text: []const u8,
 };
 
-fn readPrompt(r: *Request) !?std.json.Parsed(Prompt) {
+/// The request's body parsed as `T`, or null after answering the browser: `read_failure` when the
+/// body cannot be read, and `parse_failure` when it is not the JSON asked for.
+fn readJson(
+    r: *Request,
+    T: type,
+    limit: usize,
+    read_failure: []const u8,
+    parse_failure: []const u8,
+) !?std.json.Parsed(T) {
     const gpa = r.server.gpa;
     var body_buffer: [4096]u8 = undefined;
     const body_reader = r.request.readerExpectNone(&body_buffer);
-    const body = body_reader.allocRemaining(gpa, .limited(1 << 20)) catch {
-        try r.reply(.text, "cannot read the prompt\n", .bad_request);
+    const body = body_reader.allocRemaining(gpa, .limited(limit)) catch {
+        try r.reply(.text, read_failure, .bad_request);
         return null;
     };
     defer gpa.free(body);
 
-    return parsePrompt(gpa, body) catch {
-        try r.reply(.text, "the prompt is not JSON\n", .bad_request);
+    return parseJson(T, gpa, body) catch {
+        try r.reply(.text, parse_failure, .bad_request);
         return null;
     };
 }
 
-fn parsePrompt(gpa: std.mem.Allocator, body: []const u8) !std.json.Parsed(Prompt) {
-    return std.json.parseFromSlice(Prompt, gpa, body, .{
+fn parseJson(T: type, gpa: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {
+    return std.json.parseFromSlice(T, gpa, body, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     });
+}
+
+fn readPrompt(r: *Request) !?std.json.Parsed(Prompt) {
+    return readJson(r, Prompt, 1 << 20, "cannot read the prompt\n", "the prompt is not JSON\n");
 }
 
 fn createSession(r: *Request, registry: *Registry) !void {

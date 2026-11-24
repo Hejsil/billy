@@ -69,39 +69,35 @@ fn printInk(text: []const u8, ink: Ink, writer: Writer) !void {
 /// Prints what a call produced under the `output` label.
 pub fn printResult(call: Tools.Call, result: []const u8, writer: Writer) !void {
     if (std.mem.startsWith(u8, result, "error: ")) {
-        try printLabel("output", writer);
-        return printTruncated(result, .{ .hue = .red }, writer);
+        try printOutput(result, .{ .hue = .red }, writer);
+        return;
     }
     switch (call) {
         // A write succeeds by putting the content in the file, so that content is what it produced.
-        .write => |args| {
-            try printLabel("output", writer);
-            return printTruncated(args.content, .dim, writer);
-        },
+        .write => |args| try printOutput(args.content, .dim, writer),
         // An edit's result would only repeat the diff shown above it.
         .edit => {},
         .bash => return printBash(result, writer),
-        else => {
-            try printLabel("output", writer);
-            return printTruncated(result, .dim, writer);
-        },
+        else => try printOutput(result, .dim, writer),
     }
 }
 
+/// Prints a call's output under its label, in the ink of what it is.
+fn printOutput(text: []const u8, ink: Ink, writer: Writer) !void {
+    try printLabel("output", writer);
+    return printTruncated(text, ink, writer);
+}
+
 fn printBash(result: []const u8, writer: Writer) !void {
-    const parts = Tools.bashOutput(result) orelse {
-        try printLabel("output", writer);
-        return printTruncated(result, .dim, writer);
-    };
+    const parts = Tools.bashOutput(result) orelse return printOutput(result, .dim, writer);
     try printExit(parts.exit, writer);
-    const streams = [_]struct { name: []const u8, text: []const u8 }{
-        .{ .name = "stdout", .text = parts.stdout },
-        .{ .name = "stderr", .text = parts.stderr },
-    };
-    for (streams) |stream| {
-        if (stream.text.len == 0) continue;
-        try printLabel(stream.name, writer);
-        try printTruncated(stream.text, .dim, writer);
+    if (parts.stdout.len > 0) {
+        try printLabel("stdout", writer);
+        try printTruncated(parts.stdout, .dim, writer);
+    }
+    if (parts.stderr.len > 0) {
+        try printLabel("stderr", writer);
+        try printTruncated(parts.stderr, .dim, writer);
     }
 }
 

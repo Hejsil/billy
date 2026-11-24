@@ -2,17 +2,12 @@
 
 const std = @import("std");
 
+const reply = @import("reply.zig");
 const SearchResult = @import("../Search/Result.zig");
 
 /// A Brave search reply as the numbered list the model reads.
-pub fn renderSearch(gpa: std.mem.Allocator, reply: []const u8, _: usize) ![]const u8 {
-    const parsed = std.json.parseFromSlice(Response, gpa, reply, .{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_always,
-    }) catch |err| {
-        std.log.warn("brave: cannot read the reply: {t}", .{err});
-        return error.BadReply;
-    };
+pub fn renderSearch(gpa: std.mem.Allocator, bytes: []const u8, _: usize) ![]const u8 {
+    const parsed = try reply.parse("brave", Response, gpa, bytes);
     defer parsed.deinit();
     return SearchResult.renderMapped(gpa, parsed.value.web.results, "description");
 }

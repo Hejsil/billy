@@ -88,46 +88,37 @@ pub fn reset(writer: Writer) []const u8 {
 /// Brackets a burst of output so a terminal shows all of it at once, rather than the cleared space
 /// before it. It is a private mode rather than a colour, so it does not end in `m`.
 pub fn syncBegin(writer: Writer) []const u8 {
-    return switch (writer.style) {
-        .plain => "",
-        .ansi => "\x1b[?2026h",
-    };
+    return writer.ansiOnly("\x1b[?2026h");
 }
 
 pub fn syncEnd(writer: Writer) []const u8 {
-    return switch (writer.style) {
-        .plain => "",
-        .ansi => "\x1b[?2026l",
-    };
+    return writer.ansiOnly("\x1b[?2026l");
 }
 
 pub fn linkOpen(writer: Writer) []const u8 {
-    return switch (writer.style) {
-        .plain => "",
-        .ansi => "\x1b]8;;",
-    };
+    return writer.ansiOnly("\x1b]8;;");
 }
 
 pub fn linkClose(writer: Writer) []const u8 {
+    return writer.ansiOnly("\x1b\\");
+}
+
+fn ansiOnly(writer: Writer, comptime bytes: []const u8) []const u8 {
     return switch (writer.style) {
         .plain => "",
-        .ansi => "\x1b\\",
+        .ansi => bytes,
     };
 }
 
 fn code(writer: Writer, comptime codes: []const u8) []const u8 {
-    return switch (writer.style) {
-        .plain => "",
-        .ansi => "\x1b[" ++ codes ++ "m",
-    };
+    return writer.ansiOnly("\x1b[" ++ codes ++ "m");
 }
 
 const Weight = enum { plain, bold };
 
 fn hueCode(writer: Writer, hue: Color, comptime weight: Weight) []const u8 {
-    if (writer.style == .plain) return "";
     return switch (hue) {
-        inline else => |known| comptime std.fmt.comptimePrint("\x1b[" ++ (if (weight == .bold) "1;" else "") ++ "{d}m", .{@backingInt(known)}),
+        inline else => |known| writer.ansiOnly(comptime std.fmt.comptimePrint("\x1b[" ++ (if (weight == .bold) "1;" else "") ++ "{d}m", .{@backingInt(known)})),
     };
 }
 

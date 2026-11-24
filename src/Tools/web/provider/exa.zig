@@ -2,6 +2,7 @@
 
 const std = @import("std");
 
+const reply = @import("reply.zig");
 const SearchResult = @import("../Search/Result.zig");
 
 /// The body an Exa search is posted with.
@@ -14,8 +15,8 @@ pub fn searchBody(gpa: std.mem.Allocator, query: []const u8, max_results: usize)
 }
 
 /// An Exa search reply as the numbered list the model reads.
-pub fn renderSearch(gpa: std.mem.Allocator, reply: []const u8, _: usize) ![]const u8 {
-    const parsed = try parse(Response, gpa, reply);
+pub fn renderSearch(gpa: std.mem.Allocator, bytes: []const u8, _: usize) ![]const u8 {
+    const parsed = try reply.parse("exa", Response, gpa, bytes);
     defer parsed.deinit();
     return SearchResult.renderMapped(gpa, parsed.value.results, "text");
 }
@@ -28,22 +29,12 @@ pub fn fetchBody(gpa: std.mem.Allocator, url: []const u8) ![]const u8 {
 }
 
 /// An Exa contents reply as the url's text.
-pub fn renderFetch(gpa: std.mem.Allocator, reply: []const u8) ![]const u8 {
-    const parsed = try parse(ContentsResponse, gpa, reply);
+pub fn renderFetch(gpa: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    const parsed = try reply.parse("exa", ContentsResponse, gpa, bytes);
     defer parsed.deinit();
 
     if (parsed.value.results.len == 0 or parsed.value.results[0].text.len == 0) return error.UrlUnreadable;
     return gpa.dupe(u8, parsed.value.results[0].text);
-}
-
-fn parse(T: type, gpa: std.mem.Allocator, reply: []const u8) !std.json.Parsed(T) {
-    return std.json.parseFromSlice(T, gpa, reply, .{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_always,
-    }) catch |err| {
-        std.log.warn("exa: cannot read the reply: {t}", .{err});
-        return error.BadReply;
-    };
 }
 
 const Request = struct {

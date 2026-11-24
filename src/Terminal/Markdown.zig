@@ -249,6 +249,12 @@ fn endBlock(self: *Markdown) bool {
     return self.gather();
 }
 
+/// Ends the line the block's text was on, then the block itself.
+fn finishBody(self: *Markdown) bool {
+    self.endLine();
+    return self.endBlock();
+}
+
 /// Keeps what the block that has ended was written as, and turns to the next one.
 fn gather(self: *Markdown) bool {
     const document = self.document orelse return true;
@@ -329,31 +335,22 @@ pub fn leaveBlock(self: *Markdown, block_type: md.c.MD_BLOCKTYPE, detail: ?*anyo
             if (!self.endBlock()) return false;
         },
         md.c.MD_BLOCK_UL, md.c.MD_BLOCK_OL => {
-            self.endLine();
             self.list_depth -= 1;
             self.container_depth -= 1;
-            if (!self.endBlock()) return false;
+            return self.finishBody();
         },
         md.c.MD_BLOCK_LI => self.container_depth -= 1,
-        md.c.MD_BLOCK_HR => {
-            self.endLine();
-            if (!self.endBlock()) return false;
-        },
+        md.c.MD_BLOCK_HR => return self.finishBody(),
         md.c.MD_BLOCK_H => {
             if (!self.raw(self.writer.reset())) return false;
-            self.endLine();
-            if (!self.endBlock()) return false;
+            return self.finishBody();
         },
         md.c.MD_BLOCK_CODE => {
             if (!self.raw(self.writer.reset())) return false;
             self.in_code = false;
-            self.endLine();
-            if (!self.endBlock()) return false;
+            return self.finishBody();
         },
-        md.c.MD_BLOCK_P => {
-            self.endLine();
-            if (!self.endBlock()) return false;
-        },
+        md.c.MD_BLOCK_P => return self.finishBody(),
         md.c.MD_BLOCK_TABLE => return self.closeTable(),
         md.c.MD_BLOCK_THEAD, md.c.MD_BLOCK_TBODY => {},
         md.c.MD_BLOCK_TR => {

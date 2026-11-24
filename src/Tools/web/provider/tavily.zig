@@ -2,6 +2,7 @@
 
 const std = @import("std");
 
+const reply = @import("reply.zig");
 const SearchResult = @import("../Search/Result.zig");
 
 /// The body a Tavily search is posted with.
@@ -13,8 +14,8 @@ pub fn searchBody(gpa: std.mem.Allocator, query: []const u8, max_results: usize)
 }
 
 /// A Tavily search reply as the numbered list the model reads.
-pub fn renderSearch(gpa: std.mem.Allocator, reply: []const u8, _: usize) ![]const u8 {
-    const parsed = try parse(Response, gpa, reply);
+pub fn renderSearch(gpa: std.mem.Allocator, bytes: []const u8, _: usize) ![]const u8 {
+    const parsed = try reply.parse("tavily", Response, gpa, bytes);
     defer parsed.deinit();
     return SearchResult.renderMapped(gpa, parsed.value.results, "content");
 }
@@ -27,8 +28,8 @@ pub fn fetchBody(gpa: std.mem.Allocator, url: []const u8) ![]const u8 {
 }
 
 /// A Tavily extraction reply as the url's text.
-pub fn renderFetch(gpa: std.mem.Allocator, reply: []const u8) ![]const u8 {
-    const parsed = try parse(ExtractResponse, gpa, reply);
+pub fn renderFetch(gpa: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    const parsed = try reply.parse("tavily", ExtractResponse, gpa, bytes);
     defer parsed.deinit();
 
     if (parsed.value.results.len == 0) {
@@ -38,16 +39,6 @@ pub fn renderFetch(gpa: std.mem.Allocator, reply: []const u8) ![]const u8 {
         return error.UrlUnreadable;
     }
     return gpa.dupe(u8, parsed.value.results[0].raw_content);
-}
-
-fn parse(T: type, gpa: std.mem.Allocator, reply: []const u8) !std.json.Parsed(T) {
-    return std.json.parseFromSlice(T, gpa, reply, .{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_always,
-    }) catch |err| {
-        std.log.warn("tavily: cannot read the reply: {t}", .{err});
-        return error.BadReply;
-    };
 }
 
 const Request = struct {
@@ -85,9 +76,9 @@ const ExtractFailure = struct {
     @"error": []const u8 = "",
 };
 
-fn expectSearch(expected: []const u8, reply: []const u8) !void {
+fn expectSearch(expected: []const u8, bytes: []const u8) !void {
     const gpa = std.testing.allocator;
-    const text = try renderSearch(gpa, reply, 3);
+    const text = try renderSearch(gpa, bytes, 3);
     defer gpa.free(text);
     try std.testing.expectEqualStrings(expected, text);
 }

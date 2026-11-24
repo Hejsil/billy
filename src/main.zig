@@ -72,16 +72,44 @@ const serve_options =
     \\  -h, --help         print this message
 ;
 
-fn printHelp(
-    out: Terminal.Writer,
+/// One help message: how a command is named, what it is for, and what it takes.
+const Help = struct {
     invocation: []const u8,
     description: []const u8,
-    commands: ?[]const u8,
-    options: []const u8,
-) !void {
-    try out.print("usage: {s}\n\n{s}\n", .{ invocation, description });
-    if (commands) |list| try out.print("\nCommands:\n{s}\n", .{list});
-    try out.print("\nOptions:\n{s}\n", .{options});
+    commands: ?[]const u8 = null,
+    options: []const u8 = command_options,
+};
+
+const root_help: Help = .{
+    .invocation = "billy [command] [options]",
+    .description = billy_about,
+    .commands = billy_commands,
+};
+
+const resume_help: Help = .{ .invocation = "billy resume [<session>]", .description = resume_about };
+
+const login_help: Help = .{ .invocation = "billy login [<service>]", .description = login_about };
+
+const config_help: Help = .{ .invocation = "billy config <setting> <value>", .description = config_about };
+
+const serve_help: Help = .{
+    .invocation = "billy serve [--port <port>] [--host <addr>]",
+    .description = serve_about,
+    .options = serve_options,
+};
+
+const sessions_help: Help = .{ .invocation = "billy sessions", .description = sessions_about };
+
+const models_help: Help = .{
+    .invocation = "billy models [--refresh]",
+    .description = models_about,
+    .options = models_options,
+};
+
+fn printHelp(out: Terminal.Writer, help: Help) !void {
+    try out.print("usage: {s}\n\n{s}\n", .{ help.invocation, help.description });
+    if (help.commands) |list| try out.print("\nCommands:\n{s}\n", .{list});
+    try out.print("\nOptions:\n{s}\n", .{help.options});
 }
 
 const Options = struct {
@@ -205,53 +233,28 @@ fn fail(err: anyerror) u8 {
 }
 
 fn printAskedHelp(options: Options, out: Terminal.Writer) !bool {
-    if (options.help) {
-        try printHelp(out, "billy [command] [options]", billy_about, billy_commands, command_options);
-        return true;
-    }
-    switch (options.command) {
-        .none => {},
-        .resume_session => |asked| {
-            if (asked.help) {
-                try printHelp(out, "billy resume [<session>]", resume_about, null, command_options);
-                return true;
-            }
-        },
-        .login => |login| {
-            if (login.help) {
-                try printHelp(out, "billy login [<service>]", login_about, null, command_options);
-                return true;
-            }
-        },
-        .config => |config| {
-            if (config.help) {
-                try printHelp(out, "billy config <setting> <value>", config_about, null, command_options);
-                return true;
-            }
-        },
-        .serve => |serve| {
-            if (serve.help) {
-                try printHelp(out, "billy serve [--port <port>] [--host <addr>]", serve_about, null, serve_options);
-                return true;
-            }
-        },
-        .sessions => |sessions| {
-            if (sessions.help) {
-                try printHelp(out, "billy sessions", sessions_about, null, command_options);
-                return true;
-            }
-        },
-        .models => |models| {
-            if (models.help) {
-                try printHelp(out, "billy models [--refresh]", models_about, null, models_options);
-                return true;
-            }
-        },
-    }
-    return false;
+    const help = helpAsked(options) orelse return false;
+    try printHelp(out, help);
+    return true;
+}
+
+/// The help message `options` asks for: the root one, or the command's own.
+fn helpAsked(options: Options) ?Help {
+    if (options.help) return root_help;
+    return switch (options.command) {
+        .none => null,
+        .resume_session => |asked| if (asked.help) resume_help else null,
+        .login => |asked| if (asked.help) login_help else null,
+        .config => |asked| if (asked.help) config_help else null,
+        .serve => |asked| if (asked.help) serve_help else null,
+        .sessions => |asked| if (asked.help) sessions_help else null,
+        .models => |asked| if (asked.help) models_help else null,
+    };
 }
 
 const ParseError = error{InvalidArgument};
+
+const help_flags = [_][]const u8{ "-h", "--help" };
 
 fn parseArgsSlice(slice: []const []const u8) ParseError!Options {
     var args = spaghet.Args.initSlice(slice);
@@ -261,7 +264,7 @@ fn parseArgsSlice(slice: []const []const u8) ParseError!Options {
 fn parseArgs(args: *spaghet.Args) ParseError!Options {
     var options: Options = .{};
     while (args.next()) {
-        if (args.flag(&.{ "-h", "--help" }))
+        if (args.flag(&help_flags))
             options.help = true;
         if (args.positional()) |command|
             options.command = try parseCommand(args, command);
@@ -288,12 +291,9 @@ fn parseCommand(args: *spaghet.Args, command: []const u8) ParseError!Options.Com
 fn parseResume(args: *spaghet.Args) ParseError!Options.Resume {
     var asked: Options.Resume = .{};
     while (args.next()) {
-        if (args.flag(&.{ "-h", "--help" }))
+        if (args.flag(&help_flags))
             asked.help = true;
-        if (asked.id == null)
-            asked.id = args.positional();
-        if (args.positional()) |_|
-            return error.InvalidArgument;
+        try takePositional(args, &asked.id);
     }
     return asked;
 }
@@ -301,12 +301,9 @@ fn parseResume(args: *spaghet.Args) ParseError!Options.Resume {
 fn parseLogin(args: *spaghet.Args) ParseError!Options.Login {
     var login: Options.Login = .{};
     while (args.next()) {
-        if (args.flag(&.{ "-h", "--help" }))
+        if (args.flag(&help_flags))
             login.help = true;
-        if (login.service == null)
-            login.service = args.positional();
-        if (args.positional()) |_|
-            return error.InvalidArgument;
+        try takePositional(args, &login.service);
     }
     return login;
 }
@@ -314,14 +311,10 @@ fn parseLogin(args: *spaghet.Args) ParseError!Options.Login {
 fn parseConfig(args: *spaghet.Args) ParseError!Options.Config {
     var setting: Options.Config = .{};
     while (args.next()) {
-        if (args.flag(&.{ "-h", "--help" }))
+        if (args.flag(&help_flags))
             setting.help = true;
-        if (setting.path == null)
-            setting.path = args.positional();
-        if (setting.value == null)
-            setting.value = args.positional();
-        if (args.positional()) |_|
-            return error.InvalidArgument;
+        // The first positional is the setting's path, the second its value, and a third is refused.
+        try takePositional(args, if (setting.path == null) &setting.path else &setting.value);
     }
     if (!setting.help and (setting.path == null or setting.value == null)) {
         return error.InvalidArgument;
@@ -329,17 +322,23 @@ fn parseConfig(args: *spaghet.Args) ParseError!Options.Config {
     return setting;
 }
 
+/// Takes the next positional into `slot`, refusing one when the slot already holds something.
+fn takePositional(args: *spaghet.Args, slot: *?[]const u8) ParseError!void {
+    const argument = args.positional() orelse return;
+    if (slot.* != null) return error.InvalidArgument;
+    slot.* = argument;
+}
+
 fn parseServe(args: *spaghet.Args) ParseError!Options.Serve {
     var serve: Options.Serve = .{};
     while (args.next()) {
-        if (args.flag(&.{ "-h", "--help" }))
+        if (args.flag(&help_flags))
             serve.help = true;
         if (args.option(&.{ "-p", "--port" })) |port|
             serve.port = std.fmt.parseInt(u16, port, 10) catch return error.InvalidArgument;
         if (args.option(&.{"--host"})) |host|
             serve.host = host;
-        if (args.positional()) |_|
-            return error.InvalidArgument;
+        if (args.positional() != null) return error.InvalidArgument;
     }
     return serve;
 }
@@ -347,12 +346,11 @@ fn parseServe(args: *spaghet.Args) ParseError!Options.Serve {
 fn parseModels(args: *spaghet.Args) ParseError!Options.Models {
     var models: Options.Models = .{};
     while (args.next()) {
-        if (args.flag(&.{ "-h", "--help" }))
+        if (args.flag(&help_flags))
             models.help = true;
         if (args.flag(&.{"--refresh"}))
             models.refresh = true;
-        if (args.positional()) |_|
-            return error.InvalidArgument;
+        if (args.positional() != null) return error.InvalidArgument;
     }
     return models;
 }
@@ -360,10 +358,9 @@ fn parseModels(args: *spaghet.Args) ParseError!Options.Models {
 fn parseSessions(args: *spaghet.Args) ParseError!Options.Sessions {
     var sessions: Options.Sessions = .{};
     while (args.next()) {
-        if (args.flag(&.{ "-h", "--help" }))
+        if (args.flag(&help_flags))
             sessions.help = true;
-        if (args.positional()) |_|
-            return error.InvalidArgument;
+        if (args.positional() != null) return error.InvalidArgument;
     }
     return sessions;
 }
@@ -541,48 +538,14 @@ fn expectOptions(expected: Options, actual: Options) !void {
     }
 }
 
-const help_messages = [_]struct {
-    invocation: []const u8,
-    description: []const u8,
-    commands: ?[]const u8,
-    options: []const u8,
-}{
-    .{
-        .invocation = "billy [command] [options]",
-        .description = billy_about,
-        .commands = billy_commands,
-        .options = command_options,
-    },
-    .{
-        .invocation = "billy resume [<session>]",
-        .description = resume_about,
-        .commands = null,
-        .options = command_options,
-    },
-    .{
-        .invocation = "billy login [<service>]",
-        .description = login_about,
-        .commands = null,
-        .options = command_options,
-    },
-    .{
-        .invocation = "billy config <setting> <value>",
-        .description = config_about,
-        .commands = null,
-        .options = command_options,
-    },
-    .{
-        .invocation = "billy sessions",
-        .description = sessions_about,
-        .commands = null,
-        .options = command_options,
-    },
-    .{
-        .invocation = "billy models [--refresh]",
-        .description = models_about,
-        .commands = null,
-        .options = models_options,
-    },
+const help_messages = [_]Help{
+    root_help,
+    resume_help,
+    login_help,
+    config_help,
+    serve_help,
+    sessions_help,
+    models_help,
 };
 
 test "every help message reads the same way" {
@@ -592,7 +555,7 @@ test "every help message reads the same way" {
 
     for (help_messages) |message| {
         out.clearRetainingCapacity();
-        try printHelp(.{ .out = &out.writer }, message.invocation, message.description, message.commands, message.options);
+        try printHelp(.{ .out = &out.writer }, message);
         const text = out.written();
 
         const usage_at = std.mem.find(u8, text, "usage: ").?;
