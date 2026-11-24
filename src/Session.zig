@@ -188,10 +188,7 @@ fn writeMessage(session: *const Session, json: anytype, message: Message) !void 
     try json.objectField("role");
     try json.write(message.role);
 
-    if (session.pool.get(message.content)) |content| {
-        try json.objectField("content");
-        try json.write(content);
-    }
+    try session.writeStored(json, "content", message.content);
 
     const calls = message.tool_calls.resolve(session);
     if (calls.len > 0) {
@@ -201,17 +198,17 @@ fn writeMessage(session: *const Session, json: anytype, message: Message) !void 
         try json.endArray();
     }
 
-    if (session.pool.get(message.tool_call_id)) |tool_call_id| {
-        try json.objectField("tool_call_id");
-        try json.write(tool_call_id);
-    }
-
-    if (session.pool.get(message.reasoning)) |reasoning| {
-        try json.objectField("reasoning_content");
-        try json.write(reasoning);
-    }
+    try session.writeStored(json, "tool_call_id", message.tool_call_id);
+    try session.writeStored(json, "reasoning_content", message.reasoning);
 
     try json.endObject();
+}
+
+/// Writes the field `name` when the pool holds one: a message leaves out what it does not have.
+fn writeStored(session: *const Session, json: anytype, name: []const u8, index: Pool.Index) !void {
+    const text = session.pool.get(index) orelse return;
+    try json.objectField(name);
+    try json.write(text);
 }
 
 /// The conversation as a request carries it, for passing to a client without resolving it first.
