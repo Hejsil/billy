@@ -61,7 +61,8 @@ pub fn init(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, http: *std.http
 pub fn definitions(tools: *const Tools) []const Session.Definition {
     const has_web = tools.settings.search.providers.len > 0 or
         tools.settings.fetch.providers.len > 0;
-    return if (has_web) &specs_with_web else &specs;
+    const chosen = if (has_web) &specs_with_web else &specs;
+    return chosen.items[0..chosen.len];
 }
 
 pub fn callName(call: Call) []const u8 {
@@ -405,31 +406,26 @@ comptime {
     }
 }
 
-fn specList(comptime web_tools: Web) [specsCount(web_tools)]Session.Definition {
-    var list: [specsCount(web_tools)]Session.Definition = undefined;
-    var n: usize = 0;
+const Specs = struct {
+    items: [table.len]Session.Definition,
+    len: usize,
+};
+
+fn specList(comptime web_tools: Web) Specs {
+    var list: Specs = .{ .items = undefined, .len = 0 };
     for (table) |tool| {
         if (web_tools == .without_web and tool.web) continue;
-        list[n] = .{
+        list.items[list.len] = .{
             .name = @tagName(tool.tag),
             .description = tool.description,
             .parameters = tool.parameters,
         };
-        n += 1;
+        list.len += 1;
     }
     return list;
 }
 
 const Web = enum { with_web, without_web };
-
-fn specsCount(comptime web_tools: Web) usize {
-    var n: usize = 0;
-    for (table) |tool| {
-        if (web_tools == .without_web and tool.web) continue;
-        n += 1;
-    }
-    return n;
-}
 
 const specs = specList(.without_web);
 const specs_with_web = specList(.with_web);
