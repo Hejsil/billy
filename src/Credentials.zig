@@ -33,23 +33,23 @@ pub fn purposeOf(name: []const u8) ?[]const u8 {
     return null;
 }
 
-keys: std.array_hash_map.String([]const u8) = .empty,
+keys: std.json.ArrayHashMap([]const u8) = .{},
 
 /// A table with no key stored in it, which a run that stores none is given.
 pub const empty: Credentials = .{};
 
 pub fn get(credentials: *const Credentials, name: []const u8) ?[]const u8 {
-    return credentials.keys.get(name);
+    return credentials.keys.map.get(name);
 }
 
 pub fn put(credentials: *Credentials, arena: std.mem.Allocator, name: []const u8, key: []const u8) !void {
     const owned_name = try arena.dupe(u8, name);
     const owned_key = try arena.dupe(u8, key);
-    try credentials.keys.put(arena, owned_name, owned_key);
+    try credentials.keys.map.put(arena, owned_name, owned_key);
 }
 
 pub fn names(credentials: *const Credentials) []const []const u8 {
-    return credentials.keys.keys();
+    return credentials.keys.map.keys();
 }
 
 const format_version: u32 = 1;
@@ -70,10 +70,7 @@ pub fn load(io: std.Io, dir: std.Io.Dir, arena: std.mem.Allocator) !Credentials 
     }) catch return error.CorruptCredentials;
     if (file.version > format_version) return error.UnsupportedCredentialsVersion;
 
-    var result: Credentials = .{};
-    var stored = file.credentials.map.iterator();
-    while (stored.next()) |entry| try result.put(arena, entry.key_ptr.*, entry.value_ptr.*);
-    return result;
+    return .{ .keys = file.credentials };
 }
 
 pub fn save(credentials: *const Credentials, io: std.Io, dir: std.Io.Dir) !void {
@@ -94,18 +91,13 @@ pub fn save(credentials: *const Credentials, io: std.Io, dir: std.Io.Dir) !void 
     try atomic.replace(io);
 }
 
+const Saved = struct {
+    version: u32 = format_version,
+    credentials: std.json.ArrayHashMap([]const u8),
+};
+
 fn write(credentials: *const Credentials, json: *std.json.Stringify) !void {
-    try json.beginObject();
-    try json.objectField("version");
-    try json.write(format_version);
-    try json.objectField("credentials");
-    try json.beginObject();
-    for (credentials.keys.keys(), credentials.keys.values()) |name, key| {
-        try json.objectField(name);
-        try json.write(key);
-    }
-    try json.endObject();
-    try json.endObject();
+    return try json.write(Saved{ .credentials = credentials.keys });
 }
 
 /// Whether a key can be stored for `name`: a service billy ships, or one the configuration names.
