@@ -91,13 +91,8 @@ pub fn save(credentials: *const Credentials, io: std.Io, dir: std.Io.Dir) !void 
     try atomic.replace(io);
 }
 
-const Saved = struct {
-    version: u32 = format_version,
-    credentials: std.json.ArrayHashMap([]const u8),
-};
-
 fn write(credentials: *const Credentials, json: *std.json.Stringify) !void {
-    return try json.write(Saved{ .credentials = credentials.keys });
+    return try json.write(Stored{ .credentials = credentials.keys });
 }
 
 /// Whether a key can be stored for `name`: a service billy ships, or one the configuration names.
