@@ -243,7 +243,7 @@ fn readKeys(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u
                 dirty = true;
             },
         }
-        if (dirty and ed.drained()) {
+        if (dirty and ed.in_pos == ed.in_len) {
             try ed.redraw(prompt, content_width, if (ed.quiet) "" else line.items, if (ed.quiet) 0 else cursor);
             dirty = false;
         }
@@ -425,10 +425,6 @@ fn recall(
     recalled.* = landing;
     ed.goal_col = null;
     return true;
-}
-
-fn drained(ed: *const LineEditor) bool {
-    return ed.in_pos == ed.in_len;
 }
 
 fn nextKey(ed: *LineEditor) !Key {
