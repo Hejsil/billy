@@ -665,9 +665,7 @@ pub fn toolSet(session: *const Session) ToolSet {
 
 fn setCheckedId(buf: []u8, given: []const u8) ![]const u8 {
     if (given.len + 1 > buf.len) return error.InvalidSessionId;
-    if (!usableName(given)) return error.InvalidSessionId;
-    @memcpy(buf[0..given.len], given);
-    return buf[0..given.len];
+    return fileName(given, buf) orelse error.InvalidSessionId;
 }
 
 fn usableName(text: []const u8) bool {

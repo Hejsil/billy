@@ -63,17 +63,13 @@ pub fn run(search: Search, tools: Tools, out: *std.Io.Writer) !void {
 /// The backend `provider` is asked as, or the reason it cannot be asked: a key billy does not have,
 /// or a self-hosted backend with no address.
 fn backendFor(settings: web.SearchSettings, keys: *const Credentials, provider: web.Provider) !web.Backend {
-    return .{
-        .provider = provider,
-        .api_key = if (provider.service()) |service|
-            keys.get(service) orelse return error.MissingApiKey
-        else blk: {
-            const url = settings.searxng.url orelse return error.MissingSearchUrl;
-            if (url.len == 0) return error.MissingSearchUrl;
-            break :blk "";
-        },
-        .endpoint = if (provider.service() == null) settings.searxng.url else null,
-    };
+    if (provider.service()) |service|
+        return .{ .provider = provider, .api_key = keys.get(service) orelse return error.MissingApiKey };
+
+    // A backend billy does not run itself is asked at the address the configuration gives it.
+    const url = settings.searxng.url orelse return error.MissingSearchUrl;
+    if (url.len == 0) return error.MissingSearchUrl;
+    return .{ .provider = provider, .endpoint = url };
 }
 
 /// Asks each backend in turn until one answers.
@@ -153,9 +149,9 @@ fn searchBackend(tools: Tools, backend: web.Backend, query: []const u8, max_resu
         payload,
     );
     return switch (answer) {
-        .text => |text| text: {
+        .text => |text| {
             defer tools.gpa.free(text);
-            break :text .{ .text = try spec.render(tools.gpa, text, asked) };
+            return .{ .text = try spec.render(tools.gpa, text, asked) };
         },
         .retry_after_ms => |ms| .{ .retry_after_ms = ms },
     };

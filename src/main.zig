@@ -494,20 +494,12 @@ fn expectOptions(expected: Options, actual: Options) !void {
         .resume_session => |asked| {
             const actual_resume = actual.command.resume_session;
             try std.testing.expectEqual(asked.help, actual_resume.help);
-            if (asked.id) |id| {
-                try std.testing.expectEqualStrings(id, actual_resume.id.?);
-            } else {
-                try std.testing.expect(actual_resume.id == null);
-            }
+            try expectOptionalString(asked.id, actual_resume.id);
         },
         .login => |login| {
             const actual_login = actual.command.login;
             try std.testing.expectEqual(login.help, actual_login.help);
-            if (login.service) |service| {
-                try std.testing.expectEqualStrings(service, actual_login.service.?);
-            } else {
-                try std.testing.expect(actual_login.service == null);
-            }
+            try expectOptionalString(login.service, actual_login.service);
         },
         .serve => |serve| {
             const actual_serve = actual.command.serve;
@@ -518,16 +510,8 @@ fn expectOptions(expected: Options, actual: Options) !void {
         .config => |config| {
             const actual_config = actual.command.config;
             try std.testing.expectEqual(config.help, actual_config.help);
-            if (config.path) |path| {
-                try std.testing.expectEqualStrings(path, actual_config.path.?);
-            } else {
-                try std.testing.expect(actual_config.path == null);
-            }
-            if (config.value) |value| {
-                try std.testing.expectEqualStrings(value, actual_config.value.?);
-            } else {
-                try std.testing.expect(actual_config.value == null);
-            }
+            try expectOptionalString(config.path, actual_config.path);
+            try expectOptionalString(config.value, actual_config.value);
         },
         .sessions => |sessions| try std.testing.expectEqual(sessions.help, actual.command.sessions.help),
         .models => |models| {
@@ -536,6 +520,11 @@ fn expectOptions(expected: Options, actual: Options) !void {
             try std.testing.expectEqual(models.help, actual_models.help);
         },
     }
+}
+
+fn expectOptionalString(expected: ?[]const u8, actual: ?[]const u8) !void {
+    try std.testing.expectEqual(expected == null, actual == null);
+    if (expected) |text| try std.testing.expectEqualStrings(text, actual.?);
 }
 
 const help_messages = [_]Help{

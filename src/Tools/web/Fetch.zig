@@ -54,13 +54,8 @@ const max_backends = @typeInfo(web.Provider).@"enum".field_names.len;
 
 /// The backend `provider` is asked as, or the reason it cannot be asked.
 fn backendFor(keys: *const Credentials, provider: web.Provider) !web.Backend {
-    return .{
-        .provider = provider,
-        .api_key = if (provider.service()) |service|
-            keys.get(service) orelse return error.MissingApiKey
-        else
-            "",
-    };
+    const service = provider.service() orelse return .{ .provider = provider };
+    return .{ .provider = provider, .api_key = keys.get(service) orelse return error.MissingApiKey };
 }
 
 /// Asks each backend in turn until one reads the url.
@@ -162,10 +157,10 @@ fn fetchBackend(tools: Tools, backend: web.Backend, url: []const u8) !web.Answer
         payload,
     );
     return switch (answer) {
-        .text => |text| text: {
-            const render = spec.render orelse break :text .{ .text = text };
+        .text => |text| {
+            const render = spec.render orelse return .{ .text = text };
             defer tools.gpa.free(text);
-            break :text .{ .text = try render(tools.gpa, text) };
+            return .{ .text = try render(tools.gpa, text) };
         },
         .retry_after_ms => |ms| .{ .retry_after_ms = ms },
     };

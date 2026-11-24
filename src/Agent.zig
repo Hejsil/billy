@@ -651,7 +651,7 @@ fn runCalls(
 
     for (calls, runs) |call, *run| {
         run.* = .{
-            .parsed = Tools.parse(scratch_state.allocator(), call),
+            .parsed = Tools.parse(arena, call),
             .result = .init(arena),
         };
     }

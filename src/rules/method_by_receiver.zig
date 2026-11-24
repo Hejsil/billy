@@ -38,15 +38,17 @@ fn run(
             .identifier, .ampersand => {},
             else => continue,
         }
+        const name = tree.tokenSlice(i);
+        if (!isMethod(tree, tags, name, self_name)) continue;
+
+        // `name(receiver, ...)` is reported at the name; `Receiver.name(...)` at the receiver.
         if (tags[i - 1] != .period) {
-            if (!isMethod(tree, tags, tree.tokenSlice(i), self_name)) continue;
-            try report(arena, &problems, rule, config, tree, i, tree.tokenSlice(i));
+            try report(arena, &problems, rule, config, tree, i, name);
             continue;
         }
-        if (!isMethod(tree, tags, tree.tokenSlice(i), self_name)) continue;
         if (i < 2 or tags[i - 2] != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenSlice(i - 2), self_name)) continue;
-        try report(arena, &problems, rule, config, tree, i - 2, tree.tokenSlice(i));
+        try report(arena, &problems, rule, config, tree, i - 2, name);
     }
 
     return if (problems.items.len > 0)

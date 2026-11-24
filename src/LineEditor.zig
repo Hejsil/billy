@@ -208,17 +208,11 @@ fn readKeys(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u
                 ed.last_cursor_row = 0;
                 dirty = true;
             },
-            .up => {
-                if (moveCursorVertical(&ed.goal_col, line.items, content_width, &cursor, -1)) {
+            .up, .down => {
+                const direction: i8 = if (key == .up) -1 else 1;
+                if (moveCursorVertical(&ed.goal_col, line.items, content_width, &cursor, direction)) {
                     dirty = true;
-                } else if (try ed.recall(&line, &cursor, &draft, &recalled, -1)) {
-                    dirty = true;
-                }
-            },
-            .down => {
-                if (moveCursorVertical(&ed.goal_col, line.items, content_width, &cursor, 1)) {
-                    dirty = true;
-                } else if (try ed.recall(&line, &cursor, &draft, &recalled, 1)) {
+                } else if (try ed.recall(&line, &cursor, &draft, &recalled, direction)) {
                     dirty = true;
                 }
             },
@@ -275,8 +269,7 @@ fn readLinePiped(ed: *LineEditor) !?[]const u8 {
     var line: std.ArrayList(u8) = .empty;
     defer line.deinit(ed.gpa);
 
-    while (true) {
-        const byte = (try ed.nextByte()) orelse break;
+    while (try ed.nextByte()) |byte| {
         if (byte == '\n') break;
         try line.append(ed.gpa, byte);
     }
@@ -331,8 +324,7 @@ fn redraw(
         }
     }
 
-    if (ed.last_cursor_row > 0) try ed.out.print("\x1b[{d}A", .{ed.last_cursor_row});
-    try ed.out.writeAll("\r");
+    try moveUp(ed.out, ed.last_cursor_row);
     if (ed.last_rows == 0) {
         try ed.out.writeAll("\x1b[K");
     } else {
@@ -341,8 +333,7 @@ fn redraw(
             try ed.out.writeAll("\x1b[K");
             if (row + 1 < ed.last_rows) try ed.out.writeAll("\r\n");
         }
-        if (ed.last_rows > 1) try ed.out.print("\x1b[{d}A", .{ed.last_rows - 1});
-        try ed.out.writeAll("\r");
+        try moveUp(ed.out, ed.last_rows - 1);
     }
 
     var row: usize = 0;
@@ -366,9 +357,7 @@ fn redraw(
 
     try ed.out.writeAll("\x1b[J");
 
-    const up = rows - 1 - at.index;
-    if (up > 0) try ed.out.print("\x1b[{d}A", .{up});
-    try ed.out.writeAll("\r");
+    try moveUp(ed.out, rows - 1 - at.index);
     if (cursor_col > 0) try ed.out.print("\x1b[{d}C", .{cursor_col});
 
     ed.last_rows = rows;
@@ -381,11 +370,15 @@ fn endPrompt(ed: *LineEditor, header: []const u8) !void {
     const header_rows = ed.headerRows(header);
     const deleted = header_rows + ed.last_rows;
     if (deleted == 0) return;
-    const up = ed.last_cursor_row + header_rows;
-    if (up > 0) try ed.out.print("\x1b[{d}A", .{up});
-    try ed.out.writeAll("\r");
+    try moveUp(ed.out, ed.last_cursor_row + header_rows);
     try ed.out.print("\x1b[{d}M", .{deleted});
     try ed.out.writeAll("\r");
+}
+
+/// Puts the cursor `rows` rows up, at the start of the line.
+fn moveUp(out: *std.Io.Writer, rows: usize) !void {
+    if (rows > 0) try out.print("\x1b[{d}A", .{rows});
+    try out.writeAll("\r");
 }
 
 fn contentWidth(ed: *const LineEditor, prompt_width: usize) usize {
@@ -586,8 +579,7 @@ fn enterRaw() !std.posix.termios {
 const Reflow = struct { rows: usize, cursor_row: usize };
 
 fn contentWidthFor(width: usize, prompt_width: usize) usize {
-    if (width == 0 or width <= prompt_width) return no_wrap;
-    if (prompt_width > max_indent) return no_wrap;
+    if (width <= prompt_width or prompt_width > max_indent) return no_wrap;
     return width - prompt_width;
 }
 
@@ -666,15 +658,10 @@ fn rowAt(line: []const u8, content_width: usize, cursor: usize) Row {
         const end = newline orelse line.len;
         if (cursor <= end) {
             const text = line[start..end];
-            const columns_wide = columns(text);
-            const rows = rowsFor(columns_wide, content_width);
+            const rows = rowsFor(columns(text), content_width);
             const within = @min(columns(line[start..cursor]) / content_width, rows - 1);
-            const row_start = start + columnOffset(text, within * content_width);
-            return .{
-                .index = index + within,
-                .start = row_start,
-                .end = start + columnOffset(text, @min((within + 1) * content_width, columns_wide)),
-            };
+            const range = rowRange(line, content_width, index + within);
+            return .{ .index = index + within, .start = range.start, .end = range.end };
         }
         index += rowsFor(columns(line[start..end]), content_width);
         if (newline == null) return .{ .index = index, .start = line.len, .end = line.len };

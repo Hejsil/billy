@@ -65,16 +65,17 @@ fn repaint(self: *Answer, width: usize) !void {
 fn frame(self: *Answer, body: *const fn (self: *Answer, width: usize) anyerror!void) !void {
     // Once for the whole frame: laid out at two widths, the rows to take back would be neither's.
     const width = self.writer.width();
-    // A frame is only worth declaring when something in it is drawn again and taken back.
     const bracketed = width > 0;
     if (bracketed) try self.writer.write(Writer.syncBegin(self.writer));
+
+    // The frame ends before the body's failure is passed on, so a terminal is never left mid-frame.
+    var failure: ?anyerror = null;
     body(self, width) catch |err| {
-        if (bracketed) try self.writer.write(Writer.syncEnd(self.writer));
-        try self.writer.flush();
-        return err;
+        failure = err;
     };
     if (bracketed) try self.writer.write(Writer.syncEnd(self.writer));
     try self.writer.flush();
+    if (failure) |err| return err;
 }
 
 fn draw(self: *Answer, text: []const u8, width: usize) !void {

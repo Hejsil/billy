@@ -115,9 +115,7 @@ fn find(gpa: std.mem.Allocator, haystack: []const u8, needle: []const u8) !Found
         return .{ .rule = .exact, .spans = spans };
 
     for ([_]Matching{ .trailing_whitespace, .indentation }) |tier| {
-        spans.clearRetainingCapacity();
-
-        const trim: Trim = if (tier == .indentation) .trim else .trim_end;
+        const trim: Trim = if (tier == .indentation) .both else .trim_end;
         try findLines(gpa, haystack, needle, trim, &spans);
         if (spans.items.len > 0) {
             return .{ .rule = tier, .spans = spans };
@@ -149,16 +147,12 @@ fn findLines(
 
     var i: usize = 0;
     while (i + needle_lines.len <= haystack_lines.len) : (i += 1) {
-        var matches = true;
-        for (needle_lines, 0..) |want, j| {
+        const matches = for (needle_lines, 0..) |want, j| {
             const have = haystack_lines[i + j];
             const want_text = normalize(needle[want.start..want.content_end], trim);
             const have_text = normalize(haystack[have.start..have.content_end], trim);
-            if (!std.mem.eql(u8, want_text, have_text)) {
-                matches = false;
-                break;
-            }
-        }
+            if (!std.mem.eql(u8, want_text, have_text)) break false;
+        } else true;
         if (!matches) continue;
         const last = haystack_lines[i + needle_lines.len - 1];
         try spans.append(gpa, .{
@@ -190,17 +184,12 @@ fn splitLines(gpa: std.mem.Allocator, text: []const u8) ![]Line {
     return lines.toOwnedSlice(gpa);
 }
 
-const Trim = enum {
-    trim_start,
-    trim_end,
-    trim,
-};
+const Trim = enum { trim_end, both };
 
 fn normalize(line: []const u8, trim: Trim) []const u8 {
-    var text = line;
-    if (trim != .trim_end) text = std.mem.trimStart(u8, text, " \t");
-    if (trim != .trim_start) text = std.mem.trimEnd(u8, text, " \t\r");
-    return text;
+    const text = std.mem.trimEnd(u8, line, " \t\r");
+    if (trim == .trim_end) return text;
+    return std.mem.trimStart(u8, text, " \t");
 }
 
 fn reindent(gpa: std.mem.Allocator, text: []const u8, from: []const u8, to: []const u8) ![]u8 {

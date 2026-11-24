@@ -283,12 +283,9 @@ fn namesAnotherHost(url: []const u8) bool {
     var at: usize = 0;
     while (at < url.len and (url[at] <= ' ' or url[at] == 0x7f)) at += 1;
 
-    var slashes: usize = 0;
-    while (at < url.len and (url[at] == '/' or url[at] == '\\')) : (at += 1) {
-        slashes += 1;
-        if (slashes == 2) return true;
-    }
-    return false;
+    return at + 1 < url.len and
+        (url[at] == '/' or url[at] == '\\') and
+        (url[at + 1] == '/' or url[at + 1] == '\\');
 }
 
 /// Whether an attribute may carry `url`. An image is the one a page fetches as it draws, so it may
@@ -334,23 +331,12 @@ fn schemeOf(url: []const u8, buffer: []u8) []const u8 {
 pub fn diffLines(lines: []const diff.Line, out: *std.Io.Writer) !void {
     try out.writeAll("<pre class=\"diff\">");
     for (lines) |line| {
-        switch (line.kind) {
-            .elided => {
-                try out.writeAll("<span class=\"elided\">");
-                try out.print(" … {d} more lines", .{line.hidden});
-            },
-            else => {
-                try out.writeAll("<span class=\"");
-                try out.writeAll(switch (line.kind) {
-                    .context => "context",
-                    .removed => "removed",
-                    .added => "added",
-                    .elided => unreachable,
-                });
-                try out.writeAll("\">");
-                try out.writeAll(&.{line.kind.mark()});
-                try escape(line.text, out);
-            },
+        try out.print("<span class=\"{t}\">", .{line.kind});
+        if (line.kind == .elided) {
+            try out.print(" … {d} more lines", .{line.hidden});
+        } else {
+            try out.writeAll(&.{line.kind.mark()});
+            try escape(line.text, out);
         }
         try out.writeAll("</span>\n");
     }
