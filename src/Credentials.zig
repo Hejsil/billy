@@ -54,41 +54,25 @@ pub fn names(credentials: *const Credentials) []const []const u8 {
 
 const format_version: u32 = 1;
 
+const Stored = struct {
+    version: u32 = format_version,
+    credentials: std.json.ArrayHashMap([]const u8) = .{},
+};
+
 pub fn load(io: std.Io, dir: std.Io.Dir, arena: std.mem.Allocator) !Credentials {
     const text = dir.readFileAlloc(io, file_name, arena, .unlimited) catch |err| switch (err) {
         error.FileNotFound => return .{},
         else => return err,
     };
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch
-        return error.CorruptCredentials;
-    const object = switch (parsed) {
-        .object => |object| object,
-        else => return error.CorruptCredentials,
-    };
-    if (object.get("version")) |reported| {
-        const version: u32 = switch (reported) {
-            // A version that is not a version at all is one billy did not write.
-            .integer => |value| std.math.cast(u32, value) orelse return error.CorruptCredentials,
-            else => return error.CorruptCredentials,
-        };
-        if (version > format_version) return error.UnsupportedCredentialsVersion;
-    }
+    const file = std.json.parseFromSliceLeaky(Stored, arena, text, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_if_needed,
+    }) catch return error.CorruptCredentials;
+    if (file.version > format_version) return error.UnsupportedCredentialsVersion;
 
-    const stored = switch (object.get("credentials") orelse return .{}) {
-        .object => |stored| stored,
-        else => return error.CorruptCredentials,
-    };
     var result: Credentials = .{};
-    var it = stored.iterator();
-    while (it.next()) |entry| {
-        // A key is text; anything else under a name is a shape billy never wrote, and is refused
-        // rather than read as a name with no key.
-        const key = switch (entry.value_ptr.*) {
-            .string => |key| key,
-            else => return error.CorruptCredentials,
-        };
-        try result.put(arena, entry.key_ptr.*, key);
-    }
+    var stored = file.credentials.map.iterator();
+    while (stored.next()) |entry| try result.put(arena, entry.key_ptr.*, entry.value_ptr.*);
     return result;
 }
 
