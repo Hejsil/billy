@@ -207,7 +207,10 @@ fn answer(init: std.process.Init, out: Terminal.Writer, options: Options) !u8 {
     // A usage is answered before anything is read, so it works even when billy's own files cannot
     // be: which of them asked is the command's own business, so it is printed here rather than in
     // each arm below.
-    if (try printAskedHelp(options, out)) return 0;
+    if (helpAsked(options)) |help| {
+        try printHelp(out, help);
+        return 0;
+    }
 
     var billy = try Billy.open(init);
     defer billy.deinit();
@@ -230,12 +233,6 @@ fn fail(err: anyerror) u8 {
         if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
     }
     return 1;
-}
-
-fn printAskedHelp(options: Options, out: Terminal.Writer) !bool {
-    const help = helpAsked(options) orelse return false;
-    try printHelp(out, help);
-    return true;
 }
 
 /// The help message `options` asks for: the root one, or the command's own.
