@@ -337,22 +337,18 @@ fn redraw(
     }
 
     var row: usize = 0;
-    var start: usize = 0;
-    while (true) {
-        const newline = std.mem.findScalarPos(u8, line, start, '\n');
-        const end = newline orelse line.len;
-        var pos = start;
+    var lines = Lines{ .text = line };
+    while (lines.next()) |one| {
+        var pos = one.start;
         while (true) {
             if (row > 0) try ed.out.writeAll("\r\n");
             try ed.out.writeAll(if (row == 0) prompt else indent);
             const from = pos;
-            pos = from + columnOffset(line[from..end], content_width);
+            pos = from + columnOffset(line[from..one.end], content_width);
             try ed.out.writeAll(line[from..pos]);
             row += 1;
-            if (pos >= end) break;
+            if (pos >= one.end) break;
         }
-        if (newline == null) break;
-        start = end + 1;
     }
 
     try ed.out.writeAll("\x1b[J");
@@ -589,24 +585,21 @@ fn reflowed(line: []const u8, prompt_width: usize, old_content: usize, width: us
 
     var rows: usize = 0;
     var cursor_row: usize = 0;
-    var start: usize = 0;
-    while (true) {
-        const newline = std.mem.findScalarPos(u8, line, start, '\n');
-        const end = newline orelse line.len;
-        var pos = start;
+    var lines = Lines{ .text = line };
+    while (lines.next()) |one| {
+        var pos = one.start;
         while (true) {
             const from = pos;
-            pos = from + columnOffset(line[from..end], old_content);
+            pos = from + columnOffset(line[from..one.end], old_content);
             const wrapped = rowsFor(prompt_width + columns(line[from..pos]), width);
             if (from == old_at.start) {
                 cursor_row = rows + @min(cursor_col / width, wrapped - 1);
             }
             rows += wrapped;
-            if (pos >= end) break;
+            if (pos >= one.end) break;
         }
-        if (newline == null) return .{ .rows = rows, .cursor_row = cursor_row };
-        start = end + 1;
     }
+    return .{ .rows = rows, .cursor_row = cursor_row };
 }
 
 fn wordStart(line: []const u8, cursor: usize) usize {
@@ -652,55 +645,61 @@ fn moveCursorVertical(
 
 fn rowAt(line: []const u8, content_width: usize, cursor: usize) Row {
     var index: usize = 0;
-    var start: usize = 0;
-    while (true) {
-        const newline = std.mem.findScalarPos(u8, line, start, '\n');
-        const end = newline orelse line.len;
-        if (cursor <= end) {
-            const text = line[start..end];
+    var lines = Lines{ .text = line };
+    while (lines.next()) |one| {
+        if (cursor <= one.end) {
+            const text = line[one.start..one.end];
             const rows = rowsFor(columns(text), content_width);
-            const within = @min(columns(line[start..cursor]) / content_width, rows - 1);
+            const within = @min(columns(line[one.start..cursor]) / content_width, rows - 1);
             const range = rowRange(line, content_width, index + within);
             return .{ .index = index + within, .start = range.start, .end = range.end };
         }
-        index += rowsFor(columns(line[start..end]), content_width);
-        if (newline == null) return .{ .index = index, .start = line.len, .end = line.len };
-        start = end + 1;
+        index += rowsFor(columns(line[one.start..one.end]), content_width);
     }
+    return .{ .index = index, .start = line.len, .end = line.len };
 }
 
 fn rowRange(line: []const u8, content_width: usize, index: usize) struct { start: usize, end: usize } {
     var row: usize = 0;
-    var start: usize = 0;
-    while (true) {
-        const newline = std.mem.findScalarPos(u8, line, start, '\n');
-        const end = newline orelse line.len;
-        const rows = rowsFor(columns(line[start..end]), content_width);
+    var lines = Lines{ .text = line };
+    while (lines.next()) |one| {
+        const text = line[one.start..one.end];
+        const rows = rowsFor(columns(text), content_width);
         if (index < row + rows) {
-            const text = line[start..end];
             const columns_wide = columns(text);
             const within = index - row;
             return .{
-                .start = start + columnOffset(text, within * content_width),
-                .end = start + columnOffset(text, @min((within + 1) * content_width, columns_wide)),
+                .start = one.start + columnOffset(text, within * content_width),
+                .end = one.start + columnOffset(text, @min((within + 1) * content_width, columns_wide)),
             };
         }
         row += rows;
-        if (newline == null) return .{ .start = line.len, .end = line.len };
-        start = end + 1;
     }
+    return .{ .start = line.len, .end = line.len };
 }
+
+/// The logical lines of `text`: the byte range of each, without the newline that ends it.
+const Lines = struct {
+    text: []const u8,
+    at: usize = 0,
+
+    const Line = struct { start: usize, end: usize };
+
+    fn next(self: *Lines) ?Line {
+        if (self.at > self.text.len) return null;
+        const newline = std.mem.findScalarPos(u8, self.text, self.at, '\n');
+        const end = newline orelse self.text.len;
+        const line = Line{ .start = self.at, .end = end };
+        self.at = if (newline) |i| i + 1 else self.text.len + 1;
+        return line;
+    }
+};
 
 fn rowCount(line: []const u8, content_width: usize) usize {
     var rows: usize = 0;
-    var start: usize = 0;
-    while (true) {
-        const newline = std.mem.findScalarPos(u8, line, start, '\n');
-        const end = newline orelse line.len;
-        rows += rowsFor(columns(line[start..end]), content_width);
-        if (newline == null) return rows;
-        start = end + 1;
-    }
+    var lines = Lines{ .text = line };
+    while (lines.next()) |one| rows += rowsFor(columns(line[one.start..one.end]), content_width);
+    return rows;
 }
 
 fn rowsFor(cols: usize, content_width: usize) usize {
