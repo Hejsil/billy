@@ -181,7 +181,7 @@ pub const Conversation = struct {
 fn writeMessage(session: *const Session, json: anytype, message: Message) !void {
     try json.beginObject();
     try json.objectField("role");
-    try json.write(message.role.name());
+    try json.write(message.role);
 
     if (session.pool.get(message.content)) |content| {
         try json.objectField("content");
