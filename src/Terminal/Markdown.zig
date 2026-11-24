@@ -216,11 +216,6 @@ fn put(self: *Markdown, text: []const u8) bool {
     return true;
 }
 
-fn blank(self: *Markdown) bool {
-    self.newline();
-    return true;
-}
-
 const Head = enum { heading, body };
 
 fn beginBlock(self: *Markdown, head: Head) bool {
@@ -229,7 +224,7 @@ fn beginBlock(self: *Markdown, head: Head) bool {
         self.skipping = self.seen < self.skip;
         self.writer.out = if (self.skipping) self.discard.? else &self.recording.writer;
     }
-    if (self.emitted and self.need_blank and !self.blank()) return false;
+    if (self.emitted and self.need_blank) self.newline();
     self.emitted = true;
     self.block_head = head == .heading;
     return true;
