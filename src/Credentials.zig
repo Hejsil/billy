@@ -157,10 +157,8 @@ pub fn list(
     }
     for (credentials.names()) |name| {
         name_width = @max(name_width, name.len);
-        if (purposeOf(name) == null and !definedIn(name, providers)) {
-            const purpose = if (catalog.find(name) != null) catalog_purpose else dangling_purpose;
+        if (storedPurpose(name, providers, catalog)) |purpose|
             purpose_width = @max(purpose_width, purpose.len);
-        }
     }
 
     for (known) |service| {
@@ -175,12 +173,15 @@ pub fn list(
         try printRow(out, name, configured_purpose, name_width, purpose_width, state);
     }
     for (credentials.names()) |name| {
-        if (purposeOf(name) != null) continue;
-        if (definedIn(name, providers)) continue;
-        const purpose = if (catalog.find(name) != null) catalog_purpose else dangling_purpose;
+        const purpose = storedPurpose(name, providers, catalog) orelse continue;
         try printRow(out, name, purpose, name_width, purpose_width, .stored);
     }
     try out.writeAll("\n`billy login <service>` stores a key\n");
+}
+
+fn storedPurpose(name: []const u8, providers: []const []const u8, catalog: *const models.Catalog) ?[]const u8 {
+    if (purposeOf(name) != null or definedIn(name, providers)) return null;
+    return if (catalog.find(name) != null) catalog_purpose else dangling_purpose;
 }
 
 fn definedIn(name: []const u8, providers: []const []const u8) bool {
