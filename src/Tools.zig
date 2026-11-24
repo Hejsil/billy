@@ -380,25 +380,18 @@ fn isNotATool(comptime name: []const u8) bool {
     return std.mem.eql(u8, name, "unknown") or std.mem.eql(u8, name, "malformed");
 }
 
-fn hasRow(comptime name: []const u8) bool {
-    for (table) |tool| {
-        if (std.mem.eql(u8, @tagName(tool.tag), name)) return true;
-    }
-    return false;
-}
-
 fn tableForTag(comptime tag: std.meta.Tag(Call)) Tool {
-    for (table) |tool| {
-        if (tool.tag == tag) return tool;
-    }
-    @compileError("no table row for the tool '" ++ @tagName(tag) ++ "'");
+    return table[@backingInt(tag)];
 }
 
 comptime {
-    // A tool in the union but not in the table would be parsed and run while never being offered.
-    for (@typeInfo(Call).@"union".field_names) |name| {
+    // A tool in the union but not in the table would be parsed and run while never being offered,
+    // and the table follows the union's order so that a tag names its row.
+    for (@typeInfo(Call).@"union".field_names, 0..) |name, i| {
         if (isNotATool(name)) continue;
-        if (!hasRow(name)) @compileError("the tool '" ++ name ++ "' has no row in the tool table");
+        const tag: std.meta.Tag(Call) = @field(std.meta.Tag(Call), name);
+        if (i >= table.len or table[i].tag != tag)
+            @compileError("the tool table must follow the order of the call's tags, with a row for each tool");
     }
     for (table) |tool| {
         if (isNotATool(@tagName(tool.tag)))
