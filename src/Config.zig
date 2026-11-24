@@ -84,32 +84,19 @@ pub const Providers = struct {
         return null;
     }
 
-    /// The object is read as a value and walked, since the names are the user's and no set of
-    /// fields could hold them.
+    const Provider = struct { base_url: []const u8 };
+
+    /// The names are the user's, so the object is read into a map rather than fields.
     pub fn jsonParse(
         allocator: std.mem.Allocator,
         source: anytype,
         options: std.json.ParseOptions,
     ) !Providers {
-        const parsed = try std.json.Value.jsonParse(allocator, source, options);
-        if (parsed != .object) return error.UnexpectedToken;
-
-        // The entries are taken from the arena the configuration was read through, which frees
-        // everything it read in one go.
-        // zlinter-disable-next-line require_errdefer_dealloc - the arena owns it
-        var entries: std.ArrayList(Entry) = .empty;
-        var it = parsed.object.iterator();
-        while (it.next()) |setting| {
-            if (setting.value_ptr.* != .object) return error.UnexpectedToken;
-            const base_url = setting.value_ptr.object.get("base_url") orelse
-                return error.UnexpectedToken;
-            if (base_url != .string) return error.UnexpectedToken;
-            try entries.append(allocator, .{
-                .name = setting.key_ptr.*,
-                .base_url = base_url.string,
-            });
-        }
-        return .{ .entries = try entries.toOwnedSlice(allocator) };
+        const parsed = try std.json.ArrayHashMap(Provider).jsonParse(allocator, source, options);
+        const entries = try allocator.alloc(Entry, parsed.map.count());
+        for (parsed.map.keys(), parsed.map.values(), entries) |name, provider, *entry|
+            entry.* = .{ .name = name, .base_url = provider.base_url };
+        return .{ .entries = entries };
     }
 
     pub fn jsonStringify(providers: Providers, json: anytype) !void {
