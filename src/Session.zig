@@ -44,11 +44,11 @@ const ToolCall = extern struct {
 
     fn resolve(tool_call: ToolCall, session: *const Session) llm.ToolCall {
         return .{
-            .id = session.pool.get(tool_call.id) orelse "",
-            .type = session.pool.get(tool_call.type) orelse "",
+            .id = session.textOf(tool_call.id),
+            .type = session.textOf(tool_call.type),
             .function = .{
-                .name = session.pool.get(tool_call.function.name) orelse "",
-                .arguments = session.pool.get(tool_call.function.arguments) orelse "",
+                .name = session.textOf(tool_call.function.name),
+                .arguments = session.textOf(tool_call.function.arguments),
             },
         };
     }
@@ -146,12 +146,17 @@ pub fn deinit(session: *Session) void {
     session.tools.deinit(session.gpa);
 }
 
+/// The text `index` names, or "" when the session holds none.
+fn textOf(session: *const Session, index: Pool.Index) []const u8 {
+    return session.pool.get(index) orelse "";
+}
+
 pub fn id(session: *const Session) []const u8 {
-    return session.pool.get(session.interned.id) orelse "";
+    return session.textOf(session.interned.id);
 }
 
 pub fn cwd(session: *const Session) []const u8 {
-    return session.pool.get(session.interned.cwd) orelse "";
+    return session.textOf(session.interned.cwd);
 }
 
 /// The conversation as a request carries it: its `messages`, written straight out of the pool.
@@ -251,9 +256,9 @@ pub fn contentOf(session: *const Session, message: Message) ?[]const u8 {
 pub fn callAt(session: *const Session, message: Message, index: usize) Call {
     const call = message.tool_calls.resolve(session)[index];
     return .{
-        .id = session.pool.get(call.id) orelse "",
-        .name = session.pool.get(call.function.name) orelse "",
-        .arguments = session.pool.get(call.function.arguments) orelse "",
+        .id = session.textOf(call.id),
+        .name = session.textOf(call.function.name),
+        .arguments = session.textOf(call.function.arguments),
     };
 }
 
@@ -266,7 +271,7 @@ pub fn toolResult(session: *const Session, from: usize, call: []const u8) []cons
         if (message.role != .tool) break;
         const call_id = session.pool.get(message.tool_call_id) orelse continue;
         if (std.mem.eql(u8, call_id, call))
-            return session.pool.get(message.content) orelse "";
+            return session.textOf(message.content);
     }
 
     return "";
@@ -643,9 +648,9 @@ pub const ToolSet = struct {
             try json.objectField("function");
             try json.beginObject();
             try json.objectField("name");
-            try json.write(session.pool.get(tool.name) orelse "");
+            try json.write(session.textOf(tool.name));
             try json.objectField("description");
-            try json.write(session.pool.get(tool.description) orelse "");
+            try json.write(session.textOf(tool.description));
             try json.objectField("parameters");
             try json.print("{s}", .{session.pool.get(tool.parameters) orelse "{}"});
             try json.endObject();
