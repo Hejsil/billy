@@ -433,9 +433,7 @@ fn closeTable(self: *Markdown) bool {
     }
 
     for (self.rows.items) |row| {
-        if (!self.flush()) return false;
-        self.at_line_start = true;
-        if (!self.writeIndent()) return false;
+        if (!self.beginRow()) return false;
         for (0..columns) |column| {
             if (column > 0 and !self.raw("  ")) return false;
             const cell = if (column < row.cells.items.len) row.cells.items[column] else "";
@@ -449,10 +447,15 @@ fn closeTable(self: *Markdown) bool {
     return true;
 }
 
-fn writeRule(self: *Markdown, widths: []const usize, columns: usize) bool {
+/// Starts a table row: the pending text is flushed and the row opens at its indent.
+fn beginRow(self: *Markdown) bool {
     if (!self.flush()) return false;
     self.at_line_start = true;
-    if (!self.writeIndent()) return false;
+    return self.writeIndent();
+}
+
+fn writeRule(self: *Markdown, widths: []const usize, columns: usize) bool {
+    if (!self.beginRow()) return false;
     for (0..columns) |column| {
         if (column > 0 and !self.raw("  ")) return false;
         if (!self.fill('-', widths[column])) return false;
