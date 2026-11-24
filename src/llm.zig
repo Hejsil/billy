@@ -520,6 +520,10 @@ fn writeBody(writer: *std.Io.Writer, request: anytype) !void {
 
 const NoTools = struct {};
 
+fn testClient(gpa: std.mem.Allocator, io: std.Io, http_client: *std.http.Client, url: []const u8) Client {
+    return .{ .gpa = gpa, .io = io, .api_key = "k", .url = url, .model = "m", .http = http_client };
+}
+
 test "a request counts out to exactly the body it writes" {
     const gpa = std.testing.allocator;
 
@@ -586,14 +590,9 @@ test "a request reaches the wire with the body the head promised" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var client: Client = .{
-        .gpa = gpa,
-        .io = io,
-        .api_key = "secret",
-        .url = mock.url,
-        .model = "some-model",
-        .http = &http_client,
-    };
+    var client = testClient(gpa, io, &http_client, mock.url);
+    client.api_key = "secret";
+    client.model = "some-model";
 
     var stream = try client.complete(gpa, "01SESSION", &messages, @as([]const NoTools, &.{}));
     defer stream.deinit();
@@ -618,14 +617,7 @@ test "a request names billy and carries the session it belongs to" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var client: Client = .{
-        .gpa = gpa,
-        .io = io,
-        .api_key = "k",
-        .url = mock.url,
-        .model = "m",
-        .http = &http_client,
-    };
+    var client = testClient(gpa, io, &http_client, mock.url);
 
     var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
     defer stream.deinit();
@@ -659,14 +651,7 @@ test "a streamed reply is read a delta at a time" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var client: Client = .{
-        .gpa = gpa,
-        .io = io,
-        .api_key = "k",
-        .url = mock.url,
-        .model = "m",
-        .http = &http_client,
-    };
+    var client = testClient(gpa, io, &http_client, mock.url);
 
     var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
     defer stream.deinit();
@@ -763,14 +748,7 @@ test "a streamed reply that arrived compressed is read" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var client: Client = .{
-        .gpa = gpa,
-        .io = io,
-        .api_key = "k",
-        .url = mock.url,
-        .model = "m",
-        .http = &http_client,
-    };
+    var client = testClient(gpa, io, &http_client, mock.url);
 
     var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
     defer stream.deinit();
@@ -808,14 +786,7 @@ test "a frame that arrives in pieces is joined" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var client: Client = .{
-        .gpa = gpa,
-        .io = io,
-        .api_key = "k",
-        .url = mock.url,
-        .model = "m",
-        .http = &http_client,
-    };
+    var client = testClient(gpa, io, &http_client, mock.url);
 
     var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
     defer stream.deinit();
@@ -1010,14 +981,7 @@ test "a tool call streamed in pieces is put back together" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var client: Client = .{
-        .gpa = gpa,
-        .io = io,
-        .api_key = "k",
-        .url = mock.url,
-        .model = "m",
-        .http = &http_client,
-    };
+    var client = testClient(gpa, io, &http_client, mock.url);
 
     var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
     defer stream.deinit();
@@ -1064,14 +1028,7 @@ test "pauseFor honors Retry-After and otherwise backs off with jitter" {
     const gpa = std.testing.allocator;
     var http_client: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
     defer http_client.deinit();
-    var client: Client = .{
-        .gpa = gpa,
-        .io = std.testing.io,
-        .api_key = "k",
-        .url = "u",
-        .model = "m",
-        .http = &http_client,
-    };
+    var client = testClient(gpa, std.testing.io, &http_client, "u");
 
     // The server's own wait, clamped so it cannot park billy.
     try std.testing.expectEqual(
@@ -1194,14 +1151,7 @@ test "the HTTP client is kept, so requests reuse one connection" {
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
-    var client: Client = .{
-        .gpa = gpa,
-        .io = io,
-        .api_key = "k",
-        .url = mock.url,
-        .model = "m",
-        .http = &http_client,
-    };
+    var client = testClient(gpa, io, &http_client, mock.url);
 
     // Two completions through one client.
     const messages = [_]Message{.{ .role = .user, .content = "hi" }};
