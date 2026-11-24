@@ -718,7 +718,7 @@ pub const Named = struct {
     title: []const u8,
 };
 
-fn freeList(names: []Named, gpa: std.mem.Allocator) void {
+pub fn freeList(names: []Named, gpa: std.mem.Allocator) void {
     for (names) |made| {
         gpa.free(made.id);
         gpa.free(made.title);
@@ -740,8 +740,7 @@ fn listIn(dir: std.Io.Dir, io: std.Io, gpa: std.mem.Allocator) ![]Named {
 
     var entries = dir.iterate();
     while (try entries.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        const stem = idInName(entry.name) orelse continue;
+        if (entry.kind != .file or !usableName(entry.name)) continue;
 
         var file = dir.openFile(io, entry.name, .{}) catch continue;
         defer file.close(io);
@@ -750,7 +749,7 @@ fn listIn(dir: std.Io.Dir, io: std.Io, gpa: std.mem.Allocator) ![]Named {
         const stored_title = readTitle(io, gpa, file, stat.size) catch continue;
         errdefer gpa.free(stored_title);
 
-        const owned_id = try gpa.dupe(u8, stem);
+        const owned_id = try gpa.dupe(u8, entry.name);
         errdefer gpa.free(owned_id);
 
         try written.append(gpa, stat.mtime.toMilliseconds());
@@ -828,11 +827,6 @@ pub fn delete(io: std.Io, dir: std.Io.Dir, session_id: []const u8) !void {
         error.FileNotFound => return error.SessionNotFound,
         else => return err,
     };
-}
-
-fn idInName(file_name: []const u8) ?[]const u8 {
-    if (!usableName(file_name)) return null;
-    return file_name;
 }
 
 fn newTestSession(tmp: *std.testing.TmpDir) !Session {
@@ -1147,12 +1141,10 @@ fn writeSessionIn(
 
 fn writeRawAt(
     tmp: *std.testing.TmpDir,
-    gpa: std.mem.Allocator,
     session_id: []const u8,
     data: []const u8,
     written_ms: i64,
 ) !void {
-    _ = gpa;
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = session_id, .data = data });
     try tmp.dir.setTimestamps(std.testing.io, session_id, .{
         .modify_timestamp = .{ .new = std.Io.Timestamp.fromNanoseconds(
@@ -1226,9 +1218,8 @@ test "the latest session for a directory is the one last written there" {
     try std.testing.expectEqualStrings("second", found);
 
     try std.testing.expect(try latest(std.testing.io, tmp.dir, gpa, "/nowhere") == null);
-    var truncated: [header_len - 1]u8 = @splat(0);
-    try writeRawAt(&tmp, gpa, "old", &truncated, 4_000);
-    _ = &truncated;
+    const truncated: [header_len - 1]u8 = @splat(0);
+    try writeRawAt(&tmp, "old", &truncated, 4_000);
     const unchanged = (try latest(std.testing.io, tmp.dir, gpa, "/work")).?;
     defer gpa.free(unchanged);
     try std.testing.expectEqualStrings("second", unchanged);
@@ -1287,7 +1278,7 @@ test "a file that is not a session is left out without disturbing the order" {
     // The unreadable file is written between the others, so a session follows it wherever it comes.
     try writeSessionAt(&tmp, gpa, "a", 1_000);
     try writeSessionAt(&tmp, gpa, "b", 2_000);
-    try writeRawAt(&tmp, gpa, "broken", "not a session at all", 3_000);
+    try writeRawAt(&tmp, "broken", "not a session at all", 3_000);
     try writeSessionAt(&tmp, gpa, "c", 4_000);
     try writeSessionAt(&tmp, gpa, "d", 5_000);
 

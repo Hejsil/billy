@@ -272,13 +272,7 @@ pub fn listSessions(billy: *Billy, out: Terminal.Writer) !void {
         std.log.err("cannot list the sessions: {t}", .{err});
         return report.Reported;
     };
-    defer {
-        for (listed) |named| {
-            billy.gpa.free(named.id);
-            billy.gpa.free(named.title);
-        }
-        billy.gpa.free(listed);
-    }
+    defer Session.freeList(listed, billy.gpa);
 
     try printSessions(out, listed);
 }

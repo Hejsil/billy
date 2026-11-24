@@ -149,6 +149,12 @@ fn raw(self: *Markdown, bytes: []const u8) bool {
     return true;
 }
 
+/// Writes several pieces in a row, so a run of them fails where it stops.
+fn rawAll(self: *Markdown, parts: []const []const u8) bool {
+    for (parts) |part| if (!self.raw(part)) return false;
+    return true;
+}
+
 fn flush(self: *Markdown) bool {
     var i: usize = 0;
     while (i < self.pending_newlines) : (i += 1)
@@ -174,17 +180,21 @@ fn writeIndent(self: *Markdown) bool {
         return true;
 
     self.at_line_start = false;
-    var i: usize = 0;
+    if (!self.writePrefix(self.indentDepth())) return false;
+    if (self.in_code and !self.raw(code_indent))
+        return false;
+    return true;
+}
 
+/// Writes the quote bars and list indents a line opens with, `depth` lists deep.
+fn writePrefix(self: *Markdown, depth: usize) bool {
+    var i: usize = 0;
     while (i < self.quote_depth) : (i += 1)
         if (!self.raw("> ")) return false;
 
     i = 0;
-    while (i < self.indentDepth()) : (i += 1)
+    while (i < depth) : (i += 1)
         if (!self.raw("  ")) return false;
-
-    if (self.in_code and !self.raw(code_indent))
-        return false;
     return true;
 }
 
@@ -382,15 +392,8 @@ fn openItem(self: *Markdown, detail: *const md.c.MD_BLOCK_LI_DETAIL) bool {
         return false;
 
     self.at_line_start = true;
-
-    var i: usize = 0;
-    while (i < self.quote_depth) : (i += 1)
-        if (!self.raw("> ")) return false;
-
-    i = 0;
-    while (i + 1 < self.indentDepth()) : (i += 1)
-        if (!self.raw("  ")) return false;
-
+    // The marker takes the place of the deepest indent.
+    if (!self.writePrefix(self.indentDepth() -| 1)) return false;
     self.at_line_start = false;
 
     const frame = &self.list[self.indentDepth() - 1];
@@ -549,13 +552,12 @@ pub fn leaveSpan(self: *Markdown, span_type: md.c.MD_SPANTYPE, detail: ?*anyopaq
 fn openA(self: *Markdown, detail: *const md.c.MD_SPAN_A_DETAIL) bool {
     self.link_url = attribute(detail.href);
     if (self.writer.linkOpen().len == 0) return true;
-    if (!self.raw(self.writer.linkOpen()) or !self.raw(self.link_url) or !self.raw(self.writer.linkClose())) return false;
-    return true;
+    return self.rawAll(&.{ self.writer.linkOpen(), self.link_url, self.writer.linkClose() });
 }
 
 fn closeA(self: *Markdown) bool {
     if (self.writer.linkOpen().len > 0) {
-        if (!self.raw(self.writer.linkOpen()) or !self.raw(self.writer.linkClose())) return false;
+        if (!self.rawAll(&.{ self.writer.linkOpen(), self.writer.linkClose() })) return false;
     } else if (self.link_url.len > 0) {
         if (!self.put(" (")) return false;
         if (!self.put(self.link_url)) return false;
@@ -573,12 +575,10 @@ fn closeImg(self: *Markdown) bool {
     const has_label = std.mem.trim(u8, label, " \t\r\n").len > 0;
     const shown: []const u8 = if (has_label) label else self.image_url;
     const opens = self.writer.linkOpen().len > 0 and self.image_url.len > 0;
-    if (opens and !self.raw(self.writer.linkOpen())) return false;
-    if (opens and !self.raw(self.image_url)) return false;
-    if (opens and !self.raw(self.writer.linkClose())) return false;
+    if (opens and !self.rawAll(&.{ self.writer.linkOpen(), self.image_url, self.writer.linkClose() }))
+        return false;
     if (!self.put(shown)) return false;
-    if (opens and !self.raw(self.writer.linkOpen())) return false;
-    if (opens and !self.raw(self.writer.linkClose())) return false;
+    if (opens and !self.rawAll(&.{ self.writer.linkOpen(), self.writer.linkClose() })) return false;
     self.image_label.clearRetainingCapacity();
     self.image_url = "";
     return true;

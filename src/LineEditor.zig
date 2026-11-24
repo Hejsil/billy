@@ -93,7 +93,7 @@ fn read(ed: *LineEditor, header: []const u8, prompt: []const u8) !?[]const u8 {
 
     if (!interactive) return ed.readLinePiped();
 
-    const saved = try ed.enterRaw();
+    const saved = try enterRaw();
     // The line is read raw and the terminal given back here rather than from a `defer`: the restore
     // is the same handful of writes either way, and one place that says so runs it after the read
     // on both of the read's paths.
@@ -567,8 +567,7 @@ fn set(fd: std.posix.fd_t, term: std.posix.termios) !void {
     if (std.os.linux.tcsetattr(fd, .NOW, &term) != 0) return error.NotATerminal;
 }
 
-fn enterRaw(ed: *LineEditor) !std.posix.termios {
-    _ = ed;
+fn enterRaw() !std.posix.termios {
     const fd = std.posix.STDIN_FILENO;
     const saved = try get(fd);
     var raw = saved;

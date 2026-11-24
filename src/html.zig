@@ -765,32 +765,36 @@ pub fn block(gpa: std.mem.Allocator, b: Agent.Block, out: *std.Io.Writer) !void 
     switch (b) {
         .prompt => |text| try titled(gpa, "»", "prompt", text, out),
         .answer => |text| try titled(gpa, "◆", "answer", text, out),
-        // A tool call is one `<details>`, whose summary is the head and whose body is everything
-        // the call did.
-        .tool_begin => |call| {
-            try out.writeAll("<details class=\"tool\">");
-            try toolSummary(call, "", if (showsStatus(call)) .running else null, out);
-            // What the call means to do is already known, so it is shown while the call runs: the
-            // command a bash call is about to run, and the change an edit means to make.
-            try out.writeAll("<div class=\"tool-body\">");
-            try toolBody(gpa, call, "", out);
-            try out.writeAll("</div></details>\n");
-        },
+        // What the call means to do is already known, so it is shown while the call runs: the
+        // command a bash call is about to run, and the change an edit means to make.
+        .tool_begin => |call| try toolDetails(gpa, call, "", if (showsStatus(call)) .running else null, out),
         .tool_end => |tool| {
             const status: ?Status = if (showsStatus(tool.call))
                 .{ .finished = if (Tools.bashOutput(tool.result)) |output| output.exit else null }
             else
                 null;
-            try out.writeAll("<details class=\"tool\">");
-            try toolSummary(tool.call, tool.result, status, out);
-            try out.writeAll("<div class=\"tool-body\">");
-            try toolBody(gpa, tool.call, tool.result, out);
-            try out.writeAll("</div></details>\n");
+            try toolDetails(gpa, tool.call, tool.result, status, out);
         },
         .compacted => try element("div", "compacted", "⊟ compacted", out),
         .notice => |text| try element("div", "notice", text, out),
         .hidden => |count| try out.print("<div class=\"elided\">… {d} earlier blocks</div>\n", .{count}),
     }
+}
+
+/// Writes a tool call as one `<details>`, whose summary is the head and whose body is everything
+/// the call did.
+fn toolDetails(
+    gpa: std.mem.Allocator,
+    call: Tools.Call,
+    result: []const u8,
+    status: ?Status,
+    out: *std.Io.Writer,
+) !void {
+    try out.writeAll("<details class=\"tool\">");
+    try toolSummary(call, result, status, out);
+    try out.writeAll("<div class=\"tool-body\">");
+    try toolBody(gpa, call, result, out);
+    try out.writeAll("</div></details>\n");
 }
 
 fn titled(gpa: std.mem.Allocator, glyph: []const u8, name: []const u8, text: []const u8, out: *std.Io.Writer) !void {

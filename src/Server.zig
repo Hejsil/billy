@@ -224,14 +224,7 @@ fn route(r: *Request, registry: *Registry) !void {
     const path = target[0 .. std.mem.findScalar(u8, target, '?') orelse target.len];
 
     if (std.mem.eql(u8, path, "/")) switch (r.request.head.method) {
-        .GET => {
-            r.answered = true;
-            return try r.request.respond(page, .{
-                .status = .ok,
-                .extra_headers = &.{ContentType.html.header()},
-                .keep_alive = false,
-            });
-        },
+        .GET => return try r.reply(.html, page, .ok),
         else => return try r.replyNotAllowed(),
     };
 
@@ -307,32 +300,17 @@ fn renameSession(r: *Request, registry: *Registry, id: []const u8) !void {
     return r.reply(.text, "", .ok);
 }
 
-const Listed = struct {
-    id: []const u8,
-    title: []const u8,
-};
-
-const Listing = struct { sessions: []const Listed };
+const Listing = struct { sessions: []const Session.Named };
 
 fn writeListing(r: *Request) !void {
     const gpa = r.server.gpa;
 
     const stored = try Session.list(r.server.io, r.server.session_dir, gpa);
-    defer {
-        for (stored) |named| {
-            gpa.free(named.id);
-            gpa.free(named.title);
-        }
-        gpa.free(stored);
-    }
-
-    var sessions: std.ArrayList(Listed) = .empty;
-    defer sessions.deinit(gpa);
-    for (stored) |named| try sessions.append(gpa, .{ .id = named.id, .title = named.title });
+    defer Session.freeList(stored, gpa);
 
     var body: std.Io.Writer.Allocating = .init(gpa);
     defer body.deinit();
-    try std.json.Stringify.value(Listing{ .sessions = sessions.items }, .{}, &body.writer);
+    try std.json.Stringify.value(Listing{ .sessions = stored }, .{}, &body.writer);
     return r.reply(.json, body.written(), .ok);
 }
 

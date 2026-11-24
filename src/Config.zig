@@ -202,18 +202,18 @@ fn setPath(
 
     const info = @typeInfo(T).@"struct";
     inline for (info.field_names, info.field_types) |name, Field| {
-        if (comptime !std.mem.eql(u8, name, "version") and isSettable(Field)) {
-            if (std.mem.eql(u8, name, segment.head)) {
-                if (segment.rest.len == 0) {
-                    if (comptime @typeInfo(Field) == .@"struct") return error.NotASection;
-                    @field(target, name) = try parseValue(Field, arena, value);
-                    return;
-                }
-                if (comptime @typeInfo(Field) == .@"struct") {
-                    return setPath(Field, &@field(target, name), segment.rest, arena, value);
-                }
-                return error.NotASection;
+        // The version is the file's, not a setting, and a field nothing can be read into from the
+        // command line is no setting either.
+        const settable = comptime !std.mem.eql(u8, name, "version") and isSettable(Field);
+        if (settable and std.mem.eql(u8, name, segment.head)) {
+            const is_section = comptime @typeInfo(Field) == .@"struct";
+            if (segment.rest.len == 0) {
+                if (is_section) return error.NotASection;
+                @field(target, name) = try parseValue(Field, arena, value);
+                return;
             }
+            if (!is_section) return error.NotASection;
+            return setPath(Field, &@field(target, name), segment.rest, arena, value);
         }
     }
     return error.UnknownOption;
