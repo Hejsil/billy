@@ -306,120 +306,58 @@ test "a bash block shows only the streams the command filled" {
 }
 
 test "a bash result with no status line is shown as it is" {
-    const gpa = std.testing.allocator;
-
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    const call: llm.ToolCall = .{ .id = "1", .function = .{
-        .name = "bash",
-        .arguments = "{\"command\":\"make\"}",
-    } };
-
-    const shown: Writer = .{ .out = &out.writer };
-    try describe(gpa, Tools.parse(arena, call), "built\nnothing to do", shown);
-    try std.testing.expectEqualStrings(
+    try expectDescribe(
         "❯ bash make\nmake\n▾ output\nbuilt\nnothing to do\n\n",
-        out.written(),
+        "bash",
+        "{\"command\":\"make\"}",
+        "built\nnothing to do",
+        .plain,
     );
     try std.testing.expect(Tools.bashOutput("built\nnothing to do") == null);
 }
-
 test "what a call failed with is shown red, and what it left out is dimmed" {
-    const gpa = std.testing.allocator;
-
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    const writer: Writer = .{ .style = .ansi, .out = &out.writer };
-
-    try describe(gpa, Tools.parse(arena, .{ .id = "1", .function = .{
-        .name = "read",
-        .arguments = "{\"path\":\"a.zig\"}",
-    } }), "error: cannot read a.zig: FileNotFound", writer);
-    try std.testing.expectEqualStrings(
+    try expectDescribe(
         "\x1b[34m▸\x1b[0m \x1b[1mread\x1b[0m \x1b[2ma.zig\x1b[0m\n\x1b[1m▾ output\x1b[0m\n" ++
             "\x1b[31merror: cannot read a.zig: FileNotFound\x1b[0m\n\n",
-        out.written(),
+        "read",
+        "{\"path\":\"a.zig\"}",
+        "error: cannot read a.zig: FileNotFound",
+        .ansi,
     );
-    out.clearRetainingCapacity();
-
-    const ansi: Writer = .{ .style = .ansi, .out = &out.writer };
-    try describe(
-        arena_state.allocator(),
-        .{ .read = .{ .path = "a.zig" } },
-        "1\n2\n3\n4\n5\n6\n7\n",
-        ansi,
-    );
-    try std.testing.expectEqualStrings(
+    try expectDescribe(
         "\x1b[34m▸\x1b[0m \x1b[1mread\x1b[0m \x1b[2ma.zig\x1b[0m\n\x1b[1m▾ output\x1b[0m\n" ++
             "\x1b[2m1\x1b[0m\n\x1b[2m2\x1b[0m\n\x1b[2m3\x1b[0m\n\x1b[2m4\x1b[0m\n\x1b[2m5\x1b[0m\n" ++
             "\x1b[2m… 2 more lines\x1b[0m\n\n",
-        out.written(),
-    );
-}
-
-test "describe keeps a block short and says how much it left out" {
-    const gpa = std.testing.allocator;
-
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    const plain: Writer = .{ .out = &out.writer };
-    try describe(
-        arena_state.allocator(),
-        .{ .read = .{ .path = "a.zig" } },
-        "1\n2\n3\n4\n5",
-        plain,
-    );
-    try std.testing.expectEqualStrings(
-        "▸ read a.zig\n▾ output\n1\n2\n3\n4\n5\n\n",
-        out.written(),
-    );
-    out.clearRetainingCapacity();
-
-    try describe(
-        arena_state.allocator(),
-        .{ .read = .{ .path = "a.zig" } },
+        "read",
+        "{\"path\":\"a.zig\"}",
         "1\n2\n3\n4\n5\n6\n7\n",
-        plain,
-    );
-    try std.testing.expectEqualStrings(
-        "▸ read a.zig\n▾ output\n1\n2\n3\n4\n5\n… 2 more lines\n\n",
-        out.written(),
-    );
-    out.clearRetainingCapacity();
-
-    try describe(arena_state.allocator(), .{ .read = .{ .path = "a.zig" } }, "", plain);
-    try std.testing.expectEqualStrings("▸ read a.zig\n▾ output\n\n", out.written());
-    out.clearRetainingCapacity();
-
-    try describe(
-        arena_state.allocator(),
-        .{ .edit = .{
-            .path = "a.zig",
-            .old_string = "1\n2\n3\n4\n5\n6",
-            .new_string = "b",
-        } },
-        "replaced 1 occurrence(s) in a.zig",
-        plain,
-    );
-    try std.testing.expectEqualStrings(
-        "✎ edit a.zig\n▾ diff\n-1\n-2\n-3\n-4\n-5\n-6\n+b\n\n",
-        out.written(),
+        .ansi,
     );
 }
-
+test "describe keeps a block short and says how much it left out" {
+    try expectDescribe(
+        "▸ read a.zig\n▾ output\n1\n2\n3\n4\n5\n\n",
+        "read",
+        "{\"path\":\"a.zig\"}",
+        "1\n2\n3\n4\n5",
+        .plain,
+    );
+    try expectDescribe(
+        "▸ read a.zig\n▾ output\n1\n2\n3\n4\n5\n… 2 more lines\n\n",
+        "read",
+        "{\"path\":\"a.zig\"}",
+        "1\n2\n3\n4\n5\n6\n7\n",
+        .plain,
+    );
+    try expectDescribe("▸ read a.zig\n▾ output\n\n", "read", "{\"path\":\"a.zig\"}", "", .plain);
+    try expectDescribe(
+        "✎ edit a.zig\n▾ diff\n-1\n-2\n-3\n-4\n-5\n-6\n+b\n\n",
+        "edit",
+        "{\"path\":\"a.zig\",\"old_string\":\"1\\n2\\n3\\n4\\n5\\n6\",\"new_string\":\"b\"}",
+        "replaced 1 occurrence(s) in a.zig",
+        .plain,
+    );
+}
 test "run logs exactly what describe prints" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;

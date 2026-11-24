@@ -112,58 +112,68 @@ fn splitLines(gpa: std.mem.Allocator, text: []const u8) ![]const []const u8 {
     return list.toOwnedSlice(gpa);
 }
 
-test "a diff line is written in the colour of what it is" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
+const Want = struct {
+    kind: Kind,
+    text: []const u8 = "",
+    hidden: usize = 0,
+};
 
-    const changed = try lines(arena_state.allocator(), "old\n", "new\n");
+fn expectLines(old: []const u8, new: []const u8, expected: []const Want) !void {
+    const gpa = std.testing.allocator;
+    const diff = try lines(gpa, old, new);
+    defer gpa.free(diff);
+
+    try std.testing.expectEqual(expected.len, diff.len);
+    for (expected, diff) |want, got| {
+        try std.testing.expectEqual(want.kind, got.kind);
+        try std.testing.expectEqualStrings(want.text, got.text);
+        try std.testing.expectEqual(want.hidden, got.hidden);
+    }
+}
+
+fn expectPrinted(expected: []const u8, old: []const u8, new: []const u8, style: Terminal.Writer.Style) !void {
+    const gpa = std.testing.allocator;
+    const diff = try lines(gpa, old, new);
+    defer gpa.free(diff);
+
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
+    try print(diff, .{ .style = style, .out = &out.writer });
+    try std.testing.expectEqualStrings(expected, out.written());
+}
 
+test "a diff line is written in the colour of what it is" {
     // The colour wraps the line and its mark, which is what makes a change readable at a glance.
-    try print(changed, .{ .style = .ansi, .out = &out.writer });
-    try std.testing.expectEqualStrings("\x1b[31m-old\x1b[0m\n\x1b[32m+new\x1b[0m\n", out.written());
+    try expectPrinted(
+        "\x1b[31m-old\x1b[0m\n\x1b[32m+new\x1b[0m\n",
+        "old\n",
+        "new\n",
+        .ansi,
+    );
 }
 
 test "a change in the middle keeps the lines around it" {
-    const gpa = std.testing.allocator;
-    const diff = try lines(gpa, "a\nb\nc", "a\nx\nc");
-    defer gpa.free(diff);
-
-    try std.testing.expectEqual(@as(usize, 4), diff.len);
-    try std.testing.expectEqual(Kind.context, diff[0].kind);
-    try std.testing.expectEqualStrings("a", diff[0].text);
-    try std.testing.expectEqual(Kind.removed, diff[1].kind);
-    try std.testing.expectEqualStrings("b", diff[1].text);
-    try std.testing.expectEqual(Kind.added, diff[2].kind);
-    try std.testing.expectEqualStrings("x", diff[2].text);
-    try std.testing.expectEqual(Kind.context, diff[3].kind);
-    try std.testing.expectEqualStrings("c", diff[3].text);
+    try expectLines("a\nb\nc", "a\nx\nc", &.{
+        .{ .kind = .context, .text = "a" },
+        .{ .kind = .removed, .text = "b" },
+        .{ .kind = .added, .text = "x" },
+        .{ .kind = .context, .text = "c" },
+    });
 }
 
 test "the lines both sides share are context, and only the nearest are kept" {
-    const gpa = std.testing.allocator;
-    const diff = try lines(gpa, "1\n2\n3\n4\n5\nold\nz", "1\n2\n3\n4\n5\nnew\nz");
-    defer gpa.free(diff);
-
-    try std.testing.expectEqual(@as(usize, 6), diff.len);
-    try std.testing.expectEqualStrings("3", diff[0].text);
-    try std.testing.expectEqualStrings("4", diff[1].text);
-    try std.testing.expectEqualStrings("5", diff[2].text);
-    try std.testing.expectEqual(Kind.removed, diff[3].kind);
-    try std.testing.expectEqualStrings("old", diff[3].text);
-    try std.testing.expectEqual(Kind.added, diff[4].kind);
-    try std.testing.expectEqualStrings("new", diff[4].text);
-    try std.testing.expectEqual(Kind.context, diff[5].kind);
-    try std.testing.expectEqualStrings("z", diff[5].text);
+    try expectLines("1\n2\n3\n4\n5\nold\nz", "1\n2\n3\n4\n5\nnew\nz", &.{
+        .{ .kind = .context, .text = "3" },
+        .{ .kind = .context, .text = "4" },
+        .{ .kind = .context, .text = "5" },
+        .{ .kind = .removed, .text = "old" },
+        .{ .kind = .added, .text = "new" },
+        .{ .kind = .context, .text = "z" },
+    });
 }
 
 test "an unchanged edit has no diff" {
-    const gpa = std.testing.allocator;
-    const diff = try lines(gpa, "same\ntext", "same\ntext");
-    defer gpa.free(diff);
-    try std.testing.expectEqual(@as(usize, 0), diff.len);
+    try expectLines("same\ntext", "same\ntext", &.{});
 }
 
 test "a large side is counted rather than shown whole" {

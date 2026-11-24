@@ -786,48 +786,83 @@ fn titled(gpa: std.mem.Allocator, glyph: []const u8, name: []const u8, text: []c
     try out.writeAll("</div>\n");
 }
 
-test "a tool call is rendered as a whole element, both halves" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
+fn renderBlock(gpa: std.mem.Allocator, b: Agent.Block) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
+    try block(gpa, b, &out.writer);
+    return out.toOwnedSlice();
+}
+
+fn expectBlock(expected: []const u8, b: Agent.Block) !void {
+    const shown = try renderBlock(std.testing.allocator, b);
+    defer std.testing.allocator.free(shown);
+    try std.testing.expectEqualStrings(expected, shown);
+}
+
+fn expectBlockHas(needle: []const u8, b: Agent.Block) !void {
+    const shown = try renderBlock(std.testing.allocator, b);
+    defer std.testing.allocator.free(shown);
+    try std.testing.expect(std.mem.find(u8, shown, needle) != null);
+}
+
+fn expectBlockLacks(needle: []const u8, b: Agent.Block) !void {
+    const shown = try renderBlock(std.testing.allocator, b);
+    defer std.testing.allocator.free(shown);
+    try std.testing.expect(std.mem.find(u8, shown, needle) == null);
+}
+
+fn expectToolSummary(expected: []const u8, call: Tools.Call) !void {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try toolSummary(call, "", null, &out.writer);
+    try std.testing.expectEqualStrings(expected, out.written());
+}
+
+fn expectToolBody(expected: []const u8, call: Tools.Call, result: []const u8) !void {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try toolBody(std.testing.allocator, call, result, &out.writer);
+    try std.testing.expectEqualStrings(expected, out.written());
+}
+
+fn expectTool(expected: []const u8, call: Tools.Call, result: []const u8) !void {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try toolSummary(call, "", null, &out.writer);
+    try toolBody(std.testing.allocator, call, result, &out.writer);
+    try std.testing.expectEqualStrings(expected, out.written());
+}
+
+test "a tool call is rendered as a whole element, both halves" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
     const call = Tools.parse(arena, .{ .id = "1", .function = .{
         .name = "read",
         .arguments = "{\"path\":\"a.zig\"}",
     } });
 
-    try block(gpa, .{ .tool_begin = call }, &out.writer);
-    try std.testing.expectEqualStrings(
+    try expectBlock(
         "<details class=\"tool\"><summary class=\"tool-head\">" ++
             "<span class=\"name\">read</span>" ++
             " <span class=\"target\">a.zig</span></summary>\n" ++
             "<div class=\"tool-body\"></div></details>\n",
-        out.written(),
+        .{ .tool_begin = call },
     );
-    out.clearRetainingCapacity();
-
-    try block(gpa, .{ .tool_end = .{ .call = call, .result = "1\tconst x = 1;" } }, &out.writer);
-    try std.testing.expectEqualStrings(
+    try expectBlock(
         "<details class=\"tool\"><summary class=\"tool-head\">" ++
             "<span class=\"name\">read</span>" ++
             " <span class=\"target\">a.zig</span></summary>\n" ++
             "<div class=\"tool-body\"><pre class=\"result\">1\tconst x = 1;</pre>\n</div></details>\n",
-        out.written(),
+        .{ .tool_end = .{ .call = call, .result = "1\tconst x = 1;" } },
     );
 }
 
 test "a call naming a tool billy has not got is headed by its name as text" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
 
     // A call billy cannot run is headed by the name it named, which is the model's own string and
     // not one of billy's.
@@ -835,46 +870,33 @@ test "a call naming a tool billy has not got is headed by its name as text" {
         .name = "<img src=x onerror=alert(1)>",
         .arguments = "{}",
     } });
-    try block(gpa, .{ .tool_begin = unknown }, &out.writer);
-    try std.testing.expect(std.mem.find(
-        u8,
-        out.written(),
+    try expectBlockHas(
         "<span class=\"name\">&lt;img src=x onerror=alert(1)&gt;</span>",
-    ) != null);
-    try std.testing.expect(std.mem.find(u8, out.written(), "<img") == null);
-    out.clearRetainingCapacity();
+        .{ .tool_begin = unknown },
+    );
+    try expectBlockLacks("<img", .{ .tool_begin = unknown });
 
     const malformed = Tools.parse(arena, .{ .id = "1", .function = .{
         .name = "read\" onclick=\"x",
         .arguments = "{",
     } });
-    try block(gpa, .{ .tool_end = .{ .call = malformed, .result = "error: invalid arguments for read: SyntaxError" } }, &out.writer);
-    try std.testing.expect(std.mem.find(
-        u8,
-        out.written(),
+    try expectBlockHas(
         "<span class=\"name\">read&quot; onclick=&quot;x</span>",
-    ) != null);
+        .{ .tool_end = .{ .call = malformed, .result = "error: invalid arguments for read: SyntaxError" } },
+    );
 }
 
 test "a bash call shows its exit status in the head and its streams in the body" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
 
     const bash = Tools.parse(arena, .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"make\"}",
     } });
 
-    try block(gpa, .{ .tool_end = .{
-        .call = bash,
-        .result = "exit code: 2\nbuilt\nstderr:\nboom\n",
-    } }, &out.writer);
-    try std.testing.expectEqualStrings(
+    try expectBlock(
         "<details class=\"tool\"><summary class=\"tool-head\">" ++
             "<span class=\"name\">bash</span> <span class=\"target\">make</span>" ++
             "<span class=\"produced\">" ++
@@ -882,149 +904,127 @@ test "a bash call shows its exit status in the head and its streams in the body"
             "<div class=\"tool-body\"><pre class=\"command\">make</pre>\n" ++
             "<pre class=\"stdout\">built</pre>\n" ++
             "<pre class=\"stderr\">boom</pre>\n</div></details>\n",
-        out.written(),
+        .{ .tool_end = .{ .call = bash, .result = "exit code: 2\nbuilt\nstderr:\nboom\n" } },
     );
-    out.clearRetainingCapacity();
 
     // A command that succeeded reads ok, and one that printed nothing says so rather than leaving
     // the body empty.
-    try block(gpa, .{ .tool_end = .{ .call = bash, .result = "exit code: 0\n(no output)\n" } }, &out.writer);
-    try std.testing.expect(std.mem.find(u8, out.written(), "<span class=\"exit ok\" title=\"exit code 0\">✓ 0</span>") != null);
-    try std.testing.expect(std.mem.find(u8, out.written(), "<pre class=\"result\">(no output)</pre>") != null);
-    out.clearRetainingCapacity();
+    try expectBlockHas(
+        "<span class=\"exit ok\" title=\"exit code 0\">✓ 0</span>",
+        .{ .tool_end = .{ .call = bash, .result = "exit code: 0\n(no output)\n" } },
+    );
+    try expectBlockHas(
+        "<pre class=\"result\">(no output)</pre>",
+        .{ .tool_end = .{ .call = bash, .result = "exit code: 0\n(no output)\n" } },
+    );
 
     // A bash result billy did not write -- a session saved before the status was -- is shown as it
     // is, with an empty grey pill rather than the running one: the call has finished, so nothing
     // should claim it is still going.
-    try block(gpa, .{ .tool_end = .{ .call = bash, .result = "make: nothing to be done" } }, &out.writer);
-    try std.testing.expect(std.mem.find(u8, out.written(), "<span class=\"exit unknown\" title=\"the exit status was not recorded\"></span>") != null);
-    try std.testing.expect(std.mem.find(u8, out.written(), "running") == null);
-    try std.testing.expect(std.mem.find(u8, out.written(), "<pre class=\"result\">make: nothing to be done</pre>") != null);
+    try expectBlockHas(
+        "<span class=\"exit unknown\" title=\"the exit status was not recorded\"></span>",
+        .{ .tool_end = .{ .call = bash, .result = "make: nothing to be done" } },
+    );
+    try expectBlockLacks("running", .{ .tool_end = .{ .call = bash, .result = "make: nothing to be done" } });
+    try expectBlockHas(
+        "<pre class=\"result\">make: nothing to be done</pre>",
+        .{ .tool_end = .{ .call = bash, .result = "make: nothing to be done" } },
+    );
 }
 
 test "a running call shows a grey pill, and a finished one the status" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
 
     const bash = Tools.parse(arena, .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"make\",\"description\":\"build it\"}",
     } });
 
-    try block(gpa, .{ .tool_begin = bash }, &out.writer);
-    try std.testing.expectEqualStrings(
+    try expectBlock(
         "<details class=\"tool\"><summary class=\"tool-head\">" ++
             "<span class=\"name\">bash</span> <span class=\"target\">build it</span>" ++
             "<span class=\"produced\">" ++
             "<span class=\"exit running\" title=\"running\">" ++
             "<span class=\"dots\"><i></i><i></i><i></i></span></span></span></summary>\n" ++
             "<div class=\"tool-body\"><pre class=\"command\">make</pre>\n</div></details>\n",
-        out.written(),
+        .{ .tool_begin = bash },
     );
-    out.clearRetainingCapacity();
+    try expectBlockHas(
+        "<span class=\"exit ok\" title=\"exit code 0\">✓ 0</span>",
+        .{ .tool_end = .{ .call = bash, .result = "exit code: 0\n" } },
+    );
 
-    try block(gpa, .{ .tool_end = .{ .call = bash, .result = "exit code: 0\n" } }, &out.writer);
-    try std.testing.expect(std.mem.find(u8, out.written(), "<span class=\"exit ok\" title=\"exit code 0\">✓ 0</span>") != null);
-
-    out.clearRetainingCapacity();
     const read = Tools.parse(arena, .{ .id = "1", .function = .{
         .name = "read",
         .arguments = "{\"path\":\"a.zig\"}",
     } });
-    try block(gpa, .{ .tool_begin = read }, &out.writer);
-    try std.testing.expect(std.mem.find(u8, out.written(), "class=\"exit") == null);
-    out.clearRetainingCapacity();
-    try block(gpa, .{ .tool_end = .{ .call = read, .result = "1\tx" } }, &out.writer);
-    try std.testing.expect(std.mem.find(u8, out.written(), "class=\"exit") == null);
+    try expectBlockLacks("class=\"exit", .{ .tool_begin = read });
+    try expectBlockLacks("class=\"exit", .{ .tool_end = .{ .call = read, .result = "1\tx" } });
 }
 
 test "a bash call shows its command, and a write shows what it wrote" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
 
     const bash = Tools.parse(arena, .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"ls -la <x>\"}",
     } });
-    try toolSummary(bash, "", null, &out.writer);
-    try toolBody(arena, bash, "some output", &out.writer);
-    try std.testing.expectEqualStrings(
+    try expectTool(
         "<summary class=\"tool-head\">" ++
             "<span class=\"name\">bash</span> <span class=\"target\">ls -la &lt;x&gt;</span></summary>\n" ++
             "<pre class=\"command\">ls -la &lt;x&gt;</pre>\n" ++
             "<pre class=\"result\">some output</pre>\n",
-        out.written(),
+        bash,
+        "some output",
     );
-    out.clearRetainingCapacity();
 
     const multi = Tools.parse(arena, .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"cd /tmp\\nls\"}",
     } });
-    try toolSummary(multi, "", null, &out.writer);
-    try std.testing.expectEqualStrings(
+    try expectToolSummary(
         "<summary class=\"tool-head\">" ++
             "<span class=\"name\">bash</span> <span class=\"target\">cd /tmp</span></summary>\n",
-        out.written(),
+        multi,
     );
-    out.clearRetainingCapacity();
 
     const described = Tools.parse(arena, .{ .id = "1", .function = .{
         .name = "bash",
         .arguments = "{\"command\":\"cargo test --all\",\"description\":\"run the test suite\"}",
     } });
-    try toolSummary(described, "", null, &out.writer);
-    try std.testing.expectEqualStrings(
+    try expectToolSummary(
         "<summary class=\"tool-head\">" ++
             "<span class=\"name\">bash</span> <span class=\"target\">run the test suite</span></summary>\n",
-        out.written(),
+        described,
     );
-    out.clearRetainingCapacity();
 
     const write = Tools.parse(arena, .{ .id = "1", .function = .{
         .name = "write",
         .arguments = "{\"path\":\"a.zig\",\"content\":\"hello\"}",
     } });
-    try toolBody(arena, write, "wrote 5 bytes to a.zig", &out.writer);
-    try std.testing.expectEqualStrings("<pre class=\"result\">hello</pre>\n", out.written());
-    out.clearRetainingCapacity();
-
-    try toolBody(arena, write, "error: cannot write a.zig: AccessDenied", &out.writer);
-    try std.testing.expectEqualStrings(
+    try expectToolBody("<pre class=\"result\">hello</pre>\n", write, "wrote 5 bytes to a.zig");
+    try expectToolBody(
         "<pre class=\"error\">error: cannot write a.zig: AccessDenied</pre>\n",
-        out.written(),
+        write,
+        "error: cannot write a.zig: AccessDenied",
     );
 }
 
 test "a web search shows its sources as favicons in the summary" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
 
     const call = Tools.parse(arena, .{ .id = "1", .function = .{
         .name = "web_search",
         .arguments = "{\"query\":\"zig lang\"}",
     } });
 
-    try block(gpa, .{ .tool_end = .{
-        .call = call,
-        .result = "1. Zig\n   https://ziglang.org\n   A language.\n\n2. Docs\n   https://ziglang.org/documentation\n",
-    } }, &out.writer);
-    try std.testing.expectEqualStrings(
+    try expectBlock(
         "<details class=\"tool\"><summary class=\"tool-head\">" ++
             "<span class=\"name\">web_search</span>" ++
             " <span class=\"target\">zig lang</span>" ++
@@ -1040,18 +1040,17 @@ test "a web search shows its sources as favicons in the summary" {
             "</span></summary>\n" ++
             "<div class=\"tool-body\"><pre class=\"result\">1. Zig\n   https://ziglang.org\n   A language.\n\n" ++
             "2. Docs\n   https://ziglang.org/documentation</pre>\n</div></details>\n",
-        out.written(),
+        .{ .tool_end = .{
+            .call = call,
+            .result = "1. Zig\n   https://ziglang.org\n   A language.\n\n2. Docs\n   https://ziglang.org/documentation\n",
+        } },
     );
 }
 
 test "a search with nothing to link to shows no favicons" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
 
     const call = Tools.parse(arena, .{ .id = "1", .function = .{
         .name = "web_search",
@@ -1061,70 +1060,58 @@ test "a search with nothing to link to shows no favicons" {
     // A search that matched nothing, and one whose only result is not an `http(s)` address, both
     // leave no bubbles.
     for ([_][]const u8{ "(no results)", "1. Odd\n   javascript:alert(1)\n" }) |result| {
-        try block(gpa, .{ .tool_end = .{ .call = call, .result = result } }, &out.writer);
-        try std.testing.expect(std.mem.find(u8, out.written(), "<a class=\"fav\"") == null);
-        try std.testing.expect(std.mem.find(u8, out.written(), "<span class=\"produced\"></span>") != null);
-        out.clearRetainingCapacity();
+        const shown: Agent.Block = .{ .tool_end = .{ .call = call, .result = result } };
+        try expectBlockLacks("<a class=\"fav\"", shown);
+        try expectBlockHas("<span class=\"produced\"></span>", shown);
     }
 }
 
 test "an edit is shown as the diff of the strings it worked on" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
 
     const edit = Tools.parse(arena, .{ .id = "1", .function = .{
         .name = "edit",
         .arguments = "{\"path\":\"a.zig\",\"old_string\":\"old\",\"new_string\":\"new\"}",
     } });
-    try toolSummary(edit, "", null, &out.writer);
     // The diff is the body, and the result of the edit shows nothing of its own -- it would only
     // repeat the diff.
-    try toolBody(arena, edit, "replaced 1 occurrence(s) in a.zig", &out.writer);
-    try std.testing.expectEqualStrings(
+    try expectTool(
         "<summary class=\"tool-head\">" ++
             "<span class=\"name\">edit</span> <span class=\"target\">a.zig</span></summary>\n" ++
             "<pre class=\"diff\"><span class=\"removed\">-old</span>\n" ++
             "<span class=\"added\">+new</span>\n</pre>\n",
-        out.written(),
+        edit,
+        "replaced 1 occurrence(s) in a.zig",
     );
-    out.clearRetainingCapacity();
 
-    try toolBody(arena, .{ .edit = .{ .path = "a.zig", .old_string = "same", .new_string = "same" } }, "replaced 0 occurrence(s) in a.zig", &out.writer);
-    try std.testing.expectEqualStrings("", out.written());
+    try expectToolBody(
+        "",
+        .{ .edit = .{ .path = "a.zig", .old_string = "same", .new_string = "same" } },
+        "replaced 0 occurrence(s) in a.zig",
+    );
 }
 
 test "the blocks of a run are each rendered as what they are" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    try block(gpa, .{ .prompt = "hi <there>" }, &out.writer);
-    try std.testing.expectEqualStrings(
+    try expectBlock(
         "<div class=\"block prompt\"><div class=\"head\"><span class=\"glyph\">»</span> " ++
             "<span class=\"name\">prompt</span></div>\n<p>hi &lt;there&gt;</p>\n</div>\n",
-        out.written(),
+        .{ .prompt = "hi <there>" },
     );
-    out.clearRetainingCapacity();
-
-    try block(gpa, .{ .answer = "**done**" }, &out.writer);
-    try std.testing.expect(std.mem.find(u8, out.written(), "<strong>done</strong>") != null);
-    out.clearRetainingCapacity();
-
-    try block(gpa, .{ .compacted = .{ .prompt = "ask", .summary = "sum" } }, &out.writer);
-    try std.testing.expectEqualStrings("<div class=\"compacted\">⊟ compacted</div>\n", out.written());
-    out.clearRetainingCapacity();
-
-    try block(gpa, .{ .notice = "stopped after 3 turns" }, &out.writer);
-    try std.testing.expectEqualStrings("<div class=\"notice\">stopped after 3 turns</div>\n", out.written());
-    out.clearRetainingCapacity();
-
-    try block(gpa, .{ .hidden = 7 }, &out.writer);
-    try std.testing.expectEqualStrings("<div class=\"elided\">… 7 earlier blocks</div>\n", out.written());
+    try expectBlockHas("<strong>done</strong>", .{ .answer = "**done**" });
+    try expectBlock(
+        "<div class=\"compacted\">⊟ compacted</div>\n",
+        .{ .compacted = .{ .prompt = "ask", .summary = "sum" } },
+    );
+    try expectBlock(
+        "<div class=\"notice\">stopped after 3 turns</div>\n",
+        .{ .notice = "stopped after 3 turns" },
+    );
+    try expectBlock(
+        "<div class=\"elided\">… 7 earlier blocks</div>\n",
+        .{ .hidden = 7 },
+    );
 }
 
 /// Writes a stored conversation as HTML, oldest block first: what the web page shows when a session

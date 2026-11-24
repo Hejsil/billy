@@ -178,6 +178,22 @@ pub const Mark = struct {
     }
 };
 
+fn expectHeader(expected: []const u8, style: Style, name: []const u8, target: []const u8) !void {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    const mark: Mark = .{ .glyph = "▸", .hue = .blue };
+    try mark.header(name, target, .{ .style = style, .out = &out.writer });
+    try std.testing.expectEqualStrings(expected, out.written());
+}
+
+fn expectText(expected: []const u8, style: Style, bytes: []const u8) !void {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    const writer: Writer = .{ .style = style, .out = &out.writer };
+    try writer.writeText(bytes);
+    try std.testing.expectEqualStrings(expected, out.written());
+}
+
 test "a plain writer names no decoration, so the text is the same without them" {
     try std.testing.expectEqualStrings("", (Writer{ .out = undefined }).bold());
     try std.testing.expectEqualStrings("", (Writer{ .out = undefined }).dim());
@@ -207,62 +223,37 @@ test "an ansi writer names each decoration, and the text it prints is unchanged"
 }
 
 test "a block header is the same text in either style" {
-    const mark: Mark = .{ .glyph = "▸", .hue = .blue };
-
-    var plain_out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer plain_out.deinit();
-    try mark.header("read", "a.zig", .{ .out = &plain_out.writer });
-    try std.testing.expectEqualStrings("▸ read a.zig\n", plain_out.written());
-
-    var ansi_out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer ansi_out.deinit();
-    try mark.header("read", "a.zig", .{ .style = .ansi, .out = &ansi_out.writer });
-    try std.testing.expectEqualStrings(
+    try expectHeader("▸ read a.zig\n", .plain, "read", "a.zig");
+    try expectHeader(
         "\x1b[34m▸\x1b[0m \x1b[1mread\x1b[0m \x1b[2ma.zig\x1b[0m\n",
-        ansi_out.written(),
+        .ansi,
+        "read",
+        "a.zig",
     );
 }
-
 test "body text keeps its lines and drops every other control" {
-    const gpa = std.testing.allocator;
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    const writer: Writer = .{ .style = .plain, .out = &out.writer };
     // A reply that names a title or a clipboard would otherwise be carried out by the terminal.
-    try writer.writeText("a\x1b]0;title\x07b\x1b]52;c;c2VjcmV0\x07c\n\td\x9b");
-    try std.testing.expectEqualStrings("a]0;titleb]52;c;c2VjcmV0c\n\td", out.written());
+    try expectText(
+        "a]0;titleb]52;c;c2VjcmV0c\n\td",
+        .plain,
+        "a\x1b]0;title\x07b\x1b]52;c;c2VjcmV0\x07c\n\td\x9b",
+    );
 }
-
 test "a header writes what a model named as text, so none of it is an instruction" {
-    const gpa = std.testing.allocator;
-    const mark: Mark = .{ .glyph = "▸", .hue = .blue };
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    const ansi: Writer = .{ .style = .ansi, .out = &out.writer };
-    try mark.header("re\x1b[31mad", "a\tb\x7fc", ansi);
-    try std.testing.expectEqualStrings(
+    try expectHeader(
         "\x1b[34m▸\x1b[0m \x1b[1mre[31mad\x1b[0m \x1b[2mabc\x1b[0m\n",
-        out.written(),
+        .ansi,
+        "re\x1b[31mad",
+        "a\tb\x7fc",
     );
 
     // A control the terminal reads as one character in its own right, such as the C1 CSI, is a
     // control too, and is dropped where it is decoded rather than where its bytes happen to be.
-    out.clearRetainingCapacity();
-    const plain: Writer = .{ .out = &out.writer };
-    try mark.header("x\u{9b}2Jy", "", plain);
-    try std.testing.expectEqualStrings("▸ x2Jy\n", out.written());
+    try expectHeader("▸ x2Jy\n", .plain, "x\u{9b}2Jy", "");
 
     // A byte that is not part of a character is not text either, and a terminal that read it as a
     // control would act on it.
-    out.clearRetainingCapacity();
-    try mark.header("a\xffb", "", plain);
-    try std.testing.expectEqualStrings("▸ ab\n", out.written());
+    try expectHeader("▸ ab\n", .plain, "a\xffb", "");
 
-    out.clearRetainingCapacity();
-    try mark.header("café", "日本", plain);
-    try std.testing.expectEqualStrings("▸ café 日本\n", out.written());
+    try expectHeader("▸ café 日本\n", .plain, "café", "日本");
 }

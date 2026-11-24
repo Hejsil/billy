@@ -810,47 +810,43 @@ const Exchange = struct {
     }
 };
 
+fn expectExchange(
+    server: *TestServer,
+    method: std.http.Method,
+    path: []const u8,
+    body: ?[]const u8,
+    status: []const u8,
+    expected: []const []const u8,
+) !void {
+    var exchange = try server.exchange(method, path, body);
+    defer exchange.deinit();
+    try std.testing.expectEqualStrings(status, exchange.statusLine());
+    for (expected) |needle| try std.testing.expect(exchange.contains(needle));
+}
+
 test "a route answers a request it does not know with a 404" {
     const server = try TestServer.init();
     defer server.deinit();
 
-    var exchange = try server.exchange(.GET, "/nope", null);
-    defer exchange.deinit();
-
-    try std.testing.expectEqualStrings("HTTP/1.1 404 Not Found", exchange.statusLine());
-    try std.testing.expect(exchange.contains("not found"));
+    try expectExchange(server, .GET, "/nope", null, "HTTP/1.1 404 Not Found", &.{"not found"});
 }
-
 test "the page is served at the root, byte for byte" {
     const server = try TestServer.init();
     defer server.deinit();
 
-    var exchange = try server.exchange(.GET, "/", null);
-    defer exchange.deinit();
-
-    try std.testing.expectEqualStrings("HTTP/1.1 200 OK", exchange.statusLine());
-    try std.testing.expect(exchange.contains(page));
+    try expectExchange(server, .GET, "/", null, "HTTP/1.1 200 OK", &.{page});
 }
-
 test "the session list is read from disk, newest first" {
     const server = try TestServer.init();
     defer server.deinit();
 
-    var empty = try server.exchange(.GET, "/api/sessions", null);
-    defer empty.deinit();
-    try std.testing.expectEqualStrings("HTTP/1.1 200 OK", empty.statusLine());
-    try std.testing.expect(empty.contains("{\"sessions\":[]}"));
+    try expectExchange(server, .GET, "/api/sessions", null, "HTTP/1.1 200 OK", &.{"{\"sessions\":[]}"});
 
     const id = try server.session("a named session");
     defer std.testing.allocator.free(id);
 
-    var listed = try server.exchange(.GET, "/api/sessions", null);
-    defer listed.deinit();
-    try std.testing.expectEqualStrings("HTTP/1.1 200 OK", listed.statusLine());
-    try std.testing.expect(listed.contains(id));
-    try std.testing.expect(listed.contains("a named session"));
+    try expectExchange(server, .GET, "/api/sessions", null, "HTTP/1.1 200 OK", &.{ id, "a named session" });
 }
-
 test "one session is opened as the page the frontend reads" {
     const server = try TestServer.init();
     defer server.deinit();
@@ -860,28 +856,34 @@ test "one session is opened as the page the frontend reads" {
     const path = try sessionPath(id, "");
     defer std.testing.allocator.free(path);
 
-    var opened = try server.exchange(.GET, path, null);
-    defer opened.deinit();
-    try std.testing.expectEqualStrings("HTTP/1.1 200 OK", opened.statusLine());
-    try std.testing.expect(opened.contains("\"header\":"));
-    try std.testing.expect(opened.contains("deepseek/deepseek-flash"));
-    try std.testing.expect(opened.contains("\"blocks\":"));
-    try std.testing.expect(opened.contains("hello"));
+    try expectExchange(server, .GET, path, null, "HTTP/1.1 200 OK", &.{
+        "\"header\":",
+        "deepseek/deepseek-flash",
+        "\"blocks\":",
+        "hello",
+    });
 }
-
 test "an id with no session is a 404, and one that is not an id is a 400" {
     const server = try TestServer.init();
     defer server.deinit();
 
-    var missing = try server.exchange(.GET, "/api/sessions/01M3AAAAAAAAAAAAAAAAAAAAAA", null);
-    defer missing.deinit();
-    try std.testing.expectEqualStrings("HTTP/1.1 404 Not Found", missing.statusLine());
-
-    var malformed = try server.exchange(.GET, "/api/sessions/..%2f..%2fetc", null);
-    defer malformed.deinit();
-    try std.testing.expectEqualStrings("HTTP/1.1 400 Bad Request", malformed.statusLine());
+    try expectExchange(
+        server,
+        .GET,
+        "/api/sessions/01M3AAAAAAAAAAAAAAAAAAAAAA",
+        null,
+        "HTTP/1.1 404 Not Found",
+        &.{},
+    );
+    try expectExchange(
+        server,
+        .GET,
+        "/api/sessions/..%2f..%2fetc",
+        null,
+        "HTTP/1.1 400 Bad Request",
+        &.{},
+    );
 }
-
 test "a session is renamed, and the name is on disk" {
     const server = try TestServer.init();
     defer server.deinit();
@@ -891,16 +893,13 @@ test "a session is renamed, and the name is on disk" {
     const path = try sessionPath(id, "");
     defer std.testing.allocator.free(path);
 
-    var renamed = try server.exchange(.PATCH, path, "{\"title\":\"renamed by the test\"}");
-    defer renamed.deinit();
-    try std.testing.expectEqualStrings("HTTP/1.1 200 OK", renamed.statusLine());
+    try expectExchange(server, .PATCH, path, "{\"title\":\"renamed by the test\"}", "HTTP/1.1 200 OK", &.{});
 
     var reread = try Session.open(std.testing.io, server.server.session_dir, std.testing.allocator, id, ".");
     defer reread.deinit();
 
     try std.testing.expectEqualStrings("renamed by the test", reread.title().?);
 }
-
 test "a rename that says nothing usable is refused" {
     const server = try TestServer.init();
     defer server.deinit();
@@ -912,20 +911,14 @@ test "a rename that says nothing usable is refused" {
 
     // Whitespace is not a title: a session named " " would read as one that was never named, which
     // is what the list falls back to the id for.
-    var blank = try server.exchange(.PATCH, path, "{\"title\":\"   \"}");
-    defer blank.deinit();
-    try std.testing.expectEqualStrings("HTTP/1.1 400 Bad Request", blank.statusLine());
-
-    var not_json = try server.exchange(.PATCH, path, "not json");
-    defer not_json.deinit();
-    try std.testing.expectEqualStrings("HTTP/1.1 400 Bad Request", not_json.statusLine());
+    try expectExchange(server, .PATCH, path, "{\"title\":\"   \"}", "HTTP/1.1 400 Bad Request", &.{});
+    try expectExchange(server, .PATCH, path, "not json", "HTTP/1.1 400 Bad Request", &.{});
 
     var reread = try Session.open(std.testing.io, server.server.session_dir, std.testing.allocator, id, ".");
     defer reread.deinit();
 
     try std.testing.expect(reread.title() == null);
 }
-
 test "a session is deleted, and deleting it again is a 404" {
     const server = try TestServer.init();
     defer server.deinit();
@@ -935,9 +928,7 @@ test "a session is deleted, and deleting it again is a 404" {
     const path = try sessionPath(id, "");
     defer std.testing.allocator.free(path);
 
-    var removed = try server.exchange(.DELETE, path, null);
-    defer removed.deinit();
-    try std.testing.expectEqualStrings("HTTP/1.1 200 OK", removed.statusLine());
+    try expectExchange(server, .DELETE, path, null, "HTTP/1.1 200 OK", &.{});
 
     try std.testing.expectError(error.SessionNotFound, Session.open(
         std.testing.io,
@@ -947,11 +938,8 @@ test "a session is deleted, and deleting it again is a 404" {
         ".",
     ));
 
-    var again = try server.exchange(.DELETE, path, null);
-    defer again.deinit();
-    try std.testing.expectEqualStrings("HTTP/1.1 404 Not Found", again.statusLine());
+    try expectExchange(server, .DELETE, path, null, "HTTP/1.1 404 Not Found", &.{});
 }
-
 test "a prompt is refused while the session is busy, and one that asks nothing" {
     const server = try TestServer.init();
     defer server.deinit();
@@ -961,13 +949,16 @@ test "a prompt is refused while the session is busy, and one that asks nothing" 
     const path = try sessionPath(id, "/message");
     defer std.testing.allocator.free(path);
 
-    var empty = try server.exchange(.POST, path, "{\"text\":\"\"}");
-    defer empty.deinit();
-    try std.testing.expectEqualStrings("HTTP/1.1 400 Bad Request", empty.statusLine());
+    try expectExchange(server, .POST, path, "{\"text\":\"\"}", "HTTP/1.1 400 Bad Request", &.{});
 
     try std.testing.expect(try server.registry.claim(id));
     defer server.registry.release(id);
-    var busy = try server.exchange(.POST, path, "{\"text\":\"do something\"}");
-    defer busy.deinit();
-    try std.testing.expectEqualStrings("HTTP/1.1 409 Conflict", busy.statusLine());
+    try expectExchange(
+        server,
+        .POST,
+        path,
+        "{\"text\":\"do something\"}",
+        "HTTP/1.1 409 Conflict",
+        &.{},
+    );
 }

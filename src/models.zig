@@ -478,33 +478,37 @@ test "a choice names its provider before the slash and its model after it" {
     try std.testing.expect(!bare.isComplete());
 }
 
-test "the catalog finds a provider by the name models.dev lists it under" {
-    const found = test_catalog.find("deepseek").?;
-    try std.testing.expectEqualStrings("https://api.deepseek.com", test_catalog.baseUrl(found).?);
+fn expectBaseUrl(name: []const u8, expected: []const u8) !void {
+    const found = test_catalog.find(name) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(expected, test_catalog.baseUrl(found).?);
+}
 
-    const opencode = test_catalog.find("opencode-go").?;
-    try std.testing.expectEqualStrings("https://opencode.ai/zen/go/v1", test_catalog.baseUrl(opencode).?);
+fn expectWindow(provider: ?[]const u8, model: []const u8, expected: ?usize) !void {
+    const info = test_catalog.metadata(provider, model);
+    if (expected) |window| {
+        try std.testing.expectEqual(window, info.?.context_window);
+    } else {
+        try std.testing.expect(info == null);
+    }
+}
+
+test "the catalog finds a provider by the name models.dev lists it under" {
+    try expectBaseUrl("deepseek", "https://api.deepseek.com");
+    try expectBaseUrl("opencode-go", "https://opencode.ai/zen/go/v1");
 
     try std.testing.expect(test_catalog.find("opencode_go") == null);
     try std.testing.expect(test_catalog.find("not-a-provider") == null);
     // Every name it holds is found, which says the block is in the order a lookup expects.
-
     for (test_catalog.providers.items) |provider|
         try std.testing.expect(test_catalog.find(test_catalog.pool.get(provider.name).?) != null);
 }
 
 test "metadata is looked up at the provider, then among all providers" {
-    const flash = test_catalog.metadata("deepseek", "deepseek-flash").?;
-    try std.testing.expectEqual(1_000_000, flash.context_window);
-
-    const elsewhere = test_catalog.metadata("opencode-go", "kimi-k2.7-code").?;
-    try std.testing.expectEqual(262_144, elsewhere.context_window);
-
-    const discovered = test_catalog.metadata(null, "deepseek-flash").?;
-    try std.testing.expectEqual(1_000_000, discovered.context_window);
-
-    try std.testing.expect(test_catalog.metadata("deepseek", "kimi-k2.7-code") == null);
-    try std.testing.expect(test_catalog.metadata(null, "who-knows") == null);
+    try expectWindow("deepseek", "deepseek-flash", 1_000_000);
+    try expectWindow("opencode-go", "kimi-k2.7-code", 262_144);
+    try expectWindow(null, "deepseek-flash", 1_000_000);
+    try expectWindow("deepseek", "kimi-k2.7-code", null);
+    try expectWindow(null, "who-knows", null);
 }
 
 const source_body =

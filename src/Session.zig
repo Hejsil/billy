@@ -1411,26 +1411,32 @@ test "a listing and the latest session are read from the header alone" {
     try std.testing.expectError(error.CorruptSession, reopenTestSession(&tmp, "listed"));
 }
 
-test "setCheckedId rejects names that could escape the session directory" {
+fn expectSessionId(name: []const u8, expected: []const u8) !void {
     var buf: [max_id_len]u8 = undefined;
+    try std.testing.expectEqualStrings(expected, try setCheckedId(&buf, name));
+}
 
-    try std.testing.expectEqualStrings("dev", try setCheckedId(&buf, "dev"));
-    try std.testing.expectEqualStrings("20250131-120000", try setCheckedId(&buf, "20250131-120000"));
-    try std.testing.expectEqualStrings(
-        "01HF7YAT000000000000000000",
-        try setCheckedId(&buf, "01HF7YAT000000000000000000"),
-    );
+fn expectBadSessionId(name: []const u8) !void {
+    var buf: [max_id_len]u8 = undefined;
+    try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, name));
+}
 
-    try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, ""));
-    try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, ".."));
-    try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, "../x"));
-    try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, "a/b"));
-    try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, "a b"));
+test "setCheckedId rejects names that could escape the session directory" {
+    try expectSessionId("dev", "dev");
+    try expectSessionId("20250131-120000", "20250131-120000");
+    try expectSessionId("01HF7YAT000000000000000000", "01HF7YAT000000000000000000");
+
+    try expectBadSessionId("");
+    try expectBadSessionId("..");
+    try expectBadSessionId("../x");
+    try expectBadSessionId("a/b");
+    try expectBadSessionId("a b");
     // A name that does not fit, with room for its NUL, is refused rather than cut short: the
     // longest that fits is one byte less than the buffer.
-    try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, &@as([max_id_len + 1]u8, @splat('x'))));
-    try std.testing.expectError(error.InvalidSessionId, setCheckedId(&buf, &@as([max_id_len]u8, @splat('x'))));
-    _ = try setCheckedId(&buf, &@as([max_id_len - 1]u8, @splat('x')));
+    try expectBadSessionId(&@as([max_id_len + 1]u8, @splat('x')));
+    try expectBadSessionId(&@as([max_id_len]u8, @splat('x')));
+    const longest: [max_id_len - 1]u8 = @splat('x');
+    try expectSessionId(&longest, &longest);
 }
 
 test "a session survives a save and resume" {
@@ -2006,14 +2012,18 @@ test "a session with no recorded model is read as the configured one" {
     try std.testing.expect(std.mem.find(u8, file, "\"model\"") == null);
 }
 
+fn expectOpenError(tmp: *std.testing.TmpDir, session_id: []const u8, expected: anyerror) !void {
+    try std.testing.expectError(
+        expected,
+        Session.open(std.testing.io, tmp.dir, std.testing.allocator, session_id, "/work"),
+    );
+}
+
 test "opening an unknown or damaged session is reported" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try std.testing.expectError(
-        error.SessionNotFound,
-        Session.open(std.testing.io, tmp.dir, std.testing.allocator, "nobody", "/work"),
-    );
+    try expectOpenError(&tmp, "nobody", error.SessionNotFound);
 
     var damaged = try newTestSession(&tmp);
     defer damaged.deinit();
@@ -2030,25 +2040,16 @@ test "opening an unknown or damaged session is reported" {
         .sub_path = "cut-short",
         .data = written[0 .. written.len - 1],
     });
-    try std.testing.expectError(
-        error.CorruptSession,
-        Session.open(std.testing.io, tmp.dir, std.testing.allocator, "cut-short", "/work"),
-    );
+    try expectOpenError(&tmp, "cut-short", error.CorruptSession);
 
     var future = try std.testing.allocator.dupe(u8, written);
     defer std.testing.allocator.free(future);
     std.mem.writeInt(u32, future[@offsetOf(Header, "version")..][0..4], format_version + 1, .little);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "future", .data = future });
-    try std.testing.expectError(
-        error.UnsupportedSessionVersion,
-        Session.open(std.testing.io, tmp.dir, std.testing.allocator, "future", "/work"),
-    );
+    try expectOpenError(&tmp, "future", error.UnsupportedSessionVersion);
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "nothing-like-a-session", .data = "not a session" });
-    try std.testing.expectError(
-        error.CorruptSession,
-        Session.open(std.testing.io, tmp.dir, std.testing.allocator, "nothing-like-a-session", "/work"),
-    );
+    try expectOpenError(&tmp, "nothing-like-a-session", error.CorruptSession);
 }
 
 test "a new session does not reuse an id whose file exists" {

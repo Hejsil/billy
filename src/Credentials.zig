@@ -321,20 +321,47 @@ test "load reads a key written for a name this billy does not know" {
     try std.testing.expect(credentials.get("deepseek") == null);
 }
 
-test "the listing shows each service billy knows and whether a key is stored" {
-    const gpa = std.testing.allocator;
+const StoredKey = struct { name: []const u8, key: []const u8 };
+
+const Listing = struct {
+    stored: []const StoredKey = &.{},
+    providers: []const []const u8 = &.{},
+};
+
+fn renderListing(gpa: std.mem.Allocator, listing: Listing) ![]const u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    const allocator = arena_state.allocator();
+    const arena = arena_state.allocator();
 
     var credentials: Credentials = .{};
-    try credentials.put(allocator, "deepseek", "sk-secret");
+    for (listing.stored) |stored| try credentials.put(arena, stored.name, stored.key);
 
     var sink: std.Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try credentials.list(gpa, &sink.writer, &.{}, &models.test_catalog);
+    try credentials.list(gpa, &sink.writer, listing.providers, &models.test_catalog);
+    return sink.toOwnedSlice();
+}
 
-    try std.testing.expectEqualStrings(
+fn expectListing(listing: Listing, expected: []const u8) !void {
+    const shown = try renderListing(std.testing.allocator, listing);
+    defer std.testing.allocator.free(shown);
+    try std.testing.expectEqualStrings(expected, shown);
+}
+
+fn expectListingHas(listing: Listing, needle: []const u8) !void {
+    const shown = try renderListing(std.testing.allocator, listing);
+    defer std.testing.allocator.free(shown);
+    try std.testing.expect(std.mem.find(u8, shown, needle) != null);
+}
+
+fn expectListingLacks(listing: Listing, needle: []const u8) !void {
+    const shown = try renderListing(std.testing.allocator, listing);
+    defer std.testing.allocator.free(shown);
+    try std.testing.expect(std.mem.find(u8, shown, needle) == null);
+}
+
+test "the listing shows each service billy knows and whether a key is stored" {
+    try expectListing(.{ .stored = &.{.{ .name = "deepseek", .key = "sk-secret" }} },
         \\deepseek     DeepSeek API key           stored
         \\opencode-go  OpenCode Go API key        not set
         \\openai       OpenAI API key             not set
@@ -344,20 +371,10 @@ test "the listing shows each service billy knows and whether a key is stored" {
         \\
         \\`billy login <service>` stores a key
         \\
-    , sink.written());
+    );
 }
-
 test "the listing names a service that has no key of any kind" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-
-    const credentials: Credentials = .{};
-    var sink: std.Io.Writer.Allocating = .init(gpa);
-    defer sink.deinit();
-    try credentials.list(gpa, &sink.writer, &.{}, &models.test_catalog);
-
-    try std.testing.expectEqualStrings(
+    try expectListing(.{},
         \\deepseek     DeepSeek API key           not set
         \\opencode-go  OpenCode Go API key        not set
         \\openai       OpenAI API key             not set
@@ -367,60 +384,22 @@ test "the listing names a service that has no key of any kind" {
         \\
         \\`billy login <service>` stores a key
         \\
-    , sink.written());
+    );
 }
-
 test "the listing shows a stored name billy does not know" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
-
     // A provider the configuration named has its key stored under that name, so the listing has to
     // show it or the user cannot tell it is set.
-    var credentials: Credentials = .{};
-    try credentials.put(allocator, "a-very-long-provider-name", "k");
-
-    var sink: std.Io.Writer.Allocating = .init(gpa);
-    defer sink.deinit();
-    try credentials.list(gpa, &sink.writer, &.{}, &models.test_catalog);
-
-    try std.testing.expect(std.mem.find(
-        u8,
-        sink.written(),
-        "a-very-long-provider-name  a service billy does not know  stored",
-    ) != null);
+    const listing: Listing = .{ .stored = &.{.{ .name = "a-very-long-provider-name", .key = "k" }} };
+    try expectListingHas(listing, "a-very-long-provider-name  a service billy does not know  stored");
     // The columns widened to fit the long name and the label, so the known rows are padded to match
     // rather than running short.
-    try std.testing.expect(std.mem.find(
-        u8,
-        sink.written(),
-        "a-very-long-provider-name  a service billy does not know  stored",
-    ) != null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        sink.written(),
-        "deepseek                   DeepSeek API key               not set",
-    ) != null);
+    try expectListingHas(listing, "deepseek                   DeepSeek API key               not set");
 }
-
 test "the listing names a catalog provider whose key is stored" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
-
-    var credentials: Credentials = .{};
-    try credentials.put(allocator, "xai", "k");
-
-    var sink: std.Io.Writer.Allocating = .init(gpa);
-    defer sink.deinit();
-    try credentials.list(gpa, &sink.writer, &.{}, &models.test_catalog);
-
-    try std.testing.expect(std.mem.find(u8, sink.written(), "a provider in the model catalog") != null);
-    try std.testing.expect(std.mem.find(u8, sink.written(), "a service billy does not know") == null);
+    const listing: Listing = .{ .stored = &.{.{ .name = "xai", .key = "k" }} };
+    try expectListingHas(listing, "a provider in the model catalog");
+    try expectListingLacks(listing, "a service billy does not know");
 }
-
 test "a key is stored only for a name something will ask for" {
     try std.testing.expect(acceptable("deepseek", &.{}));
     try std.testing.expect(acceptable("tavily", &.{}));
@@ -436,62 +415,35 @@ test "a key is stored only for a name something will ask for" {
 }
 
 test "the listing names the providers the configuration defines" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-
-    const credentials: Credentials = .{};
-    var sink: std.Io.Writer.Allocating = .init(gpa);
-    defer sink.deinit();
-    try credentials.list(gpa, &sink.writer, &.{"mock"}, &models.test_catalog);
-
-    try std.testing.expect(std.mem.find(
-        u8,
-        sink.written(),
-        "mock         a provider the configuration names  not set",
-    ) != null);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, sink.written(), "deepseek"));
-    try std.testing.expect(std.mem.find(u8, sink.written(), "a provider the configuration names") != null);
+    const shown = try renderListing(std.testing.allocator, .{ .providers = &.{"mock"} });
+    defer std.testing.allocator.free(shown);
+    try std.testing.expect(std.mem.find(u8, shown, "mock         a provider the configuration names  not set") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, shown, "deepseek"));
+    try std.testing.expect(std.mem.find(u8, shown, "a provider the configuration names") != null);
 }
-
 test "the listing shows a key under a name nothing names any more" {
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
-
-    var credentials: Credentials = .{};
-    try credentials.put(allocator, "gone", "k");
-
-    var sink: std.Io.Writer.Allocating = .init(gpa);
-    defer sink.deinit();
-    try credentials.list(gpa, &sink.writer, &.{"mock"}, &models.test_catalog);
-
-    try std.testing.expect(std.mem.find(u8, sink.written(), "gone") != null);
-    try std.testing.expect(std.mem.find(u8, sink.written(), "a service billy does not know") != null);
+    const listing: Listing = .{
+        .stored = &.{.{ .name = "gone", .key = "k" }},
+        .providers = &.{"mock"},
+    };
+    try expectListingHas(listing, "gone");
+    try expectListingHas(listing, "a service billy does not know");
 }
-
-test "load refuses a damaged or future credentials file" {
+fn expectLoadError(data: []const u8, expected: anyerror) !void {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const allocator = arena_state.allocator();
+    const arena = arena_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = data });
+    try std.testing.expectError(expected, load(std.testing.io, tmp.dir, arena));
+}
 
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{" });
-    try std.testing.expectError(error.CorruptCredentials, load(std.testing.io, tmp.dir, allocator));
-
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{\"version\":99}" });
-    try std.testing.expectError(error.UnsupportedCredentialsVersion, load(std.testing.io, tmp.dir, allocator));
-
+test "load refuses a damaged or future credentials file" {
+    try expectLoadError("{", error.CorruptCredentials);
+    try expectLoadError("{\"version\":99}", error.UnsupportedCredentialsVersion);
     // A version that is not a version is refused rather than cast, which would trap in a safe build.
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = "{\"version\":-1}" });
-    try std.testing.expectError(error.CorruptCredentials, load(std.testing.io, tmp.dir, allocator));
-
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = file_name,
-        .data = "{\"version\":4294967296}",
-    });
-    try std.testing.expectError(error.CorruptCredentials, load(std.testing.io, tmp.dir, allocator));
+    try expectLoadError("{\"version\":-1}", error.CorruptCredentials);
+    try expectLoadError("{\"version\":4294967296}", error.CorruptCredentials);
 }

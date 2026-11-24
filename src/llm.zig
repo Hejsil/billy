@@ -524,6 +524,61 @@ fn testClient(gpa: std.mem.Allocator, io: std.Io, http_client: *std.http.Client,
     return .{ .gpa = gpa, .io = io, .api_key = "k", .url = url, .model = "m", .http = http_client };
 }
 
+fn expectOptionalString(expected: ?[]const u8, actual: ?[]const u8) !void {
+    try std.testing.expectEqual(expected == null, actual == null);
+    if (expected) |text| try std.testing.expectEqualStrings(text, actual.?);
+}
+
+const ExpectedCall = struct {
+    id: []const u8,
+    name: []const u8,
+    arguments: []const u8,
+};
+
+const ExpectedStream = struct {
+    content: ?[]const u8 = null,
+    reasoning: ?[]const u8 = null,
+    calls: []const ExpectedCall = &.{},
+    deltas: ?usize = null,
+    total_tokens: ?usize = null,
+};
+
+fn expectStream(comptime events: []const u8, expected: ExpectedStream) !void {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var mock = try Mock.start("/chat/completions", 1, Mock.eventStream(events));
+    defer mock.deinit();
+    try mock.serve();
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+    var client = testClient(gpa, io, &http_client, mock.url);
+
+    const messages = [_]Message{.{ .role = .user, .content = "hi" }};
+    var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
+    defer stream.deinit();
+
+    var deltas: usize = 0;
+    while (try stream.next()) |_| deltas += 1;
+    try mock.await();
+
+    if (expected.deltas) |count| try std.testing.expectEqual(count, deltas);
+    if (expected.total_tokens) |count| try std.testing.expectEqual(count, stream.usage().total_tokens);
+
+    const message = try stream.message();
+    try expectOptionalString(expected.content, message.content);
+    try expectOptionalString(expected.reasoning, message.reasoning_content);
+
+    const calls = message.tool_calls orelse &.{};
+    try std.testing.expectEqual(expected.calls.len, calls.len);
+    for (expected.calls, calls) |want, got| {
+        try std.testing.expectEqualStrings(want.id, got.id);
+        try std.testing.expectEqualStrings(want.name, got.function.name);
+        try std.testing.expectEqualStrings(want.arguments, got.function.arguments);
+    }
+}
+
 test "a request counts out to exactly the body it writes" {
     const gpa = std.testing.allocator;
 
@@ -633,11 +688,7 @@ test "a request names billy and carries the session it belongs to" {
 }
 
 test "a streamed reply is read a delta at a time" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    const messages = [_]Message{.{ .role = .user, .content = "hi" }};
-    var mock = try Mock.start("/chat/completions", 1, Mock.eventStream(
+    try expectStream(
         "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n" ++
             "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n" ++
             "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n" ++
@@ -645,38 +696,13 @@ test "a streamed reply is read a delta at a time" {
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n" ++
             "data: [DONE]\n\n",
-    ));
-    defer mock.deinit();
-    try mock.serve();
-
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-    var client = testClient(gpa, io, &http_client, mock.url);
-
-    var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
-    defer stream.deinit();
-    var deltas: usize = 0;
-    while (try stream.next()) |_| deltas += 1;
-
-    try mock.await();
-
-    try std.testing.expectEqual(3, deltas);
-
-    const message = try stream.message();
-    try std.testing.expectEqualStrings("hello", message.content.?);
-    try std.testing.expectEqualStrings("a thought", message.reasoning_content.?);
-    try std.testing.expect(message.tool_calls == null);
-    try std.testing.expectEqual(5, stream.usage().total_tokens);
+        .{ .content = "hello", .reasoning = "a thought", .deltas = 3, .total_tokens = 5 },
+    );
 }
-
 test "a delta that spells its fields as null is read, not dropped" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
     // A provider may write a field it has nothing for as an explicit null rather than leaving it
     // out, and it may do so in every field of the chunk at once.
-    const messages = [_]Message{.{ .role = .user, .content = "hi" }};
-    var mock = try Mock.start("/chat/completions", 1, Mock.eventStream(
+    try expectStream(
         "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1," ++
             "\"model\":\"m\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null," ++
             "\"delta\":{\"role\":null,\"content\":\"hel\",\"reasoning_content\":\" from REVIEW\"," ++
@@ -685,27 +711,9 @@ test "a delta that spells its fields as null is read, not dropped" {
             "\"tool_calls\":null}}]}\n\n" ++
             "data: {\"choices\":[{\"index\":0,\"delta\":null,\"finish_reason\":\"stop\"}]}\n\n" ++
             "data: [DONE]\n\n",
-    ));
-    defer mock.deinit();
-    try mock.serve();
-
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-    var client = clientAgainst(gpa, io, &http_client, mock.url, 1);
-
-    var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
-    defer stream.deinit();
-    var deltas: usize = 0;
-    while (try stream.next()) |_| deltas += 1;
-
-    try mock.await();
-
-    try std.testing.expectEqual(2, deltas);
-    const message = try stream.message();
-    try std.testing.expectEqualStrings("hello", message.content.?);
-    try std.testing.expectEqualStrings(" from REVIEW", message.reasoning_content.?);
+        .{ .content = "hello", .reasoning = " from REVIEW", .deltas = 2 },
+    );
 }
-
 test "a streamed reply that arrived compressed is read" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -839,11 +847,7 @@ test "a payload that runs over more than one data line is joined" {
 }
 
 test "the fields beside data carry nothing billy reads" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    const messages = [_]Message{.{ .role = .user, .content = "hi" }};
-    var mock = try Mock.start("/chat/completions", 1, Mock.eventStream(
+    try expectStream(
         ": keepalive\n\n" ++
             "event: message\n" ++
             "id: 1\n" ++
@@ -853,23 +857,9 @@ test "the fields beside data carry nothing billy reads" {
             ": keepalive\n\n" ++
             "data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\n" ++
             "data: [DONE]\n\n",
-    ));
-    defer mock.deinit();
-    try mock.serve();
-
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-    var client = clientAgainst(gpa, io, &http_client, mock.url, 1);
-
-    var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
-    defer stream.deinit();
-    while (try stream.next()) |_| {}
-
-    try mock.await();
-
-    try std.testing.expectEqualStrings("hi there", (try stream.message()).content.?);
+        .{ .content = "hi there", .deltas = 2 },
+    );
 }
-
 test "a frame ends at the blank line that follows it" {
     const lf = frameEnd("data: 1\n\ndata: 2\n\n").?;
     try std.testing.expectEqual(7, lf.body);
@@ -883,34 +873,16 @@ test "a frame ends at the blank line that follows it" {
 }
 
 test "a stream whose lines end with CRLF is read" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
     // A provider is free to end its lines the way HTTP allows.
-    const messages = [_]Message{.{ .role = .user, .content = "hi" }};
-    var mock = try Mock.start("/chat/completions", 1, Mock.eventStream(
+    try expectStream(
         "event: message\r\n" ++
             "data: {\r\n" ++
             "data:   \"choices\": [{\"delta\": {\"content\": \"hi\"}}]\r\n" ++
             "data: }\r\n\r\n" ++
             "data: [DONE]\r\n\r\n",
-    ));
-    defer mock.deinit();
-    try mock.serve();
-
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-    var client = clientAgainst(gpa, io, &http_client, mock.url, 1);
-
-    var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
-    defer stream.deinit();
-    while (try stream.next()) |_| {}
-
-    try mock.await();
-
-    try std.testing.expectEqualStrings("hi", (try stream.message()).content.?);
+        .{ .content = "hi" },
+    );
 }
-
 test "a reply that is not a stream is reported, not read as a plain reply" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -936,38 +908,13 @@ test "a reply that is not a stream is reported, not read as a plain reply" {
 }
 
 test "a stream that carries no choices is an empty reply" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
     // A provider that says nothing at all streams no choices, which reads as an empty reply: the
     // caller decides what a reply with nothing in it means, rather than being handed an error for
     // it here.
-    var mock = try Mock.start("/chat/completions", 1, Mock.eventStream("data: [DONE]\n\n"));
-    defer mock.deinit();
-    try mock.serve();
-
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-    var client = clientAgainst(gpa, io, &http_client, mock.url, 1);
-    const messages = [_]Message{.{ .role = .user, .content = "hi" }};
-    var stream = try client.complete(gpa, "01SESSION", &messages, @as([]const NoTools, &.{}));
-    defer stream.deinit();
-    while (try stream.next()) |_| {}
-
-    try mock.await();
-
-    const message = try stream.message();
-    try std.testing.expect(message.content == null);
-    try std.testing.expect(message.reasoning_content == null);
-    try std.testing.expect(message.tool_calls == null);
+    try expectStream("data: [DONE]\n\n", .{});
 }
-
 test "a tool call streamed in pieces is put back together" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    const messages = [_]Message{.{ .role = .user, .content = "run it" }};
-    var mock = try Mock.start("/chat/completions", 1, Mock.eventStream(
+    try expectStream(
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\"," ++
             "\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]}}]}\n\n" ++
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0," ++
@@ -975,27 +922,13 @@ test "a tool call streamed in pieces is put back together" {
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0," ++
             "\"function\":{\"arguments\":\"\\\"echo hi\\\"}\"}}]}}]}\n\n" ++
             "data: [DONE]\n\n",
-    ));
-    defer mock.deinit();
-    try mock.serve();
-
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-    var client = testClient(gpa, io, &http_client, mock.url);
-
-    var stream = try client.complete(gpa, "01ABC", &messages, @as([]const NoTools, &.{}));
-    defer stream.deinit();
-    while (try stream.next()) |_| {}
-
-    try mock.await();
-
-    const calls = (try stream.message()).tool_calls.?;
-    try std.testing.expectEqual(1, calls.len);
-    try std.testing.expectEqualStrings("call_1", calls[0].id);
-    try std.testing.expectEqualStrings("bash", calls[0].function.name);
-    try std.testing.expectEqualStrings("{\"command\":\"echo hi\"}", calls[0].function.arguments);
+        .{ .calls = &.{.{
+            .id = "call_1",
+            .name = "bash",
+            .arguments = "{\"command\":\"echo hi\"}",
+        }} },
+    );
 }
-
 test "a body only counts as a stream when its content type says so" {
     try std.testing.expect(isEventStream("text/event-stream"));
     try std.testing.expect(isEventStream("text/event-stream; charset=utf-8"));

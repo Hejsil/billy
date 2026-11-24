@@ -1358,28 +1358,24 @@ test "a summary is written into the conversation and announced" {
     try std.testing.expect(std.mem.find(u8, out.written(), "compacted") != null);
 }
 
+fn expectCommand(text: []const u8, expected: ?Command) !void {
+    try std.testing.expectEqualDeep(expected, Command.of(text));
+}
+
 test "a command is read from the whole line, and takes its argument with it" {
-    try std.testing.expectEqualStrings(
-        "deepseek/deepseek-flash",
-        Command.of("/model deepseek/deepseek-flash").?.model.?,
-    );
-    try std.testing.expectEqualStrings(
-        "deepseek/deepseek-flash",
-        Command.of("  /model  deepseek/deepseek-flash \n").?.model.?,
-    );
-    try std.testing.expect(Command.of("/model").?.model == null);
-    try std.testing.expect(Command.of("/model   ").?.model == null);
-
-    try std.testing.expectEqualStrings("/tmp", Command.of("/cwd /tmp").?.cwd.?);
-    try std.testing.expect(Command.of("/cwd").?.cwd == null);
-
-    try std.testing.expect(Command.of("/compact this") == null);
-    try std.testing.expect(Command.of("/modelling it") == null);
-    try std.testing.expect(Command.of("/modeler") == null);
-    try std.testing.expect(Command.of("//model x") == null);
-    try std.testing.expect(Command.of("/") == null);
-    try std.testing.expect(Command.of("hello") == null);
-    try std.testing.expect(Command.of("/chat") == null);
+    try expectCommand("/model deepseek/deepseek-flash", .{ .model = "deepseek/deepseek-flash" });
+    try expectCommand("  /model  deepseek/deepseek-flash \n", .{ .model = "deepseek/deepseek-flash" });
+    try expectCommand("/model", .{ .model = null });
+    try expectCommand("/model   ", .{ .model = null });
+    try expectCommand("/cwd /tmp", .{ .cwd = "/tmp" });
+    try expectCommand("/cwd", .{ .cwd = null });
+    try expectCommand("/compact this", null);
+    try expectCommand("/modelling it", null);
+    try expectCommand("/modeler", null);
+    try expectCommand("//model x", null);
+    try expectCommand("/", null);
+    try expectCommand("hello", null);
+    try expectCommand("/chat", null);
 }
 
 test "refreshLead replaces the prompt, the project instructions and the tools" {
