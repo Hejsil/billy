@@ -157,10 +157,44 @@ fn searchBackend(tools: Tools, backend: web.Backend, query: []const u8, max_resu
     };
 }
 
-test "the backends are tried in order until one answers" {
+const Backend = struct {
+    provider: web.Provider,
+    key: []const u8 = "",
+};
+
+const Case = struct {
+    backends: []const Backend,
+    expected: []const u8,
+    query: []const u8 = "zig lang",
+    max_results: usize = 3,
+};
+
+fn expectSearch(mock: *Mock, case: Case) !void {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    var backends: [max_backends]web.Backend = undefined;
+    for (case.backends, 0..) |backend, i| {
+        backends[i] = .{ .provider = backend.provider, .api_key = backend.key, .endpoint = mock.url };
+    }
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    const tools = Tools.init(io, .cwd(), gpa, &http_client, .{
+        .bash_timeout_s = 120,
+        .keys = &Credentials.empty,
+        .search = .{ .max_results = case.max_results },
+    });
+    const search: Search = .{ .query = case.query };
+    try search.ask(tools, backends[0..case.backends.len], &out.writer);
+    try mock.await();
+    try std.testing.expectEqualStrings(case.expected, out.written());
+}
+
+test "the backends are tried in order until one answers" {
     var mock = try Mock.start("/search", 2, struct {
         fn answer(number: usize, _: []const u8) Mock.Answer {
             if (number == 1) return .{ .status = .internal_server_error, .body = "{}" };
@@ -170,31 +204,19 @@ test "the backends are tried in order until one answers" {
     defer mock.deinit();
     try mock.serve();
 
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
     // Two backends, both standing in for the same server, so what is tested is the order rather
     // than which backend it is.
-    const search: Search = .{ .query = "zig lang" };
-    const backends: []const web.Backend = &.{
-        .{ .provider = .tavily, .api_key = "a", .endpoint = mock.url },
-        .{ .provider = .tavily, .api_key = "b", .endpoint = mock.url },
-    };
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    const tools = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty, .search = .{ .max_results = 3 } });
-    try search.ask(tools, backends, &out.writer);
-    try mock.await();
-
+    try expectSearch(&mock, .{
+        .backends = &.{
+            .{ .provider = .tavily, .key = "a" },
+            .{ .provider = .tavily, .key = "b" },
+        },
+        .expected = "1. Zig\n   https://ziglang.org\n   A language.\n",
+    });
     try std.testing.expectEqual(@as(usize, 2), mock.served);
-    try std.testing.expectEqualStrings("1. Zig\n   https://ziglang.org\n   A language.\n", out.written());
 }
 
 test "a search fails only when every backend has failed" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
     var mock = try Mock.start("/search", 2, struct {
         fn answer(_: usize, _: []const u8) Mock.Answer {
             return .{ .status = .internal_server_error, .body = "{}" };
@@ -203,23 +225,14 @@ test "a search fails only when every backend has failed" {
     defer mock.deinit();
     try mock.serve();
 
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
-    const search: Search = .{ .query = "zig lang" };
-    const backends: []const web.Backend = &.{
-        .{ .provider = .tavily, .api_key = "a", .endpoint = mock.url },
-        .{ .provider = .brave, .api_key = "b", .endpoint = mock.url },
-    };
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    const tools = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty, .search = .{ .max_results = 3 } });
-    try search.ask(tools, backends, &out.writer);
-    try mock.await();
-
+    try expectSearch(&mock, .{
+        .backends = &.{
+            .{ .provider = .tavily, .key = "a" },
+            .{ .provider = .brave, .key = "b" },
+        },
+        .expected = "error: search failed: RequestFailed",
+    });
     try std.testing.expectEqual(@as(usize, 2), mock.served);
-    try std.testing.expectEqualStrings("error: search failed: RequestFailed", out.written());
 }
 
 test "a backend that failed is set aside, so the next search skips it" {
@@ -273,47 +286,31 @@ test "a backend that failed is set aside, so the next search skips it" {
 }
 
 test "brave is asked for no more results than billy allows any backend" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
     var mock = try Mock.start("/search", 1, Mock.fixed("{\"web\":{\"results\":[]}}"));
     defer mock.deinit();
     try mock.serve();
 
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
-    const search: Search = .{ .query = "zig" };
-    const backends: []const web.Backend = &.{.{ .provider = .brave, .api_key = "b", .endpoint = mock.url }};
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    const tools = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty, .search = .{ .max_results = 1000 } });
-    try search.ask(tools, backends, &out.writer);
-    try mock.await();
+    try expectSearch(&mock, .{
+        .backends = &.{.{ .provider = .brave, .key = "b" }},
+        .expected = "(no results)",
+        .query = "zig",
+        .max_results = 1000,
+    });
 
     try std.testing.expectEqualStrings("/search?q=zig&count=20", mock.targets.items[0]);
     try std.testing.expectEqualStrings("application/json", mock.header("accept").?);
 }
 
 test "each provider is asked the way its table says" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
     {
         var mock = try Mock.start("/search", 1, Mock.fixed("{\"results\":[]}"));
         defer mock.deinit();
         try mock.serve();
 
-        var out: std.Io.Writer.Allocating = .init(gpa);
-        defer out.deinit();
-        const tool = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty, .search = .{ .max_results = 3 } });
-        const search: Search = .{ .query = "zig lang" };
-        try search.ask(tool, &.{.{ .provider = .tavily, .api_key = "secret", .endpoint = mock.url }}, &out.writer);
-        try mock.await();
-
+        try expectSearch(&mock, .{
+            .backends = &.{.{ .provider = .tavily, .key = "secret" }},
+            .expected = "(no results)",
+        });
         try std.testing.expectEqualStrings(
             "{\"query\":\"zig lang\",\"max_results\":3,\"search_depth\":\"basic\",\"include_answer\":false}",
             mock.bodies.items[0],
@@ -326,13 +323,10 @@ test "each provider is asked the way its table says" {
         defer mock.deinit();
         try mock.serve();
 
-        var out: std.Io.Writer.Allocating = .init(gpa);
-        defer out.deinit();
-        const tools = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty, .search = .{ .max_results = 3 } });
-        const search: Search = .{ .query = "zig lang" };
-        try search.ask(tools, &.{.{ .provider = .exa, .api_key = "secret", .endpoint = mock.url }}, &out.writer);
-        try mock.await();
-
+        try expectSearch(&mock, .{
+            .backends = &.{.{ .provider = .exa, .key = "secret" }},
+            .expected = "(no results)",
+        });
         try std.testing.expectEqualStrings(
             "{\"query\":\"zig lang\",\"numResults\":3,\"contents\":{\"text\":{\"maxCharacters\":500}}}",
             mock.bodies.items[0],
@@ -346,13 +340,10 @@ test "each provider is asked the way its table says" {
         defer mock.deinit();
         try mock.serve();
 
-        var out: std.Io.Writer.Allocating = .init(gpa);
-        defer out.deinit();
-        const tools = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty, .search = .{ .max_results = 3 } });
-        const search: Search = .{ .query = "zig lang" };
-        try search.ask(tools, &.{.{ .provider = .searxng, .endpoint = mock.url }}, &out.writer);
-        try mock.await();
-
+        try expectSearch(&mock, .{
+            .backends = &.{.{ .provider = .searxng }},
+            .expected = "(no results)",
+        });
         try std.testing.expectEqualStrings("/search?q=zig%20lang&format=json", mock.targets.items[0]);
         try std.testing.expect(mock.header("authorization") == null);
         try std.testing.expectEqualStrings("", mock.bodies.items[0]);

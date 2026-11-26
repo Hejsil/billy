@@ -166,13 +166,33 @@ fn fetchBackend(tools: Tools, backend: web.Backend, url: []const u8) !web.Answer
     };
 }
 
-test "each fetch backend is asked the way its table says" {
+const Case = struct {
+    provider: web.Provider,
+    key: []const u8 = "",
+    url: []const u8,
+    expected: []const u8,
+};
+
+fn expectFetch(mock: *Mock, case: Case) !void {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
+    // The backend is asked at the mock's address, so the request it makes can be read back.
+    const backend: web.Backend = .{ .provider = case.provider, .api_key = case.key, .endpoint = mock.url };
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    const tools = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
+    const fetch: Fetch = .{ .url = case.url };
+    try fetch.ask(tools, &.{backend}, &out.writer);
+    try mock.await();
+    try std.testing.expectEqualStrings(case.expected, out.written());
+}
+
+test "each fetch backend is asked the way its table says" {
     {
         var mock = try Mock.start("/extract", 1, Mock.fixed(
             "{\"results\":[{\"url\":\"https://ziglang.org\",\"raw_content\":\"# Zig\"}],\"failed_results\":[]}",
@@ -180,16 +200,14 @@ test "each fetch backend is asked the way its table says" {
         defer mock.deinit();
         try mock.serve();
 
-        var out: std.Io.Writer.Allocating = .init(gpa);
-        defer out.deinit();
-        const tools = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
-        const fetch: Fetch = .{ .url = "https://ziglang.org" };
-        try fetch.ask(tools, &.{.{ .provider = .tavily, .api_key = "secret", .endpoint = mock.url }}, &out.writer);
-        try mock.await();
-
+        try expectFetch(&mock, .{
+            .provider = .tavily,
+            .key = "secret",
+            .url = "https://ziglang.org",
+            .expected = "# Zig",
+        });
         try std.testing.expectEqualStrings("{\"urls\":[\"https://ziglang.org\"]}", mock.bodies.items[0]);
         try std.testing.expectEqualStrings("Bearer secret", mock.header("authorization").?);
-        try std.testing.expectEqualStrings("# Zig", out.written());
     }
 
     {
@@ -199,16 +217,14 @@ test "each fetch backend is asked the way its table says" {
         defer mock.deinit();
         try mock.serve();
 
-        var out: std.Io.Writer.Allocating = .init(gpa);
-        defer out.deinit();
-        const tools = Tools.init(io, .cwd(), gpa, &http_client, .{ .bash_timeout_s = 120, .keys = &Credentials.empty });
-        const fetch: Fetch = .{ .url = "https://ziglang.org" };
-        try fetch.ask(tools, &.{.{ .provider = .exa, .api_key = "secret", .endpoint = mock.url }}, &out.writer);
-        try mock.await();
-
+        try expectFetch(&mock, .{
+            .provider = .exa,
+            .key = "secret",
+            .url = "https://ziglang.org",
+            .expected = "# Zig",
+        });
         try std.testing.expectEqualStrings("{\"urls\":[\"https://ziglang.org\"]}", mock.bodies.items[0]);
         try std.testing.expectEqualStrings("secret", mock.header("x-api-key").?);
-        try std.testing.expectEqualStrings("# Zig", out.written());
     }
 }
 
