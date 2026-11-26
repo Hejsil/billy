@@ -756,41 +756,35 @@ fn decodeKeys(bytes: []const u8) ![]u8 {
     return keys.toOwnedSlice(std.testing.allocator);
 }
 
-test "a newline in a paste is a line break and only enter submits" {
-    const keys = try decodeKeys("\x1b[200~one\ntwo\x1b[201~more\r");
+fn expectKeys(bytes: []const u8, expected: []const u8) !void {
+    const keys = try decodeKeys(bytes);
     defer std.testing.allocator.free(keys);
-    try std.testing.expectEqualStrings(".one\ntwo.moreE", keys);
+    try std.testing.expectEqualStrings(expected, keys);
+}
+
+test "a newline in a paste is a line break and only enter submits" {
+    try expectKeys("\x1b[200~one\ntwo\x1b[201~more\r", ".one\ntwo.moreE");
 }
 
 test "a carriage return from the keyboard still submits outside a paste" {
-    const keys = try decodeKeys("hi\rhi\n");
-    defer std.testing.allocator.free(keys);
-    try std.testing.expectEqualStrings("hiEhiE", keys);
+    try expectKeys("hi\rhi\n", "hiEhiE");
 }
 
 test "a CRLF in a paste opens a single line, not one and a blank" {
-    const keys = try decodeKeys("\x1b[200~a\r\nb\x1b[201~");
-    defer std.testing.allocator.free(keys);
-    try std.testing.expectEqualStrings(".a\n.b.", keys);
+    try expectKeys("\x1b[200~a\r\nb\x1b[201~", ".a\n.b.");
 }
 
 test "a shifted enter and the arrow keys still decode" {
     // Shift+Enter is a line break outside a paste, as before, and an arrow key is its own key
     // rather than the digits of its escape sequence.
-    const keys = try decodeKeys("a\x1b[13;2ub\x1b[Du\r");
-    defer std.testing.allocator.free(keys);
-    try std.testing.expectEqualStrings("a\nb?uE", keys);
+    try expectKeys("a\x1b[13;2ub\x1b[Du\r", "a\nb?uE");
 }
 
 test "a multi-byte character is one key, and a malformed byte is none" {
-    const keys = try decodeKeys("a\u{e9}b\u{1f600}c");
-    defer std.testing.allocator.free(keys);
-    try std.testing.expectEqualStrings("a#b#c", keys);
+    try expectKeys("a\u{e9}b\u{1f600}c", "a#b#c");
 
     // A byte no character begins with is dropped rather than put in the line.
-    const bad = try decodeKeys("a\xffb");
-    defer std.testing.allocator.free(bad);
-    try std.testing.expectEqualStrings("a.b", bad);
+    try expectKeys("a\xffb", "a.b");
 }
 
 test "columns and offsets count characters, and stay safe on malformed text" {

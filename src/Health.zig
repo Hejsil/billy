@@ -94,14 +94,18 @@ pub fn retryAfterMs(head: []const u8) ?u64 {
     return null;
 }
 
+fn expectRetryAfter(header: []const u8, expected: ?u64) !void {
+    try std.testing.expectEqual(expected, retryAfterMs(header));
+}
+
 test "retryAfterMs reads the seconds form and ignores the rest" {
-    try std.testing.expectEqual(
-        @as(?u64, 2000),
-        retryAfterMs("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 2\r\nContent-Length: 0\r\n\r\n"),
+    try expectRetryAfter(
+        "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 2\r\nContent-Length: 0\r\n\r\n",
+        2000,
     );
-    try std.testing.expectEqual(@as(?u64, 5000), retryAfterMs("HTTP/1.1 503\r\nretry-after: 5\r\n\r\n"));
-    try std.testing.expect(retryAfterMs("HTTP/1.1 200 OK\r\n\r\n") == null);
-    try std.testing.expect(retryAfterMs("HTTP/1.1 429\r\nRetry-After: Wed, 21 Oct 2026 07:28:00 GMT\r\n\r\n") == null);
+    try expectRetryAfter("HTTP/1.1 503\r\nretry-after: 5\r\n\r\n", 5000);
+    try expectRetryAfter("HTTP/1.1 200 OK\r\n\r\n", null);
+    try expectRetryAfter("HTTP/1.1 429\r\nRetry-After: Wed, 21 Oct 2026 07:28:00 GMT\r\n\r\n", null);
 }
 
 fn expectSkipped(health: *Health, name: []const u8, now_ms: i64) !void {
