@@ -883,43 +883,25 @@ test "columns ignore ANSI escapes" {
     try std.testing.expectEqual(3, columns("a·b"));
 }
 
-test "endPrompt erases the header and the line it heads" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
+fn expectEndPrompt(expected: []const u8, header: []const u8, width: usize, last_rows: usize, last_cursor_row: usize) !void {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    var ed = LineEditor.init(std.testing.io, &out.writer, gpa);
+    var ed = LineEditor.init(std.testing.io, &out.writer, std.testing.allocator);
     defer ed.deinit();
 
-    ed.last_rows = 1;
-    ed.last_cursor_row = 0;
-    try ed.endPrompt("billy · m · /w");
-    try std.testing.expectEqualStrings("\x1b[1A\r\x1b[2M\r", out.written());
-    out.clearRetainingCapacity();
+    ed.width = width;
+    ed.last_rows = last_rows;
+    ed.last_cursor_row = last_cursor_row;
+    try ed.endPrompt(header);
+    try std.testing.expectEqualStrings(expected, out.written());
+}
 
-    ed.last_rows = 3;
-    ed.last_cursor_row = 2;
-    try ed.endPrompt("billy · m · /w");
-    try std.testing.expectEqualStrings("\x1b[3A\r\x1b[4M\r", out.written());
-    out.clearRetainingCapacity();
-
-    ed.width = 10;
-    ed.last_rows = 1;
-    ed.last_cursor_row = 0;
-    try ed.endPrompt("billy · m · /work");
-    try std.testing.expectEqualStrings("\x1b[2A\r\x1b[3M\r", out.written());
-    out.clearRetainingCapacity();
-    ed.width = 0;
-
-    ed.last_rows = 3;
-    ed.last_cursor_row = 1;
-    try ed.endPrompt("");
-    try std.testing.expectEqualStrings("\x1b[1A\r\x1b[3M\r", out.written());
-    out.clearRetainingCapacity();
-
-    ed.last_rows = 0;
-    ed.last_cursor_row = 0;
-    try ed.endPrompt("");
-    try std.testing.expectEqualStrings("", out.written());
+test "endPrompt erases the header and the line it heads" {
+    try expectEndPrompt("\x1b[1A\r\x1b[2M\r", "billy · m · /w", 0, 1, 0);
+    try expectEndPrompt("\x1b[3A\r\x1b[4M\r", "billy · m · /w", 0, 3, 2);
+    try expectEndPrompt("\x1b[2A\r\x1b[3M\r", "billy · m · /work", 10, 1, 0);
+    try expectEndPrompt("\x1b[1A\r\x1b[3M\r", "", 0, 3, 1);
+    try expectEndPrompt("", "", 0, 0, 0);
 }
 
 test "moveCursorVertical keeps its target column across rows" {

@@ -289,173 +289,101 @@ pub const marks = struct {
     pub const compacted = Writer.Mark{ .glyph = "⊟", .hue = .yellow };
 };
 
-test "a prompt is headed by the same block live and replayed" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
+fn expectPrompt(expected: []const u8, style: Writer.Style, text: []const u8) !void {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-
-    const plain: Writer = .{ .out = &out.writer };
-    try printPrompt(gpa, plain, "hello");
-    try std.testing.expectEqualStrings("» prompt\nhello\n\n", out.written());
-    out.clearRetainingCapacity();
-
-    const ansi: Writer = .{ .style = .ansi, .out = &out.writer };
-    try printPrompt(gpa, ansi, "**hello**");
-    try std.testing.expectEqualStrings(
-        "\x1b[34m»\x1b[0m \x1b[1mprompt\x1b[0m\n\x1b[1mhello\x1b[0m\n\n",
-        out.written(),
-    );
-}
-
-test "a streamed answer is written as it arrives, and is not written again" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var terminal = Terminal{ .writer = .{ .out = &out.writer }, .io = undefined, .scratch = gpa };
-    defer terminal.deinit();
-    const emit = terminal.emitter();
-
-    try emit.showDelta(.{ .content = "hel" });
-    try std.testing.expectEqualStrings("◆ answer\n", out.written());
-
-    // One paragraph, so nothing is a block yet: a block is only written once it has ended.
-    try emit.showDelta(.{ .content = "lo\n**world**\n" });
-    try std.testing.expectEqualStrings("◆ answer\n", out.written());
-
-    try emit.show(.{ .answer = "hello\n**world**\n" });
-    try std.testing.expectEqualStrings("◆ answer\nhello\nworld\n\n", out.written());
-}
-
-test "streamed reasoning is shown before the answer" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var terminal = Terminal{ .writer = .{ .out = &out.writer }, .io = undefined, .scratch = gpa };
-    defer terminal.deinit();
-    const emit = terminal.emitter();
-
-    try emit.showDelta(.{ .reasoning = "I should check.\n" });
-    try std.testing.expectEqualStrings("◇ reasoning\nI should check.\n", out.written());
-
-    try emit.showDelta(.{ .content = "hello\n" });
-    try std.testing.expectEqualStrings(
-        "◇ reasoning\nI should check.\n\n◆ answer\n",
-        out.written(),
-    );
-
-    try emit.show(.{ .answer = "hello\n" });
-    try std.testing.expectEqualStrings(
-        "◇ reasoning\nI should check.\n\n◆ answer\nhello\n\n",
-        out.written(),
-    );
-}
-
-test "reasoning is text like the answer, so the terminal runs none of it" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var terminal = Terminal{
-        .writer = .{ .style = .plain, .out = &out.writer },
-        .io = undefined,
-        .scratch = gpa,
-    };
-    defer terminal.deinit();
-    const emit = terminal.emitter();
-
-    try emit.showDelta(.{ .reasoning = "think\x1b]0;gone\x07\n" });
-    try std.testing.expectEqualStrings("◇ reasoning\nthink]0;gone\n", out.written());
-}
-
-test "reasoning is dim and the answer is not" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var terminal = Terminal{
-        .writer = .{ .style = .ansi, .out = &out.writer },
-        .io = undefined,
-        .scratch = gpa,
-    };
-    defer terminal.deinit();
-    const emit = terminal.emitter();
-
-    try emit.showDelta(.{ .reasoning = "think" });
-    try std.testing.expectEqualStrings(
-        "\x1b[35m◇\x1b[0m \x1b[1mreasoning\x1b[0m\n\x1b[2mthink",
-        out.written(),
-    );
-
-    try emit.showDelta(.{ .content = "hi" });
-    try std.testing.expectEqualStrings(
-        "\x1b[35m◇\x1b[0m \x1b[1mreasoning\x1b[0m\n\x1b[2mthink\x1b[0m\n\n" ++
-            "\x1b[32m◆\x1b[0m \x1b[1manswer\x1b[0m\n",
-        out.written(),
-    );
-}
-
-test "an answer with no fragments is written whole" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var terminal = Terminal{ .writer = .{ .out = &out.writer }, .io = undefined, .scratch = gpa };
-    defer terminal.deinit();
-
-    try terminal.emitter().show(.{ .answer = "**hi**" });
-    try std.testing.expectEqualStrings("◆ answer\nhi\n\n", out.written());
-}
-
-test "an answer that arrives as a block ends the reasoning before it" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var terminal = Terminal{ .writer = .{ .style = .ansi, .out = &out.writer }, .io = undefined, .scratch = gpa };
-    defer terminal.deinit();
-    const emit = terminal.emitter();
-
-    try emit.showDelta(.{ .reasoning = "think" });
-    try emit.show(.{ .answer = "done" });
-    try std.testing.expectEqualStrings(
-        "\x1b[35m◇\x1b[0m \x1b[1mreasoning\x1b[0m\n\x1b[2mthink\x1b[0m\n\n" ++
-            "\x1b[32m◆\x1b[0m \x1b[1manswer\x1b[0m\ndone\n\n",
-        out.written(),
-    );
-}
-
-fn expectTranscript(
-    expected: []const u8,
-    messages: []const llm.Message,
-    style: Writer.Style,
-) !void {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
-    defer session.deinit();
-    for (messages) |message| try session.append(message);
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    // Plain, since what these cover is how a message is headed and laid out rather than how a
-    // terminal decorates it.
-    var terminal = Terminal{
-        .writer = .{ .style = style, .out = &out.writer },
-        .io = io,
-        .scratch = gpa,
-    };
-    defer terminal.deinit();
-    try terminal.printTranscript(&session, 0);
+    try printPrompt(std.testing.allocator, .{ .style = style, .out = &out.writer }, text);
     try std.testing.expectEqualStrings(expected, out.written());
 }
 
+const Step = union(enum) {
+    delta: Agent.Delta,
+    block: Agent.Block,
+};
+
+fn expectEmitted(expected: []const []const u8, style: Writer.Style, steps: []const Step) !void {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var terminal = Terminal{ .writer = .{ .style = style, .out = &out.writer }, .io = undefined, .scratch = gpa };
+    defer terminal.deinit();
+    const emit = terminal.emitter();
+
+    try std.testing.expectEqual(expected.len, steps.len);
+    for (expected, steps) |want, step| {
+        switch (step) {
+            .delta => |delta| try emit.showDelta(delta),
+            .block => |block| try emit.show(block),
+        }
+        try std.testing.expectEqualStrings(want, out.written());
+    }
+}
+
+test "a prompt is headed by the same block live and replayed" {
+    try expectPrompt("» prompt\nhello\n\n", .plain, "hello");
+    try expectPrompt(
+        "\x1b[34m»\x1b[0m \x1b[1mprompt\x1b[0m\n\x1b[1mhello\x1b[0m\n\n",
+        .ansi,
+        "**hello**",
+    );
+}
+test "a streamed answer is written as it arrives, and is not written again" {
+    // One paragraph, so nothing is a block yet: a block is only written once it has ended.
+    try expectEmitted(&.{
+        "◆ answer\n",
+        "◆ answer\n",
+        "◆ answer\nhello\nworld\n\n",
+    }, .plain, &.{
+        .{ .delta = .{ .content = "hel" } },
+        .{ .delta = .{ .content = "lo\n**world**\n" } },
+        .{ .block = .{ .answer = "hello\n**world**\n" } },
+    });
+}
+test "streamed reasoning is shown before the answer" {
+    try expectEmitted(&.{
+        "◇ reasoning\nI should check.\n",
+        "◇ reasoning\nI should check.\n\n◆ answer\n",
+        "◇ reasoning\nI should check.\n\n◆ answer\nhello\n\n",
+    }, .plain, &.{
+        .{ .delta = .{ .reasoning = "I should check.\n" } },
+        .{ .delta = .{ .content = "hello\n" } },
+        .{ .block = .{ .answer = "hello\n" } },
+    });
+}
+test "reasoning is text like the answer, so the terminal runs none of it" {
+    try expectEmitted(
+        &.{"◇ reasoning\nthink]0;gone\n"},
+        .plain,
+        &.{.{ .delta = .{ .reasoning = "think\x1b]0;gone\x07\n" } }},
+    );
+}
+test "reasoning is dim and the answer is not" {
+    try expectEmitted(&.{
+        "\x1b[35m◇\x1b[0m \x1b[1mreasoning\x1b[0m\n\x1b[2mthink",
+        "\x1b[35m◇\x1b[0m \x1b[1mreasoning\x1b[0m\n\x1b[2mthink\x1b[0m\n\n" ++
+            "\x1b[32m◆\x1b[0m \x1b[1manswer\x1b[0m\n",
+    }, .ansi, &.{
+        .{ .delta = .{ .reasoning = "think" } },
+        .{ .delta = .{ .content = "hi" } },
+    });
+}
+test "an answer with no fragments is written whole" {
+    try expectEmitted(
+        &.{"◆ answer\nhi\n\n"},
+        .plain,
+        &.{.{ .block = .{ .answer = "**hi**" } }},
+    );
+}
+test "an answer that arrives as a block ends the reasoning before it" {
+    try expectEmitted(&.{
+        "\x1b[35m◇\x1b[0m \x1b[1mreasoning\x1b[0m\n\x1b[2mthink",
+        "\x1b[35m◇\x1b[0m \x1b[1mreasoning\x1b[0m\n\x1b[2mthink\x1b[0m\n\n" ++
+            "\x1b[32m◆\x1b[0m \x1b[1manswer\x1b[0m\ndone\n\n",
+    }, .ansi, &.{
+        .{ .delta = .{ .reasoning = "think" } },
+        .{ .block = .{ .answer = "done" } },
+    });
+}
 test "a transcript shows only the last blocks and counts the rest" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
@@ -496,6 +424,36 @@ test "a transcript shows only the last blocks and counts the rest" {
     try terminal.printTranscript(&session, 0);
     try std.testing.expect(std.mem.find(u8, out.written(), "earlier blocks") == null);
     try std.testing.expect(std.mem.startsWith(u8, out.written(), "» prompt\none\n\n"));
+}
+
+fn expectTranscript(
+    expected: []const u8,
+    messages: []const llm.Message,
+    style: Writer.Style,
+) !void {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
+    defer session.deinit();
+    for (messages) |message| try session.append(message);
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // Plain, since what these cover is how a message is headed and laid out rather than how a
+    // terminal decorates it.
+    var terminal = Terminal{
+        .writer = .{ .style = style, .out = &out.writer },
+        .io = io,
+        .scratch = gpa,
+    };
+    defer terminal.deinit();
+    try terminal.printTranscript(&session, 0);
+    try std.testing.expectEqualStrings(expected, out.written());
 }
 
 test "a transcript replays a conversation as the blocks it was made of" {

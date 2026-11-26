@@ -445,22 +445,18 @@ const Web = enum { with_web, without_web };
 const specs = specList(.without_web);
 const specs_with_web = specList(.with_web);
 
+fn expectBash(result: []const u8, code: []const u8, stdout: []const u8, stderr: []const u8) !void {
+    const output = bashOutput(result) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(code, output.exit.code);
+    try std.testing.expectEqual(std.mem.eql(u8, code, "0"), output.exit.ok);
+    try std.testing.expectEqualStrings(stdout, output.stdout);
+    try std.testing.expectEqualStrings(stderr, output.stderr);
+}
+
 test "a bash result splits into its status and its streams" {
-    const failed = bashOutput("exit code: 2\nbuilt\nstderr:\nboom\n").?;
-    try std.testing.expectEqualStrings("2", failed.exit.code);
-    try std.testing.expect(!failed.exit.ok);
-    try std.testing.expectEqualStrings("built", failed.stdout);
-    try std.testing.expectEqualStrings("boom\n", failed.stderr);
-
-    const ok = bashOutput("exit code: 0\nhello\n").?;
-    try std.testing.expectEqualStrings("0", ok.exit.code);
-    try std.testing.expect(ok.exit.ok);
-    try std.testing.expectEqualStrings("hello\n", ok.stdout);
-    try std.testing.expectEqualStrings("", ok.stderr);
-
-    const quiet = bashOutput("exit code: 0\n(no output)\n").?;
-    try std.testing.expectEqualStrings("", quiet.stdout);
-    try std.testing.expectEqualStrings("", quiet.stderr);
+    try expectBash("exit code: 2\nbuilt\nstderr:\nboom\n", "2", "built", "boom\n");
+    try expectBash("exit code: 0\nhello\n", "0", "hello\n", "");
+    try expectBash("exit code: 0\n(no output)\n", "0", "", "");
 }
 
 test "a bash command that outlives the timeout is killed and reported" {

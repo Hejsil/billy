@@ -1146,6 +1146,13 @@ fn writeRawAt(
     });
 }
 
+fn expectListed(dir: std.Io.Dir, expected: []const []const u8) !void {
+    const listed = try listIn(dir, std.testing.io, std.testing.allocator);
+    defer freeList(listed, std.testing.allocator);
+    try std.testing.expectEqual(expected.len, listed.len);
+    for (expected, listed) |want, got| try std.testing.expectEqualStrings(want, got.id);
+}
+
 test "the sessions in a directory are listed by when they were written" {
     const gpa = std.testing.allocator;
 
@@ -1170,14 +1177,8 @@ test "the sessions in a directory are listed by when they were written" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad name", .data = "x" });
     try tmp.dir.createDirPath(std.testing.io, "a-directory");
 
-    const ids = try listIn(tmp.dir, std.testing.io, std.testing.allocator);
-    defer freeList(ids, std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 3), ids.len);
-    try std.testing.expectEqualStrings("dev", ids[0].id);
-    try std.testing.expectEqualStrings(newest_id, ids[1].id);
-    try std.testing.expectEqualStrings(oldest, ids[2].id);
+    try expectListed(tmp.dir, &.{ "dev", newest_id, oldest });
 }
-
 test "the directory a session was started in is written at the front" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1227,21 +1228,16 @@ test "the ordering keeps each id with the time it was written at" {
     // times along with the ids rather than reorder one list on its own.
     const count = 6;
     var buffers: [count][max_id_len]u8 = undefined;
+    var expected: [count][]const u8 = undefined;
     for (0..count) |i| {
         const made = buffers[i][0..ulid.length];
         ulid.encode(made, 1_700_000_000_000 + @as(u48, @intCast(i)), @splat(0));
+        expected[i] = made;
         try writeSessionAt(&tmp, gpa, made, @intCast(1_000 + (count - 1 - i) * 1_000));
     }
 
-    const ids = try listIn(tmp.dir, std.testing.io, std.testing.allocator);
-    defer freeList(ids, std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, count), ids.len);
-    for (ids, 0..) |listed, position| {
-        try std.testing.expectEqualStrings(buffers[position][0..ulid.length], listed.id);
-    }
+    try expectListed(tmp.dir, &expected);
 }
-
 test "sessions written at the same moment are ordered by their ids" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -1256,13 +1252,8 @@ test "sessions written at the same moment are ordered by their ids" {
         try writeSessionAt(&tmp, gpa, made, 1_000);
     }
 
-    const ids = try listIn(tmp.dir, std.testing.io, std.testing.allocator);
-    defer freeList(ids, std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), ids.len);
-    try std.testing.expectEqualStrings(newer_buf[0..ulid.length], ids[0].id);
-    try std.testing.expectEqualStrings(older_buf[0..ulid.length], ids[1].id);
+    try expectListed(tmp.dir, &.{ newer_buf[0..ulid.length], older_buf[0..ulid.length] });
 }
-
 test "a file that is not a session is left out without disturbing the order" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -1275,22 +1266,14 @@ test "a file that is not a session is left out without disturbing the order" {
     try writeSessionAt(&tmp, gpa, "c", 4_000);
     try writeSessionAt(&tmp, gpa, "d", 5_000);
 
-    const listed = try listIn(tmp.dir, std.testing.io, gpa);
-    defer freeList(listed, gpa);
-    try std.testing.expectEqual(@as(usize, 4), listed.len);
-    const expected = [_][]const u8{ "d", "c", "b", "a" };
-    for (listed, expected) |entry, want| try std.testing.expectEqualStrings(want, entry.id);
+    try expectListed(tmp.dir, &.{ "d", "c", "b", "a" });
 }
-
 test "an empty sessions directory lists nothing" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    const ids = try listIn(tmp.dir, std.testing.io, std.testing.allocator);
-    defer freeList(ids, std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), ids.len);
+    try expectListed(tmp.dir, &.{});
 }
-
 test "a listing carries each session's title" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
