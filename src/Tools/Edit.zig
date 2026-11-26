@@ -304,16 +304,16 @@ test "text that appears more than once is ambiguous unless replace_all" {
     try expectReplaceAll("a = 2;\na = 2;\n", contents, "a = 1;", "a = 2;");
 }
 
+fn expectNotFound(haystack: []const u8, needle: []const u8) !void {
+    switch (try replace(std.testing.allocator, haystack, needle, "q", .one)) {
+        .not_found => {},
+        else => return error.TestExpectedNoMatch,
+    }
+}
+
 test "text that is not in the haystack is not found" {
-    const gpa = std.testing.allocator;
-    switch (try replace(gpa, "abc\ndef\n", "xyz", "q", .one)) {
-        .not_found => {},
-        else => return error.TestExpectedNoMatch,
-    }
-    switch (try replace(gpa, "def\nabc\n", "abc\ndef\n", "q", .one)) {
-        .not_found => {},
-        else => return error.TestExpectedNoMatch,
-    }
+    try expectNotFound("abc\ndef\n", "xyz");
+    try expectNotFound("def\nabc\n", "abc\ndef\n");
 }
 
 test "trailing whitespace and the line ending are ignored when exact fails" {
