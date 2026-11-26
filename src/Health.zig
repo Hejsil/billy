@@ -104,56 +104,64 @@ test "retryAfterMs reads the seconds form and ignores the rest" {
     try std.testing.expect(retryAfterMs("HTTP/1.1 429\r\nRetry-After: Wed, 21 Oct 2026 07:28:00 GMT\r\n\r\n") == null);
 }
 
+fn expectSkipped(health: *Health, name: []const u8, now_ms: i64) !void {
+    try std.testing.expect(health.skips(name, now_ms));
+}
+
+fn expectNotSkipped(health: *Health, name: []const u8, now_ms: i64) !void {
+    try std.testing.expect(!health.skips(name, now_ms));
+}
+
+fn expectWait(failures: u32, expected: i64) !void {
+    try std.testing.expectEqual(expected, waitFor(failures));
+}
+
 test "a failed backend is skipped until its wait is over" {
     const gpa = std.testing.allocator;
     var health = Health{ .io = std.testing.io, .gpa = gpa };
     defer health.deinit();
 
-    try std.testing.expect(!health.skips("a", 1000));
+    try health.expectNotSkipped("a", 1000);
 
     health.record("a", null, 1000);
-    try std.testing.expect(health.skips("a", 1000));
-    try std.testing.expect(health.skips("a", 1000 + base_wait_ms - 1));
-    try std.testing.expect(!health.skips("a", 1000 + base_wait_ms));
-    try std.testing.expect(!health.skips("b", 0));
+    try health.expectSkipped("a", 1000);
+    try health.expectSkipped("a", 1000 + base_wait_ms - 1);
+    try health.expectNotSkipped("a", 1000 + base_wait_ms);
+    try health.expectNotSkipped("b", 0);
 }
-
 test "a backend that answers is cleared" {
     const gpa = std.testing.allocator;
     var health = Health{ .io = std.testing.io, .gpa = gpa };
     defer health.deinit();
 
     health.record("a", null, 1000);
-    try std.testing.expect(health.skips("a", 1000));
+    try health.expectSkipped("a", 1000);
 
     health.clear("a");
-    try std.testing.expect(!health.skips("a", 1000));
+    try health.expectNotSkipped("a", 1000);
 }
-
 test "a backend that asks to be waited for is set aside for what it asked" {
     const gpa = std.testing.allocator;
     var health = Health{ .io = std.testing.io, .gpa = gpa };
     defer health.deinit();
 
     health.record("a", 5_000, 0);
-    try std.testing.expect(health.skips("a", 4_999));
-    try std.testing.expect(!health.skips("a", 5_000));
+    try health.expectSkipped("a", 4_999);
+    try health.expectNotSkipped("a", 5_000);
 
     // One longer than the cap is brought back to it, so a backend cannot set billy aside for longer
     // than the longest wait.
     health.record("a", max_wait_ms * 10, 0);
-    try std.testing.expect(health.skips("a", max_wait_ms - 1));
-    try std.testing.expect(!health.skips("a", max_wait_ms));
+    try health.expectSkipped("a", max_wait_ms - 1);
+    try health.expectNotSkipped("a", max_wait_ms);
 }
-
 test "a backend is set aside for longer with each failure, up to the cap" {
-    try std.testing.expectEqual(base_wait_ms, waitFor(1));
-    try std.testing.expectEqual(base_wait_ms * 2, waitFor(2));
-    try std.testing.expectEqual(base_wait_ms * 4, waitFor(3));
+    try expectWait(1, base_wait_ms);
+    try expectWait(2, base_wait_ms * 2);
+    try expectWait(3, base_wait_ms * 4);
     // It never grows past the cap, however many failures there are in a row.
-    try std.testing.expectEqual(max_wait_ms, waitFor(100));
+    try expectWait(100, max_wait_ms);
 }
-
 test "only a recorded name is kept, and then only once" {
     const gpa = std.testing.allocator;
     var health = Health{ .io = std.testing.io, .gpa = gpa };
@@ -168,11 +176,10 @@ test "only a recorded name is kept, and then only once" {
     health.record("brave", null, 0);
     health.record("tavily", null, 0);
     try std.testing.expectEqual(@as(usize, 2), health.waits.count());
-    try std.testing.expect(health.skips("tavily", 0));
-    try std.testing.expect(!health.skips("tavilyx", 0));
-    try std.testing.expect(!health.skips("tavil", 0));
+    try health.expectSkipped("tavily", 0);
+    try health.expectNotSkipped("tavilyx", 0);
+    try health.expectNotSkipped("tavil", 0);
 }
-
 test "the optional helpers do nothing without a table, and act on one" {
     try std.testing.expect(!isSetAside(null, "a", 0));
     recordFailure(null, "a", null, 0);

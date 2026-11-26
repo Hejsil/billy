@@ -61,9 +61,13 @@ pub fn exitCode(term: std.process.Child.Term) u8 {
     };
 }
 
+fn expectExit(term: std.process.Child.Term, expected: u8) !void {
+    try std.testing.expectEqual(expected, exitCode(term));
+}
+
 test "exit codes of signals follow the shell convention" {
-    try std.testing.expectEqual(0, exitCode(.{ .exited = 0 }));
-    try std.testing.expectEqual(1, exitCode(.{ .exited = 1 }));
-    try std.testing.expectEqual(130, exitCode(.{ .signal = .INT }));
-    try std.testing.expectEqual(143, exitCode(.{ .signal = .TERM }));
+    try expectExit(.{ .exited = 0 }, 0);
+    try expectExit(.{ .exited = 1 }, 1);
+    try expectExit(.{ .signal = .INT }, 130);
+    try expectExit(.{ .signal = .TERM }, 143);
 }

@@ -2529,90 +2529,87 @@ test "a client is made for a provider the configuration defines itself" {
     try std.testing.expectEqualStrings("qwen3-coder:30b", client.model);
 }
 
-test "a model as a header shows it carries the choice and the window of its model" {
-    const known = modelOf("opencode-go/kimi-k2.7-code", &models.test_catalog);
-    try std.testing.expectEqualStrings("opencode-go/kimi-k2.7-code", known.choice);
-    try std.testing.expectEqual(@as(usize, 262_144), known.info.?.context_window);
-
-    const bare = modelOf("kimi-k2.7-code", &models.test_catalog);
-    try std.testing.expectEqualStrings("kimi-k2.7-code", bare.choice);
-    try std.testing.expectEqual(@as(usize, 262_144), bare.info.?.context_window);
-
-    try std.testing.expect(modelOf("test/m", &models.test_catalog).info == null);
+fn expectModel(choice: []const u8, expected: ?usize) !void {
+    const shown = modelOf(choice, &models.test_catalog);
+    try std.testing.expectEqualStrings(choice, shown.choice);
+    if (expected) |window| {
+        try std.testing.expectEqual(window, shown.info.?.context_window);
+    } else {
+        try std.testing.expect(shown.info == null);
+    }
 }
 
+fn expectBaseUrl(providers: Config.Providers, provider: []const u8, expected: ?[]const u8) !void {
+    const found = baseUrlOf(providers, &models.test_catalog, provider);
+    if (expected) |want| {
+        try std.testing.expect(found != null);
+        try std.testing.expectEqualStrings(want, found.?);
+    } else {
+        try std.testing.expect(found == null);
+    }
+}
+
+fn expectCompletions(base: []const u8, expected: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try std.testing.expectEqualStrings(expected, try completionsUrl(arena_state.allocator(), base));
+}
+
+fn expectUnreachable(err: anyerror, choice: []const u8, expected: []const u8) !void {
+    var buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(expected, unreachableModel(&buffer, err, choice));
+}
+
+test "a model as a header shows it carries the choice and the window of its model" {
+    try expectModel("opencode-go/kimi-k2.7-code", 262_144);
+    try expectModel("kimi-k2.7-code", 262_144);
+    try expectModel("test/m", null);
+}
 test "the endpoint comes from the provider the file or the catalog names" {
     const none: Config.Providers = .{};
-
-    try std.testing.expectEqualStrings(
-        "https://api.deepseek.com",
-        baseUrlOf(none, &models.test_catalog, "deepseek").?,
-    );
-    try std.testing.expectEqualStrings(
-        "https://opencode.ai/zen/go/v1",
-        baseUrlOf(none, &models.test_catalog, "opencode-go").?,
-    );
+    try expectBaseUrl(none, "deepseek", "https://api.deepseek.com");
+    try expectBaseUrl(none, "opencode-go", "https://opencode.ai/zen/go/v1");
 
     const defined: Config.Providers = .{ .entries = &.{
         .{ .name = "mock", .base_url = "http://127.0.0.1:8901/v1" },
     } };
-    try std.testing.expectEqualStrings("http://127.0.0.1:8901/v1", baseUrlOf(defined, &models.test_catalog, "mock").?);
+    try expectBaseUrl(defined, "mock", "http://127.0.0.1:8901/v1");
 
     const overriding: Config.Providers = .{ .entries = &.{
         .{ .name = "deepseek", .base_url = "http://127.0.0.1:9/v1" },
     } };
-    try std.testing.expectEqualStrings(
-        "http://127.0.0.1:9/v1",
-        baseUrlOf(overriding, &models.test_catalog, "deepseek").?,
-    );
+    try expectBaseUrl(overriding, "deepseek", "http://127.0.0.1:9/v1");
 }
-
 test "a provider the configuration does not name is refused, not defaulted" {
     const none: Config.Providers = .{};
     // A typo would otherwise send the conversation to whichever endpoint billy fell back on, which
     // is worse than failing: the request would go somewhere the user did not name.
-    try std.testing.expect(baseUrlOf(none, &models.test_catalog, "who-knows") == null);
+    try expectBaseUrl(none, "who-knows", null);
     // A choice with no provider part names no provider, which is no address either.
-    try std.testing.expect(baseUrlOf(none, &models.test_catalog, "") == null);
+    try expectBaseUrl(none, "", null);
 
     const defined: Config.Providers = .{ .entries = &.{
         .{ .name = "who-knows", .base_url = "http://127.0.0.1:8901/v1" },
     } };
-    try std.testing.expectEqualStrings("http://127.0.0.1:8901/v1", baseUrlOf(defined, &models.test_catalog, "who-knows").?);
+    try expectBaseUrl(defined, "who-knows", "http://127.0.0.1:8901/v1");
 }
-
 test "the completions path is appended once, whatever the base carries" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    try std.testing.expectEqualStrings(
-        "https://api.deepseek.com/chat/completions",
-        try completionsUrl(arena, "https://api.deepseek.com"),
-    );
-    try std.testing.expectEqualStrings(
-        "https://api.deepseek.com/chat/completions",
-        try completionsUrl(arena, "https://api.deepseek.com/"),
-    );
-    try std.testing.expectEqualStrings(
-        "http://127.0.0.1:8901/v1/chat/completions",
-        try completionsUrl(arena, "http://127.0.0.1:8901/v1"),
-    );
+    try expectCompletions("https://api.deepseek.com", "https://api.deepseek.com/chat/completions");
+    try expectCompletions("https://api.deepseek.com/", "https://api.deepseek.com/chat/completions");
+    try expectCompletions("http://127.0.0.1:8901/v1", "http://127.0.0.1:8901/v1/chat/completions");
 }
-
 test "what is wrong with a model is said with what to do about it" {
-    var buffer: [256]u8 = undefined;
-
-    try std.testing.expectEqualStrings(
+    try expectUnreachable(
+        error.MissingApiKey,
+        "deepseek/deepseek-flash",
         "the model deepseek/deepseek-flash cannot be reached: no key is stored for 'deepseek'" ++
             " — run `billy login deepseek` to store one",
-        unreachableModel(&buffer, error.MissingApiKey, "deepseek/deepseek-flash"),
     );
-
-    try std.testing.expectEqualStrings(
+    try expectUnreachable(
+        error.UnknownProvider,
+        "who-knows/m",
         "the model who-knows/m cannot be reached: name its address under `providers`" ++
             " in the configuration, or run `billy models --refresh`",
-        unreachableModel(&buffer, error.UnknownProvider, "who-knows/m"),
     );
 
     // A buffer too small for the sentence loses it rather than the message: what is shown still
@@ -2620,7 +2617,6 @@ test "what is wrong with a model is said with what to do about it" {
     var small: [8]u8 = undefined;
     try std.testing.expect(std.mem.startsWith(u8, unreachableModel(&small, error.MissingApiKey, "a/b"), "the model cannot be reached"));
 }
-
 test "a client names bytes of its own, not a slice of the session's pool" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
