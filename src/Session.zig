@@ -865,16 +865,23 @@ fn expectSessionConvo(session: *const Session, expected: []const llm.Message) !v
 }
 
 fn expectResume(messages: []const llm.Message) !void {
+    try expectReopen(messages, messages);
+}
+
+/// Writes `opened` out as it stands, even when a call has no result, and reads it back: where a
+/// resume repairs what a killed run left.
+fn expectReopen(opened: []const llm.Message, expected: []const llm.Message) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var session = try newTestSession(&tmp);
     defer session.deinit();
-    for (messages) |message| try session.append(message);
+    for (opened) |message| try session.append(message);
+    try session.save();
 
     var resumed = try reopenTestSession(&tmp, session.id());
     defer resumed.deinit();
-    try resumed.expectSessionConvo(messages);
+    try resumed.expectSessionConvo(expected);
 }
 
 fn expectRequestJson(session: *const Session, extra: []const llm.Message, expected: []const u8) !void {
@@ -1435,64 +1442,50 @@ test "a session survives a save and resume" {
 }
 
 test "a resume answers a tool call a killed run left open" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var session = try newTestSession(&tmp);
-    defer session.deinit();
-
-    try session.append(.{ .role = .user, .content = "hello" });
-    try session.append(.{ .role = .assistant, .tool_calls = &.{.{
-        .id = "call_1",
-        .function = .{ .name = "bash", .arguments = "{}" },
-    }} });
-    // Written whatever state the conversation is in, which is what an older billy
-    // left when a run was killed between a call and its result.
-    try session.save();
-
-    var resumed = try reopenTestSession(&tmp, session.id());
-    defer resumed.deinit();
-    try resumed.expectSessionConvo(&.{
-        .{ .role = .user, .content = "hello" },
-        .{ .role = .assistant, .tool_calls = &.{.{
-            .id = "call_1",
-            .function = .{ .name = "bash", .arguments = "{}" },
-        }} },
-        .{ .role = .tool, .tool_call_id = "call_1", .content = interrupted_result },
-    });
+    try expectReopen(
+        &.{
+            .{ .role = .user, .content = "hello" },
+            .{ .role = .assistant, .tool_calls = &.{.{
+                .id = "call_1",
+                .function = .{ .name = "bash", .arguments = "{}" },
+            }} },
+        },
+        &.{
+            .{ .role = .user, .content = "hello" },
+            .{ .role = .assistant, .tool_calls = &.{.{
+                .id = "call_1",
+                .function = .{ .name = "bash", .arguments = "{}" },
+            }} },
+            .{ .role = .tool, .tool_call_id = "call_1", .content = interrupted_result },
+        },
+    );
 }
 
 test "a resume answers every call a kill left open, in the order made" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var session = try newTestSession(&tmp);
-    defer session.deinit();
-
-    try session.append(.{ .role = .user, .content = "go" });
-    try session.append(.{ .role = .assistant, .tool_calls = &.{
-        .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{}" } },
-        .{ .id = "call_2", .function = .{ .name = "read", .arguments = "{}" } },
-    } });
-    try session.append(.{ .role = .tool, .tool_call_id = "call_1", .content = "the first result" });
-    try session.append(.{ .role = .user, .content = "still there?" });
-    // As an older billy left it: one call answered, one lost, and a line typed after.
-    try session.save();
-
-    // The result the file held stays with its call, and the call it lost is answered in the place
-    // it was made rather than after the user message.
-    var resumed = try reopenTestSession(&tmp, session.id());
-    defer resumed.deinit();
-    try resumed.expectSessionConvo(&.{
-        .{ .role = .user, .content = "go" },
-        .{ .role = .assistant, .tool_calls = &.{
-            .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{}" } },
-            .{ .id = "call_2", .function = .{ .name = "read", .arguments = "{}" } },
-        } },
-        .{ .role = .tool, .tool_call_id = "call_1", .content = "the first result" },
-        .{ .role = .tool, .tool_call_id = "call_2", .content = interrupted_result },
-        .{ .role = .user, .content = "still there?" },
-    });
+    // As an older billy left it: one call answered, one lost, and a line typed after. The result the
+    // file held stays with its call, and the call it lost is answered in the place it was made
+    // rather than after the user message.
+    try expectReopen(
+        &.{
+            .{ .role = .user, .content = "go" },
+            .{ .role = .assistant, .tool_calls = &.{
+                .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{}" } },
+                .{ .id = "call_2", .function = .{ .name = "read", .arguments = "{}" } },
+            } },
+            .{ .role = .tool, .tool_call_id = "call_1", .content = "the first result" },
+            .{ .role = .user, .content = "still there?" },
+        },
+        &.{
+            .{ .role = .user, .content = "go" },
+            .{ .role = .assistant, .tool_calls = &.{
+                .{ .id = "call_1", .function = .{ .name = "read", .arguments = "{}" } },
+                .{ .id = "call_2", .function = .{ .name = "read", .arguments = "{}" } },
+            } },
+            .{ .role = .tool, .tool_call_id = "call_1", .content = "the first result" },
+            .{ .role = .tool, .tool_call_id = "call_2", .content = interrupted_result },
+            .{ .role = .user, .content = "still there?" },
+        },
+    );
 }
 
 test "a resume leaves a finished conversation alone" {

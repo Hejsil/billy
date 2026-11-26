@@ -282,24 +282,24 @@ fn isWide(cp: u21) bool {
 }
 
 test "a column is a character, and malformed text counts bytes" {
-    try std.testing.expectEqual(0, columns(""));
-    try std.testing.expectEqual(4, columns("a\u{e9}\u{20ac}b"));
-    try std.testing.expectEqual(2, columns("\xff\xff"));
+    try expectColumns("", 0);
+    try expectColumns("a\u{e9}\u{20ac}b", 4);
+    try expectColumns("\xff\xff", 2);
 }
 
 test "a wide character is two columns, a narrow one is one" {
-    try std.testing.expectEqual(2, columns("漢"));
-    try std.testing.expectEqual(4, columns("漢字"));
-    try std.testing.expectEqual(2, columns("\u{1f600}"));
-    try std.testing.expectEqual(3, columns("a漢"));
-    try std.testing.expectEqual(2, columns("\u{3042}"));
-    try std.testing.expectEqual(2, columns("\u{ff21}"));
-    try std.testing.expectEqual(1, columns("·"));
+    try expectColumns("漢", 2);
+    try expectColumns("漢字", 4);
+    try expectColumns("\u{1f600}", 2);
+    try expectColumns("a漢", 3);
+    try expectColumns("\u{3042}", 2);
+    try expectColumns("\u{ff21}", 2);
+    try expectColumns("·", 1);
 }
 
 test "an ANSI escape takes no column" {
-    try std.testing.expectEqual(0, columns("\x1b[31m\x1b[0m"));
-    try std.testing.expectEqual(5, columns("\x1b[1mbilly\x1b[0m"));
+    try expectColumns("\x1b[31m\x1b[0m", 0);
+    try expectColumns("\x1b[1mbilly\x1b[0m", 5);
 }
 
 test "columnOffset is the inverse of columns" {
@@ -334,20 +334,20 @@ test "columnOffset is the inverse of columns" {
             i = next;
             col += width;
         }
-        try std.testing.expectEqual(col, columns(text));
+        try expectColumns(text, col);
     }
 }
 
 test "a character is a grapheme cluster, not a codepoint" {
-    try std.testing.expectEqual(1, columns("e\u{0301}"));
-    try std.testing.expectEqual("e\u{0301}".len, charLen("e\u{0301}x"));
-    try std.testing.expectEqual(2, columns("\u{1f44d}\u{1f3fd}"));
+    try expectColumns("e\u{0301}", 1);
+    try expectCharLen("e\u{0301}x", "e\u{0301}".len);
+    try expectColumns("\u{1f44d}\u{1f3fd}", 2);
     try std.testing.expectEqualStrings("\u{1f44d}\u{1f3fd}", "\u{1f44d}\u{1f3fd}"[0..charLen("\u{1f44d}\u{1f3fd}")]);
     const family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
-    try std.testing.expectEqual(family.len, charLen(family ++ "x"));
-    try std.testing.expectEqual(2, columns(family));
+    try expectCharLen(family ++ "x", family.len);
+    try expectColumns(family, 2);
     const flag = "\u{1f1ee}\u{1f1f9}";
-    try std.testing.expectEqual(flag.len, charLen(flag ++ "x"));
+    try expectCharLen(flag ++ "x", flag.len);
 }
 
 test "stepping back is the mirror of stepping forward" {
@@ -371,6 +371,14 @@ test "stepping back is the mirror of stepping forward" {
         }
         try std.testing.expectEqual(text.len, i);
     }
+}
+
+fn expectColumns(text: []const u8, expected: usize) !void {
+    try std.testing.expectEqual(expected, columns(text));
+}
+
+fn expectCharLen(text: []const u8, expected: usize) !void {
+    try std.testing.expectEqual(expected, charLen(text));
 }
 
 fn expectWrapped(expected: []const u8, text: []const u8, width: usize) !void {
