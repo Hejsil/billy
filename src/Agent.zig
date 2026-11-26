@@ -897,7 +897,7 @@ test "a model that cannot be resolved is a notice, and asks nothing" {
     var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
 
-    var out: std.Io.Writer.Allocating = .init(gpa);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     var terminal = testTerminal(.{ .out = &out.writer });
     defer terminal.deinit();
@@ -1252,7 +1252,7 @@ test "a conversation that has filled the window is summarized in place of itself
     var agent = try testAgent(io, gpa, setup, &http_client);
     defer agent.deinit();
 
-    var out: std.Io.Writer.Allocating = .init(gpa);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     var terminal = testTerminal(.{ .out = &out.writer });
     var client = try agent.clientFor(&session);
@@ -1342,7 +1342,7 @@ test "a summary is written into the conversation and announced" {
     var agent = try testAgent(io, gpa, setup, &http_client);
     defer agent.deinit();
 
-    var out: std.Io.Writer.Allocating = .init(gpa);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     var terminal = testTerminal(.{ .out = &out.writer });
     var client = try agent.clientFor(&session);
@@ -1468,7 +1468,7 @@ test "a first prompt gives the session its prompt and tools, and is asked as typ
     var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
 
-    var out: std.Io.Writer.Allocating = .init(gpa);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     var terminal = testTerminal(.{ .out = &out.writer });
     const waiting = try agent.take(terminal.emitter(), &session, "do the thing");
@@ -1494,7 +1494,7 @@ test "a prompt after the first leaves the session as it was set up" {
     var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
 
-    var out: std.Io.Writer.Allocating = .init(gpa);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     var terminal = testTerminal(.{ .out = &out.writer });
 
@@ -1523,7 +1523,7 @@ test "the model command says where the session is sent, and moves it there" {
     var agent = try testAgent(io, gpa, setup, null);
     defer agent.deinit();
 
-    var out: std.Io.Writer.Allocating = .init(gpa);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     var terminal = testTerminal(.{ .out = &out.writer });
 
@@ -1559,7 +1559,7 @@ test "a model chosen mid-session is the one the session is resumed with" {
 
     try session.append(.{ .role = .user, .content = "hello" });
 
-    var out: std.Io.Writer.Allocating = .init(gpa);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     var terminal = testTerminal(.{ .out = &out.writer });
 
@@ -1601,7 +1601,7 @@ test "the cwd command moves the session, its tools and its prompt" {
     try std.testing.expect(std.mem.find(u8, session.systemPrompt().?, "ROOT RULES") != null);
     try session.append(.{ .role = .user, .content = "hello" });
 
-    var out: std.Io.Writer.Allocating = .init(gpa);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     var terminal = testTerminal(.{ .out = &out.writer });
 
@@ -1662,7 +1662,7 @@ test "the cwd command writes no session that has not been asked anything" {
     var agent = try testAgentIn(io, gpa, setup, root, null);
     defer agent.deinit();
 
-    var out: std.Io.Writer.Allocating = .init(gpa);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     var terminal = testTerminal(.{ .out = &out.writer });
 
@@ -1693,7 +1693,7 @@ test "the model command can move a session off a model that cannot be reached" {
     // itself.
     try session.setModel("who-knows/m");
 
-    var out: std.Io.Writer.Allocating = .init(gpa);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     var terminal = testTerminal(.{ .out = &out.writer });
 
@@ -1806,19 +1806,71 @@ const Recorder = struct {
     }
 };
 
+/// A session, an agent and a recorder against a mock, closed in reverse order, besides a temp dir.
+const Harness = struct {
+    tmp: std.testing.TmpDir,
+    recorder_state: std.heap.ArenaAllocator,
+    http_client: std.http.Client,
+    setup: TestSetup,
+    session: Session,
+    agent: Agent,
+    recorder: Recorder,
+
+    fn init(harness: *Harness) !void {
+        const gpa = std.testing.allocator;
+        const io = std.testing.io;
+
+        harness.tmp = std.testing.tmpDir(.{});
+        errdefer harness.tmp.cleanup();
+
+        harness.recorder_state = std.heap.ArenaAllocator.init(gpa);
+        errdefer harness.recorder_state.deinit();
+
+        harness.http_client = .{ .allocator = gpa, .io = io };
+        errdefer harness.http_client.deinit();
+
+        harness.setup = try TestSetup.init(gpa, "m");
+        errdefer harness.setup.deinit();
+
+        harness.session = try Session.open(io, harness.tmp.dir, gpa, null, "/work");
+        errdefer harness.session.deinit();
+
+        harness.agent = try testAgent(io, gpa, harness.setup, &harness.http_client);
+        errdefer harness.agent.deinit();
+
+        harness.recorder = .{ .gpa = harness.recorder_state.allocator() };
+    }
+
+    fn deinit(harness: *Harness) void {
+        harness.agent.deinit();
+        harness.session.deinit();
+        harness.setup.deinit();
+        harness.http_client.deinit();
+        harness.recorder_state.deinit();
+        harness.tmp.cleanup();
+    }
+
+    fn run(harness: *Harness) !void {
+        var client = try harness.agent.clientFor(&harness.session);
+        try harness.agent.turn(harness.recorder.emitter(), &harness.session, &client);
+    }
+};
+
+fn expectSeen(recorder: *const Recorder, expected: []const Recorder.Seen) !void {
+    try std.testing.expectEqual(expected.len, recorder.seen.items.len);
+    for (expected, recorder.seen.items) |want, got| try std.testing.expectEqualDeep(want, got);
+}
+
+fn expectFragments(fragments: []const Recorder.Fragment, expected: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, fragments.len);
+    for (expected, fragments) |want, got| try std.testing.expectEqualStrings(want, got.text);
+}
+
 test "a turn shows the tool it runs and then the answer" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-
-    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
-    defer session.deinit();
-    try session.setSystemPrompt("be terse");
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    try harness.session.setSystemPrompt("be terse");
 
     const answering = struct {
         fn answer(_: usize, body: []const u8) Mock.Answer {
@@ -1845,20 +1897,9 @@ test "a turn shows the tool it runs and then the answer" {
     var mock = try Mock.start("/chat/completions", 2, answering);
     defer mock.deinit();
     try mock.serve();
+    harness.setup.pointAt("test", mock.url);
 
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
-    var setup = try TestSetup.init(gpa, "m");
-    defer setup.deinit();
-    setup.pointAt("test", mock.url);
-    var agent = try testAgent(io, gpa, setup, &http_client);
-    defer agent.deinit();
-
-    var recorder = Recorder{ .gpa = arena_state.allocator() };
-    var client = try agent.clientFor(&session);
-    try agent.turn(recorder.emitter(), &session, &client);
-
+    try harness.run();
     try mock.await();
 
     try std.testing.expectEqual(@as(usize, 2), mock.bodies.items.len);
@@ -1868,26 +1909,21 @@ test "a turn shows the tool it runs and then the answer" {
         "\"reasoning_content\":\"I should run the command.\"",
     ) != null);
 
-    try std.testing.expectEqual(3, recorder.seen.items.len);
-    try std.testing.expectEqualStrings("bash", recorder.seen.items[0].tool_begin);
-    const tool = recorder.seen.items[1].tool_end;
-    try std.testing.expectEqualStrings("bash", tool.name);
-    try std.testing.expectEqualStrings("exit code: 0\nhi\n", tool.result);
-    try std.testing.expectEqualStrings("all done", recorder.seen.items[2].answer);
-
-    try std.testing.expectEqual(1, recorder.reasonings.items.len);
-    try std.testing.expectEqualStrings("I should run the command.", recorder.reasonings.items[0].text);
-    try std.testing.expectEqual(2, recorder.deltas.items.len);
-    try std.testing.expectEqualStrings("all ", recorder.deltas.items[0].text);
-    try std.testing.expectEqualStrings("done", recorder.deltas.items[1].text);
+    try expectSeen(&harness.recorder, &.{
+        .{ .tool_begin = "bash" },
+        .{ .tool_end = .{ .name = "bash", .result = "exit code: 0\nhi\n" } },
+        .{ .answer = "all done" },
+    });
+    try expectFragments(harness.recorder.reasonings.items, &.{"I should run the command."});
+    try expectFragments(harness.recorder.deltas.items, &.{ "all ", "done" });
 
     try std.testing.expectEqualStrings(
         "exit code: 0\nhi\n",
-        session.contentOf(session.messages.items[session.messages.items.len - 2]).?,
+        harness.session.contentOf(harness.session.messages.items[harness.session.messages.items.len - 2]).?,
     );
     try std.testing.expectEqualStrings(
         "all done",
-        session.contentOf(session.messages.items[session.messages.items.len - 1]).?,
+        harness.session.contentOf(harness.session.messages.items[harness.session.messages.items.len - 1]).?,
     );
 }
 
@@ -1977,14 +2013,9 @@ test "an emitter counts what it shows, and not a delta it drops" {
 }
 
 test "a turn that fails mid-answer has shown something" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
 
     var mock = try Mock.start("/chat/completions", 1, Mock.eventStream(
         "data: {\"choices\":[{\"delta\":{\"content\":\"half an answer\"}}]}\n\n" ++
@@ -1992,38 +2023,19 @@ test "a turn that fails mid-answer has shown something" {
     ));
     defer mock.deinit();
     try mock.serve();
+    harness.setup.pointAt("test", mock.url);
 
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
-    var setup = try TestSetup.init(gpa, "m");
-    defer setup.deinit();
-    setup.pointAt("test", mock.url);
-    var agent = try testAgent(io, gpa, setup, &http_client);
-    defer agent.deinit();
-
-    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
-    defer session.deinit();
-
-    var recorder = Recorder{ .gpa = arena_state.allocator() };
-    var client = try agent.clientFor(&session);
-    try std.testing.expectError(error.ApiError, agent.turn(recorder.emitter(), &session, &client));
+    try std.testing.expectError(error.ApiError, harness.run());
     try mock.await();
 
-    try std.testing.expectEqual(@as(usize, 1), recorder.interface.shown);
-    try std.testing.expectEqual(1, recorder.deltas.items.len);
-    try std.testing.expectEqualStrings("half an answer", recorder.deltas.items[0].text);
+    try std.testing.expectEqual(@as(usize, 1), harness.recorder.interface.shown);
+    try expectFragments(harness.recorder.deltas.items, &.{"half an answer"});
 }
 
 test "a turn that fails before showing anything has shown nothing" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
 
     const refusing = struct {
         fn answer(_: usize, _: []const u8) Mock.Answer {
@@ -2033,42 +2045,21 @@ test "a turn that fails before showing anything has shown nothing" {
     var mock = try Mock.start("/chat/completions", 1, refusing);
     defer mock.deinit();
     try mock.serve();
+    harness.setup.pointAt("test", mock.url);
 
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
-    var setup = try TestSetup.init(gpa, "m");
-    defer setup.deinit();
-    setup.pointAt("test", mock.url);
-    var agent = try testAgent(io, gpa, setup, &http_client);
-    defer agent.deinit();
-
-    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
-    defer session.deinit();
-
-    var recorder = Recorder{ .gpa = arena_state.allocator() };
-    var client = try agent.clientFor(&session);
-    try std.testing.expectError(error.HttpStatus, agent.turn(recorder.emitter(), &session, &client));
+    try std.testing.expectError(error.HttpStatus, harness.run());
     try mock.await();
 
-    try std.testing.expectEqual(@as(usize, 0), recorder.interface.shown);
-    try std.testing.expectEqual(0, recorder.deltas.items.len);
+    try std.testing.expectEqual(@as(usize, 0), harness.recorder.interface.shown);
+    try expectFragments(harness.recorder.deltas.items, &.{});
 }
 
 test "a reply with nothing is not kept, and the turn is asked again" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-
-    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
-    defer session.deinit();
-    try session.setSystemPrompt("be terse");
-    try session.append(.{ .role = .user, .content = "first" });
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    try harness.session.setSystemPrompt("be terse");
+    try harness.session.append(.{ .role = .user, .content = "first" });
 
     const answering = struct {
         fn answer(number: usize, _: []const u8) Mock.Answer {
@@ -2091,74 +2082,42 @@ test "a reply with nothing is not kept, and the turn is asked again" {
     var mock = try Mock.start("/chat/completions", 2, answering);
     defer mock.deinit();
     try mock.serve();
+    harness.setup.pointAt("test", mock.url);
 
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
-    var setup = try TestSetup.init(gpa, "m");
-    defer setup.deinit();
-    setup.pointAt("test", mock.url);
-    var agent = try testAgent(io, gpa, setup, &http_client);
-    defer agent.deinit();
-
-    var recorder = Recorder{ .gpa = arena_state.allocator() };
-    var client = try agent.clientFor(&session);
-    try agent.turn(recorder.emitter(), &session, &client);
-
+    try harness.run();
     try mock.await();
 
-    try std.testing.expectEqual(1, recorder.seen.items.len);
-    try std.testing.expectEqualStrings("all done", recorder.seen.items[0].answer);
-    try std.testing.expectEqual(1, recorder.reasonings.items.len);
-    try std.testing.expectEqualStrings("thinking it over", recorder.reasonings.items[0].text);
-    try std.testing.expectEqual(@as(usize, 1), recorder.deltas.items.len);
+    try expectSeen(&harness.recorder, &.{.{ .answer = "all done" }});
+    try expectFragments(harness.recorder.reasonings.items, &.{"thinking it over"});
+    try expectFragments(harness.recorder.deltas.items, &.{"all done"});
 
     try std.testing.expectEqualStrings(mock.bodies.items[0], mock.bodies.items[1]);
     try std.testing.expect(std.mem.find(u8, mock.bodies.items[1], "\"assistant\"") == null);
 
-    try std.testing.expectEqual(@as(usize, 2), session.messages.items.len);
-    try std.testing.expectEqualStrings("assistant", session.messages.items[1].role.name());
-    try std.testing.expectEqualStrings("all done", session.contentOf(session.messages.items[1]).?);
+    try std.testing.expectEqual(@as(usize, 2), harness.session.messages.items.len);
+    try std.testing.expectEqualStrings("assistant", harness.session.messages.items[1].role.name());
+    try std.testing.expectEqualStrings("all done", harness.session.contentOf(harness.session.messages.items[1]).?);
 }
 
 test "a provider that keeps saying nothing ends the turn" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-
-    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
-    defer session.deinit();
-    try session.setSystemPrompt("be terse");
-    try session.append(.{ .role = .user, .content = "first" });
-
-    var setup = try TestSetup.init(gpa, "m");
-    defer setup.deinit();
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    try harness.session.setSystemPrompt("be terse");
+    try harness.session.append(.{ .role = .user, .content = "first" });
 
     // Every reply says nothing, which is a provider that is not answering rather than a model that
     // thought and stopped: the next ask gets the same nothing.
-    var mock = try Mock.start("/chat/completions", setup.config.stored.max_turns, Mock.eventStream(
+    var mock = try Mock.start("/chat/completions", harness.setup.config.stored.max_turns, Mock.eventStream(
         "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking it over\"}}]}\n\n" ++
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
             "data: [DONE]\n\n",
     ));
     defer mock.deinit();
     try mock.serve();
-    setup.pointAt("test", mock.url);
+    harness.setup.pointAt("test", mock.url);
 
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
-    var agent = try testAgent(io, gpa, setup, &http_client);
-    defer agent.deinit();
-
-    var recorder = Recorder{ .gpa = arena_state.allocator() };
-    var client = try agent.clientFor(&session);
-    try agent.turn(recorder.emitter(), &session, &client);
+    try harness.run();
 
     // Stopped rather than waited on, since a turn that stops asking leaves the mock waiting for the
     // requests it was started for.
@@ -2167,36 +2126,24 @@ test "a provider that keeps saying nothing ends the turn" {
     // What the turn ends with is a notice saying the model kept saying nothing, which is not the
     // notice a turn that ran out of turns shows: the model was asked and did not answer, rather
     // than getting as far as it was allowed.
-    try std.testing.expectEqual(1, recorder.seen.items.len);
-    try std.testing.expect(recorder.seen.items[0] == .notice);
-    try std.testing.expectEqual(max_retries, recorder.reasonings.items.len);
-    for (recorder.reasonings.items) |fragment|
-        try std.testing.expectEqualStrings("thinking it over", fragment.text);
     var expected: [96]u8 = undefined;
-    try std.testing.expectEqualStrings(
-        try std.mem.print(&expected, "stopped after {d} replies in a row that said nothing", .{max_retries}),
-        recorder.seen.items[0].notice,
-    );
+    const notice = try std.mem.print(&expected, "stopped after {d} replies in a row that said nothing", .{max_retries});
+    try expectSeen(&harness.recorder, &.{.{ .notice = notice }});
+    try std.testing.expectEqual(max_retries, harness.recorder.reasonings.items.len);
+    for (harness.recorder.reasonings.items) |fragment|
+        try std.testing.expectEqualStrings("thinking it over", fragment.text);
 
-    try std.testing.expectEqual(@as(usize, 1), session.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 1), harness.session.messages.items.len);
     try std.testing.expectEqual(@as(usize, max_retries), mock.bodies.items.len);
     for (mock.bodies.items[1..]) |body| try std.testing.expectEqualStrings(mock.bodies.items[0], body);
 }
 
 test "a reply that says something starts the run of silence over" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-
-    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
-    defer session.deinit();
-    try session.setSystemPrompt("be terse");
-    try session.append(.{ .role = .user, .content = "first" });
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    try harness.session.setSystemPrompt("be terse");
+    try harness.session.append(.{ .role = .user, .content = "first" });
 
     // Silence, then a call, then silence again, then the answer: more replies that say nothing than
     // the turn may take in a row, and a call in the middle of them.
@@ -2229,47 +2176,31 @@ test "a reply that says something starts the run of silence over" {
     var mock = try Mock.start("/chat/completions", 5, answering);
     defer mock.deinit();
     try mock.serve();
+    harness.setup.pointAt("test", mock.url);
 
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
-    var setup = try TestSetup.init(gpa, "m");
-    defer setup.deinit();
-    setup.pointAt("test", mock.url);
-    var agent = try testAgent(io, gpa, setup, &http_client);
-    defer agent.deinit();
-
-    var recorder = Recorder{ .gpa = arena_state.allocator() };
-    var client = try agent.clientFor(&session);
-    try agent.turn(recorder.emitter(), &session, &client);
+    try harness.run();
 
     // Stopped rather than waited on: the mock is answering the request that carries the answer, and
     // a turn that stopped before reaching it would leave the mock waiting for one that is not
     // coming.
     try mock.stop();
 
-    try std.testing.expectEqual(3, recorder.seen.items.len);
-    try std.testing.expectEqualStrings("bash", recorder.seen.items[0].tool_begin);
-    try std.testing.expect(recorder.seen.items[2] == .answer);
-    try std.testing.expectEqualStrings("all done", recorder.seen.items[2].answer);
-    try std.testing.expectEqual(3, recorder.reasonings.items.len);
+    try expectSeen(&harness.recorder, &.{
+        .{ .tool_begin = "bash" },
+        .{ .tool_end = .{ .name = "bash", .result = "exit code: 0\nhi\n" } },
+        .{ .answer = "all done" },
+    });
+    try std.testing.expectEqual(3, harness.recorder.reasonings.items.len);
     try std.testing.expectEqual(@as(usize, 5), mock.bodies.items.len);
 }
 
 test "a turn that runs out of turns says so" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-
-    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
-    defer session.deinit();
-    try session.setSystemPrompt("be terse");
-    try session.append(.{ .role = .user, .content = "first" });
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    try harness.session.setSystemPrompt("be terse");
+    try harness.session.append(.{ .role = .user, .content = "first" });
+    harness.setup.config.stored.max_turns = 2;
 
     // A model that keeps calling a tool never reaches an answer, so the turn is the turn limit's to
     // end.
@@ -2281,44 +2212,27 @@ test "a turn that runs out of turns says so" {
     ));
     defer mock.deinit();
     try mock.serve();
+    harness.setup.pointAt("test", mock.url);
 
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
-    var setup = try TestSetup.init(gpa, "m");
-    defer setup.deinit();
-    setup.pointAt("test", mock.url);
-    var agent = try testAgent(io, gpa, setup, &http_client);
-    defer agent.deinit();
-    setup.config.stored.max_turns = 2;
-
-    var recorder = Recorder{ .gpa = arena_state.allocator() };
-    var client = try agent.clientFor(&session);
-    try agent.turn(recorder.emitter(), &session, &client);
+    try harness.run();
 
     try mock.stop();
 
     try std.testing.expectEqual(@as(usize, 2), mock.bodies.items.len);
-    try std.testing.expectEqual(5, recorder.seen.items.len);
-    try std.testing.expectEqualStrings("bash", recorder.seen.items[0].tool_begin);
-    try std.testing.expectEqualStrings("bash", recorder.seen.items[2].tool_begin);
-    try std.testing.expect(recorder.seen.items[4] == .notice);
-    try std.testing.expectEqualStrings(
-        "stopped after 2 turns without a final answer",
-        recorder.seen.items[4].notice,
-    );
+    try expectSeen(&harness.recorder, &.{
+        .{ .tool_begin = "bash" },
+        .{ .tool_end = .{ .name = "bash", .result = "exit code: 0\nhi\n" } },
+        .{ .tool_begin = "bash" },
+        .{ .tool_end = .{ .name = "bash", .result = "exit code: 0\nhi\n" } },
+        .{ .notice = "stopped after 2 turns without a final answer" },
+    });
 }
 
 test "the first turn names the session, and the naming is not part of it" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
-    defer session.deinit();
-    try session.setSystemPrompt("be terse");
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    try harness.session.setSystemPrompt("be terse");
 
     const answering = struct {
         fn answer(_: usize, body: []const u8) Mock.Answer {
@@ -2342,32 +2256,26 @@ test "the first turn names the session, and the naming is not part of it" {
     defer mock.deinit();
     try mock.serve();
 
-    var setup = try TestSetup.init(gpa, "m");
-    defer setup.deinit();
-    setup.config.stored.title = true;
-    setup.pointAt("test", mock.url);
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-    var agent = try testAgent(io, gpa, setup, &http_client);
-    defer agent.deinit();
+    harness.setup.config.stored.title = true;
+    harness.setup.pointAt("test", mock.url);
 
-    var out: std.Io.Writer.Allocating = .init(gpa);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     var terminal = testTerminal(.{ .out = &out.writer });
-    try agent.ask(terminal.emitter(), &session, "the flaky test keeps failing, please fix it");
+    try harness.agent.ask(terminal.emitter(), &harness.session, "the flaky test keeps failing, please fix it");
 
     try mock.await();
 
-    try std.testing.expectEqualStrings("Fix the flaky test", session.title().?);
-    var resumed = try Session.open(io, tmp.dir, gpa, session.id(), "/work");
+    try std.testing.expectEqualStrings("Fix the flaky test", harness.session.title().?);
+    var resumed = try Session.open(std.testing.io, harness.tmp.dir, std.testing.allocator, harness.session.id(), "/work");
     defer resumed.deinit();
     try std.testing.expectEqualStrings("Fix the flaky test", resumed.title().?);
 
-    try std.testing.expectEqual(@as(usize, 2), session.messages.items.len);
-    try std.testing.expectEqualStrings("user", session.messages.items[0].role.name());
-    try std.testing.expectEqualStrings("assistant", session.messages.items[1].role.name());
-    for (session.messages.items) |message| {
-        const text = session.contentOf(message) orelse "";
+    try std.testing.expectEqual(@as(usize, 2), harness.session.messages.items.len);
+    try std.testing.expectEqualStrings("user", harness.session.messages.items[0].role.name());
+    try std.testing.expectEqualStrings("assistant", harness.session.messages.items[1].role.name());
+    for (harness.session.messages.items) |message| {
+        const text = harness.session.contentOf(message) orelse "";
         try std.testing.expect(std.mem.find(u8, text, "short title") == null);
     }
 }
@@ -2389,8 +2297,9 @@ test "a title is the first line of what was written, or nothing when there is no
 }
 
 test "a turn is sent to the model the session records when it begins" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
 
     var deepseek = try Mock.start("/chat/completions", 1, Mock.completion("from the deepseek model"));
     defer deepseek.deinit();
@@ -2399,31 +2308,19 @@ test "a turn is sent to the model the session records when it begins" {
     defer opencode.deinit();
     try opencode.serve();
 
-    var setup = try TestSetup.init(gpa, "m");
-    defer setup.deinit();
-    setup.config.stored.title = false;
-    setup.pointAt("test", deepseek.url);
-    setup.pointAt("other", opencode.url);
+    harness.setup.config.stored.title = false;
+    harness.setup.pointAt("test", deepseek.url);
+    harness.setup.pointAt("other", opencode.url);
 
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-    var agent = try testAgent(io, gpa, setup, &http_client);
-    defer agent.deinit();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
-    defer session.deinit();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     var terminal = testTerminal(.{ .out = &out.writer });
 
-    try session.setModel("test/deepseek/deepseek-flash");
-    try agent.ask(terminal.emitter(), &session, "the first question");
+    try harness.session.setModel("test/deepseek/deepseek-flash");
+    try harness.agent.ask(terminal.emitter(), &harness.session, "the first question");
 
-    try session.setModel("other/kimi-k2.7-code");
-    try agent.ask(terminal.emitter(), &session, "the second question");
+    try harness.session.setModel("other/kimi-k2.7-code");
+    try harness.agent.ask(terminal.emitter(), &harness.session, "the second question");
 
     try deepseek.await();
     try opencode.await();
@@ -2433,8 +2330,9 @@ test "a turn is sent to the model the session records when it begins" {
 }
 
 test "a session is sent where the choice it recorded points, not the configuration" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
 
     // The configuration names an endpoint nothing listens on, so a request that went there would
     // fail rather than quietly answering.
@@ -2442,29 +2340,17 @@ test "a session is sent where the choice it recorded points, not the configurati
     defer chosen.deinit();
     try chosen.serve();
 
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
-    var setup = try TestSetup.init(gpa, "m");
-    defer setup.deinit();
     // Only the provider the session records is pointed at a server; the one the configuration names
     // is left at a closed port, so a turn that went there would fail rather than answer.
-    setup.config.stored.title = false;
-    setup.pointAt("other", chosen.url);
-    var agent = try testAgent(io, gpa, setup, &http_client);
-    defer agent.deinit();
+    harness.setup.config.stored.title = false;
+    harness.setup.pointAt("other", chosen.url);
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
-    defer session.deinit();
+    try harness.session.setModel("other/kimi-k2.7-code");
 
-    try session.setModel("other/kimi-k2.7-code");
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     var terminal = testTerminal(.{ .out = &out.writer });
-    try agent.ask(terminal.emitter(), &session, "a question");
+    try harness.agent.ask(terminal.emitter(), &harness.session, "a question");
 
     try chosen.await();
     try std.testing.expectEqual(@as(usize, 1), chosen.served);
@@ -2472,59 +2358,37 @@ test "a session is sent where the choice it recorded points, not the configurati
 }
 
 test "a client carries the address, the key and the model of the choice it names" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
 
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-
-    var setup = try TestSetup.init(gpa, "m");
-    defer setup.deinit();
     // The addresses the catalog knows, so the ones the providers really have.
-    setup.config.stored.providers = .{};
-    try setup.credentials.put(setup.arena.allocator(), "deepseek", "k");
-    try setup.credentials.put(setup.arena.allocator(), "opencode-go", "k");
-    var agent = try testAgent(io, gpa, setup, &http_client);
-    defer agent.deinit();
+    harness.setup.config.stored.providers = .{};
+    try harness.setup.credentials.put(harness.setup.arena.allocator(), "deepseek", "k");
+    try harness.setup.credentials.put(harness.setup.arena.allocator(), "opencode-go", "k");
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
-    defer session.deinit();
-
-    try session.setModel("deepseek/deepseek-flash");
-    const flash = try agent.clientFor(&session);
+    try harness.session.setModel("deepseek/deepseek-flash");
+    const flash = try harness.agent.clientFor(&harness.session);
     try std.testing.expectEqualStrings("https://api.deepseek.com/chat/completions", flash.url);
     try std.testing.expectEqualStrings("k", flash.api_key);
     try std.testing.expectEqualStrings("deepseek-flash", flash.model);
 
-    try session.setModel("opencode-go/kimi-k2.7-code");
-    const kimi = try agent.clientFor(&session);
+    try harness.session.setModel("opencode-go/kimi-k2.7-code");
+    const kimi = try harness.agent.clientFor(&harness.session);
     try std.testing.expectEqualStrings("https://opencode.ai/zen/go/v1/chat/completions", kimi.url);
     try std.testing.expectEqualStrings("kimi-k2.7-code", kimi.model);
 }
 
 test "a client is made for a provider the configuration defines itself" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
 
     // `test` is a provider the catalog does not have, so its address is the one the file gives it.
-    var setup = try TestSetup.init(gpa, "m");
-    defer setup.deinit();
-    setup.pointAt("test", "http://localhost:8080/v1");
-    var agent = try testAgent(io, gpa, setup, &http_client);
-    defer agent.deinit();
+    harness.setup.pointAt("test", "http://localhost:8080/v1");
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
-    defer session.deinit();
-
-    try session.setModel("test/qwen3-coder:30b");
-    const client = try agent.clientFor(&session);
+    try harness.session.setModel("test/qwen3-coder:30b");
+    const client = try harness.agent.clientFor(&harness.session);
     try std.testing.expectEqualStrings("http://localhost:8080/v1/chat/completions", client.url);
     try std.testing.expectEqualStrings("qwen3-coder:30b", client.model);
 }
@@ -2618,33 +2482,22 @@ test "what is wrong with a model is said with what to do about it" {
     try std.testing.expect(std.mem.startsWith(u8, unreachableModel(&small, error.MissingApiKey, "a/b"), "the model cannot be reached"));
 }
 test "a client names bytes of its own, not a slice of the session's pool" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
 
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
+    harness.setup.config.stored.providers = .{};
+    try harness.setup.credentials.put(harness.setup.arena.allocator(), "opencode-go", "k");
+    try harness.session.setModel("opencode-go/glm-5.3-flash");
 
-    var setup = try TestSetup.init(gpa, "m");
-    defer setup.deinit();
-    setup.config.stored.providers = .{};
-    try setup.credentials.put(setup.arena.allocator(), "opencode-go", "k");
-    var agent = try testAgent(io, gpa, setup, &http_client);
-    defer agent.deinit();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var session = try Session.open(io, tmp.dir, gpa, null, "/work");
-    defer session.deinit();
-    try session.setModel("opencode-go/glm-5.3-flash");
-
-    const client = try agent.clientFor(&session);
+    const client = try harness.agent.clientFor(&harness.session);
     // The model the session recorded is interned in its string pool, and a pointer into that pool
     // survives no write to it.
     try std.testing.expectEqualStrings("glm-5.3-flash", client.model);
     for (0..40) |i| {
         var buffer: [64]u8 = undefined;
         const filler = try std.mem.print(&buffer, "filler {d} padding padding padding padding", .{i});
-        try session.append(.{ .role = .user, .content = filler });
+        try harness.session.append(.{ .role = .user, .content = filler });
     }
     try std.testing.expectEqualStrings("glm-5.3-flash", client.model);
     try std.testing.expectEqualStrings("https://opencode.ai/zen/go/v1/chat/completions", client.url);
