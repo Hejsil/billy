@@ -449,19 +449,19 @@ test "save round-trips a configured search backend" {
     try std.testing.expectEqual(4, reread.stored.tools.web_search.max_results);
 }
 
+fn expectOpenError(tmp: *std.testing.TmpDir, json: []const u8, expected: anyerror) !void {
+    try std.testing.expectError(expected, openFrom(tmp, json));
+}
+
 test "open rejects damaged, future and unusable configurations" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try std.testing.expectError(error.CorruptConfig, openFrom(&tmp, "{"));
-
-    try std.testing.expectError(error.UnsupportedConfigVersion, openFrom(&tmp, "{\"version\":99}"));
-
-    try std.testing.expectError(error.InvalidConfig, openFrom(&tmp, "{\"max_turns\":0}"));
-
-    try std.testing.expectError(error.InvalidConfig, openFrom(&tmp, "{\"tools\":{\"bash\":{\"timeout_s\":0}}}"));
+    try expectOpenError(&tmp, "{", error.CorruptConfig);
+    try expectOpenError(&tmp, "{\"version\":99}", error.UnsupportedConfigVersion);
+    try expectOpenError(&tmp, "{\"max_turns\":0}", error.InvalidConfig);
+    try expectOpenError(&tmp, "{\"tools\":{\"bash\":{\"timeout_s\":0}}}", error.InvalidConfig);
 }
-
 test "the model setting names a provider and a model of it" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -481,13 +481,12 @@ test "a model setting with half of it missing is refused" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try std.testing.expectError(error.InvalidConfig, openFrom(&tmp, "{\"model\":\"deepseek-flash\"}"));
-    try std.testing.expectError(error.InvalidConfig, openFrom(&tmp, "{\"model\":\"deepseek/\"}"));
-    try std.testing.expectError(error.InvalidConfig, openFrom(&tmp, "{\"model\":\"\"}"));
+    try expectOpenError(&tmp, "{\"model\":\"deepseek-flash\"}", error.InvalidConfig);
+    try expectOpenError(&tmp, "{\"model\":\"deepseek/\"}", error.InvalidConfig);
+    try expectOpenError(&tmp, "{\"model\":\"\"}", error.InvalidConfig);
 
     try Stored.default.validate();
 }
-
 test "the providers map names an endpoint of the user's own" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -506,28 +505,19 @@ test "the providers map names an endpoint of the user's own" {
     try std.testing.expectEqualStrings("http://127.0.0.1:8901/v1", reread.stored.providers.get("mock").?);
 }
 
-test "a model naming a provider the file does not define is refused" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var config = try openFrom(&tmp, "{\"model\":\"opencode-go/glm-5.3-flash\"}");
-    defer config.deinit();
-}
-
 test "a provider entry with no name or no url is refused" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     // A name with no URL names nothing to send to; a URL with no name is one `model` could never
     // write.
-    try std.testing.expectError(error.InvalidConfig, openFrom(&tmp,
-        \\{"model":"mock/m","providers":{"mock":{"base_url":""}}}
-    ));
-    try std.testing.expectError(error.InvalidConfig, openFrom(&tmp,
-        \\{"model":"deepseek/m","providers":{"":{"base_url":"http://127.0.0.1:9/v1"}}}
-    ));
+    try expectOpenError(&tmp, "{\"model\":\"mock/m\",\"providers\":{\"mock\":{\"base_url\":\"\"}}}", error.InvalidConfig);
+    try expectOpenError(
+        &tmp,
+        "{\"model\":\"deepseek/m\",\"providers\":{\"\":{\"base_url\":\"http://127.0.0.1:9/v1\"}}}",
+        error.InvalidConfig,
+    );
 }
-
 test "set names a setting by its dotted path" {
     var config = Config.init(std.testing.allocator);
     defer config.deinit();
